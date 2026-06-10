@@ -13,68 +13,57 @@ simulations. See `CLAUDE.md` for repo layout and conventions.
 
 ## Train a proxy (steering) model
 
-The proxy is trained in **two stages**, both from `openpi/`. Example below is the
-`pot` task with 150 demonstration episodes (`proxy_isaaclab_droid_pot_pi05_jointpos`).
+The proxy is trained in **two stages**, both from `openpi/`. `<train-config>` is the
+proxy training config (e.g. `proxy_isaaclab_droid_pot_pi05_jointpos` for the pot task,
+`proxy_isaaclab_droid_tea_pi05_jointpos` for tea); the dataset is defined by the config.
 
 **Stage 1 — distill the mimic** from the base policy (the "on-the-fly" distillation):
 
 ```bash
 cd openpi
-uv run scripts/distill_pytorch.py proxy_isaaclab_droid_pot_pi05_jointpos \
+uv run scripts/distill_pytorch.py <train-config> \
   --exp_name distill_on_the_fly_150 \
   --teacher_config_name pi05_droid_jointpos \
   --teacher_checkpoint_dir checkpoints/pytorch/pi05_droid_jointpos \
   --num_distill_steps 10 \
   --num_train_steps 20001 \
   --save_interval 20000 \
-  --batch_size 8 \
-  --data.num_episodes 150 \
-  --overwrite
-# -> checkpoints/proxy_isaaclab_droid_pot_pi05_jointpos/distill_on_the_fly_150/20000
+  --batch_size 8
+# -> checkpoints/<train-config>/distill_on_the_fly_150/20000
 ```
 
 **Stage 2 — train the steer model from the mimic**:
 
 ```bash
-uv run scripts/train_pytorch.py proxy_isaaclab_droid_pot_pi05_jointpos \
+uv run scripts/train_pytorch.py <train-config> \
   --exp_name steer_from_mimic_150 \
-  --pytorch_weight_path checkpoints/proxy_isaaclab_droid_pot_pi05_jointpos/distill_on_the_fly_150/20000 \
+  --pytorch_weight_path checkpoints/<train-config>/distill_on_the_fly_150/20000 \
   --num_train_steps 24001 \
   --save_interval 8000 \
-  --batch_size 64 \
-  --data.num_episodes 150 \
-  --overwrite
-# -> checkpoints/proxy_isaaclab_droid_pot_pi05_jointpos/steer_from_mimic_150/{8000,16000,24000}
+  --batch_size 64
+# -> checkpoints/<train-config>/steer_from_mimic_150/{8000,16000,24000}
 ```
-
-For another task, swap the config name (e.g. `proxy_isaaclab_droid_tea_pi05_jointpos`),
-the task id, and the prompt. The dataset is defined by the config.
 
 ## Evaluate with steering (`eval_steering.py`)
 
 Run from the repo root. Steering combines a base policy with a `steer` and a
 `mimic` proxy (here both are the same proxy config, using the Stage-2 steer
-checkpoint and the Stage-1 mimic checkpoint):
+checkpoint and the Stage-1 mimic checkpoint). The config names are read from the
+checkpoint dir paths, so they are not passed explicitly; cameras and headless
+mode are on by default, and steering is applied over the whole denoise:
 
 ```bash
 TASK="Isaac-Pot-Droid-Visuomotor-v0"
 PROMPT="remove the lid of the pot and put egg in it"
-STEER_MODEL_NAME="proxy_isaaclab_droid_pot_pi05_jointpos"
 
 python eval_steering.py \
   --task "$TASK" \
   --exp_name steering_pot_pi05_jointpos_steer150_24000_mimic150_20000 \
-  --enable_cameras \
-  --base_model_name  pi05_droid_jointpos \
-  --steer_model_name "$STEER_MODEL_NAME" \
-  --mimic_model_name "$STEER_MODEL_NAME" \
   --base_checkpoint_dir  openpi/checkpoints/pytorch/pi05_droid_jointpos \
-  --steer_checkpoint_dir openpi/checkpoints/$STEER_MODEL_NAME/steer_from_mimic_150/24000 \
-  --mimic_checkpoint_dir openpi/checkpoints/$STEER_MODEL_NAME/distill_on_the_fly_150/20000 \
-  --headless \
+  --steer_checkpoint_dir openpi/checkpoints/<train-config>/steer_from_mimic_150/24000 \
+  --mimic_checkpoint_dir openpi/checkpoints/<train-config>/distill_on_the_fly_150/20000 \
   --prompt "$PROMPT" \
   --steer_scale 0.4 \
-  --steer_step 0.0 \
   --seed_start 1 \
   --seed_end 31 \
   --task_num_steps 1200
