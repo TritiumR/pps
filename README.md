@@ -23,8 +23,7 @@ proxy training config (e.g. `proxy_isaaclab_droid_pot_pi05_jointpos` for the pot
 cd openpi
 uv run scripts/distill_pytorch.py <train-config> \
   --exp_name reference \
-  --teacher_checkpoint_dir checkpoints/pytorch/pi05_droid_jointpos \
-  --num_distill_steps 10
+  --teacher_checkpoint_dir checkpoints/pytorch/pi05_droid_jointpos
 # -> checkpoints/<train-config>/reference/20000
 ```
 
