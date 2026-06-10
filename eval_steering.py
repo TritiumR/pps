@@ -592,7 +592,7 @@ def _infer_actions_compiled(base_policy, steer_policy, mimic_policy, raw_obs, ar
         noise,
         args.num_steps,
         proxy_action_dim,
-        torch.as_tensor(args.steer_step, dtype=torch.float32, device=device),
+        torch.as_tensor(0.0, dtype=torch.float32, device=device),
         torch.as_tensor(args.steer_scale, dtype=torch.float32, device=device),
         share_proxy_dino,
         args.only_steer,
@@ -722,7 +722,7 @@ def _infer_actions_eager(base_policy, steer_policy, mimic_policy, raw_obs, args)
                 expanded_time,
             )
 
-        if denoise_time >= args.steer_step:
+        if denoise_time >= 0.0:
             steer_v_t = _predict_proxy_flow(
                 prepared_steer, steer_model, x_t, expanded_time
             )
@@ -1308,13 +1308,6 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Evaluate the model on the real droid robot."
     )
-    parser.add_argument("--base_model_name", type=str, default="pi05_droid")
-    parser.add_argument(
-        "--steer_model_name", type=str, default="proxy_droid_water_jointpos"
-    )
-    parser.add_argument(
-        "--mimic_model_name", type=str, default="proxy_droid_water_jointpos"
-    )
     parser.add_argument("--task", type=str, required=True)
     parser.add_argument("--prompt", type=str, default="water the plant with the cup")
     parser.add_argument("--exp_name", type=str, default="demo")
@@ -1341,22 +1334,21 @@ def parse_args():
         "--base_checkpoint_dir",
         type=str,
         default=None,
-        help="Path to the checkpoint directory. If not provided, will try to download from S3 or use default location.",
+        help="Path to the checkpoint directory. Required; the training config name is derived from this path.",
     )
     parser.add_argument(
         "--steer_checkpoint_dir",
         type=str,
         default=None,
-        help="Path to the checkpoint directory. If not provided, will try to download from S3 or use default location.",
+        help="Path to the checkpoint directory. Required; the training config name is derived from this path.",
     )
     parser.add_argument(
         "--mimic_checkpoint_dir",
         type=str,
         default=None,
-        help="Path to the checkpoint directory. If not provided, will try to download from S3 or use default location.",
+        help="Path to the checkpoint directory. Required; the training config name is derived from this path.",
     )
     parser.add_argument("--steer_scale", type=float, default=0.4)
-    parser.add_argument("--steer_step", type=float, default=0.0)
     parser.add_argument("--num_steps", type=int, default=10)
     parser.add_argument("--task_num_steps", type=int, default=1200)
     parser.add_argument("--only_steer", action="store_true")
@@ -1366,6 +1358,9 @@ def parse_args():
 
 parser = parse_args()
 AppLauncher.add_app_launcher_args(parser)
+# Default the IsaacLab app to headless rendering with cameras enabled so these
+# flags are not needed on the inference command line.
+parser.set_defaults(enable_cameras=True, headless=True)
 
 args = parser.parse_args()
 
@@ -1431,13 +1426,37 @@ else:
 # Create environment
 env = gym.make(env_name, cfg=env_cfg).unwrapped
 
+# Derive each training-config name from its checkpoint dir so the model names do
+# not need to be passed on the command line. Checkpoints follow the layout
+# ".../checkpoints/<config_name>/<exp_name>/<step>" (proxies) or
+# ".../checkpoints/pytorch/<config_name>" (base policy).
+def _config_name_from_checkpoint_dir(checkpoint_dir):
+    if checkpoint_dir is None:
+        raise ValueError(
+            "A checkpoint dir is required so the training config name can be derived from it."
+        )
+    parts = [p for p in os.path.normpath(checkpoint_dir).split(os.sep) if p]
+    if "checkpoints" in parts:
+        idx = parts.index("checkpoints") + 1
+        # skip an optional framework wrapper segment (e.g. "pytorch")
+        if idx < len(parts) and parts[idx] == "pytorch":
+            idx += 1
+        if idx < len(parts):
+            return parts[idx]
+    raise ValueError(
+        f"Could not derive a training config name from checkpoint dir: {checkpoint_dir!r}. "
+        "Expected '.../checkpoints/<config_name>/<exp_name>/<step>' or "
+        "'.../checkpoints/pytorch/<config_name>'."
+    )
+
+
 # load checkpoint
-base_config = _config.get_config(args.base_model_name)
 base_checkpoint_dir = args.base_checkpoint_dir
-steer_config = _config.get_config(args.steer_model_name)
 steer_checkpoint_dir = args.steer_checkpoint_dir
-mimic_config = _config.get_config(args.mimic_model_name)
 mimic_checkpoint_dir = args.mimic_checkpoint_dir
+base_config = _config.get_config(_config_name_from_checkpoint_dir(base_checkpoint_dir))
+steer_config = _config.get_config(_config_name_from_checkpoint_dir(steer_checkpoint_dir))
+mimic_config = _config.get_config(_config_name_from_checkpoint_dir(mimic_checkpoint_dir))
 
 # Create the trained policies.
 base_policy = policy_config.create_trained_policy(base_config, base_checkpoint_dir)
