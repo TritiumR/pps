@@ -1310,7 +1310,7 @@ def parse_args():
     )
     parser.add_argument("--task", type=str, required=True)
     parser.add_argument("--prompt", type=str, default="water the plant with the cup")
-    parser.add_argument("--exp_name", type=str, default="demo")
+    parser.add_argument("--exp_name", type=str, default="eval")
     parser.add_argument(
         "--output", type=str, default=None, help="Path to the output directory."
     )
