@@ -7,16 +7,16 @@ the tf.data pipeline is sharded across GPUs so each process reads a disjoint sub
 Usage
 Single GPU:
   python scripts/distill_pytorch.py <config_name> --exp_name <run_name> \
-      --teacher_config_name <teacher_cfg> --teacher_checkpoint_dir <teacher_ckpt>
+      --teacher_checkpoint_dir <teacher_ckpt>
 Multi-GPU (single node):
   torchrun --standalone --nnodes=1 --nproc_per_node=<num_gpus> \
       scripts/distill_pytorch.py <config_name> --exp_name <run_name> \
-      --teacher_config_name <teacher_cfg> --teacher_checkpoint_dir <teacher_ckpt>
+      --teacher_checkpoint_dir <teacher_ckpt>
 Multi-Node:
   torchrun --nnodes=<N> --nproc_per_node=<gpus> --node_rank=<rank> \
       --master_addr=<ip> --master_port=<port> \
       scripts/distill_pytorch.py <config_name> --exp_name <run_name> \
-      --teacher_config_name <teacher_cfg> --teacher_checkpoint_dir <teacher_ckpt>
+      --teacher_checkpoint_dir <teacher_ckpt>
 
 """
 
@@ -58,6 +58,27 @@ import openpi.training.config as _config
 import openpi.training.data_loader as _data
 import openpi.shared.download as download
 import openpi.transforms as _transforms
+
+
+def _config_name_from_checkpoint_dir(checkpoint_dir):
+    """Derive the training-config name from a checkpoint dir path.
+
+    Checkpoints follow ".../checkpoints/<config_name>/<exp>/<step>" or
+    ".../checkpoints/pytorch/<config_name>".
+    """
+    parts = [p for p in os.path.normpath(os.fspath(checkpoint_dir)).split(os.sep) if p]
+    if "checkpoints" in parts:
+        idx = parts.index("checkpoints") + 1
+        # skip an optional framework wrapper segment (e.g. "pytorch")
+        if idx < len(parts) and parts[idx] == "pytorch":
+            idx += 1
+        if idx < len(parts):
+            return parts[idx]
+    raise ValueError(
+        f"Could not derive a teacher config name from checkpoint dir: {checkpoint_dir!r}. "
+        "Expected '.../checkpoints/<config_name>/<exp>/<step>' or "
+        "'.../checkpoints/pytorch/<config_name>'."
+    )
 
 
 def init_logging():
@@ -866,14 +887,18 @@ def train_loop(config: _config.TrainConfig):
 
     # Load the teacher config before constructing the dataset: pointcloud students
     # need hybrid batches that also include the teacher's image inputs.
-    teacher_config_name = getattr(config, "teacher_config_name", None)
     teacher_checkpoint_dir = getattr(config, "teacher_checkpoint_dir", None)
-
-    if teacher_config_name is None or teacher_checkpoint_dir is None:
+    if teacher_checkpoint_dir is None:
         raise ValueError(
-            "teacher_config_name and teacher_checkpoint_dir must be specified for distillation. "
-            "Use --teacher_config_name <config_name> --teacher_checkpoint_dir <checkpoint_dir>"
+            "teacher_checkpoint_dir must be specified for distillation. "
+            "Use --teacher_checkpoint_dir <checkpoint_dir>"
         )
+
+    # The teacher config name is inferred from its checkpoint dir; pass
+    # --teacher_config_name only to override the inferred value.
+    teacher_config_name = getattr(config, "teacher_config_name", None)
+    if teacher_config_name is None:
+        teacher_config_name = _config_name_from_checkpoint_dir(teacher_checkpoint_dir)
 
     teacher_train_config = _config.get_config(teacher_config_name)
     log_teacher_tokenization_config(config, teacher_train_config)
