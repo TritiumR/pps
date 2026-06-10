@@ -1,0 +1,10 @@
+{
+    "exclude": [
+        "data/**",
+        "data_local/**",
+        "outputs/**"
+    ],
+    "extraPaths": [
+        "openpi"
+    ]
+}
