@@ -1,0 +1,6 @@
+[submodule "openpi/third_party/aloha"]
+	path = openpi/third_party/aloha
+	url = https://github.com/Physical-Intelligence/aloha.git
+[submodule "openpi/third_party/libero"]
+	path = openpi/third_party/libero
+	url = https://github.com/Lifelong-Robot-Learning/LIBERO.git
