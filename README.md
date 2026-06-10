@@ -23,24 +23,19 @@ proxy training config (e.g. `proxy_isaaclab_droid_pot_pi05_jointpos` for the pot
 cd openpi
 uv run scripts/distill_pytorch.py <train-config> \
   --exp_name reference \
-  --teacher_config_name pi05_droid_jointpos \
   --teacher_checkpoint_dir checkpoints/pytorch/pi05_droid_jointpos \
-  --num_distill_steps 10 \
-  --num_train_steps 20001 \
-  --save_interval 20000 \
-  --batch_size 8
+  --num_distill_steps 10
 # -> checkpoints/<train-config>/reference/20000
 ```
+
+The teacher config name is inferred from `--teacher_checkpoint_dir`.
 
 **Stage 2 — train the steer model from the mimic**:
 
 ```bash
 uv run scripts/train_pytorch.py <train-config> \
   --exp_name task \
-  --pytorch_weight_path checkpoints/<train-config>/reference/20000 \
-  --num_train_steps 24001 \
-  --save_interval 8000 \
-  --batch_size 64
+  --pytorch_weight_path checkpoints/<train-config>/reference/20000
 # -> checkpoints/<train-config>/task/{8000,16000,24000}
 ```
 
@@ -64,8 +59,6 @@ python eval_steering.py \
   --mimic_checkpoint_dir openpi/checkpoints/<train-config>/reference/20000 \
   --prompt "$PROMPT" \
   --steer_scale 0.4 \
-  --seed_start 1 \
-  --seed_end 31 \
   --task_num_steps 1200
 ```
 

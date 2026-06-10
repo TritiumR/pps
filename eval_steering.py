@@ -1314,8 +1314,8 @@ def parse_args():
     parser.add_argument(
         "--output", type=str, default=None, help="Path to the output directory."
     )
-    parser.add_argument("--seed_start", type=int, default=42)
-    parser.add_argument("--seed_end", type=int, default=43)
+    parser.add_argument("--seed_start", type=int, default=1)
+    parser.add_argument("--seed_end", type=int, default=21)
     parser.add_argument(
         "--load_init_from_dataset",
         type=str,
