@@ -22,26 +22,26 @@ proxy training config (e.g. `proxy_isaaclab_droid_pot_pi05_jointpos` for the pot
 ```bash
 cd openpi
 uv run scripts/distill_pytorch.py <train-config> \
-  --exp_name distill_on_the_fly_150 \
+  --exp_name reference \
   --teacher_config_name pi05_droid_jointpos \
   --teacher_checkpoint_dir checkpoints/pytorch/pi05_droid_jointpos \
   --num_distill_steps 10 \
   --num_train_steps 20001 \
   --save_interval 20000 \
   --batch_size 8
-# -> checkpoints/<train-config>/distill_on_the_fly_150/20000
+# -> checkpoints/<train-config>/reference/20000
 ```
 
 **Stage 2 — train the steer model from the mimic**:
 
 ```bash
 uv run scripts/train_pytorch.py <train-config> \
-  --exp_name steer_from_mimic_150 \
-  --pytorch_weight_path checkpoints/<train-config>/distill_on_the_fly_150/20000 \
+  --exp_name task \
+  --pytorch_weight_path checkpoints/<train-config>/reference/20000 \
   --num_train_steps 24001 \
   --save_interval 8000 \
   --batch_size 64
-# -> checkpoints/<train-config>/steer_from_mimic_150/{8000,16000,24000}
+# -> checkpoints/<train-config>/task/{8000,16000,24000}
 ```
 
 ## Evaluate with steering (`eval_steering.py`)
@@ -58,10 +58,10 @@ PROMPT="remove the lid of the pot and put egg in it"
 
 python eval_steering.py \
   --task "$TASK" \
-  --exp_name steering_pot_pi05_jointpos_steer150_24000_mimic150_20000 \
+  --exp_name eval \
   --base_checkpoint_dir  openpi/checkpoints/pytorch/pi05_droid_jointpos \
-  --steer_checkpoint_dir openpi/checkpoints/<train-config>/steer_from_mimic_150/24000 \
-  --mimic_checkpoint_dir openpi/checkpoints/<train-config>/distill_on_the_fly_150/20000 \
+  --steer_checkpoint_dir openpi/checkpoints/<train-config>/task/24000 \
+  --mimic_checkpoint_dir openpi/checkpoints/<train-config>/reference/20000 \
   --prompt "$PROMPT" \
   --steer_scale 0.4 \
   --seed_start 1 \
