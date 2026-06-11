@@ -8,23 +8,11 @@ core
 core.*
 .vscode
 _wandb
-/droid
-reconstruction/gaussians/output
-reconstruction/gaussians/data
-reconstruction/results
-reconstruction/sam2/checkpoints
-reconstruction/asset
+/droid/results
 *.mp4
 similarity
 gap_similarity
 # dinov3
-FoundationPose/weights
-FoundationPose/demo_data
-FoundationPose/debug
-Grounded-SAM-2/outputs
-Grounded-SAM-2/checkpoints
-Grounded-SAM-2/gdino_checkpoints
-videos
 openpi/small_droid_dataset
 openpi/checkpoints
 openpi/dinov3/checkpoints
@@ -33,29 +21,12 @@ openpi/third_party/libero
 uv.lock
 openpi/uv.lock
 
-openpi/sonata/checkpoints
 openpi/pyproject.toml
-
-logs/
-exps/
-/3D-Diffusion-Policy/
-
-LIBERO/
-LIBERO-plus/
-
-dsrl-pi0/
-dsrl/checkpoints/
 
 **/.DS_Store
 
-fuse.cfg
-
-*.ai
-
 # results
 results
-
-ray/auth.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

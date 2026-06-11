@@ -1,0 +1,5 @@
+flake8-mypy>=17.8.0
+mypy-extensions>=0.4.1
+https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-2.3.0/en_core_web_sm-2.3.0.tar.gz
+imantics>=0.1.12
+

@@ -1,0 +1,36 @@
+# Copyright (c) Facebook, Inc. and its affiliates.
+FROM shaomai/craftassist:1 as base
+
+ARG current_branch
+
+
+# Clone/make repo
+ADD . /fairo
+WORKDIR /fairo
+
+
+RUN source activate /root/miniconda3/envs/droidlet
+RUN mamba install python=3.8 --file conda.txt -c conda-forge  -c pytorch -c nvidia
+RUN pip3 install -r requirements.txt
+RUN pip3 install -r agents/craftassist/requirements.txt
+
+RUN cd droidlet/lowlevel/minecraft && \
+    make clean && \
+    make && \
+    cd ../../..
+
+RUN cd /fairo && \
+    python3 setup.py develop && \
+    yes | python3 droidlet/tools/artifact_scripts/try_download.py --agent_name craftassist
+
+
+RUN npm install -g yarn
+RUN cd /fairo/droidlet/dashboard/web && yarn install
+
+
+RUN echo "alias python=python3" >> ~/.bashrc
+
+ENV LANG C.UTF-8
+ENV LC_ALL C.UTF-8
+
+CMD ["bash"]

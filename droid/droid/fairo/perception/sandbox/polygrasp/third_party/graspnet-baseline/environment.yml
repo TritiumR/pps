@@ -1,0 +1,34 @@
+name: mrp_grasp_server
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - pcl
+  - ninja
+  - pillow
+  - gdown
+  - gcc_linux-64=8.5.0
+  - gxx_linux-64=8.5.0
+  - ffmpeg
+  - opencv=4.5.5=py38h578d9bd_6
+  - libopencv=4.5.5=py38h9b278ad_6
+  - wandb
+  - pybind11
+  - librealsense
+  - jupyterlab
+
+  - pytorch=1.11.0=py3.8_cuda11.3_cudnn8.2.0_0
+  - pytorch-mutex=1.0=cuda
+  - cudatoolkit=11.3
+  - tensorboard
+  - numpy=1.23.5
+  - scipy=1.7.3
+  - Pillow
+  - tqdm
+
+  - pip
+  - pip:
+    - graspnetAPI
+    - open3d
+    - grpcio-tools

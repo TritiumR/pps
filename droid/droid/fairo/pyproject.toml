@@ -1,0 +1,17 @@
+[tool.black]
+line-length = 99
+exclude = '''
+/(
+    \.git
+  | __pycache__
+  | droidlet/lowlevel/minecraft/bin
+  | droidlet/lowlevel/minecraft/client
+  | droidlet/lowlevel/minecraft/server/cuberite
+  | droidlet/lowlevel/minecraft/server/cuberite_config
+  | droidlet/lowlevel/minecraft/server/cuberite_plugins
+)/
+'''
+
+[tool.pytest.ini_options]
+addopts = "--ignore 'droidlet/lowlevel/minecraft/server' --ignore 'droidlet/lowlevel/minecraft/client'"
+

@@ -1,0 +1,144 @@
+// Copyright (c) Facebook, Inc. and its affiliates.
+
+// This source code is licensed under the MIT license found in the
+// LICENSE file in the root directory of this source tree.
+syntax = "proto3";
+option cc_enable_arenas = true;
+import "google/protobuf/timestamp.proto";
+
+service PolymetisControllerServer {
+
+  /*
+  ***** User client methods *****
+
+  These are user-facing methods allowing you to change
+  the current controller and get the full robot states.
+  */
+
+  // Switch the current controller, and return the log index at start of 
+  // controller execution
+  rpc SetController(stream ControllerChunk) returns(LogInterval) {}
+
+  // Update the current controller, and return the log index at the point
+  // where update takes effect
+  rpc UpdateController(stream ControllerChunk) returns(LogInterval) {}
+
+  // Terminate the current controller, and return the log indices at
+  // start & end of controller execution
+  rpc TerminateController(Empty) returns(LogInterval) {}
+
+  // Get the current robot state
+  rpc GetRobotState(Empty) returns(RobotState) {}
+
+  // Get a stream of robot states
+  rpc GetRobotStateStream(Empty) returns(stream RobotState) {}
+
+  // Get a stream of past robot states
+  rpc GetRobotStateLog(LogInterval) returns(stream RobotState) {}
+
+  // Get the start & end log indices of current controller
+  rpc GetEpisodeInterval(Empty) returns(LogInterval) {}
+
+  /*
+  ***** Robot client methods *****
+
+  Clients implementing these methods should provide the robot
+  environment, e.g. the process which connects to the robot
+  hardware or simulation.
+  */
+
+  // Send relevant metadata to initialize RobotClient connection
+  rpc InitRobotClient(RobotClientMetadata) returns(Empty) {}
+
+  // Compute torque command in response to a robot state.
+  rpc ControlUpdate(RobotState) returns(TorqueCommand) {}
+
+  rpc GetRobotClientMetadata(Empty) returns(RobotClientMetadata) {}
+}
+
+service GripperServer {
+    rpc InitRobotClient(GripperMetadata) returns(Empty) {}
+    rpc GetRobotClientMetadata(Empty) returns(GripperMetadata) {}
+
+    rpc GetState(Empty) returns(GripperState) {}
+    rpc Goto(GripperCommand) returns(Empty) {}
+
+    rpc ControlUpdate(GripperState) returns(GripperCommand) {}
+}
+
+message GripperMetadata {
+  string polymetis_version = 1;
+  int32 hz = 2;
+  float max_width = 3;
+}
+
+message GripperCommand {
+    google.protobuf.Timestamp timestamp = 1;
+    float width = 2;
+    float speed = 3;
+    float force = 4;
+    bool grasp = 5;
+    float epsilon_inner = 6;
+    float epsilon_outer = 7;
+}
+
+message GripperState {
+    google.protobuf.Timestamp timestamp = 1;
+    float width = 2;
+    bool is_grasped = 3;
+    bool is_moving = 4;
+    bool prev_command_successful = 6;
+    int32 error_code = 5;
+}
+
+message LogInterval {
+  int32 start = 1;
+  int32 end = 2;
+}
+
+message ControllerChunk {
+  // A subset of the binary stream which contains
+  // the serialized Torchscript module.
+  bytes torchscript_binary_chunk = 1;
+}
+
+message RobotClientMetadata {
+  string urdf_file = 1;
+  int32 hz = 2;
+  repeated float default_Kq = 3;
+  repeated float default_Kqd = 4;
+  bytes default_controller = 5;
+  int32 dof = 6;
+  string ee_link_name = 7;
+  int32 ee_link_idx = 8;
+  repeated float rest_pose = 9;
+  string polymetis_version = 10;
+  repeated float default_Kx = 11;
+  repeated float default_Kxd = 12;
+}
+
+message RobotState {
+  // Contains the robot state. Fields are optional
+  // depending on context. Add to this message to
+  // extend for different types of robots/sensors.
+  google.protobuf.Timestamp timestamp = 1;
+  repeated float joint_positions = 2;
+  repeated float joint_velocities = 3;
+  repeated float joint_torques_computed = 4;              //Torques received from the controller server (copy of TorqueCommand.joint_torques)
+  repeated float prev_joint_torques_computed = 5;         //Torques received from the controller server in the previous timestep
+  repeated float prev_joint_torques_computed_safened = 6; //Torques after adding safety mechanisms in the previous timestep
+  repeated float motor_torques_measured = 7;              //Measured torque signals from the robot motors
+  repeated float motor_torques_external = 8;              //Measured external torques exerted on the robot motors
+  repeated float motor_torques_desired = 9;               //Desired torques signals from the robot motors
+  float prev_controller_latency_ms = 10;                  //Latency of previous ControlUpdate call
+  bool prev_command_successful = 11;                      //Whether previous command packet is successfully transmitted
+  int32 error_code = 12;
+}
+
+message TorqueCommand {
+  // Contains the command sent to the robot.
+  google.protobuf.Timestamp timestamp = 1;
+  repeated float joint_torques = 2;
+}
+
+message Empty {}

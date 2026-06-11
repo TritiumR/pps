@@ -1,0 +1,93 @@
+<!DOCTYPE HTML>
+<html lang="en">
+  <head>
+    <title>Voxel Hello World</title>
+    <meta charset="utf-8">
+    <style type="text/css">
+      body {
+        font-family: Monospace;
+        font-size: 12px;
+        background-color: #f0f0f0;
+        margin: 0px;
+        overflow: hidden;
+      }
+      #container {
+        -moz-user-select: none;
+        -webkit-user-select: none;
+        user-select: none;
+      }
+      #crosshair {
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        margin: -16px 0 0 -16px;
+        width: 32px;
+        height: 32px;
+      }
+      #stats { bottom: 0px; right: 0px; }
+      .bar-tab { right: 33% !important; left: 33% !important; }
+      .logo {position: absolute; top: 5px; left: 5px; }
+      .errorMessage { text-align: center; width: 200px; margin: 20px auto; }
+    </style>
+  </head>
+  <body>
+    <div id="text-container">Voxel World</div>
+    <script type="text/javascript" src="myWorld.js"></script>
+  </body>
+  <script>
+    // Send a message to the parent window when the user clicks in so the prompt text can be removed
+    window.addEventListener("click", () => {
+      window.parent.postMessage(JSON.stringify({ msg: "click" }), "*");
+      document.body.requestPointerLock();
+    }, false);
+    
+    window.addEventListener("message", (event) => {
+
+      function updateAgents(agentsInfo) {
+        if (agentsInfo != null) {
+          myWorld.updateAgents(agentsInfo)
+        }
+      }
+
+      function updateMobs(mobsInfo) {
+        if (mobsInfo != null) {
+          myWorld.updateMobs(mobsInfo)
+        }
+      }
+
+      function updateItemStacks(itemStacksInfo) {
+        if (itemStacksInfo != null) {
+          myWorld.updateItemStacks(itemStacksInfo)
+        }
+      }
+
+      function updateBlocks(blocksInfo) {
+        if (blocksInfo != null) {
+          myWorld.updateBlocks(blocksInfo)
+        }
+      }
+
+      function flashBlocks(bbox) {
+        if (flashBlocks != null) {
+          myWorld.flashBlocks(bbox)
+        }
+      }
+      // console.log("world.html get data")
+      // document.getElementById("text-container").innerHTML=JSON.stringify(event.data)
+      status = event.data['status']
+
+      if (status == "updateVoxelWorldState") {
+        worldState = event.data['world_state']
+        updateAgents(worldState['agent'])
+        updateMobs(worldState['mob'])
+        updateItemStacks(worldState['item_stack'])
+        updateBlocks(worldState['block'])
+      } 
+      
+      flash_bbox = event.data['flash_bbox']
+      if (flash_bbox) {
+        flashBlocks(flash_bbox);
+      }
+    }, false);
+  </script>
+</html>

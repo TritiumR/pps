@@ -1,0 +1,718 @@
+{
+  "$id": "grammar_spec.schema.json",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Build Schema",
+  "type": "object",
+  "required": [
+    "dialogue_type"
+  ],
+  "definitions": {
+    "span": {
+      "$ref": "action_dict_components.schema.json#/definitions/span"
+    },
+    "reference_object": {
+      "$ref": "action_dict_components.schema.json#/definitions/reference_object"
+    },
+    "filters": {
+      "$ref": "filters.schema.json#/definitions/filters"
+    },
+    "triples": {
+      "$ref": "filters.schema.json#/definitions/triples"
+    },
+    "location": {
+      "$ref": "action_dict_components.schema.json#/definitions/location"
+    },
+    "terminate_condition": {
+      "$ref": "action_dict_components.schema.json#/definitions/terminate_condition"
+    },
+    "stop_condition": {
+      "$ref": "action_dict_components.schema.json#/definitions/stop_condition"
+    },
+    "schematic": {
+      "$ref": "action_dict_components.schema.json#/definitions/schematic"
+    },
+    "facing": {
+      "$ref": "action_dict_components.schema.json#/definitions/facing"
+    },
+    "dance_type": {
+      "$ref": "action_dict_components.schema.json#/definitions/dance_type"
+    },
+    "noop": {
+      "$ref": "other_dialogue.schema.json#/definitions/noop"
+    },
+    "upsert": {
+      "$ref": "other_dialogue.schema.json#/definitions/upsert"
+    },
+    "otheraction": {
+      "$ref": "other_dialogue.schema.json#/definitions/otheraction"
+    },
+    "say": {
+      "type": "object",
+      "properties": {
+        "action_type": {
+          "enum": [
+            "SAY"
+          ]
+        },
+        "say_span": {
+          "$ref": "action_dict_components.schema.json#/definitions/span"
+        }
+      }
+    },
+    "build": {
+      "type": "object",
+      "properties": {
+        "location": {
+          "$ref": "#/definitions/location"
+        },
+        "replace": {
+          "type": "boolean"
+        },
+        "action_type": {
+          "enum": [
+            "BUILD"
+          ]
+        },
+        "schematic": {
+          "$ref": "#/definitions/schematic"
+        },
+        "dialogue_target": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "filters": {
+                  "$ref": "filters.schema.json#/definitions/filters"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "action_type"
+          ]
+        }
+      ]
+    },
+    "replace": {
+      "type": "boolean",
+      "description": "Whether to replace"
+    },
+    "move": {
+      "type": "object",
+      "properties": {
+        "location": {
+          "$ref": "#/definitions/location"
+        },
+        "replace": {
+          "type": "boolean"
+        },
+        "action_type": {
+          "enum": [
+            "MOVE"
+          ]
+        },
+        "dialogue_target": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "filters": {
+                  "$ref": "filters.schema.json#/definitions/filters"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "composite": {
+      "type": "object",
+      "properties": {
+        "action_type": {
+          "enum": ["COMPOSITE_ACTION"]
+        }
+      }
+    },
+    "spawn": {
+      "type": "object",
+      "properties": {
+        "action_type": {
+          "const": "SPAWN"
+        },
+        "dialogue_target": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "filters": {
+                  "$ref": "filters.schema.json#/definitions/filters"
+                }
+              }
+            }
+          ]
+        },
+        "reference_object": {
+          "$ref": "#/definitions/reference_object"
+        },
+        "replace": {
+          "$ref": "#/definitions/replace"
+        }
+      },
+      "required": [
+        "action_type"
+      ]
+    },
+    "resume": {
+      "type": "object",
+      "properties": {
+        "action_type": {
+          "enum": [
+            "RESUME"
+          ]
+        },
+        "dialogue_target": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "filters": {
+                  "$ref": "filters.schema.json#/definitions/filters"
+                }
+              }
+            }
+          ]
+        },
+        "target_action_type": {
+          "$ref": "#/definitions/span"
+        }
+      },
+      "required": [
+        "action_type"
+      ]
+    },
+    "fill": {
+      "type": "object",
+      "properties": {
+        "action_type": {
+          "enum": [
+            "FILL"
+          ]
+        },
+        "dialogue_target": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "filters": {
+                  "$ref": "filters.schema.json#/definitions/filters"
+                }
+              }
+            }
+          ]
+        },
+        "schematic": {
+          "$ref": "action_dict_components.schema.json#/definitions/schematic"
+        },
+        "reference_object": {
+          "$ref": "#/definitions/reference_object"
+        },
+        "replace": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "action_type"
+      ]
+    },
+    "destroy": {
+      "type": "object",
+      "properties": {
+        "action_type": {
+          "enum": [
+            "DESTROY"
+          ]
+        },
+        "dialogue_target": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "filters": {
+                  "$ref": "filters.schema.json#/definitions/filters"
+                }
+              }
+            }
+          ]
+        },
+        "reference_object": {
+          "$ref": "#/definitions/reference_object"
+        },
+        "replace": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "action_type"
+      ]
+    },
+    "target_action_type": {
+      "oneOf": [
+        {
+          "$ref": "#/definitions/span"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "fixed_value": {
+              "$ref": "action_dict_components.schema.json#/definitions/fixed_value"
+            }
+          }
+        }
+      ]
+    },
+    "undo": {
+      "type": "object",
+      "properties": {
+        "action_type": {
+          "const": "UNDO"
+        },
+        "dialogue_target": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "filters": {
+                  "$ref": "filters.schema.json#/definitions/filters"
+                }
+              }
+            }
+          ]
+        },
+        "target_action_type": {
+          "$ref": "#/definitions/target_action_type"
+        }
+      },
+      "required": [
+        "action_type"
+      ]
+    },
+    "stop": {
+      "type": "object",
+      "properties": {
+        "action_type": {
+          "const": "STOP"
+        },
+        "dialogue_target": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "filters": {
+                  "$ref": "filters.schema.json#/definitions/filters"
+                }
+              }
+            }
+          ]
+        },
+        "target_action_type": {
+          "$ref": "#/definitions/target_action_type"
+        }
+      },
+      "required": [
+        "action_type"
+      ]
+    },
+    "dig": {
+      "type": "object",
+      "properties": {
+        "action_type": {
+          "enum": [
+            "DIG"
+          ]
+        },
+        "dialogue_target": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "filters": {
+                  "$ref": "filters.schema.json#/definitions/filters"
+                }
+              }
+            }
+          ]
+        },
+        "location": {
+          "$ref": "#/definitions/location"
+        },
+        "schematic": {
+          "$ref": "#/definitions/schematic"
+        },
+        "reference_object": {
+          "$ref": "#/definitions/reference_object"
+        },
+        "replace": {
+          "$ref": "#/definitions/replace"
+        }
+      },
+      "required": [
+        "action_type"
+      ],
+      "additionalProperties": false
+    },
+    "freebuild": {
+      "type": "object",
+      "properties": {
+        "action_type": {
+          "const": "FREEBUILD"
+        },
+        "dialogue_target": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "filters": {
+                  "$ref": "filters.schema.json#/definitions/filters"
+                }
+              }
+            }
+          ]
+        },
+        "reference_object": {
+          "$ref": "#/definitions/reference_object"
+        },
+        "location": {
+          "$ref": "#/definitions/location"
+        },
+        "replace": {
+          "$ref": "#/definitions/replace"
+        }
+      },
+      "required": [
+        "action_type"
+      ],
+      "additionalProperties": false
+    },
+    "dance": {
+      "type": "object",
+      "properties": {
+        "action_type": {
+          "enum": [
+            "DANCE"
+          ]
+        },
+        "dialogue_target": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "filters": {
+                  "$ref": "filters.schema.json#/definitions/filters"
+                }
+              }
+            }
+          ]
+        },
+        "location": {
+          "$ref": "#/definitions/location"
+        },
+        "dance_type": {
+          "$ref": "#/definitions/dance_type"
+        },
+        "replace": {
+          "$ref": "#/definitions/replace"
+        }
+      },
+      "required": [
+        "action_type"
+      ]
+    },
+    "get": {
+      "type": "object",
+      "properties": {
+        "action_type": {
+          "enum": [
+            "GET"
+          ]
+        },
+        "dialogue_target": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "filters": {
+                  "$ref": "filters.schema.json#/definitions/filters"
+                }
+              }
+            }
+          ]
+        },
+        "reference_object": {
+          "$ref": "#/definitions/reference_object"
+        },
+        "receiver": {
+          "$ref": "#/definitions/receiver"
+        }
+      }
+    },
+    "get_capabilities": {
+      "properties": {
+        "dialogue_type": {
+          "enum": [
+            "GET_CAPABILITIES"
+          ]
+        },
+        "action_type": {
+          "enum": [
+            "UNKNOWN",
+            "ANY",
+            "BUILD",
+            "PUT_MEMORY",
+            "GET_MEMORY"
+          ]
+        },
+        "dialogue_target": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "filters": {
+                  "$ref": "filters.schema.json#/definitions/filters"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "human_give_command": {
+      "properties": {
+        "dialogue_type": {
+          "const": "HUMAN_GIVE_COMMAND"
+        },
+        "event_sequence": {
+          "$ref": "#/definitions/event_sequence"
+        }
+      }
+    },
+    "receiver": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "reference_object": {
+              "$ref": "#/definitions/reference_object"
+            }
+          },
+          "required": [
+            "reference_object"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "location": {
+              "$ref": "#/definitions/location"
+            }
+          },
+          "required": [
+            "location"
+          ]
+        }
+      ]
+    },
+    "scout": {
+      "type": "object",
+      "properties": {
+        "action_type": {
+          "enum": [
+            "SCOUT"
+          ]
+        },
+        "dialogue_target": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "filters": {
+                  "$ref": "filters.schema.json#/definitions/filters"
+                }
+              }
+            }
+          ]
+        },
+        "reference_object": {
+          "$ref": "#/definitions/reference_object"
+        }
+      }
+    },
+    "event_sequence": {
+      "type": "array",
+      "items": {
+        "anyOf": [
+          {
+            "$ref": "#/definitions/move"
+          },
+          {
+            "$ref": "#/definitions/say"
+          },
+          {
+            "$ref": "#/definitions/composite"
+          },
+          {
+            "$ref": "#/definitions/build"
+          },
+          {
+            "$ref": "#/definitions/spawn"
+          },
+          {
+            "$ref": "#/definitions/resume"
+          },
+          {
+            "$ref": "#/definitions/fill"
+          },
+          {
+            "$ref": "#/definitions/destroy"
+          },
+          {
+            "$ref": "#/definitions/undo"
+          },
+          {
+            "$ref": "#/definitions/stop"
+          },
+          {
+            "$ref": "#/definitions/dig"
+          },
+          {
+            "$ref": "#/definitions/freebuild"
+          },
+          {
+            "$ref": "#/definitions/dance"
+          },
+          {
+            "$ref": "#/definitions/get"
+          },
+          {
+            "$ref": "#/definitions/scout"
+          },
+          {
+            "$ref": "#/definitions/otheraction"
+          }
+        ]
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "dialogue_type": {
+          "const": "HUMAN_GIVE_COMMAND"
+        },
+        "event_sequence": {
+          "$ref": "#/definitions/event_sequence"
+        }
+      }
+    },
+    {
+      "properties": {
+        "dialogue_type": {
+          "enum": [
+            "NOOP",
+            "BOT_CAPABILITIES",
+            "OTHERACTION"
+          ]
+        }
+      }
+    },
+    {
+      "properties": {
+        "dialogue_type": {
+          "enum": [
+            "GET_CAPABILITIES"
+          ]
+        },
+        "action_type": {
+          "enum": [
+            "UNKNOWN",
+            "ANY",
+            "BUILD",
+            "PUT_MEMORY",
+            "GET_MEMORY"
+          ]
+        }
+      }
+    },
+    {
+      "properties": {
+        "dialogue_type": {
+          "const": "GET_MEMORY"
+        },
+        "filters": {
+          "$ref": "#/definitions/filters"
+        },
+        "replace": {
+          "$ref": "#/definitions/replace"
+        }
+      }
+    },
+    {
+      "properties": {
+        "dialogue_type": {
+          "const": "PUT_MEMORY"
+        },
+        "filters": {
+          "$ref": "#/definitions/filters"
+        },
+        "upsert": {
+          "$ref": "#/definitions/upsert"
+        }
+      }
+    }
+  ]
+}

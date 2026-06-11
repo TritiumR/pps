@@ -1,0 +1,35 @@
+/*
+Copyright (c) Facebook, Inc. and its affiliates.
+*/
+import React from "react";
+import LocoView from "./components/LocoView";
+import VoxelWorld from "./components/VoxelWorld/VoxelWorld";
+
+class MainPane extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = {
+      agentType: "locobot",
+    };
+  }
+
+  componentDidMount() {
+    if (this.props.stateManager) this.props.stateManager.connect(this);
+  }
+
+  render() {
+    console.log("MainPane rendering agent type: " + this.state.agentType);
+    const stateManager = this.props.stateManager;
+
+    if (this.state.agentType === "locobot") {
+      return <LocoView stateManager={stateManager} />;
+    } else if (this.state.agentType === "craftassist") {
+      return <VoxelWorld stateManager={stateManager} />;
+    } else {
+      console.log("MainPane received invalid agent type");
+      return <h1>Error: Invalid agent type</h1>;
+    }
+  }
+}
+
+export default MainPane;

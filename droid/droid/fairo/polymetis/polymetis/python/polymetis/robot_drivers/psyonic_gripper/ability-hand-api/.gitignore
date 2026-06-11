@@ -1,0 +1,7 @@
+*.d
+*.o
+*.out
+*.pyc
+__pycache__
+**/.vscode
+outputs/

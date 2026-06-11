@@ -1,0 +1,63 @@
+/* Copyright (c) Facebook, Inc. and its affiliates. */
+
+.App {
+  margin: 0;
+  text-align: center;
+  height: 100%;
+  width: 100%;
+}
+
+.App-title {
+  text-align: center;
+  margin-top: 10px;
+  font-size: 60;
+}
+
+.infoContent {
+  margin: 0;
+  position: relative;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-evenly;
+  text-align: center;
+  height: 100%;
+  width: 100%;
+}
+
+.stoplight {
+  --status-indicator-size: 25px;
+  position: static;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  margin: 2%;
+  width: 85%;
+}
+
+.timer {
+  position: static;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  margin: 2%;
+  width: 85%;
+}
+
+.below-nav {
+  padding-top: 10px;
+  max-height: 50vh;
+}
+
+.MuiInputBase-input {
+  text-align: left !important;
+}
+
+.MsgButton {
+  color: black !important;
+  background-color: white !important; 
+}
+
+.MsgButton:disabled {
+  visibility: hidden;
+}
