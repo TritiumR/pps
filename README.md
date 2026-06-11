@@ -1,5 +1,7 @@
 # Proxy Policy Steering
 
+Project page: https://proxy-policy-steering.github.io/
+
 ## Prerequisites
 
 - NVIDIA Isaac Sim + IsaacLab dependencies and a GPU (evaluation launches a sim app).
