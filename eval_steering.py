@@ -180,15 +180,15 @@ def _stat_values_for_compare(stats, use_quantiles: bool):
 
 def _warn_if_norm_mismatch(
     base_policy,
-    steer_policy,
-    mimic_policy,
+    task_policy,
+    ref_policy,
     *,
     action_dim: int,
 ):
     policies = {
         "base": base_policy,
-        "steer": steer_policy,
-        "mimic": mimic_policy,
+        "task": task_policy,
+        "ref": ref_policy,
     }
     norm_info = {
         role: _policy_input_norm_stats(policy)
@@ -208,7 +208,7 @@ def _warn_if_norm_mismatch(
     if base_stats is None:
         return
 
-    for role in ("steer", "mimic"):
+    for role in ("task", "ref"):
         role_stats, role_use_quantiles = norm_info[role]
         if role_stats is None:
             continue
@@ -393,19 +393,19 @@ def _sequence_proxy_flow_from_prefix(
 
 def _eval_steer_forward_all(
     base_model,
-    steer_model,
-    mimic_model,
+    task_model,
+    ref_model,
     base_images,
     base_img_masks,
     lang_tokens,
     lang_masks,
     base_state,
-    steer_images,
-    steer_img_masks,
-    steer_state,
-    mimic_images,
-    mimic_img_masks,
-    mimic_state,
+    task_images,
+    task_img_masks,
+    task_state,
+    ref_images,
+    ref_img_masks,
+    ref_state,
     x_t,
     num_steps: int,
     proxy_action_dim: int,
@@ -433,15 +433,15 @@ def _eval_steer_forward_all(
         use_cache=True,
     )
 
-    steer_prefix_embs, steer_prefix_pad_masks, _ = steer_model.embed_prefix(
-        steer_images, steer_img_masks
+    task_prefix_embs, task_prefix_pad_masks, _ = task_model.embed_prefix(
+        task_images, task_img_masks
     )
     if share_proxy_dino:
-        mimic_prefix_embs = steer_prefix_embs
-        mimic_prefix_pad_masks = steer_prefix_pad_masks
+        ref_prefix_embs = task_prefix_embs
+        ref_prefix_pad_masks = task_prefix_pad_masks
     else:
-        mimic_prefix_embs, mimic_prefix_pad_masks, _ = mimic_model.embed_prefix(
-            mimic_images, mimic_img_masks
+        ref_prefix_embs, ref_prefix_pad_masks, _ = ref_model.embed_prefix(
+            ref_images, ref_img_masks
         )
 
     bsize = x_t.shape[0]
@@ -458,20 +458,20 @@ def _eval_steer_forward_all(
             x_t,
             expanded_time,
         )
-        steer_v_t = _sequence_proxy_flow_from_prefix(
-            steer_model,
-            steer_state,
-            steer_prefix_embs,
-            steer_prefix_pad_masks,
+        task_v_t = _sequence_proxy_flow_from_prefix(
+            task_model,
+            task_state,
+            task_prefix_embs,
+            task_prefix_pad_masks,
             x_t,
             expanded_time,
             proxy_action_dim,
         )
-        mimic_v_t = _sequence_proxy_flow_from_prefix(
-            mimic_model,
-            mimic_state,
-            mimic_prefix_embs,
-            mimic_prefix_pad_masks,
+        ref_v_t = _sequence_proxy_flow_from_prefix(
+            ref_model,
+            ref_state,
+            ref_prefix_embs,
+            ref_prefix_pad_masks,
             x_t,
             expanded_time,
             proxy_action_dim,
@@ -480,12 +480,12 @@ def _eval_steer_forward_all(
         steer_mask = (denoise_time >= steer_step).to(dtype=base_v_t.dtype)
         if only_steer:
             steered_v_t = base_v_t.clone()
-            steered_v_t[:, :, :proxy_action_dim] = steer_v_t
+            steered_v_t[:, :, :proxy_action_dim] = task_v_t
             v_t = torch.where(steer_mask.to(dtype=torch.bool), steered_v_t, base_v_t)
         else:
             v_t = base_v_t.clone()
             v_t[:, :, :proxy_action_dim] += (
-                steer_mask * steer_scale * (steer_v_t - mimic_v_t)
+                steer_mask * steer_scale * (task_v_t - ref_v_t)
             )
 
         x_t = x_t + dt * v_t
@@ -517,7 +517,7 @@ def _get_compiled_eval_steer_forward():
     return _compiled_eval_steer_forward_all
 
 
-def _can_use_compiled_infer(base_policy, steer_policy, mimic_policy, args) -> bool:
+def _can_use_compiled_infer(base_policy, task_policy, ref_policy, args) -> bool:
     if args.compare_difference:
         return False
     if base_policy._model.config.model_type not in (
@@ -525,27 +525,27 @@ def _can_use_compiled_infer(base_policy, steer_policy, mimic_policy, args) -> bo
         _model.ModelType.PI05,
     ):
         return False
-    if steer_policy._model.config.model_type != _model.ModelType.PROXY:
+    if task_policy._model.config.model_type != _model.ModelType.PROXY:
         return False
-    if mimic_policy._model.config.model_type != _model.ModelType.PROXY:
+    if ref_policy._model.config.model_type != _model.ModelType.PROXY:
         return False
     return True
 
 
-def _infer_actions_compiled(base_policy, steer_policy, mimic_policy, raw_obs, args):
+def _infer_actions_compiled(base_policy, task_policy, ref_policy, raw_obs, args):
     base_obs, base_inputs = _obs_to_input_checked(base_policy, raw_obs, "base")
-    steer_obs, _ = _obs_to_input_checked(steer_policy, raw_obs, "steer")
-    mimic_obs, _ = _obs_to_input_checked(mimic_policy, raw_obs, "mimic")
+    task_obs, _ = _obs_to_input_checked(task_policy, raw_obs, "task")
+    ref_obs, _ = _obs_to_input_checked(ref_policy, raw_obs, "ref")
 
     bsize = base_obs.state.shape[0]
     device = base_obs.state.device
 
     base_model = base_policy._model
-    steer_model = steer_policy._model
-    mimic_model = mimic_policy._model
+    task_model = task_policy._model
+    ref_model = ref_policy._model
 
     base_action_dim = base_model.config.action_dim
-    proxy_action_dim = steer_model.config.action_dim
+    proxy_action_dim = task_model.config.action_dim
     actions_shape = (
         bsize,
         base_model.config.action_horizon,
@@ -556,39 +556,39 @@ def _infer_actions_compiled(base_policy, steer_policy, mimic_policy, raw_obs, ar
     base_images, base_img_masks, lang_tokens, lang_masks, base_state = (
         base_model._preprocess_observation(base_obs, train=False)
     )
-    steer_images, steer_img_masks, steer_state = steer_model._preprocess_observation(
-        steer_obs, train=False
+    task_images, task_img_masks, task_state = task_model._preprocess_observation(
+        task_obs, train=False
     )
-    mimic_images, mimic_img_masks, mimic_state = mimic_model._preprocess_observation(
-        mimic_obs, train=False
+    ref_images, ref_img_masks, ref_state = ref_model._preprocess_observation(
+        ref_obs, train=False
     )
 
     base_model.paligemma_with_expert.paligemma.language_model.config._attn_implementation = (
         "eager"  # noqa: SLF001
     )
     share_proxy_dino = (
-        getattr(steer_model.config, "freeze_dino_encoder", False)
-        and getattr(mimic_model.config, "freeze_dino_encoder", False)
-        and getattr(steer_model.config, "dino_model_name", None)
-        == getattr(mimic_model.config, "dino_model_name", None)
+        getattr(task_model.config, "freeze_dino_encoder", False)
+        and getattr(ref_model.config, "freeze_dino_encoder", False)
+        and getattr(task_model.config, "dino_model_name", None)
+        == getattr(ref_model.config, "dino_model_name", None)
     )
 
     forward_fn = _get_compiled_eval_steer_forward()
     x_t = forward_fn(
         base_model,
-        steer_model,
-        mimic_model,
+        task_model,
+        ref_model,
         base_images,
         base_img_masks,
         lang_tokens,
         lang_masks,
         base_state,
-        steer_images,
-        steer_img_masks,
-        steer_state,
-        mimic_images,
-        mimic_img_masks,
-        mimic_state,
+        task_images,
+        task_img_masks,
+        task_state,
+        ref_images,
+        ref_img_masks,
+        ref_state,
         noise,
         args.num_steps,
         proxy_action_dim,
@@ -602,39 +602,39 @@ def _infer_actions_compiled(base_policy, steer_policy, mimic_policy, raw_obs, ar
     return actions, {}
 
 
-def infer_actions(base_policy, steer_policy, mimic_policy, raw_obs, args):
+def infer_actions(base_policy, task_policy, ref_policy, raw_obs, args):
     global _compiled_eval_steer_failed
     if (
         not _compiled_eval_steer_failed
-        and _can_use_compiled_infer(base_policy, steer_policy, mimic_policy, args)
+        and _can_use_compiled_infer(base_policy, task_policy, ref_policy, args)
     ):
         try:
             return _infer_actions_compiled(
-                base_policy, steer_policy, mimic_policy, raw_obs, args
+                base_policy, task_policy, ref_policy, raw_obs, args
             )
         except Exception as exc:
             _compiled_eval_steer_failed = True
             print(
                 f"Compiled eval inference failed once; falling back to eager infer_actions. Error: {exc}"
             )
-    return _infer_actions_eager(base_policy, steer_policy, mimic_policy, raw_obs, args)
+    return _infer_actions_eager(base_policy, task_policy, ref_policy, raw_obs, args)
 
 
-def _infer_actions_eager(base_policy, steer_policy, mimic_policy, raw_obs, args):
+def _infer_actions_eager(base_policy, task_policy, ref_policy, raw_obs, args):
     base_obs, base_inputs = _obs_to_input_checked(base_policy, raw_obs, "base")
-    steer_obs, _ = _obs_to_input_checked(steer_policy, raw_obs, "steer")
-    mimic_obs, _ = _obs_to_input_checked(mimic_policy, raw_obs, "mimic")
+    task_obs, _ = _obs_to_input_checked(task_policy, raw_obs, "task")
+    ref_obs, _ = _obs_to_input_checked(ref_policy, raw_obs, "ref")
 
     bsize = base_obs.state.shape[0]
     device = base_obs.state.device
     need_compare = args.compare_difference
 
     base_model = base_policy._model
-    steer_model = steer_policy._model
-    mimic_model = mimic_policy._model
+    task_model = task_policy._model
+    ref_model = ref_policy._model
 
     base_action_dim = base_model.config.action_dim
-    proxy_action_dim = steer_model.config.action_dim
+    proxy_action_dim = task_model.config.action_dim
     compare_action_dim = proxy_action_dim - 1
 
     actions_shape = (
@@ -671,20 +671,20 @@ def _infer_actions_eager(base_policy, steer_policy, mimic_policy, raw_obs, args)
         use_cache=True,
     )
 
-    prepared_steer = _prepare_proxy_steering(steer_model, steer_obs)
-    prepared_mimic = _prepare_proxy_steering(mimic_model, mimic_obs)
+    prepared_task = _prepare_proxy_steering(task_model, task_obs)
+    prepared_ref = _prepare_proxy_steering(ref_model, ref_obs)
 
     # if the DINO encoder is frozen and the model names are the same, use the same prefix embeddings for mimic
     if (
-        getattr(steer_model.config, "freeze_dino_encoder", False)
-        and getattr(mimic_model.config, "freeze_dino_encoder", False)
-        and getattr(steer_model.config, "dino_model_name", None)
-        == getattr(mimic_model.config, "dino_model_name", None)
-        and prepared_steer["kind"] == "sequence"
-        and prepared_mimic["kind"] == "sequence"
+        getattr(task_model.config, "freeze_dino_encoder", False)
+        and getattr(ref_model.config, "freeze_dino_encoder", False)
+        and getattr(task_model.config, "dino_model_name", None)
+        == getattr(ref_model.config, "dino_model_name", None)
+        and prepared_task["kind"] == "sequence"
+        and prepared_ref["kind"] == "sequence"
     ):
-        prepared_mimic["prefix_embs"] = prepared_steer["prefix_embs"]
-        prepared_mimic["prefix_pad_masks"] = prepared_steer["prefix_pad_masks"]
+        prepared_ref["prefix_embs"] = prepared_task["prefix_embs"]
+        prepared_ref["prefix_pad_masks"] = prepared_task["prefix_pad_masks"]
 
     dt = -1.0 / args.num_steps
     dt = torch.tensor(dt, dtype=torch.float32, device=device)
@@ -695,12 +695,12 @@ def _infer_actions_eager(base_policy, steer_policy, mimic_policy, raw_obs, args)
 
     if need_compare:
         shared_compare_stats = {
-            "mimic_minus_base": None,
-            "steer_minus_mimic": None,
+            "ref_minus_base": None,
+            "task_minus_ref": None,
         }
         teacher_compare_stats = {
-            "mimic_minus_base": None,
-            "steer_minus_mimic": None,
+            "ref_minus_base": None,
+            "task_minus_ref": None,
         }
 
     while denoise_time >= -dt / 2:
@@ -723,49 +723,49 @@ def _infer_actions_eager(base_policy, steer_policy, mimic_policy, raw_obs, args)
             )
 
         if denoise_time >= 0.0:
-            steer_v_t = _predict_proxy_flow(
-                prepared_steer, steer_model, x_t, expanded_time
+            task_v_t = _predict_proxy_flow(
+                prepared_task, task_model, x_t, expanded_time
             )
-            mimic_v_t = _predict_proxy_flow(
-                prepared_mimic, mimic_model, x_t, expanded_time
+            ref_v_t = _predict_proxy_flow(
+                prepared_ref, ref_model, x_t, expanded_time
             )
             if need_compare:
-                teacher_steer_v_t = _predict_proxy_flow(
-                    prepared_steer, steer_model, teacher_path_x_t, expanded_time
+                teacher_task_v_t = _predict_proxy_flow(
+                    prepared_task, task_model, teacher_path_x_t, expanded_time
                 )
-                teacher_mimic_v_t = _predict_proxy_flow(
-                    prepared_mimic, mimic_model, teacher_path_x_t, expanded_time
+                teacher_ref_v_t = _predict_proxy_flow(
+                    prepared_ref, ref_model, teacher_path_x_t, expanded_time
                 )
 
             if need_compare:
                 shared_base = base_v_t[:, :, :compare_action_dim]
-                shared_steer = steer_v_t[:, :, :compare_action_dim]
-                shared_mimic = mimic_v_t[:, :, :compare_action_dim]
+                shared_task = task_v_t[:, :, :compare_action_dim]
+                shared_ref = ref_v_t[:, :, :compare_action_dim]
                 teacher_base = teacher_base_v_t[:, :, :compare_action_dim]
-                teacher_steer = teacher_steer_v_t[:, :, :compare_action_dim]
-                teacher_mimic = teacher_mimic_v_t[:, :, :compare_action_dim]
+                teacher_task = teacher_task_v_t[:, :, :compare_action_dim]
+                teacher_ref = teacher_ref_v_t[:, :, :compare_action_dim]
 
-                shared_compare_stats["mimic_minus_base"] = accumulate_stats(
-                    shared_compare_stats["mimic_minus_base"],
-                    compute_batch_metrics(shared_base, shared_mimic),
+                shared_compare_stats["ref_minus_base"] = accumulate_stats(
+                    shared_compare_stats["ref_minus_base"],
+                    compute_batch_metrics(shared_base, shared_ref),
                 )
-                shared_compare_stats["steer_minus_mimic"] = accumulate_stats(
-                    shared_compare_stats["steer_minus_mimic"],
-                    compute_batch_metrics(shared_mimic, shared_steer),
+                shared_compare_stats["task_minus_ref"] = accumulate_stats(
+                    shared_compare_stats["task_minus_ref"],
+                    compute_batch_metrics(shared_ref, shared_task),
                 )
-                teacher_compare_stats["mimic_minus_base"] = accumulate_stats(
-                    teacher_compare_stats["mimic_minus_base"],
-                    compute_batch_metrics(teacher_base, teacher_mimic),
+                teacher_compare_stats["ref_minus_base"] = accumulate_stats(
+                    teacher_compare_stats["ref_minus_base"],
+                    compute_batch_metrics(teacher_base, teacher_ref),
                 )
-                teacher_compare_stats["steer_minus_mimic"] = accumulate_stats(
-                    teacher_compare_stats["steer_minus_mimic"],
-                    compute_batch_metrics(teacher_mimic, teacher_steer),
+                teacher_compare_stats["task_minus_ref"] = accumulate_stats(
+                    teacher_compare_stats["task_minus_ref"],
+                    compute_batch_metrics(teacher_ref, teacher_task),
                 )
 
             v_t = base_v_t.clone()
-            v_t[:, :, :proxy_action_dim] += args.steer_scale * (steer_v_t - mimic_v_t)
+            v_t[:, :, :proxy_action_dim] += args.steer_scale * (task_v_t - ref_v_t)
             if args.only_steer:  # testing the code for steering only
-                v_t[:, :, :proxy_action_dim] = steer_v_t
+                v_t[:, :, :proxy_action_dim] = task_v_t
         else:
             v_t = base_v_t
 
@@ -1337,13 +1337,13 @@ def parse_args():
         help="Path to the checkpoint directory. Required; the training config name is derived from this path.",
     )
     parser.add_argument(
-        "--steer_checkpoint_dir",
+        "--task_checkpoint_dir",
         type=str,
         default=None,
         help="Path to the checkpoint directory. Required; the training config name is derived from this path.",
     )
     parser.add_argument(
-        "--mimic_checkpoint_dir",
+        "--ref_checkpoint_dir",
         type=str,
         default=None,
         help="Path to the checkpoint directory. Required; the training config name is derived from this path.",
@@ -1452,16 +1452,16 @@ def _config_name_from_checkpoint_dir(checkpoint_dir):
 
 # load checkpoint
 base_checkpoint_dir = args.base_checkpoint_dir
-steer_checkpoint_dir = args.steer_checkpoint_dir
-mimic_checkpoint_dir = args.mimic_checkpoint_dir
+task_checkpoint_dir = args.task_checkpoint_dir
+ref_checkpoint_dir = args.ref_checkpoint_dir
 base_config = _config.get_config(_config_name_from_checkpoint_dir(base_checkpoint_dir))
-steer_config = _config.get_config(_config_name_from_checkpoint_dir(steer_checkpoint_dir))
-mimic_config = _config.get_config(_config_name_from_checkpoint_dir(mimic_checkpoint_dir))
+task_config = _config.get_config(_config_name_from_checkpoint_dir(task_checkpoint_dir))
+ref_config = _config.get_config(_config_name_from_checkpoint_dir(ref_checkpoint_dir))
 
 # Create the trained policies.
 base_policy = policy_config.create_trained_policy(base_config, base_checkpoint_dir)
-steer_policy = policy_config.create_trained_policy(steer_config, steer_checkpoint_dir)
-mimic_policy = policy_config.create_trained_policy(mimic_config, mimic_checkpoint_dir)
+task_policy = policy_config.create_trained_policy(task_config, task_checkpoint_dir)
+ref_policy = policy_config.create_trained_policy(ref_config, ref_checkpoint_dir)
 
 dataset_file = None
 dataset_demo_names = None
@@ -1477,19 +1477,19 @@ if args.load_init_from_dataset is not None:
 
 assert (
     base_policy._model.config.action_horizon
-    == steer_policy._model.config.action_horizon
-    == mimic_policy._model.config.action_horizon
+    == task_policy._model.config.action_horizon
+    == ref_policy._model.config.action_horizon
 ), "Action horizon must be the same for all models"
 
 assert (
-    steer_policy._model.config.action_dim == mimic_policy._model.config.action_dim
+    task_policy._model.config.action_dim == ref_policy._model.config.action_dim
 ), "Action dimension must be the same for proxy models"
 
 _warn_if_norm_mismatch(
     base_policy,
-    steer_policy,
-    mimic_policy,
-    action_dim=steer_policy._model.config.action_dim,
+    task_policy,
+    ref_policy,
+    action_dim=task_policy._model.config.action_dim,
 )
 
 steps_per_inference = 8
@@ -1501,7 +1501,7 @@ obs = get_pi_observation(env_obs_dict["policy"])
 obs["prompt"] = args.prompt
 with torch.no_grad():
     _, _ = infer_actions(
-        base_policy, steer_policy, mimic_policy, copy.deepcopy(obs), args
+        base_policy, task_policy, ref_policy, copy.deepcopy(obs), args
     )
 
 print("Ready!")
@@ -1509,26 +1509,26 @@ comparison_metadata = {
     "shared_flow_path": {
         "description": "Compare on the rollout's shared denoise path.",
         "comparisons": {
-            "mimic_minus_base": {
+            "ref_minus_base": {
                 "teacher_model": "base_model",
-                "student_model": "mimic_model",
+                "student_model": "ref_model",
             },
-            "steer_minus_mimic": {
-                "teacher_model": "mimic_model",
-                "student_model": "steer_model",
+            "task_minus_ref": {
+                "teacher_model": "ref_model",
+                "student_model": "task_model",
             },
         },
     },
     "teacher_denoise_path": {
         "description": "Compare on the base model's own denoise path.",
         "comparisons": {
-            "mimic_minus_base": {
+            "ref_minus_base": {
                 "teacher_model": "base_model",
-                "student_model": "mimic_model",
+                "student_model": "ref_model",
             },
-            "steer_minus_mimic": {
-                "teacher_model": "mimic_model",
-                "student_model": "steer_model",
+            "task_minus_ref": {
+                "teacher_model": "ref_model",
+                "student_model": "task_model",
             },
         },
     },
@@ -1602,7 +1602,7 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                 with torch.no_grad():
                     infer_start = time.perf_counter()
                     actions, compare_stats = infer_actions(
-                        base_policy, steer_policy, mimic_policy, copy.deepcopy(obs), args
+                        base_policy, task_policy, ref_policy, copy.deepcopy(obs), args
                     )
                     infer_elapsed = time.perf_counter() - infer_start
                     episode_inference_time_s += infer_elapsed

@@ -1,7 +1,4 @@
-# PPS
-
-Steering pi0 / pi0.5 VLA policies and evaluating them in IsaacLab manipulation
-simulations. See `CLAUDE.md` for repo layout and conventions.
+# Proxy Policy Steering
 
 ## Prerequisites
 
@@ -11,13 +8,13 @@ simulations. See `CLAUDE.md` for repo layout and conventions.
 - A trained base policy checkpoint, e.g. `pi05_droid_jointpos` at
   `openpi/checkpoints/pytorch/pi05_droid_jointpos`.
 
-## Train a proxy (steering) model
+## Training
 
 The proxy is trained in **two stages**, both from `openpi/`. `<train-config>` is the
 proxy training config (e.g. `proxy_isaaclab_droid_pot_pi05_jointpos` for the pot task,
 `proxy_isaaclab_droid_tea_pi05_jointpos` for tea); the dataset is defined by the config.
 
-**Stage 1 — distill the mimic** from the base policy (the "on-the-fly" distillation):
+**Stage 1 — reference proxy** from the base policy (the "on-the-fly" distillation):
 
 ```bash
 cd openpi
@@ -27,9 +24,7 @@ uv run scripts/distill_pytorch.py <train-config> \
 # -> checkpoints/<train-config>/reference/20000
 ```
 
-The teacher config name is inferred from `--teacher_checkpoint_dir`.
-
-**Stage 2 — train the steer model from the mimic**:
+**Stage 2 — task proxy**:
 
 ```bash
 uv run scripts/train_pytorch.py <train-config> \
@@ -38,13 +33,10 @@ uv run scripts/train_pytorch.py <train-config> \
 # -> checkpoints/<train-config>/task/{8000,16000,24000}
 ```
 
-## Evaluate with steering (`eval_steering.py`)
+## Evaluation in simulation
 
-Run from the repo root. Steering combines a base policy with a `steer` and a
-`mimic` proxy (here both are the same proxy config, using the Stage-2 steer
-checkpoint and the Stage-1 mimic checkpoint). The config names are read from the
-checkpoint dir paths, so they are not passed explicitly; cameras and headless
-mode are on by default, and steering is applied over the whole denoise:
+Run from the repo root. Steering combines a base policy with a `reference` and a
+`task` proxy (using the Stage-1 reference checkpoint and the Stage-2 task checkpoint).
 
 ```bash
 TASK="Isaac-Pot-Droid-Visuomotor-v0"
@@ -54,8 +46,8 @@ python eval_steering.py \
   --task "$TASK" \
   --exp_name eval \
   --base_checkpoint_dir  openpi/checkpoints/pytorch/pi05_droid_jointpos \
-  --steer_checkpoint_dir openpi/checkpoints/<train-config>/task/24000 \
-  --mimic_checkpoint_dir openpi/checkpoints/<train-config>/reference/20000 \
+  --task_checkpoint_dir openpi/checkpoints/<train-config>/task/24000 \
+  --ref_checkpoint_dir openpi/checkpoints/<train-config>/reference/20000 \
   --prompt "$PROMPT" \
   --steer_scale 0.4 \
   --task_num_steps 1200
@@ -65,7 +57,7 @@ Rollout videos are written to `results/<task>/<exp_name>/<seed>_{success,fail}.m
 `--steer_scale` controls steering strength (0.4–0.8 typical); `--only_steer` uses
 the steer velocity alone.
 
-## Serve pi-0.5 on droid
+## Evaluation in the real world
 
 ```bash
 cd openpi
