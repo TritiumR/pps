@@ -44,14 +44,23 @@ Run from the repo root. Steering combines a base policy with a `reference` and a
 TASK="Isaac-Pot-Droid-Visuomotor-v0"
 PROMPT="remove the lid of the pot and put egg in it"
 
+# Evaluate PPS
 python eval_steering.py \
   --task "$TASK" \
-  --exp_name eval \
+  --exp_name eval_pps \
   --base_checkpoint_dir  openpi/checkpoints/pytorch/pi05_droid_jointpos \
   --task_checkpoint_dir openpi/checkpoints/<train-config>/task/24000 \
   --ref_checkpoint_dir openpi/checkpoints/<train-config>/reference/20000 \
   --prompt "$PROMPT" \
   --steer_scale 0.4 \
+  --task_num_steps 1200
+
+# Evaluate pi0.5
+python eval_steering.py \
+  --task "$TASK" \
+  --exp_name eval_pi05 \
+  --base_checkpoint_dir  openpi/checkpoints/pytorch/pi05_droid_jointpos \
+  --prompt "$PROMPT" \
   --task_num_steps 1200
 ```
 
