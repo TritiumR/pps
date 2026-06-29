@@ -56,6 +56,7 @@ from tqdm import tqdm
 
 # import scipy.spatial.transform as R
 from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
+from sim_free_mpc import SimFreeMPC, SimFreeMPCConfig
 
 
 _SOUND_VIDEO_SCALE = None
@@ -65,6 +66,7 @@ _SOUND_AUDIO_SAMPLE_RATE = 48_000
 _SOUND_AUDIO_ATTENUATION_POWER = 2.0
 _SOUND_AUDIO_REFERENCE_DISTANCE = 1.0
 _SOUND_AUDIO_MIN_DISTANCE = 1e-3
+_LAST_INFERENCE_RUNTIME = {}
 
 
 def _phone_ringtone_path():
@@ -517,7 +519,13 @@ def _get_compiled_eval_steer_forward():
     return _compiled_eval_steer_forward_all
 
 
+def _uses_vlm_mpc_base(args) -> bool:
+    return bool(getattr(args, "vlm_base", False))
+
+
 def _can_use_compiled_infer(base_policy, task_policy, ref_policy, args) -> bool:
+    if _uses_vlm_mpc_base(args):
+        return False
     if args.compare_difference:
         return False
     if base_policy._model.config.model_type not in (
@@ -533,6 +541,7 @@ def _can_use_compiled_infer(base_policy, task_policy, ref_policy, args) -> bool:
 
 
 def _infer_actions_compiled(base_policy, task_policy, ref_policy, raw_obs, args):
+    global _LAST_INFERENCE_RUNTIME
     base_obs, base_inputs = _obs_to_input_checked(base_policy, raw_obs, "base")
     task_obs, _ = _obs_to_input_checked(task_policy, raw_obs, "task")
     ref_obs, _ = _obs_to_input_checked(ref_policy, raw_obs, "ref")
@@ -599,6 +608,18 @@ def _infer_actions_compiled(base_policy, task_policy, ref_policy, raw_obs, args)
     )
 
     actions = base_policy.output_to_actions(base_inputs, x_t)
+    _LAST_INFERENCE_RUNTIME = {
+        "base_source": "pi_checkpoint",
+        "used_base_model_velocity": True,
+        "checked_vlm_task_ref_shapes": False,
+        "x_t_shape": tuple(x_t.shape),
+        "v_vlm_shape": None,
+        "v_task_shape": None,
+        "v_ref_shape": None,
+        "proxy_task_shape": None,
+        "proxy_ref_shape": None,
+        "mpc_last": None,
+    }
     return actions, {}
 
 
@@ -620,7 +641,44 @@ def infer_actions(base_policy, task_policy, ref_policy, raw_obs, args):
     return _infer_actions_eager(base_policy, task_policy, ref_policy, raw_obs, args)
 
 
-def _infer_actions_eager(base_policy, task_policy, ref_policy, raw_obs, args):
+def infer_actions_with_mpc(
+    base_policy,
+    task_policy,
+    ref_policy,
+    raw_obs,
+    args,
+    *,
+    mpc_planner=None,
+    mpc_context=None,
+):
+    if _uses_vlm_mpc_base(args) and mpc_planner is None:
+        raise ValueError("VLM/MPC base mode requires a SimFreeMPC planner.")
+    if not _uses_vlm_mpc_base(args):
+        return infer_actions(base_policy, task_policy, ref_policy, raw_obs, args)
+    if mpc_planner is None:
+        return infer_actions(base_policy, task_policy, ref_policy, raw_obs, args)
+    return _infer_actions_eager(
+        base_policy,
+        task_policy,
+        ref_policy,
+        raw_obs,
+        args,
+        mpc_planner=mpc_planner,
+        mpc_context=mpc_context,
+    )
+
+
+def _infer_actions_eager(
+    base_policy,
+    task_policy,
+    ref_policy,
+    raw_obs,
+    args,
+    *,
+    mpc_planner=None,
+    mpc_context=None,
+):
+    global _LAST_INFERENCE_RUNTIME
     base_obs, base_inputs = _obs_to_input_checked(base_policy, raw_obs, "base")
     task_obs, _ = _obs_to_input_checked(task_policy, raw_obs, "task")
     ref_obs, _ = _obs_to_input_checked(ref_policy, raw_obs, "ref")
@@ -628,6 +686,14 @@ def _infer_actions_eager(base_policy, task_policy, ref_policy, raw_obs, args):
     bsize = base_obs.state.shape[0]
     device = base_obs.state.device
     need_compare = args.compare_difference
+    use_vlm_mpc_base = _uses_vlm_mpc_base(args)
+    if need_compare and use_vlm_mpc_base:
+        raise ValueError(
+            "--compare_difference compares against the pi checkpoint base path and is "
+            "not compatible with --vlm_base."
+        )
+    if use_vlm_mpc_base and (mpc_planner is None or mpc_context is None):
+        raise ValueError("VLM/MPC base mode requires mpc_planner and mpc_context.")
 
     base_model = base_policy._model
     task_model = task_policy._model
@@ -644,32 +710,37 @@ def _infer_actions_eager(base_policy, task_policy, ref_policy, raw_obs, args):
     )
     noise = base_model.sample_noise(actions_shape, device)
 
-    images, img_masks, lang_tokens, lang_masks, state = (
-        base_model._preprocess_observation(base_obs, train=False)
-    )
+    if use_vlm_mpc_base:
+        state = None
+        base_prefix_pad_masks = None
+        base_past_key_values = None
+    else:
+        images, img_masks, lang_tokens, lang_masks, state = (
+            base_model._preprocess_observation(base_obs, train=False)
+        )
 
-    base_prefix_embs, base_prefix_pad_masks, base_prefix_att_masks = (
-        base_model.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-    )
-    base_prefix_att_2d_masks = make_att_2d_masks(
-        base_prefix_pad_masks, base_prefix_att_masks
-    )
-    base_prefix_position_ids = torch.cumsum(base_prefix_pad_masks, dim=1) - 1
+        base_prefix_embs, base_prefix_pad_masks, base_prefix_att_masks = (
+            base_model.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        )
+        base_prefix_att_2d_masks = make_att_2d_masks(
+            base_prefix_pad_masks, base_prefix_att_masks
+        )
+        base_prefix_position_ids = torch.cumsum(base_prefix_pad_masks, dim=1) - 1
 
-    base_prefix_att_2d_masks_4d = base_model._prepare_attention_masks_4d(
-        base_prefix_att_2d_masks
-    )
-    base_model.paligemma_with_expert.paligemma.language_model.config._attn_implementation = (
-        "eager"  # noqa: SLF001
-    )
+        base_prefix_att_2d_masks_4d = base_model._prepare_attention_masks_4d(
+            base_prefix_att_2d_masks
+        )
+        base_model.paligemma_with_expert.paligemma.language_model.config._attn_implementation = (
+            "eager"  # noqa: SLF001
+        )
 
-    _, base_past_key_values = base_model.paligemma_with_expert.forward(
-        attention_mask=base_prefix_att_2d_masks_4d,
-        position_ids=base_prefix_position_ids,
-        past_key_values=None,
-        inputs_embeds=[base_prefix_embs, None],
-        use_cache=True,
-    )
+        _, base_past_key_values = base_model.paligemma_with_expert.forward(
+            attention_mask=base_prefix_att_2d_masks_4d,
+            position_ids=base_prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[base_prefix_embs, None],
+            use_cache=True,
+        )
 
     prepared_task = _prepare_proxy_steering(task_model, task_obs)
     prepared_ref = _prepare_proxy_steering(ref_model, ref_obs)
@@ -692,6 +763,18 @@ def _infer_actions_eager(base_policy, task_policy, ref_policy, raw_obs, args):
     x_t = noise
     teacher_path_x_t = noise.clone() if need_compare else None
     denoise_time = torch.tensor(1.0, dtype=torch.float32, device=device)
+    runtime_stats = {
+        "base_source": "vlm_mpc" if use_vlm_mpc_base else "pi_checkpoint",
+        "used_base_model_velocity": False,
+        "checked_vlm_task_ref_shapes": False,
+        "x_t_shape": tuple(x_t.shape),
+        "v_vlm_shape": None,
+        "v_task_shape": None,
+        "v_ref_shape": None,
+        "proxy_task_shape": None,
+        "proxy_ref_shape": None,
+        "mpc_last": None,
+    }
 
     if need_compare:
         shared_compare_stats = {
@@ -706,13 +789,38 @@ def _infer_actions_eager(base_policy, task_policy, ref_policy, raw_obs, args):
     while denoise_time >= -dt / 2:
         expanded_time = denoise_time.expand(bsize)
 
-        base_v_t = base_model.denoise_step(
-            state,
-            base_prefix_pad_masks,
-            base_past_key_values,
-            x_t,
-            expanded_time,
-        )
+        if use_vlm_mpc_base:
+            base_v_t, geom_stats = mpc_planner.step(
+                x_t,
+                base_inputs,
+                mpc_context,
+                dt=dt,
+            )
+            if base_v_t.shape != x_t.shape:
+                raise ValueError(
+                    "VLM/MPC base velocity shape must match x_t: "
+                    f"got {tuple(base_v_t.shape)} vs {tuple(x_t.shape)}."
+                )
+            runtime_stats["v_vlm_shape"] = tuple(base_v_t.shape)
+            runtime_stats["mpc_last"] = geom_stats
+            if args.mpc_debug:
+                print(
+                    "vlm_mpc_base "
+                    f"cost_min={geom_stats['cost_min']:.4f} "
+                    f"cost_mean={geom_stats['cost_mean']:.4f} "
+                    f"cost_weighted={geom_stats['cost_weighted']:.4f} "
+                    f"target_delta_norm={geom_stats['target_delta_norm']:.4f}",
+                    flush=True,
+                )
+        else:
+            base_v_t = base_model.denoise_step(
+                state,
+                base_prefix_pad_masks,
+                base_past_key_values,
+                x_t,
+                expanded_time,
+            )
+            runtime_stats["used_base_model_velocity"] = True
         if need_compare:
             teacher_base_v_t = base_model.denoise_step(
                 state,
@@ -729,6 +837,20 @@ def _infer_actions_eager(base_policy, task_policy, ref_policy, raw_obs, args):
             ref_v_t = _predict_proxy_flow(
                 prepared_ref, ref_model, x_t, expanded_time
             )
+            if task_v_t.shape != ref_v_t.shape:
+                raise ValueError(
+                    "task/ref velocity shapes must match: "
+                    f"task={tuple(task_v_t.shape)}, ref={tuple(ref_v_t.shape)}."
+                )
+            if task_v_t.shape[:2] != x_t.shape[:2] or task_v_t.shape[-1] > x_t.shape[-1]:
+                raise ValueError(
+                    "task/ref velocity shape is incompatible with x_t: "
+                    f"task={tuple(task_v_t.shape)}, x_t={tuple(x_t.shape)}."
+                )
+            runtime_stats["proxy_task_shape"] = tuple(task_v_t.shape)
+            runtime_stats["proxy_ref_shape"] = tuple(ref_v_t.shape)
+            runtime_stats["v_task_shape"] = tuple(task_v_t.shape)
+            runtime_stats["v_ref_shape"] = tuple(ref_v_t.shape)
             if need_compare:
                 teacher_task_v_t = _predict_proxy_flow(
                     prepared_task, task_model, teacher_path_x_t, expanded_time
@@ -762,10 +884,25 @@ def _infer_actions_eager(base_policy, task_policy, ref_policy, raw_obs, args):
                     compute_batch_metrics(teacher_ref, teacher_task),
                 )
 
-            v_t = base_v_t.clone()
-            v_t[:, :, :proxy_action_dim] += args.steer_scale * (task_v_t - ref_v_t)
-            if args.only_steer:  # testing the code for steering only
-                v_t[:, :, :proxy_action_dim] = task_v_t
+            if use_vlm_mpc_base:
+                task_full_v_t = torch.zeros_like(x_t)
+                ref_full_v_t = torch.zeros_like(x_t)
+                task_full_v_t[:, :, :proxy_action_dim] = task_v_t
+                ref_full_v_t[:, :, :proxy_action_dim] = ref_v_t
+                runtime_stats["v_task_shape"] = tuple(task_full_v_t.shape)
+                runtime_stats["v_ref_shape"] = tuple(ref_full_v_t.shape)
+                v_t = (
+                    args.gamma_base * base_v_t
+                    + args.steer_scale * (task_full_v_t - ref_full_v_t)
+                )
+                runtime_stats["checked_vlm_task_ref_shapes"] = True
+                if args.only_steer:
+                    v_t = task_full_v_t
+            else:
+                v_t = base_v_t.clone()
+                v_t[:, :, :proxy_action_dim] += args.steer_scale * (task_v_t - ref_v_t)
+                if args.only_steer:  # testing the code for steering only
+                    v_t[:, :, :proxy_action_dim] = task_v_t
         else:
             v_t = base_v_t
 
@@ -787,6 +924,7 @@ def _infer_actions_eager(base_policy, task_policy, ref_policy, raw_obs, args):
             for key, value in teacher_compare_stats.items()
             if value is not None
         }
+    _LAST_INFERENCE_RUNTIME = runtime_stats
     return actions, compare_stats
 
 
@@ -867,6 +1005,128 @@ def get_pi_observation(env_obs_dict):
             obs["observation/sound"] = _to_numpy_unbatched(env_obs_dict[sound_key])
 
     return obs
+
+
+def _task_name_for_mpc(task_name: str) -> str:
+    task = task_name.lower()
+    for name in ("pot", "weight", "tea", "capsule"):
+        if name in task:
+            return name
+    return task_name
+
+
+def _context_tensor(value):
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        value = value.detach()
+        if value.ndim > 0 and value.shape[0] == 1:
+            value = value[0]
+        return value
+    value = torch.as_tensor(value)
+    if value.ndim > 0 and value.shape[0] == 1:
+        value = value[0]
+    return value
+
+
+def _extract_subtasks(env_obs_dict):
+    subtasks = {}
+    raw = env_obs_dict.get("subtask_terms")
+    if raw is None:
+        return subtasks
+    for key, value in raw.items():
+        tensor = _context_tensor(value)
+        if tensor is not None:
+            subtasks[key] = tensor
+    return subtasks
+
+
+def _extract_scene_objects(env, names, env_origin=None):
+    objects = {}
+    for name in names:
+        try:
+            asset = env.scene[name]
+        except Exception:
+            continue
+        data = getattr(asset, "data", None)
+        if data is None:
+            continue
+        item = {}
+        if hasattr(data, "root_pos_w"):
+            pos = _context_tensor(data.root_pos_w)
+            if pos is not None and env_origin is not None:
+                pos = pos - env_origin.to(device=pos.device, dtype=pos.dtype)
+            item["pos"] = pos
+        if hasattr(data, "root_quat_w"):
+            item["quat"] = _context_tensor(data.root_quat_w)
+        if item:
+            objects[name] = item
+    return objects
+
+
+def build_mpc_context(env, env_obs_dict, args):
+    policy_obs = env_obs_dict["policy"]
+    env_origin = None
+    if hasattr(env.scene, "env_origins"):
+        env_origin = _context_tensor(env.scene.env_origins)
+    robot_root_pos = None
+    robot_root_quat = None
+    try:
+        robot = env.scene["robot"]
+        robot_root_pos = _context_tensor(robot.data.root_pos_w)
+        robot_root_quat = _context_tensor(robot.data.root_quat_w)
+        if robot_root_pos is not None and env_origin is not None:
+            robot_root_pos = robot_root_pos - env_origin.to(
+                device=robot_root_pos.device,
+                dtype=robot_root_pos.dtype,
+            )
+    except Exception:
+        pass
+    try:
+        ee_frame = env.scene["ee_frame"]
+        ee_frame.update(0.0, force_recompute=True)
+        fk_source_pos = _context_tensor(ee_frame.data.source_pos_w)
+        fk_source_quat = _context_tensor(ee_frame.data.source_quat_w)
+        if fk_source_pos is not None:
+            if env_origin is not None:
+                fk_source_pos = fk_source_pos - env_origin.to(
+                    device=fk_source_pos.device,
+                    dtype=fk_source_pos.dtype,
+                )
+            robot_root_pos = fk_source_pos
+        if fk_source_quat is not None:
+            robot_root_quat = fk_source_quat
+    except Exception:
+        pass
+    context = {
+        "task": _task_name_for_mpc(args.task),
+        "subtasks": _extract_subtasks(env_obs_dict),
+        "joint_pos": _context_tensor(policy_obs.get("joint_pos")),
+        "joint_vel": _context_tensor(policy_obs.get("joint_vel")),
+        "eef_pos": _context_tensor(policy_obs.get("eef_pos")),
+        "eef_quat": _context_tensor(policy_obs.get("eef_quat")),
+        "gripper_pos": _context_tensor(policy_obs.get("gripper_pos")),
+        "env_origin": env_origin,
+        "robot_root_pos": robot_root_pos,
+        "robot_root_quat": robot_root_quat,
+    }
+    context["objects"] = _extract_scene_objects(
+        env,
+        (
+            "pot",
+            "cover",
+            "egg",
+            "pear",
+            "apple",
+            "scale",
+            "teapot",
+            "teacup",
+            "capsule",
+            "can",
+        ),
+        env_origin=env_origin,
+    )
+    return context
 
 
 def _to_uint8_image(image):
@@ -1353,6 +1613,27 @@ def parse_args():
     parser.add_argument("--task_num_steps", type=int, default=1200)
     parser.add_argument("--only_steer", action="store_true")
     parser.add_argument("--compare_difference", action="store_true")
+    parser.add_argument(
+        "--vlm_base",
+        action="store_true",
+        help="Replace the pi checkpoint base velocity with FK/cost sim-free MPC velocity.",
+    )
+    parser.add_argument(
+        "--gamma_base",
+        type=float,
+        default=1.0,
+        help="Scale for VLM/MPC base velocity in vlm_mpc base mode.",
+    )
+    parser.add_argument("--mpc_num_samples", type=int, default=64)
+    parser.add_argument("--mpc_iterations", type=int, default=2)
+    parser.add_argument("--mpc_noise", type=float, default=0.35)
+    parser.add_argument("--mpc_temperature", type=float, default=0.15)
+    parser.add_argument("--mpc_debug", action="store_true")
+    parser.add_argument(
+        "--dry_run",
+        action="store_true",
+        help="Run one warmup inference, print base-source and shape diagnostics, then exit.",
+    )
     return parser
 
 
@@ -1402,9 +1683,10 @@ if task_name:
     task_name = args.task.split(":")[-1]
 env_name = task_name
 
-print(f"Environment name: {env_name}")
+print(f"Environment name: {env_name}", flush=True)
 
 # Configure environment
+print("Parsing env cfg...", flush=True)
 env_cfg = parse_env_cfg(env_name, device=args.device, num_envs=1)
 
 env_cfg.env_name = env_name
@@ -1424,7 +1706,9 @@ else:
 # env_cfg.observations.policy.concatenate_terms = False
 
 # Create environment
+print("Creating eval env...", flush=True)
 env = gym.make(env_name, cfg=env_cfg).unwrapped
+print("Eval env created.", flush=True)
 
 # Derive each training-config name from its checkpoint dir so the model names do
 # not need to be passed on the command line. Checkpoints follow the layout
@@ -1454,14 +1738,49 @@ def _config_name_from_checkpoint_dir(checkpoint_dir):
 base_checkpoint_dir = args.base_checkpoint_dir
 task_checkpoint_dir = args.task_checkpoint_dir
 ref_checkpoint_dir = args.ref_checkpoint_dir
+print("Resolving checkpoint configs...", flush=True)
 base_config = _config.get_config(_config_name_from_checkpoint_dir(base_checkpoint_dir))
 task_config = _config.get_config(_config_name_from_checkpoint_dir(task_checkpoint_dir))
 ref_config = _config.get_config(_config_name_from_checkpoint_dir(ref_checkpoint_dir))
 
 # Create the trained policies.
+print("Loading base policy checkpoint...", flush=True)
 base_policy = policy_config.create_trained_policy(base_config, base_checkpoint_dir)
+print("Loading task policy checkpoint...", flush=True)
 task_policy = policy_config.create_trained_policy(task_config, task_checkpoint_dir)
+print("Loading ref policy checkpoint...", flush=True)
 ref_policy = policy_config.create_trained_policy(ref_config, ref_checkpoint_dir)
+
+base_source = "vlm_mpc" if _uses_vlm_mpc_base(args) else "pi_checkpoint"
+print(f"Base velocity source: {base_source}", flush=True)
+print(
+    "Loaded checkpoints: "
+    f"base={base_policy._model.config.model_type.value}, "
+    f"task={task_policy._model.config.model_type.value}, "
+    f"ref={ref_policy._model.config.model_type.value}",
+    flush=True,
+)
+
+mpc_planner = None
+if _uses_vlm_mpc_base(args):
+    inferred_task = _task_name_for_mpc(args.task)
+    mpc_planner = SimFreeMPC(
+        base_policy,
+        SimFreeMPCConfig(
+            task_name=inferred_task,
+            num_samples=args.mpc_num_samples,
+            iterations=args.mpc_iterations,
+            noise=args.mpc_noise,
+            temperature=args.mpc_temperature,
+            action_dims=8,
+        ),
+    )
+    print(
+        "Sim-free MPC planner enabled: "
+        f"base_source={base_source}, task={inferred_task}, samples={args.mpc_num_samples}, "
+        f"iterations={args.mpc_iterations}, gamma_base={args.gamma_base}",
+        flush=True,
+    )
 
 dataset_file = None
 dataset_demo_names = None
@@ -1495,16 +1814,54 @@ _warn_if_norm_mismatch(
 steps_per_inference = 8
 CONTROL_FREQUENCY = 15
 
-print("Warming up policy inference")
+print("Resetting env for warmup...", flush=True)
 env_obs_dict, _ = env.reset()
+print("Building warmup observation...", flush=True)
 obs = get_pi_observation(env_obs_dict["policy"])
 obs["prompt"] = args.prompt
+print("Running warmup policy inference...", flush=True)
 with torch.no_grad():
-    _, _ = infer_actions(
-        base_policy, task_policy, ref_policy, copy.deepcopy(obs), args
+    warmup_actions, _ = infer_actions_with_mpc(
+        base_policy,
+        task_policy,
+        ref_policy,
+        copy.deepcopy(obs),
+        args,
+        mpc_planner=mpc_planner,
+        mpc_context=build_mpc_context(env, env_obs_dict, args),
     )
+print("Warmup policy inference finished.", flush=True)
 
-print("Ready!")
+if args.dry_run:
+    print("Dry-run inference check passed", flush=True)
+    print(
+        "  checkpoints_loaded: "
+        f"task={task_policy._model.config.model_type.value}, "
+        f"ref={ref_policy._model.config.model_type.value}",
+        flush=True,
+    )
+    print(f"  base_source: {_LAST_INFERENCE_RUNTIME.get('base_source')}", flush=True)
+    print(
+        "  used_base_model_velocity: "
+        f"{_LAST_INFERENCE_RUNTIME.get('used_base_model_velocity')}",
+        flush=True,
+    )
+    print(f"  x_t_shape: {_LAST_INFERENCE_RUNTIME.get('x_t_shape')}", flush=True)
+    print(f"  v_vlm_shape: {_LAST_INFERENCE_RUNTIME.get('v_vlm_shape')}", flush=True)
+    print(f"  v_task_shape: {_LAST_INFERENCE_RUNTIME.get('v_task_shape')}", flush=True)
+    print(f"  v_ref_shape: {_LAST_INFERENCE_RUNTIME.get('v_ref_shape')}", flush=True)
+    print(f"  proxy_task_shape: {_LAST_INFERENCE_RUNTIME.get('proxy_task_shape')}", flush=True)
+    print(f"  proxy_ref_shape: {_LAST_INFERENCE_RUNTIME.get('proxy_ref_shape')}", flush=True)
+    print(f"  output_action_shape: {np.asarray(warmup_actions).shape}", flush=True)
+    if _LAST_INFERENCE_RUNTIME.get("mpc_last") is not None:
+        print(f"  mpc_last: {_LAST_INFERENCE_RUNTIME['mpc_last']}", flush=True)
+    env.close()
+    if dataset_file is not None:
+        dataset_file.close()
+    simulation_app.close()
+    sys.exit(0)
+
+print("Ready!", flush=True)
 comparison_metadata = {
     "shared_flow_path": {
         "description": "Compare on the rollout's shared denoise path.",
@@ -1601,8 +1958,14 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                 # run inference
                 with torch.no_grad():
                     infer_start = time.perf_counter()
-                    actions, compare_stats = infer_actions(
-                        base_policy, task_policy, ref_policy, copy.deepcopy(obs), args
+                    actions, compare_stats = infer_actions_with_mpc(
+                        base_policy,
+                        task_policy,
+                        ref_policy,
+                        copy.deepcopy(obs),
+                        args,
+                        mpc_planner=mpc_planner,
+                        mpc_context=build_mpc_context(env, env_obs_dict, args),
                     )
                     infer_elapsed = time.perf_counter() - infer_start
                     episode_inference_time_s += infer_elapsed
