@@ -4,6 +4,9 @@ from typing import Any
 import subprocess
 
 _REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+_OPENPI_SRC_DIR = os.path.join(_REPO_DIR, "openpi", "src")
+if _OPENPI_SRC_DIR not in sys.path:
+    sys.path.insert(0, _OPENPI_SRC_DIR)
 _ISAACLAB_DIR = os.path.join(_REPO_DIR, "IsaacLab")
 for _isaaclab_pkg in (
     "isaaclab",
@@ -58,6 +61,10 @@ from tqdm import tqdm
 from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
 from sim_free_mpc import SimFreeMPC, SimFreeMPCConfig
 
+
+DEFAULT_BASE_CHECKPOINT_DIR = "openpi/checkpoints/pytorch/pi05_droid_jointpos"
+DEFAULT_TASK_CHECKPOINT_DIR = "openpi/checkpoints/proxy_isaaclab_droid_weight_pi05_jointpos/task/24000"
+DEFAULT_REF_CHECKPOINT_DIR = "openpi/checkpoints/proxy_isaaclab_droid_weight_pi05_jointpos/reference/20000"
 
 _SOUND_VIDEO_SCALE = None
 _SOUND_VIDEO_MAX_DISTANCE_M = 0.05
@@ -415,6 +422,7 @@ def _eval_steer_forward_all(
     steer_scale: torch.Tensor,
     share_proxy_dino: bool,
     only_steer: bool,
+    no_steer: bool,
 ):
     base_prefix_embs, base_prefix_pad_masks, base_prefix_att_masks = (
         base_model.embed_prefix(base_images, base_img_masks, lang_tokens, lang_masks)
@@ -480,7 +488,9 @@ def _eval_steer_forward_all(
         )
 
         steer_mask = (denoise_time >= steer_step).to(dtype=base_v_t.dtype)
-        if only_steer:
+        if no_steer:
+            v_t = base_v_t
+        elif only_steer:
             steered_v_t = base_v_t.clone()
             steered_v_t[:, :, :proxy_action_dim] = task_v_t
             v_t = torch.where(steer_mask.to(dtype=torch.bool), steered_v_t, base_v_t)
@@ -523,8 +533,18 @@ def _uses_vlm_mpc_base(args) -> bool:
     return bool(getattr(args, "vlm_base", False))
 
 
+def _base_source_name(args) -> str:
+    if not _uses_vlm_mpc_base(args):
+        return "pi_checkpoint"
+    if getattr(args, "no_steer", False):
+        return "vlm_mpc_score"
+    return "vlm_mpc_velocity"
+
+
 def _can_use_compiled_infer(base_policy, task_policy, ref_policy, args) -> bool:
     if _uses_vlm_mpc_base(args):
+        return False
+    if args.no_steer:
         return False
     if args.compare_difference:
         return False
@@ -605,15 +625,18 @@ def _infer_actions_compiled(base_policy, task_policy, ref_policy, raw_obs, args)
         torch.as_tensor(args.steer_scale, dtype=torch.float32, device=device),
         share_proxy_dino,
         args.only_steer,
+        args.no_steer,
     )
 
     actions = base_policy.output_to_actions(base_inputs, x_t)
     _LAST_INFERENCE_RUNTIME = {
         "base_source": "pi_checkpoint",
         "used_base_model_velocity": True,
+        "steering_mode": "none" if args.no_steer else ("only_steer" if args.only_steer else "task_minus_ref"),
         "checked_vlm_task_ref_shapes": False,
         "x_t_shape": tuple(x_t.shape),
         "v_vlm_shape": None,
+        "score_shape": None,
         "v_task_shape": None,
         "v_ref_shape": None,
         "proxy_task_shape": None,
@@ -680,13 +703,13 @@ def _infer_actions_eager(
 ):
     global _LAST_INFERENCE_RUNTIME
     base_obs, base_inputs = _obs_to_input_checked(base_policy, raw_obs, "base")
-    task_obs, _ = _obs_to_input_checked(task_policy, raw_obs, "task")
-    ref_obs, _ = _obs_to_input_checked(ref_policy, raw_obs, "ref")
 
     bsize = base_obs.state.shape[0]
     device = base_obs.state.device
     need_compare = args.compare_difference
     use_vlm_mpc_base = _uses_vlm_mpc_base(args)
+    disable_steering = bool(getattr(args, "no_steer", False))
+    need_task_ref = (not disable_steering) or need_compare
     if need_compare and use_vlm_mpc_base:
         raise ValueError(
             "--compare_difference compares against the pi checkpoint base path and is "
@@ -700,8 +723,8 @@ def _infer_actions_eager(
     ref_model = ref_policy._model
 
     base_action_dim = base_model.config.action_dim
-    proxy_action_dim = task_model.config.action_dim
-    compare_action_dim = proxy_action_dim - 1
+    proxy_action_dim = task_model.config.action_dim if need_task_ref else None
+    compare_action_dim = proxy_action_dim - 1 if need_compare else None
 
     actions_shape = (
         bsize,
@@ -742,11 +765,19 @@ def _infer_actions_eager(
             use_cache=True,
         )
 
-    prepared_task = _prepare_proxy_steering(task_model, task_obs)
-    prepared_ref = _prepare_proxy_steering(ref_model, ref_obs)
+    if need_task_ref:
+        task_obs, _ = _obs_to_input_checked(task_policy, raw_obs, "task")
+        ref_obs, _ = _obs_to_input_checked(ref_policy, raw_obs, "ref")
+        prepared_task = _prepare_proxy_steering(task_model, task_obs)
+        prepared_ref = _prepare_proxy_steering(ref_model, ref_obs)
+    else:
+        prepared_task = None
+        prepared_ref = None
 
     # if the DINO encoder is frozen and the model names are the same, use the same prefix embeddings for mimic
     if (
+        need_task_ref
+        and
         getattr(task_model.config, "freeze_dino_encoder", False)
         and getattr(ref_model.config, "freeze_dino_encoder", False)
         and getattr(task_model.config, "dino_model_name", None)
@@ -764,11 +795,13 @@ def _infer_actions_eager(
     teacher_path_x_t = noise.clone() if need_compare else None
     denoise_time = torch.tensor(1.0, dtype=torch.float32, device=device)
     runtime_stats = {
-        "base_source": "vlm_mpc" if use_vlm_mpc_base else "pi_checkpoint",
+        "base_source": _base_source_name(args),
         "used_base_model_velocity": False,
+        "steering_mode": "none" if disable_steering else ("only_steer" if args.only_steer else "task_minus_ref"),
         "checked_vlm_task_ref_shapes": False,
         "x_t_shape": tuple(x_t.shape),
         "v_vlm_shape": None,
+        "score_shape": None,
         "v_task_shape": None,
         "v_ref_shape": None,
         "proxy_task_shape": None,
@@ -788,6 +821,28 @@ def _infer_actions_eager(
 
     while denoise_time >= -dt / 2:
         expanded_time = denoise_time.expand(bsize)
+
+        if use_vlm_mpc_base and disable_steering:
+            x_t, geom_stats = mpc_planner.step_score_space(
+                x_t,
+                base_inputs,
+                mpc_context,
+                step_scale=args.gamma_base,
+            )
+            runtime_stats["score_shape"] = tuple(x_t.shape)
+            runtime_stats["mpc_last"] = geom_stats
+            if args.mpc_debug:
+                print(
+                    "vlm_mpc_score "
+                    f"cost_min={geom_stats['cost_min']:.4f} "
+                    f"cost_mean={geom_stats['cost_mean']:.4f} "
+                    f"cost_weighted={geom_stats['cost_weighted']:.4f} "
+                    f"target_delta_norm={geom_stats['target_delta_norm']:.4f} "
+                    f"score_norm={geom_stats['score_norm']:.4f}",
+                    flush=True,
+                )
+            denoise_time += dt
+            continue
 
         if use_vlm_mpc_base:
             base_v_t, geom_stats = mpc_planner.step(
@@ -831,33 +886,38 @@ def _infer_actions_eager(
             )
 
         if denoise_time >= 0.0:
-            task_v_t = _predict_proxy_flow(
-                prepared_task, task_model, x_t, expanded_time
-            )
-            ref_v_t = _predict_proxy_flow(
-                prepared_ref, ref_model, x_t, expanded_time
-            )
-            if task_v_t.shape != ref_v_t.shape:
-                raise ValueError(
-                    "task/ref velocity shapes must match: "
-                    f"task={tuple(task_v_t.shape)}, ref={tuple(ref_v_t.shape)}."
+            if need_task_ref:
+                task_v_t = _predict_proxy_flow(
+                    prepared_task, task_model, x_t, expanded_time
                 )
-            if task_v_t.shape[:2] != x_t.shape[:2] or task_v_t.shape[-1] > x_t.shape[-1]:
-                raise ValueError(
-                    "task/ref velocity shape is incompatible with x_t: "
-                    f"task={tuple(task_v_t.shape)}, x_t={tuple(x_t.shape)}."
+                ref_v_t = _predict_proxy_flow(
+                    prepared_ref, ref_model, x_t, expanded_time
                 )
-            runtime_stats["proxy_task_shape"] = tuple(task_v_t.shape)
-            runtime_stats["proxy_ref_shape"] = tuple(ref_v_t.shape)
-            runtime_stats["v_task_shape"] = tuple(task_v_t.shape)
-            runtime_stats["v_ref_shape"] = tuple(ref_v_t.shape)
-            if need_compare:
-                teacher_task_v_t = _predict_proxy_flow(
-                    prepared_task, task_model, teacher_path_x_t, expanded_time
-                )
-                teacher_ref_v_t = _predict_proxy_flow(
-                    prepared_ref, ref_model, teacher_path_x_t, expanded_time
-                )
+            else:
+                task_v_t = None
+                ref_v_t = None
+            if need_task_ref:
+                if task_v_t.shape != ref_v_t.shape:
+                    raise ValueError(
+                        "task/ref velocity shapes must match: "
+                        f"task={tuple(task_v_t.shape)}, ref={tuple(ref_v_t.shape)}."
+                    )
+                if task_v_t.shape[:2] != x_t.shape[:2] or task_v_t.shape[-1] > x_t.shape[-1]:
+                    raise ValueError(
+                        "task/ref velocity shape is incompatible with x_t: "
+                        f"task={tuple(task_v_t.shape)}, x_t={tuple(x_t.shape)}."
+                    )
+                runtime_stats["proxy_task_shape"] = tuple(task_v_t.shape)
+                runtime_stats["proxy_ref_shape"] = tuple(ref_v_t.shape)
+                runtime_stats["v_task_shape"] = tuple(task_v_t.shape)
+                runtime_stats["v_ref_shape"] = tuple(ref_v_t.shape)
+                if need_compare:
+                    teacher_task_v_t = _predict_proxy_flow(
+                        prepared_task, task_model, teacher_path_x_t, expanded_time
+                    )
+                    teacher_ref_v_t = _predict_proxy_flow(
+                        prepared_ref, ref_model, teacher_path_x_t, expanded_time
+                    )
 
             if need_compare:
                 shared_base = base_v_t[:, :, :compare_action_dim]
@@ -885,24 +945,31 @@ def _infer_actions_eager(
                 )
 
             if use_vlm_mpc_base:
-                task_full_v_t = torch.zeros_like(x_t)
-                ref_full_v_t = torch.zeros_like(x_t)
-                task_full_v_t[:, :, :proxy_action_dim] = task_v_t
-                ref_full_v_t[:, :, :proxy_action_dim] = ref_v_t
-                runtime_stats["v_task_shape"] = tuple(task_full_v_t.shape)
-                runtime_stats["v_ref_shape"] = tuple(ref_full_v_t.shape)
-                v_t = (
-                    args.gamma_base * base_v_t
-                    + args.steer_scale * (task_full_v_t - ref_full_v_t)
-                )
-                runtime_stats["checked_vlm_task_ref_shapes"] = True
-                if args.only_steer:
+                if disable_steering:
+                    v_t = args.gamma_base * base_v_t
+                    runtime_stats["checked_vlm_task_ref_shapes"] = False
+                else:
+                    task_full_v_t = torch.zeros_like(x_t)
+                    ref_full_v_t = torch.zeros_like(x_t)
+                    task_full_v_t[:, :, :proxy_action_dim] = task_v_t
+                    ref_full_v_t[:, :, :proxy_action_dim] = ref_v_t
+                    runtime_stats["v_task_shape"] = tuple(task_full_v_t.shape)
+                    runtime_stats["v_ref_shape"] = tuple(ref_full_v_t.shape)
+                    v_t = (
+                        args.gamma_base * base_v_t
+                        + args.steer_scale * (task_full_v_t - ref_full_v_t)
+                    )
+                    runtime_stats["checked_vlm_task_ref_shapes"] = True
+                if args.only_steer and not disable_steering:
                     v_t = task_full_v_t
             else:
-                v_t = base_v_t.clone()
-                v_t[:, :, :proxy_action_dim] += args.steer_scale * (task_v_t - ref_v_t)
-                if args.only_steer:  # testing the code for steering only
-                    v_t[:, :, :proxy_action_dim] = task_v_t
+                if disable_steering:
+                    v_t = base_v_t
+                else:
+                    v_t = base_v_t.clone()
+                    v_t[:, :, :proxy_action_dim] += args.steer_scale * (task_v_t - ref_v_t)
+                    if args.only_steer:  # testing the code for steering only
+                        v_t[:, :, :proxy_action_dim] = task_v_t
         else:
             v_t = base_v_t
 
@@ -1593,30 +1660,35 @@ def parse_args():
     parser.add_argument(
         "--base_checkpoint_dir",
         type=str,
-        default=None,
-        help="Path to the checkpoint directory. Required; the training config name is derived from this path.",
+        default=DEFAULT_BASE_CHECKPOINT_DIR,
+        help="Base policy checkpoint directory. Defaults to the weight-task pi05 Droid joint-position checkpoint.",
     )
     parser.add_argument(
         "--task_checkpoint_dir",
         type=str,
-        default=None,
-        help="Path to the checkpoint directory. Required; the training config name is derived from this path.",
+        default=DEFAULT_TASK_CHECKPOINT_DIR,
+        help="Task proxy checkpoint directory. Defaults to the weight-task proxy checkpoint.",
     )
     parser.add_argument(
         "--ref_checkpoint_dir",
         type=str,
-        default=None,
-        help="Path to the checkpoint directory. Required; the training config name is derived from this path.",
+        default=DEFAULT_REF_CHECKPOINT_DIR,
+        help="Reference proxy checkpoint directory. Defaults to the weight-task reference checkpoint.",
     )
     parser.add_argument("--steer_scale", type=float, default=0.4)
     parser.add_argument("--num_steps", type=int, default=10)
     parser.add_argument("--task_num_steps", type=int, default=1200)
     parser.add_argument("--only_steer", action="store_true")
+    parser.add_argument(
+        "--no_steer",
+        action="store_true",
+        help="Disable task/ref steering and use only the base path.",
+    )
     parser.add_argument("--compare_difference", action="store_true")
     parser.add_argument(
         "--vlm_base",
         action="store_true",
-        help="Replace the pi checkpoint base velocity with FK/cost sim-free MPC velocity.",
+        help="Replace the pi checkpoint base path with FK/cost sim-free MPC.",
     )
     parser.add_argument(
         "--gamma_base",
@@ -1751,8 +1823,8 @@ task_policy = policy_config.create_trained_policy(task_config, task_checkpoint_d
 print("Loading ref policy checkpoint...", flush=True)
 ref_policy = policy_config.create_trained_policy(ref_config, ref_checkpoint_dir)
 
-base_source = "vlm_mpc" if _uses_vlm_mpc_base(args) else "pi_checkpoint"
-print(f"Base velocity source: {base_source}", flush=True)
+base_source = _base_source_name(args)
+print(f"Base source: {base_source}", flush=True)
 print(
     "Loaded checkpoints: "
     f"base={base_policy._model.config.model_type.value}, "
@@ -1846,8 +1918,10 @@ if args.dry_run:
         f"{_LAST_INFERENCE_RUNTIME.get('used_base_model_velocity')}",
         flush=True,
     )
+    print(f"  steering_mode: {_LAST_INFERENCE_RUNTIME.get('steering_mode')}", flush=True)
     print(f"  x_t_shape: {_LAST_INFERENCE_RUNTIME.get('x_t_shape')}", flush=True)
     print(f"  v_vlm_shape: {_LAST_INFERENCE_RUNTIME.get('v_vlm_shape')}", flush=True)
+    print(f"  score_shape: {_LAST_INFERENCE_RUNTIME.get('score_shape')}", flush=True)
     print(f"  v_task_shape: {_LAST_INFERENCE_RUNTIME.get('v_task_shape')}", flush=True)
     print(f"  v_ref_shape: {_LAST_INFERENCE_RUNTIME.get('v_ref_shape')}", flush=True)
     print(f"  proxy_task_shape: {_LAST_INFERENCE_RUNTIME.get('proxy_task_shape')}", flush=True)

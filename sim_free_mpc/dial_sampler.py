@@ -23,6 +23,7 @@ class DIALResult:
     costs: torch.Tensor
     weights: torch.Tensor
     samples: torch.Tensor
+    noise_scale: torch.Tensor
 
 
 class DIALSampler:
@@ -50,6 +51,7 @@ class DIALSampler:
         last_costs = None
         last_weights = None
         last_samples = None
+        last_noise_scale = None
 
         for opt_iter in range(self.config.iterations):
             noise = torch.randn(
@@ -78,6 +80,18 @@ class DIALSampler:
             last_costs = costs
             last_weights = weights
             last_samples = samples
+            last_noise_scale = noise_level
 
-        assert last_costs is not None and last_weights is not None and last_samples is not None
-        return DIALResult(mean=mean, costs=last_costs, weights=last_weights, samples=last_samples)
+        assert (
+            last_costs is not None
+            and last_weights is not None
+            and last_samples is not None
+            and last_noise_scale is not None
+        )
+        return DIALResult(
+            mean=mean,
+            costs=last_costs,
+            weights=last_weights,
+            samples=last_samples,
+            noise_scale=last_noise_scale,
+        )

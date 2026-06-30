@@ -166,5 +166,10 @@ def create_trained_policy(
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
     )
+    policy._metadata = {
+        **policy._metadata,
+        "output_norm_stats": output_norm_stats,
+        "use_quantile_norm": data_config.use_quantile_norm,
+    }
     logging.info("Policy wrapper created.")
     return policy
