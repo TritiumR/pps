@@ -60,6 +60,7 @@ from tqdm import tqdm
 # import scipy.spatial.transform as R
 from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
 from sim_free_mpc import SimFreeMPC, SimFreeMPCConfig
+from sim_free_mpc.action_space import clamp_real_action_chunk
 
 
 DEFAULT_BASE_CHECKPOINT_DIR = "openpi/checkpoints/pytorch/pi05_droid_jointpos"
@@ -819,21 +820,42 @@ def _infer_actions_eager(
             "task_minus_ref": None,
         }
 
+    mpc_denoise_iteration = 0
+    mpc_denoise_iterations = args.num_steps + 1
     while denoise_time >= -dt / 2:
         expanded_time = denoise_time.expand(bsize)
 
         if use_vlm_mpc_base and disable_steering:
-            x_t, geom_stats = mpc_planner.step_score_space(
-                x_t,
-                base_inputs,
-                mpc_context,
-                step_scale=args.gamma_base,
-            )
+            if args.mpc_update == "legacy_score":
+                x_t, geom_stats = mpc_planner.step_score_space(
+                    x_t,
+                    base_inputs,
+                    mpc_context,
+                    step_scale=args.gamma_base,
+                )
+            elif args.mpc_update == "mbd_score":
+                x_t, geom_stats = mpc_planner.step_mbd_score(
+                    x_t,
+                    base_inputs,
+                    mpc_context,
+                    iteration=mpc_denoise_iteration,
+                    num_iterations=mpc_denoise_iterations,
+                    score_scale=args.gamma_base,
+                )
+            else:
+                x_t, geom_stats = mpc_planner.step_ddim(
+                    x_t,
+                    base_inputs,
+                    mpc_context,
+                    iteration=mpc_denoise_iteration,
+                    num_iterations=mpc_denoise_iterations,
+                    step_scale=args.gamma_base,
+                )
             runtime_stats["score_shape"] = tuple(x_t.shape)
             runtime_stats["mpc_last"] = geom_stats
             if args.mpc_debug:
                 print(
-                    "vlm_mpc_score "
+                    f"vlm_mpc_{geom_stats['update_mode']} "
                     f"cost_min={geom_stats['cost_min']:.4f} "
                     f"cost_mean={geom_stats['cost_mean']:.4f} "
                     f"cost_weighted={geom_stats['cost_weighted']:.4f} "
@@ -841,6 +863,7 @@ def _infer_actions_eager(
                     f"score_norm={geom_stats['score_norm']:.4f}",
                     flush=True,
                 )
+            mpc_denoise_iteration += 1
             denoise_time += dt
             continue
 
@@ -979,6 +1002,20 @@ def _infer_actions_eager(
         denoise_time += dt
 
     actions = base_policy.output_to_actions(base_inputs, x_t)
+    if use_vlm_mpc_base:
+        current_joint_pos = raw_obs.get("observation/joint_position")
+        max_joint_delta = args.mpc_joint_delta_clip if args.mpc_joint_delta_clip > 0.0 else None
+        action_tensor = torch.as_tensor(actions, device=device, dtype=torch.float32)
+        actions = (
+            clamp_real_action_chunk(
+                action_tensor,
+                current_joint_pos=current_joint_pos,
+                max_joint_delta=max_joint_delta,
+            )
+            .detach()
+            .cpu()
+            .numpy()
+        )
     compare_stats = {}
     if need_compare:
         compare_stats["shared_flow_path"] = {
@@ -1185,6 +1222,8 @@ def build_mpc_context(env, env_obs_dict, args):
             "egg",
             "pear",
             "apple",
+            "mango",
+            "cabbage",
             "scale",
             "teapot",
             "teacup",
@@ -1547,6 +1586,120 @@ def _episode_video_name(seed, success, suffix=""):
     return video_name + "_fail.mp4"
 
 
+def _first_bool(value) -> bool:
+    if torch.is_tensor(value):
+        return bool(value.detach().flatten()[0].item())
+    if isinstance(value, np.ndarray):
+        return bool(value.reshape(-1)[0])
+    return bool(value)
+
+
+def _first_list(value):
+    if torch.is_tensor(value):
+        return value.detach().flatten().cpu().tolist()
+    if isinstance(value, np.ndarray):
+        return value.reshape(-1).tolist()
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
+def _debug_scene_root_pos(env, asset_name: str):
+    try:
+        asset = env.scene[asset_name]
+        return asset.data.root_pos_w[0].detach().cpu().tolist()
+    except Exception:
+        return None
+
+
+def _capture_debug_object_xy_guard(env, asset_name: str, *, margin: float):
+    try:
+        asset = env.scene[asset_name]
+        pos = asset.data.root_pos_w.detach()
+        return {
+            "asset_name": asset_name,
+            "xy_min": pos[:, :2].clone() - float(margin),
+            "xy_max": pos[:, :2].clone() + float(margin),
+        }
+    except Exception as exc:
+        print(f"debug_object_xy_guard unavailable for {asset_name}: {exc}", flush=True)
+        return None
+
+
+def _subtask_flag_from_obs(env_obs_dict, key: str) -> bool:
+    raw = env_obs_dict.get("subtask_terms", {})
+    if key not in raw:
+        return False
+    return _first_bool(raw[key])
+
+
+def _apply_debug_object_xy_guard(env, guard_state, *, release: bool) -> bool:
+    if guard_state is None or release:
+        return False
+    asset_name = guard_state["asset_name"]
+    try:
+        asset = env.scene[asset_name]
+        pos = asset.data.root_pos_w.detach().clone()
+        quat = asset.data.root_quat_w.detach().clone()
+        xy_min = guard_state["xy_min"].to(device=pos.device, dtype=pos.dtype)
+        xy_max = guard_state["xy_max"].to(device=pos.device, dtype=pos.dtype)
+        below = pos[:, :2] < xy_min
+        above = pos[:, :2] > xy_max
+
+        pose_changed = bool((below | above).any().item())
+        if pose_changed:
+            pos[:, :2] = torch.maximum(torch.minimum(pos[:, :2], xy_max), xy_min)
+            asset.write_root_pose_to_sim(torch.cat((pos, quat), dim=-1))
+
+        vel = asset.data.root_vel_w.detach().clone()
+        outward_x = (below[:, 0] & (vel[:, 0] < 0.0)) | (above[:, 0] & (vel[:, 0] > 0.0))
+        outward_y = (below[:, 1] & (vel[:, 1] < 0.0)) | (above[:, 1] & (vel[:, 1] > 0.0))
+        if bool((outward_x | outward_y).any().item()):
+            vel[outward_x, 0] = 0.0
+            vel[outward_y, 1] = 0.0
+            asset.write_root_velocity_to_sim(vel)
+        return pose_changed
+    except Exception as exc:
+        print(f"debug_object_xy_guard failed for {asset_name}: {exc}", flush=True)
+        return False
+
+
+def _print_task_debug_done(
+    *,
+    env,
+    step_idx: int,
+    terminated,
+    truncated,
+    task_success: bool,
+):
+    print(
+        "task_debug_done "
+        f"step={step_idx} "
+        f"terminated={_first_bool(terminated)} "
+        f"truncated={_first_bool(truncated)} "
+        f"task_success={task_success}",
+        flush=True,
+    )
+    try:
+        terms = env.termination_manager.get_active_iterable_terms(0)
+        term_text = ", ".join(f"{name}={_first_list(values)[0]}" for name, values in terms)
+        print(f"task_debug_done terms: {term_text}", flush=True)
+    except Exception as exc:
+        print(f"task_debug_done terms unavailable: {exc}", flush=True)
+
+    scene_positions = {
+        name: _debug_scene_root_pos(env, name)
+        for name in ("apple", "pear", "pot", "egg", "cover")
+    }
+    scene_positions = {name: pos for name, pos in scene_positions.items() if pos is not None}
+    if scene_positions:
+        print(
+            "task_debug_done scene_root_pos_after_possible_reset: "
+            + json.dumps(scene_positions),
+            flush=True,
+        )
+
+
 def _episode_sort_key(name):
     match = re.search(r"(\d+)$", name)
     if match is None:
@@ -1700,7 +1853,66 @@ def parse_args():
     parser.add_argument("--mpc_iterations", type=int, default=2)
     parser.add_argument("--mpc_noise", type=float, default=0.35)
     parser.add_argument("--mpc_temperature", type=float, default=0.15)
+    parser.add_argument(
+        "--mpc_update",
+        choices=("ddim", "mbd_score", "legacy_score"),
+        default="ddim",
+        help="Update rule for --vlm_base --no_steer sim-free MPC.",
+    )
+    parser.add_argument(
+        "--mpc_ddim_train_timesteps",
+        type=int,
+        default=100,
+        help="Number of training timesteps used to discretize the DDIM cosine schedule.",
+    )
+    parser.add_argument(
+        "--interpolate",
+        action="store_true",
+        help=(
+            "Optimize sim-free MPC at a lower knot rate and linearly "
+            "interpolate back to the action horizon."
+        ),
+    )
+    parser.add_argument(
+        "--interpolate_low_frequency",
+        type=float,
+        default=5.0,
+        help="Low-frequency knot rate used by --interpolate.",
+    )
+    parser.add_argument(
+        "--interpolate_high_frequency",
+        type=float,
+        default=40.0,
+        help=(
+            "High-frequency rate used by --interpolate to compute the knot ratio. "
+            "This does not change the Isaac env control rate."
+        ),
+    )
+    parser.add_argument(
+        "--mpc_joint_delta_clip",
+        type=float,
+        default=0.25,
+        help=(
+            "Clamp decoded MPC joint-position targets to this many radians per control step. "
+            "Set to 0 to disable the per-step delta clamp. Joint limits are still enforced."
+        ),
+    )
     parser.add_argument("--mpc_debug", action="store_true")
+    parser.add_argument("--task_debug", action="store_true")
+    parser.add_argument(
+        "--debug_hold_pear",
+        action="store_true",
+        help=(
+            "Debug-only: before pear is detected as grasped, keep it inside a "
+            "small horizontal XY guard window so it does not slide off the table edge."
+        ),
+    )
+    parser.add_argument(
+        "--debug_hold_pear_xy_margin",
+        type=float,
+        default=0.10,
+        help="Half-width in meters of the debug pear XY guard window around the reset position.",
+    )
     parser.add_argument(
         "--dry_run",
         action="store_true",
@@ -1833,6 +2045,8 @@ print(
     flush=True,
 )
 
+CONTROL_FREQUENCY = 15
+
 mpc_planner = None
 if _uses_vlm_mpc_base(args):
     inferred_task = _task_name_for_mpc(args.task)
@@ -1845,12 +2059,21 @@ if _uses_vlm_mpc_base(args):
             noise=args.mpc_noise,
             temperature=args.mpc_temperature,
             action_dims=8,
+            joint_delta_clip=args.mpc_joint_delta_clip,
+            ddim_num_train_timesteps=args.mpc_ddim_train_timesteps,
+            interpolate=args.interpolate,
+            control_frequency=args.interpolate_high_frequency,
+            interpolate_frequency=args.interpolate_low_frequency,
         ),
     )
     print(
         "Sim-free MPC planner enabled: "
         f"base_source={base_source}, task={inferred_task}, samples={args.mpc_num_samples}, "
-        f"iterations={args.mpc_iterations}, gamma_base={args.gamma_base}",
+        f"iterations={args.mpc_iterations}, update={args.mpc_update}, "
+        f"ddim_train_timesteps={args.mpc_ddim_train_timesteps}, gamma_base={args.gamma_base}, "
+        f"joint_delta_clip={args.mpc_joint_delta_clip}, interpolate={args.interpolate}, "
+        f"interpolate_low_frequency={args.interpolate_low_frequency}, "
+        f"interpolate_high_frequency={args.interpolate_high_frequency}",
         flush=True,
     )
 
@@ -1884,7 +2107,6 @@ _warn_if_norm_mismatch(
 )
 
 steps_per_inference = 8
-CONTROL_FREQUENCY = 15
 
 print("Resetting env for warmup...", flush=True)
 env_obs_dict, _ = env.reset()
@@ -2016,6 +2238,23 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
             )
         )
 
+    pear_guard_state = (
+        _capture_debug_object_xy_guard(
+            env,
+            "pear",
+            margin=args.debug_hold_pear_xy_margin,
+        )
+        if args.debug_hold_pear
+        else None
+    )
+    if pear_guard_state is not None:
+        print(
+            "debug_hold_pear enabled "
+            f"xy_min={pear_guard_state['xy_min'].detach().cpu().tolist()} "
+            f"xy_max={pear_guard_state['xy_max'].detach().cpu().tolist()}",
+            flush=True,
+        )
+
     excute_frames = []
     thermal_overlay_frames = []
     sound_audio_frames = []
@@ -2074,6 +2313,15 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                     device=env.device,
                 )
             )
+            if args.debug_hold_pear:
+                pear_grasped = _subtask_flag_from_obs(env_obs_dict, "grasp_pear")
+                pose_changed = _apply_debug_object_xy_guard(
+                    env,
+                    pear_guard_state,
+                    release=pear_grasped,
+                )
+                if pose_changed:
+                    env_obs_dict = env.observation_manager.compute(update_history=True)
 
             obs = get_pi_observation(env_obs_dict["policy"])
             obs["prompt"] = args.prompt
@@ -2100,6 +2348,14 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
             step_idx += 1
 
             if terminated or truncated or task_success:
+                if args.task_debug:
+                    _print_task_debug_done(
+                        env=env,
+                        step_idx=step_idx,
+                        terminated=terminated,
+                        truncated=truncated,
+                        task_success=task_success,
+                    )
                 print("terminated or truncated or task completed")
                 success = task_success
                 break

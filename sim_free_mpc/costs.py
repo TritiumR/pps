@@ -13,19 +13,33 @@ _WEIGHT_SCALE_TOP_OFFSET_Z = 0.0523800
 _WEIGHT_OBJECT_HALF_HEIGHT = {
     "apple": 0.037665,
     "pear": 0.0620635,
+    "mango": 0.06,
+    "cabbage": 0.055,
+}
+_WEIGHT_OBJECT_HORIZONTAL_RADIUS = {
+    "apple": 0.0413,
+    "pear": 0.0517,
+    "mango": 0.06,
+    "cabbage": 0.07,
 }
 _WEIGHT_PLACE_CLEARANCE_Z = 0.015
 _WEIGHT_APPROACH_CLEARANCE_Z = 0.03
+_WEIGHT_COLLISION_OBJECTS = ("pear", "apple", "mango", "cabbage")
 
 
 @dataclass(frozen=True)
 class CostWeights:
     reach: float = 25.0
     terminal_reach: float = 40.0
-    smooth: float = 0.03
+    smooth: float = 0.08
     joint_delta: float = 0.005
     gripper: float = 0.1
+    gripper_smooth: float = 0.5
     orientation: float = 0.25
+    grasp_yaw: float = 0.35
+    grasp_floor: float = 20.0
+    grasp_straddle: float = 30.0
+    non_target_collision: float = 0.1
 
 
 def _first_tensor(context: dict[str, Any], *keys: str, device, dtype) -> torch.Tensor | None:
@@ -86,6 +100,20 @@ def _weight_is_place_phase(context: dict[str, Any]) -> bool:
     ) or _flag(context, "grasp_apple")
 
 
+def _weight_pick_object_name(context: dict[str, Any]) -> str | None:
+    if not _flag(context, "grasp_pear"):
+        return "pear"
+    if _flag(context, "pear_on_scale") and not _flag(context, "grasp_apple"):
+        return "apple"
+    return None
+
+
+def _weight_manipulated_object_name(context: dict[str, Any]) -> str | None:
+    if not _flag(context, "pear_on_scale"):
+        return "pear"
+    return "apple"
+
+
 def _pot_is_place_phase(context: dict[str, Any]) -> bool:
     return (
         _flag(context, "grasp_cover")
@@ -126,7 +154,11 @@ def _gripper_cost(
         desired = near_target
 
     gripper = real_actions[..., 7]
-    return weights.gripper * torch.mean((gripper - desired) ** 2, dim=1)
+    tracking = weights.gripper * torch.mean((gripper - desired) ** 2, dim=1)
+    if gripper.shape[1] <= 1:
+        return tracking
+    smooth = weights.gripper_smooth * torch.mean((gripper[:, 1:] - gripper[:, :-1]) ** 2, dim=1)
+    return tracking + smooth
 
 
 def _downward_orientation_cost(
@@ -141,6 +173,74 @@ def _downward_orientation_cost(
     desired_axis_world = torch.tensor([0.0, 0.0, -1.0], device=ee_quat.device, dtype=ee_quat.dtype)
     alignment = torch.sum(tool_axis_world * desired_axis_world.view(1, 1, 3), dim=-1)
     return weights.orientation * torch.mean(1.0 - alignment, dim=1)
+
+
+def _weight_grasp_feasibility_cost(
+    ee_pos: torch.Tensor,
+    ee_quat: torch.Tensor | None,
+    context: dict[str, Any],
+    weights: CostWeights,
+) -> torch.Tensor | None:
+    object_name = _weight_pick_object_name(context)
+    if object_name is None or ee_quat is None:
+        return None
+    object_pos = _target_from_object(context, object_name, ee_pos.device, ee_pos.dtype)
+    if object_pos is None:
+        return None
+
+    local_closing_axis = torch.zeros((*ee_quat.shape[:-1], 3), device=ee_quat.device, dtype=ee_quat.dtype)
+    local_closing_axis[..., 1] = 1.0
+    closing_axis_world = quat_apply_wxyz(ee_quat, local_closing_axis)
+
+    yaw = 1.0 - torch.maximum(closing_axis_world[..., 0].abs(), closing_axis_world[..., 1].abs())
+    yaw_cost = weights.grasp_yaw * torch.mean(yaw, dim=1)
+
+    object_half_height = _WEIGHT_OBJECT_HALF_HEIGHT.get(object_name, 0.05)
+    z_floor = object_pos[2] - object_half_height
+    floor = torch.clamp(z_floor - ee_pos[..., 2], min=0.0).pow(2)
+    floor_cost = weights.grasp_floor * torch.mean(floor, dim=1)
+
+    open_half = 0.04
+    finger_r = 0.012
+    object_radius = _WEIGHT_OBJECT_HORIZONTAL_RADIUS.get(object_name, 0.05)
+    min_fingertip_center_dist = object_radius + finger_r
+    object_center = object_pos.view(1, 1, 3)
+    fingertip_l = ee_pos + open_half * closing_axis_world
+    fingertip_r = ee_pos - open_half * closing_axis_world
+    dist_l = torch.linalg.vector_norm(fingertip_l - object_center, dim=-1)
+    dist_r = torch.linalg.vector_norm(fingertip_r - object_center, dim=-1)
+    straddle = (
+        torch.clamp(min_fingertip_center_dist - dist_l, min=0.0).pow(2)
+        + torch.clamp(min_fingertip_center_dist - dist_r, min=0.0).pow(2)
+    )
+    straddle_cost = weights.grasp_straddle * torch.mean(straddle, dim=1)
+
+    return yaw_cost + floor_cost + straddle_cost
+
+
+def _weight_non_target_collision_cost(
+    ee_pos: torch.Tensor,
+    context: dict[str, Any],
+    weights: CostWeights,
+) -> torch.Tensor | None:
+    manipulated = _weight_manipulated_object_name(context)
+    terms = []
+    ee_radius = 0.035
+    clearance = 0.02
+    for object_name in _WEIGHT_COLLISION_OBJECTS:
+        if object_name == manipulated:
+            continue
+        object_pos = _target_from_object(context, object_name, ee_pos.device, ee_pos.dtype)
+        if object_pos is None:
+            continue
+        object_radius = _WEIGHT_OBJECT_HORIZONTAL_RADIUS.get(object_name, 0.06)
+        keepout = object_radius + ee_radius + clearance
+        dist = torch.linalg.vector_norm(ee_pos - object_pos.view(1, 1, 3), dim=-1)
+        terms.append(torch.clamp(keepout - dist, min=0.0).pow(2))
+    if not terms:
+        return None
+    penalty = torch.stack(terms, dim=0).sum(dim=0)
+    return weights.non_target_collision * torch.mean(penalty, dim=1)
 
 
 def _default_target(context: dict[str, Any], device, dtype) -> torch.Tensor:
@@ -253,4 +353,11 @@ class PriorityStateCost:
         orientation_cost = _downward_orientation_cost(ee_quat, self.weights)
         if orientation_cost is not None:
             cost = cost + orientation_cost
+        if "weight" in self.task_name:
+            grasp_cost = _weight_grasp_feasibility_cost(ee_pos, ee_quat, context, self.weights)
+            if grasp_cost is not None:
+                cost = cost + grasp_cost
+            collision_cost = _weight_non_target_collision_cost(ee_pos, context, self.weights)
+            if collision_cost is not None:
+                cost = cost + collision_cost
         return cost
