@@ -9,6 +9,8 @@ import torch.nn.functional as F
 
 from .action_space import decode_model_action_chunks
 from .costs import PriorityStateCost
+from .costs_explore import ExploreStateCost
+from .costs_ref_style import RefStyleStateCost
 from .ddim import ddim_clean_sample_std_scale, ddim_iteration_alphas
 from .dial_sampler import DIALSampler, DIALSamplerConfig
 from .fk import PandaFK, quat_mul_wxyz, transform_points_wxyz
@@ -30,6 +32,8 @@ class SimFreeMPCConfig:
     interpolate: bool = False
     control_frequency: float = 40.0
     interpolate_frequency: float = 5.0
+    cost_style: str = "priority"
+    optimize_space: str = "action"
 
 
 class SimFreeMPC:
@@ -50,7 +54,16 @@ class SimFreeMPC:
                 action_dims=config.action_dims,
             )
         )
-        self.cost = PriorityStateCost(config.task_name)
+        if config.cost_style == "ref_style":
+            self.cost = RefStyleStateCost(config.task_name)
+        elif config.cost_style == "explore":
+            self.cost = ExploreStateCost(config.task_name)
+        elif config.cost_style == "priority":
+            self.cost = PriorityStateCost(config.task_name)
+        else:
+            raise ValueError(f"Unknown sim-free MPC cost_style: {config.cost_style!r}")
+        if config.optimize_space not in ("action", "accel"):
+            raise ValueError(f"Unknown sim-free MPC optimize_space: {config.optimize_space!r}")
 
     def _interpolation_knot_count(self, horizon: int) -> int:
         if not self.config.interpolate or horizon <= 1:
@@ -82,6 +95,127 @@ class SimFreeMPC:
             return resampled[0]
         return resampled
 
+    @staticmethod
+    def _bspline_basis(
+        num_control_points: int,
+        output_horizon: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        degree: int = 3,
+    ) -> torch.Tensor:
+        if num_control_points <= 0 or output_horizon <= 0:
+            raise ValueError("B-spline interpolation expects positive horizon sizes.")
+        if num_control_points == 1:
+            return torch.ones(output_horizon, 1, device=device, dtype=dtype)
+
+        degree = min(degree, num_control_points - 1)
+        interior_count = num_control_points - degree - 1
+        start = torch.zeros(degree + 1, device=device, dtype=dtype)
+        end = torch.ones(degree + 1, device=device, dtype=dtype)
+        if interior_count > 0:
+            interior = torch.linspace(0.0, 1.0, interior_count + 2, device=device, dtype=dtype)[1:-1]
+            knots = torch.cat([start, interior, end])
+        else:
+            knots = torch.cat([start, end])
+
+        u = torch.linspace(0.0, 1.0, output_horizon, device=device, dtype=dtype)
+        basis = torch.stack(
+            [((u >= knots[i]) & (u < knots[i + 1])).to(dtype) for i in range(knots.numel() - 1)],
+            dim=1,
+        )
+        for level in range(1, degree + 1):
+            cols = basis.shape[1] - 1
+            next_basis = []
+            for i in range(cols):
+                left_den = knots[i + level] - knots[i]
+                if torch.abs(left_den) > 0:
+                    left = (u - knots[i]) / left_den * basis[:, i]
+                else:
+                    left = torch.zeros_like(u)
+
+                right_den = knots[i + level + 1] - knots[i + 1]
+                if torch.abs(right_den) > 0:
+                    right = (knots[i + level + 1] - u) / right_den * basis[:, i + 1]
+                else:
+                    right = torch.zeros_like(u)
+                next_basis.append(left + right)
+            basis = torch.stack(next_basis, dim=1)
+
+        terminal = u == 1.0
+        if terminal.any():
+            basis[terminal] = 0.0
+            basis[terminal, -1] = 1.0
+        row_sum = torch.clamp(basis.sum(dim=1, keepdim=True), min=torch.finfo(dtype).eps)
+        return basis / row_sum
+
+    @classmethod
+    def _bspline_resample(cls, sequence: torch.Tensor, output_horizon: int) -> torch.Tensor:
+        if sequence.shape[-2] == output_horizon:
+            return sequence
+        if sequence.shape[-2] == 1:
+            return sequence.expand(*sequence.shape[:-2], output_horizon, sequence.shape[-1])
+
+        original_ndim = sequence.ndim
+        if original_ndim == 2:
+            sequence = sequence.unsqueeze(0)
+        if sequence.ndim != 3:
+            raise ValueError(f"Expected sequence [H,D] or [B,H,D], got {tuple(sequence.shape)}")
+
+        basis = cls._bspline_basis(
+            sequence.shape[1],
+            output_horizon,
+            device=sequence.device,
+            dtype=sequence.dtype,
+        )
+        resampled = torch.einsum("oh,bhd->bod", basis, sequence)
+        if original_ndim == 2:
+            return resampled[0]
+        return resampled
+
+    def _control_point_resample(self, sequence: torch.Tensor, output_horizon: int) -> torch.Tensor:
+        return self._linear_resample(sequence, output_horizon)
+
+    def _interpolate_control_points(self, sequence: torch.Tensor, output_horizon: int) -> torch.Tensor:
+        if not self.config.interpolate:
+            return self._linear_resample(sequence, output_horizon)
+        return self._bspline_resample(sequence, output_horizon)
+
+    @staticmethod
+    def _trajectory_to_accel_code(sequence: torch.Tensor) -> torch.Tensor:
+        """Encode a trajectory as a same-shaped acceleration-space code.
+
+        The code is a linear, invertible coordinate transform:
+        code[0] is the first position, code[1] is the first velocity, and
+        code[2:] are second differences. MBD/DDIM updates must happen in this
+        code space if sampling is done in acceleration space; updating the
+        original action trajectory with an acceleration-space weighted mean
+        mixes coordinates and gives inconsistent reverse steps.
+        """
+        if sequence.ndim != 2:
+            raise ValueError(f"Expected sequence [H,D], got {tuple(sequence.shape)}")
+        code = torch.zeros_like(sequence)
+        code[0] = sequence[0]
+        if sequence.shape[0] > 1:
+            code[1] = sequence[1] - sequence[0]
+        if sequence.shape[0] > 2:
+            code[2:] = sequence[2:] - 2.0 * sequence[1:-1] + sequence[:-2]
+        return code
+
+    @staticmethod
+    def _accel_code_to_trajectory(code: torch.Tensor) -> torch.Tensor:
+        if code.ndim != 3:
+            raise ValueError(f"Expected accel code [K,H,D], got {tuple(code.shape)}")
+        horizon = code.shape[1]
+        if horizon == 0:
+            return code
+        traj = [code[:, 0, :]]
+        if horizon > 1:
+            traj.append(traj[0] + code[:, 1, :])
+        for step in range(2, horizon):
+            traj.append(2.0 * traj[-1] - traj[-2] + code[:, step, :])
+        return torch.stack(traj, dim=1)
+
     def _optimize_chunk(
         self,
         x_t: torch.Tensor,
@@ -94,15 +228,26 @@ class SimFreeMPC:
         active_dims = min(self.config.action_dims, x_t.shape[-1])
         horizon = x_t.shape[1]
         opt_horizon = self._interpolation_knot_count(horizon)
-        mean0 = self._linear_resample(x_t[0, :, :active_dims].detach(), opt_horizon)
+        mean0 = self._control_point_resample(x_t[0, :, :active_dims].detach(), opt_horizon)
 
-        def cost_fn(samples: torch.Tensor) -> torch.Tensor:
-            full_horizon_samples = self._linear_resample(samples, horizon)
+        def cost_from_positions(samples: torch.Tensor) -> torch.Tensor:
+            full_horizon_samples = self._interpolate_control_points(samples, horizon)
             return self._cost_active_samples(full_horizon_samples, x_t, active_dims, policy_inputs, context)
 
-        result = self.sampler.optimize(mean0, cost_fn)
+        if self.config.optimize_space == "accel":
+            mean_accel = self._trajectory_to_accel_code(mean0)
+
+            def cost_fn(samples: torch.Tensor) -> torch.Tensor:
+                positions = self._accel_code_to_trajectory(samples)
+                return cost_from_positions(positions)
+
+            result = self.sampler.optimize(mean_accel, cost_fn)
+            result_mean = self._accel_code_to_trajectory(result.mean.unsqueeze(0))[0]
+        else:
+            result = self.sampler.optimize(mean0, cost_from_positions)
+            result_mean = result.mean
         target = x_t.detach().clone()
-        target[:, :, :active_dims] = self._linear_resample(result.mean, horizon).unsqueeze(0)
+        target[:, :, :active_dims] = self._interpolate_control_points(result_mean, horizon).unsqueeze(0)
         return target, result, active_dims
 
     def _cost_active_samples(
@@ -119,8 +264,7 @@ class SimFreeMPC:
             self.policy,
             policy_inputs,
             full,
-            current_joint_pos=context.get("joint_pos"),
-            max_joint_delta=self.config.joint_delta_clip,
+            apply_clamp=False,
         )
         real = decoded.real_actions
         joints = real[..., :7]
@@ -143,6 +287,8 @@ class SimFreeMPC:
                 root_quat.to(device=ee_quat.device, dtype=ee_quat.dtype),
                 ee_quat,
             )
+        if self.config.cost_style in ("ref_style", "explore"):
+            return self.cost(real_actions=real, tcp_pos=ee_pos, tcp_quat=ee_quat, context=context)
         return self.cost(real_actions=real, ee_pos=ee_pos, ee_quat=ee_quat, context=context)
 
     def _optimize_ddim_clean_chunk(
@@ -160,20 +306,33 @@ class SimFreeMPC:
         horizon = x_t.shape[1]
         opt_horizon = self._interpolation_knot_count(horizon)
         sqrt_alpha = torch.as_tensor(alpha_bar, device=x_t.device, dtype=x_t.dtype).sqrt()
-        clean_center_full = x_t.detach()[0, :, :active_dims] / torch.clamp(
-            sqrt_alpha,
-            min=self.config.flow_eps,
-        )
-        clean_center = self._linear_resample(clean_center_full, opt_horizon)
+        active_x_opt = self._control_point_resample(x_t.detach()[0, :, :active_dims], opt_horizon)
         clean_std = self.config.noise * ddim_clean_sample_std_scale(alpha_bar)
 
-        def cost_fn(samples: torch.Tensor) -> torch.Tensor:
-            full_horizon_samples = self._linear_resample(samples, horizon)
+        def cost_from_positions(samples: torch.Tensor) -> torch.Tensor:
+            full_horizon_samples = self._interpolate_control_points(samples, horizon)
             return self._cost_active_samples(full_horizon_samples, x_t, active_dims, policy_inputs, context)
 
-        result = self.sampler.optimize_with_noise_scale(clean_center, cost_fn, noise_scale=clean_std)
+        if self.config.optimize_space == "accel":
+            active_code = self._trajectory_to_accel_code(active_x_opt)
+            mean_accel = active_code / torch.clamp(sqrt_alpha, min=self.config.flow_eps)
+
+            def cost_fn(samples: torch.Tensor) -> torch.Tensor:
+                positions = self._accel_code_to_trajectory(samples)
+                return cost_from_positions(positions)
+
+            result = self.sampler.optimize_with_noise_scale(mean_accel, cost_fn, noise_scale=clean_std)
+            result_mean = self._accel_code_to_trajectory(result.mean.unsqueeze(0))[0]
+        else:
+            clean_center = active_x_opt / torch.clamp(sqrt_alpha, min=self.config.flow_eps)
+            result = self.sampler.optimize_with_noise_scale(
+                clean_center,
+                cost_from_positions,
+                noise_scale=clean_std,
+            )
+            result_mean = result.mean
         x0_hat = x_t.detach().clone()
-        x0_hat[:, :, :active_dims] = self._linear_resample(result.mean, horizon).unsqueeze(0)
+        x0_hat[:, :, :active_dims] = self._interpolate_control_points(result_mean, horizon).unsqueeze(0)
         return x0_hat, result, active_dims, clean_std
 
     def _diagnostics(
@@ -190,6 +349,8 @@ class SimFreeMPC:
             "cost_weighted": float(torch.sum(result.costs * result.weights).detach().cpu()),
             "target_delta_norm": float(torch.linalg.vector_norm((target - x_t).detach()).cpu()),
             "interpolate": bool(self.config.interpolate),
+            "cost_style": self.config.cost_style,
+            "optimize_space": self.config.optimize_space,
         }
         if self.config.interpolate:
             diagnostics.update(
@@ -198,6 +359,7 @@ class SimFreeMPC:
                     "interpolate_knot_count": int(self._interpolation_knot_count(x_t.shape[1])),
                     "interpolate_frequency": float(self.config.interpolate_frequency),
                     "control_frequency": float(self.config.control_frequency),
+                    "interpolate_method": "clamped_cubic_bspline",
                 }
             )
         if score is not None:
@@ -236,7 +398,7 @@ class SimFreeMPC:
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         target, result, active_dims = self._optimize_chunk(x_t, policy_inputs, context)
         variance = torch.clamp(
-            self._linear_resample(
+            self._interpolate_control_points(
                 result.noise_scale.to(device=x_t.device, dtype=x_t.dtype).view(-1, 1),
                 x_t.shape[1],
             )
@@ -288,13 +450,34 @@ class SimFreeMPC:
         score = torch.zeros_like(x_t)
         active_x = x_t.detach()[:, :, :active_dims]
         active_x0 = x0_hat[:, :, :active_dims]
-        score[:, :, :active_dims] = (-active_x + sqrt_alpha * active_x0) / beta
+        if self.config.optimize_space == "accel":
+            horizon = x_t.shape[1]
+            opt_horizon = self._interpolation_knot_count(horizon)
+            active_x_opt = self._control_point_resample(active_x[0], opt_horizon)
+            active_code = self._trajectory_to_accel_code(active_x_opt)
+            clean_code = result.mean.to(device=x_t.device, dtype=x_t.dtype)
+            code_score = (-active_code + sqrt_alpha * clean_code) / beta
+            score[:, :, :active_dims] = self._interpolate_control_points(
+                self._accel_code_to_trajectory(code_score.unsqueeze(0))[0],
+                horizon,
+            ).unsqueeze(0)
+            pred_epsilon = (active_code - sqrt_alpha * clean_code) / sqrt_beta
+            prev_code = (
+                torch.sqrt(torch.clamp(alpha_prev, min=0.0)) * clean_code
+                + torch.sqrt(torch.clamp(1.0 - alpha_prev, min=0.0)) * pred_epsilon
+            )
+            active_prev = self._interpolate_control_points(
+                self._accel_code_to_trajectory(prev_code.unsqueeze(0))[0],
+                horizon,
+            ).unsqueeze(0)
+        else:
+            score[:, :, :active_dims] = (-active_x + sqrt_alpha * active_x0) / beta
 
-        pred_epsilon = (active_x - sqrt_alpha * active_x0) / sqrt_beta
-        active_prev = (
-            torch.sqrt(torch.clamp(alpha_prev, min=0.0)) * active_x0
-            + torch.sqrt(torch.clamp(1.0 - alpha_prev, min=0.0)) * pred_epsilon
-        )
+            pred_epsilon = (active_x - sqrt_alpha * active_x0) / sqrt_beta
+            active_prev = (
+                torch.sqrt(torch.clamp(alpha_prev, min=0.0)) * active_x0
+                + torch.sqrt(torch.clamp(1.0 - alpha_prev, min=0.0)) * pred_epsilon
+            )
 
         next_x = x_t.detach().clone()
         next_x[:, :, :active_dims] = active_x + float(step_scale) * (active_prev - active_x)
@@ -343,11 +526,31 @@ class SimFreeMPC:
         score = torch.zeros_like(x_t)
         active_x = x_t.detach()[:, :, :active_dims]
         active_x0 = x0_hat[:, :, :active_dims]
-        score_numerator = sqrt_alpha * active_x0 - active_x
-        score[:, :, :active_dims] = score_numerator / beta
 
         alpha_step = torch.clamp(alpha / torch.clamp(alpha_prev, min=self.config.flow_eps), min=self.config.flow_eps)
-        active_prev = (active_x + float(score_scale) * score_numerator) / torch.sqrt(alpha_step)
+        if self.config.optimize_space == "accel":
+            horizon = x_t.shape[1]
+            opt_horizon = self._interpolation_knot_count(horizon)
+            active_x_opt = self._control_point_resample(active_x[0], opt_horizon)
+            active_code = self._trajectory_to_accel_code(active_x_opt)
+            clean_code = result.mean.to(device=x_t.device, dtype=x_t.dtype)
+            score_numerator_code = sqrt_alpha * clean_code - active_code
+            score_code = score_numerator_code / beta
+            score[:, :, :active_dims] = self._interpolate_control_points(
+                self._accel_code_to_trajectory(score_code.unsqueeze(0))[0],
+                horizon,
+            ).unsqueeze(0)
+            prev_code = (
+                active_code + float(score_scale) * score_numerator_code
+            ) / torch.sqrt(alpha_step)
+            active_prev = self._interpolate_control_points(
+                self._accel_code_to_trajectory(prev_code.unsqueeze(0))[0],
+                horizon,
+            ).unsqueeze(0)
+        else:
+            score_numerator = sqrt_alpha * active_x0 - active_x
+            score[:, :, :active_dims] = score_numerator / beta
+            active_prev = (active_x + float(score_scale) * score_numerator) / torch.sqrt(alpha_step)
 
         next_x = x_t.detach().clone()
         next_x[:, :, :active_dims] = active_prev

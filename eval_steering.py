@@ -59,7 +59,7 @@ from tqdm import tqdm
 
 # import scipy.spatial.transform as R
 from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
-from sim_free_mpc import SimFreeMPC, SimFreeMPCConfig
+from sim_free_mpc import AccelActionMPC, AccelMPCConfig, SimFreeMPC, SimFreeMPCConfig
 from sim_free_mpc.action_space import clamp_real_action_chunk
 
 
@@ -534,9 +534,15 @@ def _uses_vlm_mpc_base(args) -> bool:
     return bool(getattr(args, "vlm_base", False))
 
 
+def _uses_accel_action_mpc(args) -> bool:
+    return _uses_vlm_mpc_base(args) and getattr(args, "mpc_optimize_space", "action") == "accel"
+
+
 def _base_source_name(args) -> str:
     if not _uses_vlm_mpc_base(args):
         return "pi_checkpoint"
+    if _uses_accel_action_mpc(args):
+        return "accel_action_mppi"
     if getattr(args, "no_steer", False):
         return "vlm_mpc_score"
     return "vlm_mpc_velocity"
@@ -809,6 +815,74 @@ def _infer_actions_eager(
         "proxy_ref_shape": None,
         "mpc_last": None,
     }
+
+    if _uses_accel_action_mpc(args):
+        if not disable_steering:
+            raise ValueError("--mpc_optimize_space accel currently supports --vlm_base --no_steer only.")
+        if args.mpc_update not in ("legacy_score", "mbd_score"):
+            raise ValueError(
+                "Acceleration action-space MPC supports --mpc_update legacy_score or mbd_score. "
+                "DDIM without the MBD score path is not implemented for this direct-action planner."
+            )
+        base_outputs = base_policy.infer(raw_obs)
+        base_actions = np.asarray(base_outputs["actions"], dtype=np.float32)
+        if base_actions.ndim != 2:
+            raise ValueError(f"Expected base policy actions [H,D], got {tuple(base_actions.shape)}")
+        if base_actions.shape[-1] < 8:
+            current_gripper = raw_obs.get("observation/gripper_position")
+            if current_gripper is None:
+                raise ValueError(
+                    "Acceleration action-space MPC needs a gripper trajectory, but base actions have "
+                    f"{base_actions.shape[-1]} dims and no observation/gripper_position was found."
+                )
+            gripper_value = np.asarray(current_gripper, dtype=np.float32).reshape(-1)[0]
+            gripper_traj = np.full((base_actions.shape[0], 1), gripper_value, dtype=np.float32)
+        else:
+            gripper_traj = base_actions[:, 7:8]
+        gripper_tensor = torch.as_tensor(gripper_traj, device=device, dtype=torch.float32)
+        if args.mpc_update == "mbd_score":
+            planned_actions, geom_stats = mpc_planner.plan_mbd_score(
+                context=mpc_context,
+                gripper_traj=gripper_tensor,
+                num_iterations=args.num_steps + 1,
+                score_scale=args.gamma_base,
+                device=device,
+                dtype=torch.float32,
+            )
+        else:
+            planned_actions, geom_stats = mpc_planner.plan(
+                context=mpc_context,
+                gripper_traj=gripper_tensor,
+                device=device,
+                dtype=torch.float32,
+            )
+        current_joint_pos = raw_obs.get("observation/joint_position")
+        max_joint_delta = args.mpc_joint_delta_clip if args.mpc_joint_delta_clip > 0.0 else None
+        actions = (
+            clamp_real_action_chunk(
+                planned_actions,
+                current_joint_pos=current_joint_pos,
+                max_joint_delta=max_joint_delta,
+            )
+            .detach()
+            .cpu()
+            .numpy()
+        )
+        runtime_stats["score_shape"] = tuple(planned_actions.shape)
+        runtime_stats["mpc_last"] = geom_stats
+        if args.mpc_debug:
+            print(
+                f"vlm_mpc_{geom_stats['update_mode']} "
+                f"cost_min={geom_stats['cost_min']:.4f} "
+                f"cost_mean={geom_stats['cost_mean']:.4f} "
+                f"cost_weighted={geom_stats['cost_weighted']:.4f} "
+                f"target_delta_norm={geom_stats['target_delta_norm']:.4f} "
+                f"accel_norm={geom_stats['accel_norm']:.4f} "
+                f"score_norm={geom_stats.get('score_norm', 0.0):.4f}",
+                flush=True,
+            )
+        _LAST_INFERENCE_RUNTIME = runtime_stats
+        return actions, {}
 
     if need_compare:
         shared_compare_stats = {
@@ -1579,11 +1653,72 @@ def _build_rollout_frame(obs, use_thermal_overlay=False):
     return frame
 
 
-def _episode_video_name(seed, success, suffix=""):
-    video_name = f"{seed}{suffix}"
-    if success:
-        return video_name + "_success.mp4"
-    return video_name + "_fail.mp4"
+def _slugify(text: str) -> str:
+    safe_chars = []
+    for char in text:
+        if char.isalnum() or char in ("-", "_", "."):
+            safe_chars.append(char)
+        else:
+            safe_chars.append("-")
+    return "".join(safe_chars).strip("-") or "eval"
+
+
+def _video_config_slug(args) -> str:
+    parts = [
+        args.mpc_update if _uses_vlm_mpc_base(args) else _base_source_name(args),
+        f"cost-{getattr(args, 'mpc_cost', 'na')}",
+        f"space-{getattr(args, 'mpc_optimize_space', 'na')}",
+        f"g{float(args.gamma_base):g}",
+        f"n{float(args.mpc_noise):g}",
+        f"t{float(args.mpc_temperature):g}",
+        f"clip{float(args.mpc_joint_delta_clip):g}",
+    ]
+    return _slugify("_".join(parts))
+
+
+def _episode_video_name(seed, success, *, args, run_id: str, suffix=""):
+    status = "success" if success else "fail"
+    return f"{seed}_{run_id}_{_video_config_slug(args)}{suffix}_{status}.mp4"
+
+
+def _video_config_lines(args, *, seed: int) -> list[str]:
+    return [
+        f"seed={seed} task={args.task} prompt={args.prompt}",
+        (
+            f"base={_base_source_name(args)} update={args.mpc_update} "
+            f"cost={getattr(args, 'mpc_cost', 'na')} "
+            f"space={getattr(args, 'mpc_optimize_space', 'na')} "
+            f"gamma={args.gamma_base:g} steps={args.num_steps} "
+            f"rollout_steps={args.task_num_steps} spi={args.steps_per_inference}"
+        ),
+        (
+            f"samples={args.mpc_num_samples} iters={args.mpc_iterations} "
+            f"noise={args.mpc_noise:g} temp={args.mpc_temperature:g} "
+            f"joint_clip={args.mpc_joint_delta_clip:g}"
+        ),
+    ]
+
+
+def _add_video_header(frame: np.ndarray, lines: list[str]) -> np.ndarray:
+    if frame.size == 0:
+        return frame
+    height = 26 * len(lines) + 12
+    header = np.zeros((height, frame.shape[1], frame.shape[2]), dtype=frame.dtype)
+    header[:] = 12
+    y = 24
+    for line in lines:
+        cv2.putText(
+            header,
+            line,
+            (12, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (230, 230, 230),
+            1,
+            cv2.LINE_AA,
+        )
+        y += 26
+    return np.concatenate((header, frame), axis=0)
 
 
 def _first_bool(value) -> bool:
@@ -1830,7 +1965,21 @@ def parse_args():
     )
     parser.add_argument("--steer_scale", type=float, default=0.4)
     parser.add_argument("--num_steps", type=int, default=10)
-    parser.add_argument("--task_num_steps", type=int, default=1200)
+    parser.add_argument(
+        "--task_num_steps",
+        type=int,
+        default=225,
+        help="Maximum rollout control steps. Default 225 is 15 seconds at 15 Hz.",
+    )
+    parser.add_argument(
+        "--steps_per_inference",
+        type=int,
+        default=8,
+        help=(
+            "Number of environment control steps executed from each inferred action chunk. "
+            "Smaller values replan more often. Default 8 preserves the previous behavior."
+        ),
+    )
     parser.add_argument("--only_steer", action="store_true")
     parser.add_argument(
         "--no_steer",
@@ -1849,8 +1998,8 @@ def parse_args():
         default=1.0,
         help="Scale for VLM/MPC base velocity in vlm_mpc base mode.",
     )
-    parser.add_argument("--mpc_num_samples", type=int, default=64)
-    parser.add_argument("--mpc_iterations", type=int, default=2)
+    parser.add_argument("--mpc_num_samples", type=int, default=512)
+    parser.add_argument("--mpc_iterations", type=int, default=8)
     parser.add_argument("--mpc_noise", type=float, default=0.35)
     parser.add_argument("--mpc_temperature", type=float, default=0.15)
     parser.add_argument(
@@ -1858,6 +2007,21 @@ def parse_args():
         choices=("ddim", "mbd_score", "legacy_score"),
         default="ddim",
         help="Update rule for --vlm_base --no_steer sim-free MPC.",
+    )
+    parser.add_argument(
+        "--mpc_cost",
+        choices=("priority", "ref_style", "explore"),
+        default="priority",
+        help="Cost function used by sim-free MPC.",
+    )
+    parser.add_argument(
+        "--mpc_optimize_space",
+        choices=("action", "accel"),
+        default="action",
+        help=(
+            "Parameterization used by sim-free MPC sampling. 'accel' runs pure "
+            "MPPI over real joint accelerations and integrates directly to action chunks."
+        ),
     )
     parser.add_argument(
         "--mpc_ddim_train_timesteps",
@@ -1891,7 +2055,7 @@ def parse_args():
     parser.add_argument(
         "--mpc_joint_delta_clip",
         type=float,
-        default=0.25,
+        default=0.15,
         help=(
             "Clamp decoded MPC joint-position targets to this many radians per control step. "
             "Set to 0 to disable the per-step delta clamp. Joint limits are still enforced."
@@ -1928,6 +2092,16 @@ AppLauncher.add_app_launcher_args(parser)
 parser.set_defaults(enable_cameras=True, headless=True)
 
 args = parser.parse_args()
+if _uses_accel_action_mpc(args):
+    if not args.no_steer:
+        raise ValueError("--mpc_optimize_space accel currently supports --vlm_base --no_steer only.")
+    if args.mpc_update not in ("legacy_score", "mbd_score"):
+        raise ValueError(
+            "Acceleration action-space MPC supports --mpc_update legacy_score or mbd_score. "
+            "DDIM without the MBD score path is not implemented for this direct-action planner."
+        )
+if args.steps_per_inference <= 0:
+    raise ValueError("--steps_per_inference must be positive.")
 
 # output path
 output_path = os.path.join("results", f"{args.task}/{args.exp_name}")
@@ -2044,32 +2218,54 @@ print(
     f"ref={ref_policy._model.config.model_type.value}",
     flush=True,
 )
+if args.mpc_debug:
+    base_policy._metadata = {
+        **(getattr(base_policy, "_metadata", {}) or {}),
+        "debug_torch_output_to_actions_norm_stats": True,
+    }
 
 CONTROL_FREQUENCY = 15
 
 mpc_planner = None
 if _uses_vlm_mpc_base(args):
     inferred_task = _task_name_for_mpc(args.task)
-    mpc_planner = SimFreeMPC(
-        base_policy,
-        SimFreeMPCConfig(
-            task_name=inferred_task,
-            num_samples=args.mpc_num_samples,
-            iterations=args.mpc_iterations,
-            noise=args.mpc_noise,
-            temperature=args.mpc_temperature,
-            action_dims=8,
-            joint_delta_clip=args.mpc_joint_delta_clip,
-            ddim_num_train_timesteps=args.mpc_ddim_train_timesteps,
-            interpolate=args.interpolate,
-            control_frequency=args.interpolate_high_frequency,
-            interpolate_frequency=args.interpolate_low_frequency,
-        ),
-    )
+    if _uses_accel_action_mpc(args):
+        mpc_planner = AccelActionMPC(
+            AccelMPCConfig(
+                task_name=inferred_task,
+                num_samples=args.mpc_num_samples,
+                iterations=args.mpc_iterations,
+                noise=args.mpc_noise,
+                temperature=args.mpc_temperature,
+                cost_style=args.mpc_cost,
+                control_frequency=CONTROL_FREQUENCY,
+                ddim_num_train_timesteps=args.mpc_ddim_train_timesteps,
+            )
+        )
+    else:
+        mpc_planner = SimFreeMPC(
+            base_policy,
+            SimFreeMPCConfig(
+                task_name=inferred_task,
+                num_samples=args.mpc_num_samples,
+                iterations=args.mpc_iterations,
+                noise=args.mpc_noise,
+                temperature=args.mpc_temperature,
+                action_dims=8,
+                joint_delta_clip=args.mpc_joint_delta_clip,
+                ddim_num_train_timesteps=args.mpc_ddim_train_timesteps,
+                interpolate=args.interpolate,
+                control_frequency=args.interpolate_high_frequency,
+                interpolate_frequency=args.interpolate_low_frequency,
+                cost_style=args.mpc_cost,
+                optimize_space=args.mpc_optimize_space,
+            ),
+        )
     print(
         "Sim-free MPC planner enabled: "
         f"base_source={base_source}, task={inferred_task}, samples={args.mpc_num_samples}, "
-        f"iterations={args.mpc_iterations}, update={args.mpc_update}, "
+        f"iterations={args.mpc_iterations}, update={args.mpc_update}, cost={args.mpc_cost}, "
+        f"optimize_space={args.mpc_optimize_space}, "
         f"ddim_train_timesteps={args.mpc_ddim_train_timesteps}, gamma_base={args.gamma_base}, "
         f"joint_delta_clip={args.mpc_joint_delta_clip}, interpolate={args.interpolate}, "
         f"interpolate_low_frequency={args.interpolate_low_frequency}, "
@@ -2106,7 +2302,12 @@ _warn_if_norm_mismatch(
     action_dim=task_policy._model.config.action_dim,
 )
 
-steps_per_inference = 8
+steps_per_inference = int(args.steps_per_inference)
+print(
+    f"steps_per_inference={steps_per_inference} "
+    f"({steps_per_inference / CONTROL_FREQUENCY:.3f}s between replans at {CONTROL_FREQUENCY}Hz)",
+    flush=True,
+)
 
 print("Resetting env for warmup...", flush=True)
 env_obs_dict, _ = env.reset()
@@ -2197,6 +2398,12 @@ episode_comparison_summaries = []
 total_comparison_observation_steps = 0
 total_inference_time_s = 0.0
 total_inference_calls = 0
+video_run_id = time.strftime("%Y%m%d-%H%M%S") + f"-pid{os.getpid()}"
+print(
+    f"Video run id: {video_run_id}; max rollout duration "
+    f"{args.task_num_steps / CONTROL_FREQUENCY:.1f}s",
+    flush=True,
+)
 for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
     success = None
     episode_comparison_stats = {
@@ -2260,6 +2467,7 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
     sound_audio_frames = []
     obs = get_pi_observation(env_obs_dict["policy"])
     obs["prompt"] = args.prompt
+    video_header_lines = _video_config_lines(args, seed=seed)
 
     # ========== policy control loop ==============
     step_idx = 0
@@ -2331,7 +2539,7 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
 
             # save visualization
             vis_image = _build_rollout_frame(obs, use_thermal_overlay=False)
-            excute_frames.append(vis_image)
+            excute_frames.append(_add_video_header(vis_image, video_header_lines))
             if _has_sound_observation(obs):
                 sound_audio_frame = _build_stereo_sound_audio_frame(
                     env,
@@ -2342,7 +2550,10 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                     sound_audio_frames.append(sound_audio_frame)
             if _has_thermal_observation(obs):
                 thermal_overlay_frames.append(
-                    _build_rollout_frame(obs, use_thermal_overlay=True)
+                    _add_video_header(
+                        _build_rollout_frame(obs, use_thermal_overlay=True),
+                        video_header_lines,
+                    )
                 )
 
             step_idx += 1
@@ -2365,7 +2576,7 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
             break
 
     # save excute_frames as video
-    video_name = _episode_video_name(seed, success)
+    video_name = _episode_video_name(seed, success, args=args, run_id=video_run_id)
     if success:
         print("success")
     else:
@@ -2373,11 +2584,11 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
 
     video_path = os.path.join(output_path, video_name)
     audio_path = _write_stereo_sound_audio(
-        os.path.join(output_path, f"{seed}_recording.wav"),
+        os.path.join(output_path, f"{seed}_{video_run_id}_recording.wav"),
         sound_audio_frames,
     )
     video_write_path = (
-        os.path.join(output_path, f"{seed}_recording.mp4")
+        os.path.join(output_path, f"{seed}_{video_run_id}_recording.mp4")
         if audio_path is not None
         else video_path
     )
@@ -2392,7 +2603,13 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
         _mux_audio_into_video(video_write_path, video_path, audio_path, "rollout")
 
     if thermal_overlay_frames:
-        thermal_video_name = _episode_video_name(seed, success, "_thermal_overlay")
+        thermal_video_name = _episode_video_name(
+            seed,
+            success,
+            args=args,
+            run_id=video_run_id,
+            suffix="_thermal_overlay",
+        )
         thermal_video_path = os.path.join(output_path, thermal_video_name)
         thermal_out = cv2.VideoWriter(
             thermal_video_path,

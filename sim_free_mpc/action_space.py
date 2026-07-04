@@ -9,6 +9,10 @@ import torch
 from .fk import PANDA_JOINT_LIMITS
 
 
+_PRINTED_TORCH_OUTPUT_NORM_DEBUG_IDS: set[int] = set()
+_PRINTED_TORCH_OUTPUT_NORM_UNAVAILABLE_IDS: set[int] = set()
+
+
 @dataclass(frozen=True)
 class DecodedActionChunk:
     """Decoded action chunk used by sim-free cost evaluation."""
@@ -81,6 +85,74 @@ def _unnormalize_torch(
         return values * (std + 1e-6) + mean
 
 
+def _norm_stat_debug_head(stats: Any, field: str, *, count: int = 8) -> str:
+    value = getattr(stats, field, None)
+    if value is None:
+        return "None"
+    arr = np.asarray(value).reshape(-1)
+    head = ", ".join(f"{float(v):.6g}" for v in arr[:count])
+    return f"len={arr.size} first{min(count, arr.size)}=[{head}]"
+
+
+def _maybe_print_torch_output_norm_debug(
+    policy: Any,
+    output_norm_stats: dict[str, Any],
+    *,
+    use_quantile_norm: bool,
+    model_chunks: torch.Tensor,
+):
+    metadata = getattr(policy, "_metadata", {}) or {}
+    if not metadata.get("debug_torch_output_to_actions_norm_stats", False):
+        return
+
+    policy_id = id(policy)
+    if policy_id in _PRINTED_TORCH_OUTPUT_NORM_DEBUG_IDS:
+        return
+    _PRINTED_TORCH_OUTPUT_NORM_DEBUG_IDS.add(policy_id)
+
+    print(
+        "torch_output_to_actions_norm_debug: "
+        f"source={metadata.get('output_norm_stats_source', '<unknown>')} "
+        f"use_quantile_norm={use_quantile_norm} "
+        f"model_chunks_shape={tuple(model_chunks.shape)} "
+        f"output_keys={sorted(output_norm_stats.keys())}",
+        flush=True,
+    )
+    for key in ("state", "actions"):
+        stats = output_norm_stats.get(key)
+        if stats is None:
+            print(f"torch_output_to_actions_norm_debug {key}: MISSING", flush=True)
+            continue
+        for field in ("mean", "std", "q01", "q99"):
+            print(
+                f"torch_output_to_actions_norm_debug {key}.{field}: "
+                f"{_norm_stat_debug_head(stats, field)}",
+                flush=True,
+            )
+
+
+def _maybe_print_torch_output_norm_unavailable(
+    policy: Any,
+    output_norm_stats: Any,
+):
+    metadata = getattr(policy, "_metadata", {}) or {}
+    if not metadata.get("debug_torch_output_to_actions_norm_stats", False):
+        return
+
+    policy_id = id(policy)
+    if policy_id in _PRINTED_TORCH_OUTPUT_NORM_UNAVAILABLE_IDS:
+        return
+    _PRINTED_TORCH_OUTPUT_NORM_UNAVAILABLE_IDS.add(policy_id)
+
+    keys = sorted(output_norm_stats.keys()) if isinstance(output_norm_stats, dict) else None
+    print(
+        "torch_output_to_actions_norm_debug: fast_path_disabled "
+        f"source={metadata.get('output_norm_stats_source', '<unknown>')} "
+        f"output_keys={keys} required_keys=['actions', 'state']",
+        flush=True,
+    )
+
+
 def _torch_output_to_actions(
     policy: Any,
     policy_inputs: dict[str, Any],
@@ -93,6 +165,7 @@ def _torch_output_to_actions(
         or "actions" not in output_norm_stats
         or "state" not in output_norm_stats
     ):
+        _maybe_print_torch_output_norm_unavailable(policy, output_norm_stats)
         return None
 
     device = model_chunks.device
@@ -117,6 +190,12 @@ def _torch_output_to_actions(
         return None
     if state.ndim != 1:
         return None
+    _maybe_print_torch_output_norm_debug(
+        policy,
+        output_norm_stats,
+        use_quantile_norm=use_quantile_norm,
+        model_chunks=model_chunks,
+    )
     delta_dims = min(7, actions.shape[-1], state.shape[-1])
     actions = actions.clone()
     actions[..., :delta_dims] = actions[..., :delta_dims] + state[:delta_dims]
@@ -180,6 +259,7 @@ def decode_model_action_chunks(
     policy_inputs: dict[str, Any],
     model_chunks: torch.Tensor,
     *,
+    apply_clamp: bool = True,
     current_joint_pos: torch.Tensor | np.ndarray | None = None,
     max_joint_delta: float | None = None,
     joint_limit_margin: float = 0.0,
@@ -198,6 +278,8 @@ def decode_model_action_chunks(
 
     fast_actions = _torch_output_to_actions(policy, policy_inputs, model_chunks)
     if fast_actions is not None:
+        if not apply_clamp:
+            return DecodedActionChunk(real_actions=fast_actions, model_actions=model_chunks)
         fast_actions = clamp_real_action_chunk(
             fast_actions,
             current_joint_pos=current_joint_pos,
@@ -218,15 +300,15 @@ def decode_model_action_chunks(
                 torch.as_tensor(decoded, device=model_chunks.device, dtype=model_chunks.dtype)
             )
 
-    return DecodedActionChunk(
-        real_actions=clamp_real_action_chunk(
-            torch.stack(real_chunks, dim=0),
+    real_actions = torch.stack(real_chunks, dim=0)
+    if apply_clamp:
+        real_actions = clamp_real_action_chunk(
+            real_actions,
             current_joint_pos=current_joint_pos,
             max_joint_delta=max_joint_delta,
             joint_limit_margin=joint_limit_margin,
-        ),
-        model_actions=model_chunks,
-    )
+        )
+    return DecodedActionChunk(real_actions=real_actions, model_actions=model_chunks)
 
 
 def decode_numpy_action_chunk(

@@ -13,6 +13,66 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sim_free_mpc import SimFreeMPC, SimFreeMPCConfig  # noqa: E402
 
 
+def test_bspline_basis_is_partition_of_unity():
+    basis = SimFreeMPC._bspline_basis(
+        4,
+        11,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert basis.shape == (11, 4)
+    assert torch.allclose(basis.sum(dim=1), torch.ones(11), atol=1e-6)
+    assert torch.all(basis >= 0.0)
+
+
+def test_bspline_resample_preserves_clamped_endpoints():
+    control_points = torch.tensor(
+        [
+            [0.0, 1.0],
+            [1.0, 2.0],
+            [2.0, -1.0],
+            [4.0, 0.5],
+        ],
+        dtype=torch.float32,
+    )
+
+    resampled = SimFreeMPC._bspline_resample(control_points, 13)
+
+    assert resampled.shape == (13, 2)
+    assert torch.allclose(resampled[0], control_points[0], atol=1e-6)
+    assert torch.allclose(resampled[-1], control_points[-1], atol=1e-6)
+
+
+def test_interpolate_control_points_uses_bspline_when_enabled():
+    planner = object.__new__(SimFreeMPC)
+    planner.config = SimFreeMPCConfig(interpolate=True)
+    control_points = torch.tensor([[[0.0], [1.0], [0.0], [1.0]]], dtype=torch.float32)
+
+    resampled = planner._interpolate_control_points(control_points, 9)
+
+    assert resampled.shape == (1, 9, 1)
+    assert torch.allclose(resampled[:, 0], control_points[:, 0], atol=1e-6)
+    assert torch.allclose(resampled[:, -1], control_points[:, -1], atol=1e-6)
+
+
+def test_accel_parameterization_reconstructs_trajectory():
+    sequence = torch.tensor(
+        [
+            [0.2, -0.1, 0.0],
+            [0.4, -0.3, 0.1],
+            [0.45, -0.2, 0.15],
+            [0.3, 0.0, 0.2],
+        ],
+        dtype=torch.float32,
+    )
+
+    accel_code = SimFreeMPC._trajectory_to_accel_code(sequence)
+    reconstructed = SimFreeMPC._accel_code_to_trajectory(accel_code.unsqueeze(0))[0]
+
+    assert torch.allclose(reconstructed, sequence, atol=1e-6)
+
+
 def test_step_ddim_updates_only_active_dims(monkeypatch):
     planner = object.__new__(SimFreeMPC)
     planner.config = SimFreeMPCConfig(action_dims=2, noise=0.0, flow_eps=1e-6)
