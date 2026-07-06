@@ -14,7 +14,7 @@ literature flags as the collapse knobs (``score_space`` vs ``ddim``, the flow-ma
 Nothing is executed during a probe; the state is frozen. Metrics JSON + a figure land in
 ``results/vlm_mpc/probe/``.
 
-    /isaac-sim/python.sh -m vlm_mpc.main --task probe_steerability --grasp_obj pear
+    /isaac-sim/python.sh -m vlm_base.main --task probe_steerability --grasp_obj pear
 """
 import os
 
@@ -58,9 +58,10 @@ def run(args):
     import numpy as np
     import torch
 
-    from vlm_mpc import sim_free_core as core
-    from vlm_mpc.minimal_base_cost import MinimalBaseCost, usd_extents
-    from vlm_mpc.droid_env import DroidEnv
+    from vlm_base import sim_free_core as core
+    from vlm_base.minimal_base_cost import MinimalBaseCost
+    from sim_common.scene_extents import usd_extents
+    from sim_common.droid_env import DroidEnv
 
     DEV = "cuda:0"
     repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

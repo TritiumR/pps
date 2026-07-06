@@ -6,7 +6,7 @@ and the per-chunk plan/decode helpers. The engine (``SimFreeMPC``, the decode, d
 is imported unchanged from ``sim_free_mpc``.
 
 Heavy imports stay at module top: this module is only imported from inside a task's ``run()``, i.e.
-after the Isaac app has booted (see ``vlm_mpc/main.py``).
+after the Isaac app has booted (see ``vlm_base/main.py``).
 """
 from __future__ import annotations
 

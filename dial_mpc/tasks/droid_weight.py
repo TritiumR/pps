@@ -10,7 +10,7 @@ Per stage: build the DIAL cost from the loaded subgoal constraint, plan->execute
 subgoal constraint is SATISFIED on the tracked keypoints (the ReKep transition), then grasp/release per
 the metadata flag.
 
-    python -m vlm_mpc.main --task droid_weight [--vlm fake|real] ...
+    python -m dial_mpc.main --task droid_weight [--vlm fake|real] ...
 """
 import json
 import os
@@ -62,11 +62,12 @@ def run(args):
     from rekep.keypoint_tracking import KeypointTracker
     from rekep.utils import get_callable_grasping_cost_fn, load_default_config
     from rekep.video import write_video_h264
-    from vlm_mpc.droid_env import DroidEnv, ROBOTIQ_GRASP_OFFSET
-    from vlm_mpc.sampler import make_accel_sampler
-    from vlm_mpc.costs import make_grasp_cost, make_rekep_cost
-    from vlm_mpc.np_shim import TorchNumpyShim, load_torch_constraints, make_torch_constraint
-    from vlm_mpc import weight_fake_vlm, overlay, control
+    from sim_common.droid_env import DroidEnv, ROBOTIQ_GRASP_OFFSET
+    from dial_mpc.sampler import make_accel_sampler
+    from dial_mpc.costs import make_grasp_cost, make_rekep_cost
+    from sim_common.np_shim import TorchNumpyShim, load_torch_constraints, make_torch_constraint
+    from sim_common import weight_fake_vlm, overlay
+    from dial_mpc import control
 
     DEV = "cuda:0"
     _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # vlm_mpc/tasks -> repo root

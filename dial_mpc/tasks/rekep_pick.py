@@ -7,7 +7,7 @@
 
 Both: LiftEnv mug task -> HOVER -> DESCEND (relational cost) -> CLOSE -> fixed-target LIFT probe.
 
-    python -m vlm_mpc.main --task rekep_pick --ground vlm ...
+    python -m dial_mpc.main --task rekep_pick --ground vlm ...
 
 Outputs -> results/vlm_mpc/rekep_pick.mp4 (gt) / rekep_vlm_pick_<exp_name>.mp4 (vlm).
 """
@@ -61,10 +61,10 @@ def run(args):
     from scipy.spatial.transform import Rotation as Rot
 
     from rekep.video import write_video_h264
-    from vlm_mpc.isaac_env import LiftEnv, GRASP_OFFSET
-    from vlm_mpc.sampler import make_accel_sampler
-    from vlm_mpc.costs import make_rekep_cost, make_rekep_grasp_cost, fixed_reach
-    from vlm_mpc import overlay
+    from sim_common.isaac_env import LiftEnv, GRASP_OFFSET
+    from dial_mpc.sampler import make_accel_sampler
+    from dial_mpc.costs import make_rekep_cost, make_rekep_grasp_cost, fixed_reach
+    from sim_common import overlay
 
     DEV = "cuda:0"
     _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -139,7 +139,7 @@ def run(args):
         from rekep.constraint_generation import ConstraintGenerator
         from rekep.keypoint_tracking import KeypointTracker
         from rekep.utils import get_callable_grasping_cost_fn, load_default_config
-        from vlm_mpc.np_shim import TorchNumpyShim, load_torch_constraints, make_torch_constraint
+        from sim_common.np_shim import TorchNumpyShim, load_torch_constraints, make_torch_constraint
 
         out_dir = os.path.join(_REPO, "results", "vlm_mpc", "rekep", args.exp_name)
         os.makedirs(out_dir, exist_ok=True)

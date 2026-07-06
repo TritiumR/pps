@@ -10,7 +10,7 @@ Grounding is GT object selection (the object's GT instance mask) + real table_ca
 VLM. The carry HOLD is contact-limited (the residual's job), so expect mid-carry slips; this validates
 the *pipeline structure*, not task success.
 
-    python -m vlm_mpc.main --task droid_weight_free ...
+    python -m dial_mpc.main --task droid_weight_free ...
 """
 import os
 
@@ -45,11 +45,11 @@ def run(args):
     from rekep.keypoint_tracking import KeypointTracker
     from rekep.utils import load_default_config
     from rekep.video import write_video_h264
-    from vlm_mpc.droid_env import DroidEnv, ROBOTIQ_GRASP_OFFSET
-    from vlm_mpc.sampler import make_accel_sampler
-    from vlm_mpc.costs import make_grasp_cost, make_rekep_cost, fixed_reach
-    from vlm_mpc import overlay
-    from vlm_mpc.control import tt as _tt
+    from sim_common.droid_env import DroidEnv, ROBOTIQ_GRASP_OFFSET
+    from dial_mpc.sampler import make_accel_sampler
+    from dial_mpc.costs import make_grasp_cost, make_rekep_cost, fixed_reach
+    from sim_common import overlay
+    from dial_mpc.control import tt as _tt
 
     DEV = "cuda:0"
     _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root

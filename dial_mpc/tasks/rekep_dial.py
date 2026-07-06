@@ -12,7 +12,7 @@ The gripper is an in-cost proximity decision inside the DIAL chunk (8th variable
 object on grasp stages and opens near the target on place stages. Contact-hold / articulation stay the
 PPS residual's job. The cost terms + weights mirror the collaborator's sim_free_mpc.
 
-    python -m vlm_mpc.main --task rekep_dial --task_key tea --vlm real
+    python -m dial_mpc.main --task rekep_dial --task_key tea --vlm real
 """
 import json
 import os
@@ -58,11 +58,11 @@ def run(args):
     from rekep.keypoint_tracking import KeypointTracker
     from rekep.utils import get_callable_grasping_cost_fn, load_default_config
     from rekep.video import write_video_h264
-    from vlm_mpc.droid_env import DroidEnv, ROBOTIQ_GRASP_OFFSET
-    from vlm_mpc.sampler import make_accel_sampler
-    from vlm_mpc.costs import make_task_cost
-    from vlm_mpc.np_shim import TorchNumpyShim, load_torch_constraints, make_torch_constraint
-    from vlm_mpc import weight_fake_vlm, overlay
+    from sim_common.droid_env import DroidEnv, ROBOTIQ_GRASP_OFFSET
+    from dial_mpc.sampler import make_accel_sampler
+    from dial_mpc.costs import make_task_cost
+    from sim_common.np_shim import TorchNumpyShim, load_torch_constraints, make_torch_constraint
+    from sim_common import weight_fake_vlm, overlay
 
     DEV = "cuda:0"
     OFFSET = ROBOTIQ_GRASP_OFFSET

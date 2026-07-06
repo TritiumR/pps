@@ -20,10 +20,10 @@ import torch
 from rekep import grounding as rk_grounding
 from rekep.keypoint_tracking import KeypointTracker
 from rekep.utils import get_callable_grasping_cost_fn, load_default_config
-from vlm_mpc import weight_fake_vlm
-from vlm_mpc.grounding.api import Grounding, SceneObject, Stage
-from vlm_mpc.minimal_base_cost import usd_extents
-from vlm_mpc.np_shim import TorchNumpyShim, load_torch_constraints, make_torch_constraint
+from sim_common import weight_fake_vlm
+from sim_common.grounding.api import Grounding, SceneObject, Stage
+from sim_common.scene_extents import usd_extents
+from sim_common.np_shim import TorchNumpyShim, load_torch_constraints, make_torch_constraint
 
 _DEFAULT_EXTENT = (0.05, 0.05, 0.05)
 _PLACE_HOVER = (0.0, 0.0, 0.10)   # reference height above the placement (gripper proximity + place-release)

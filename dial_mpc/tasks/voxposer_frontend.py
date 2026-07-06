@@ -4,7 +4,7 @@ but on the joint-pos Isaac-Lift-Mug-Franka-v0 task: 4-camera rig + VoxPoserIsaac
 setup_LMP + plan_ui("grasp the mug by the handle"). Plan-only (the greedy planner runs harmlessly;
 nothing moves). The affordance map is saved when LMP_interface.execute calls our MapSaver.visualize.
 
-    python -m vlm_mpc.main --task voxposer_frontend ...
+    python -m dial_mpc.main --task voxposer_frontend ...
 """
 import json
 import os
@@ -40,7 +40,7 @@ def run(args):
     from voxposer.interfaces import setup_LMP
     from voxposer.utils import set_lmp_objects
     from voxposer.envs.isaac_env import VoxPoserIsaacEnv, _RIG_NAMES
-    import vlm_mpc.lift_mug_task  # noqa: F401  -- registers Isaac-Lift-Mug-Franka-v0
+    import sim_common.lift_mug_task  # noqa: F401  -- registers Isaac-Lift-Mug-Franka-v0
 
     _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     OBJ_XY = [0.55, 0.0]

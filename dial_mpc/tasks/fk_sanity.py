@@ -3,7 +3,7 @@
 The MPC cost plans on this FK and executes on Isaac, so the two must be the same kinematics. Isolated
 check -- no sampler, no cost, no gripper. Prints FK_OK / FK_FAIL.
 
-    python -m vlm_mpc.main --task fk_sanity --n 64
+    python -m dial_mpc.main --task fk_sanity --n 64
 """
 
 NAME = "fk_sanity"
@@ -24,7 +24,7 @@ def run(args):
     import isaaclab_tasks  # noqa: F401
     from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
     from isaaclab_assets.robots.franka import FRANKA_PANDA_HIGH_PD_CFG
-    from vlm_mpc.fk import FrankaFK
+    from sim_common.fk import FrankaFK
 
     DEV = "cuda:0"
     TASK = "Isaac-Lift-Cube-Franka-v0"

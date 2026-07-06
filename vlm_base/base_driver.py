@@ -13,9 +13,9 @@ import numpy as np
 import torch
 
 from rekep.video import write_video_h264
-from vlm_mpc import overlay
-from vlm_mpc import sim_free_core as core
-from vlm_mpc.droid_env import ROBOTIQ_GRASP_OFFSET
+from sim_common import overlay
+from vlm_base import sim_free_core as core
+from sim_common.droid_env import ROBOTIQ_GRASP_OFFSET
 
 
 def _capture_held(env, grounding, held_idx):

@@ -3,7 +3,7 @@ ball region on the GT handle (the 'fake' analog of VoxPoser's set_voxel_by_radiu
 cost field (voxposer_bridge.build_costmap) is sampled by DIAL at the candidate TCPs. Tests whether a
 REGION grasps better than ReKep's single keypoint. Records camera | affordance-map + DIAL-path panel.
 
-    python -m vlm_mpc.main --task voxposer_pick ...
+    python -m dial_mpc.main --task voxposer_pick ...
 """
 import argparse
 import json
@@ -55,10 +55,10 @@ def run(args):
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
     from rekep.video import write_video_h264
-    from vlm_mpc.isaac_env import LiftEnv, GRASP_OFFSET
-    from vlm_mpc.sampler import make_accel_sampler
-    from vlm_mpc.costs import make_rekep_cost
-    from vlm_mpc.voxposer_bridge import (affordance_region, build_costmap, make_voxposer_cost,
+    from sim_common.isaac_env import LiftEnv, GRASP_OFFSET
+    from dial_mpc.sampler import make_accel_sampler
+    from dial_mpc.costs import make_rekep_cost
+    from dial_mpc.voxposer_bridge import (affordance_region, build_costmap, make_voxposer_cost,
                                          make_voxposer_grasp_cost)
 
     DEV = "cuda:0"

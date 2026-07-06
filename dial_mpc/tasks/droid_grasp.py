@@ -10,7 +10,7 @@ target selection + sampler; only the control loop differs:
                   (reach/terminal/smooth/delta/orient; --no-clamp to study the unclamped case).
   scaffold     -- the scripted HOVER -> DESCEND -> CLOSE -> LIFT grasp (the earliest D1 pear grasp).
 
-    python -m vlm_mpc.main --task droid_grasp --mode cost_only --object pear ...
+    python -m dial_mpc.main --task droid_grasp --mode cost_only --object pear ...
 
 Outputs -> results/vlm_mpc/droid_grasp/<mode>_<exp_name>.mp4.
 """
@@ -74,10 +74,11 @@ def run(args):
     from rekep.keypoint_tracking import KeypointTracker
     from rekep.utils import load_default_config
     from rekep.video import write_video_h264
-    from vlm_mpc.droid_env import DroidEnv, ROBOTIQ_GRASP_OFFSET
-    from vlm_mpc.sampler import make_accel_sampler
-    from vlm_mpc.costs import make_grasp_cost, make_rekep_cost, fixed_reach
-    from vlm_mpc import overlay, control
+    from sim_common.droid_env import DroidEnv, ROBOTIQ_GRASP_OFFSET
+    from dial_mpc.sampler import make_accel_sampler
+    from dial_mpc.costs import make_grasp_cost, make_rekep_cost, fixed_reach
+    from sim_common import overlay
+    from dial_mpc import control
 
     DEV = "cuda:0"
     _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root

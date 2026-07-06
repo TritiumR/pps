@@ -6,8 +6,8 @@ serves as the reference a perception/VLM front-end is swapped in against.
 """
 from __future__ import annotations
 
-from vlm_mpc.grounding.api import Grounding, SceneObject, Stage
-from vlm_mpc.minimal_base_cost import usd_extents
+from sim_common.grounding.api import Grounding, SceneObject, Stage
+from sim_common.scene_extents import usd_extents
 
 _DEFAULT_EXTENT = (0.05, 0.05, 0.05)
 _PLACE_CLEARANCE = 0.10   # hover height above the place surface (m)

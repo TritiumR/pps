@@ -19,7 +19,7 @@ from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 from scipy.spatial.transform import Rotation as _Rot
 
 from rekep import isaaclab_helpers   # augment_table_cam_with_depth_and_seg (reused front-end camera)
-from vlm_mpc.fk import FrankaFK
+from sim_common.fk import FrankaFK
 
 TASK = "Isaac-Weight-Droid-Visuomotor-v0"
 ROBOTIQ_GRASP_OFFSET = (0.0, 0.0, 0.1716)   # calibrated panda_hand -> Robotiq TCP (probe)

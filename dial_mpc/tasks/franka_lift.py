@@ -6,7 +6,7 @@ Two modes on the shared `LiftEnv` (isaac_env.py):
   pick  -- full pick: HOVER -> DESCEND -> CLOSE (grasp cost) -> LIFT (carry cost, gripper closed), then a
            cube-z success check. Mirrors hydrax's predefined pick-place.
 
-    python -m vlm_mpc.main --task franka_lift --mode pick ...
+    python -m dial_mpc.main --task franka_lift --mode pick ...
 
 Outputs -> results/vlm_mpc/<reach|pick>.mp4 (kept names, matches the franka_lift_rekep milestone dir).
 """
@@ -56,10 +56,10 @@ def run(args):
     from scipy.spatial.transform import Rotation as Rot
 
     from rekep.video import write_video_h264
-    from vlm_mpc.isaac_env import LiftCubeEnv, GRASP_OFFSET
-    from vlm_mpc.sampler import make_accel_sampler
-    from vlm_mpc.costs import make_reach_cost, make_grasp_cost, make_lift_cost
-    from vlm_mpc import overlay
+    from sim_common.isaac_env import LiftCubeEnv, GRASP_OFFSET
+    from dial_mpc.sampler import make_accel_sampler
+    from dial_mpc.costs import make_reach_cost, make_grasp_cost, make_lift_cost
+    from sim_common import overlay
 
     DEV = "cuda:0"
     _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

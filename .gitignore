@@ -16,8 +16,8 @@ similarity
 gap_similarity
 # MOKA perception checkpoints (SAM + GroundingDINO, ~3GB — fetch separately)
 moka/ckpts
-# vlm_mpc archived scratch drivers (kept local, not shared)
-vlm_mpc/archive
+# dial_mpc archived scratch drivers (kept local, not shared)
+dial_mpc/archive
 # dinov3
 openpi/small_droid_dataset
 openpi/checkpoints

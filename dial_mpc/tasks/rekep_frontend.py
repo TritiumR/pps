@@ -6,7 +6,7 @@ Mirrors rekep/run_rekep.py, but Lift-Cube has no camera, so we ADD a depth+seg o
 (pose set via the cfg offset so camera.data.pos_w is correct -- camera_to_rekep_inputs
 reads it directly). Everything else is reuse of rekep.grounding / ConstraintGenerator.
 
-    python -m vlm_mpc.main --task rekep_frontend ...
+    python -m dial_mpc.main --task rekep_frontend ...
 """
 import json
 import os
@@ -47,8 +47,8 @@ def run(args):
     from rekep import grounding
     from rekep.constraint_generation import ConstraintGenerator
     from rekep.utils import load_default_config
-    import vlm_mpc.lift_mug_task  # noqa: F401  -- registers Isaac-Lift-Mug-Franka-v0
-    from vlm_mpc.isaac_env import look_at_quat_ros
+    import sim_common.lift_mug_task  # noqa: F401  -- registers Isaac-Lift-Mug-Franka-v0
+    from sim_common.isaac_env import look_at_quat_ros
 
     _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     OBJ_XY = [0.55, 0.0]  # the object is teleported here (under the overhead camera)

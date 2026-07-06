@@ -16,8 +16,8 @@ import isaaclab.sim as sim_utils
 
 from scipy.spatial.transform import Rotation as _Rot
 
-from vlm_mpc.fk import FrankaFK
-import vlm_mpc.lift_mug_task  # noqa: F401  -- registers Isaac-Lift-Mug-Franka-v0
+from sim_common.fk import FrankaFK
+import sim_common.lift_mug_task  # noqa: F401  -- registers Isaac-Lift-Mug-Franka-v0
 
 TASK = "Isaac-Lift-Cube-Franka-v0"
 CUBE = [0.55, 0.0, 0.0205]

@@ -6,7 +6,7 @@ collision + smoothness), grounds the task via a swappable ``GroundingSource``, a
 while the front-end varies. All parameters live in the YAML config (``--config``); the CLI keeps only the
 common per-run overrides ``--exp_name`` / ``--seed`` / ``--ground``.
 
-    /isaac-sim/python.sh -m vlm_mpc.main --task minimal_base --config vlm_mpc/configs/base.yaml
+    /isaac-sim/python.sh -m vlm_base.main --task minimal_base --config vlm_base/configs/base.yaml
 """
 import os
 
@@ -14,7 +14,7 @@ NAME = "minimal_base"
 
 
 def add_args(ap):
-    ap.add_argument("--config", type=str, default="vlm_mpc/configs/base.yaml",
+    ap.add_argument("--config", type=str, default="vlm_base/configs/base.yaml",
                     help="pipeline config (all parameters); copy it for a variant")
     ap.add_argument("--exp_name", type=str, default=None, help="override run.exp_name")
     ap.add_argument("--seed", type=int, default=None, help="override run.seed")
@@ -25,12 +25,12 @@ def add_args(ap):
 def run(args):
     import torch
 
-    from vlm_mpc import base_driver
-    from vlm_mpc import config as cfg
-    from vlm_mpc import sim_free_core as core
-    from vlm_mpc.droid_env import DroidEnv
-    from vlm_mpc.grounding import get_source
-    from vlm_mpc.minimal_base_cost import CostParams, MinimalBaseCost
+    from vlm_base import base_driver
+    from vlm_base import config as cfg
+    from vlm_base import sim_free_core as core
+    from sim_common.droid_env import DroidEnv
+    from sim_common.grounding import get_source
+    from vlm_base.minimal_base_cost import CostParams, MinimalBaseCost
 
     repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     config = cfg.load_config(args.config if os.path.isabs(args.config) else os.path.join(repo, args.config))

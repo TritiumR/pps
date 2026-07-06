@@ -7,7 +7,7 @@ demonstrate the vetted position-space recipe on the real pipeline: B-spline knot
 term, warm-start, a joint-delta rate limit, and a NaN guard. Phase flags come from the env's own
 ``subtask_terms`` group.
 
-    /isaac-sim/python.sh -m vlm_mpc.main --task sim_free_mbd --real_stats --interpolate --guard --w_consist 30
+    /isaac-sim/python.sh -m vlm_base.main --task sim_free_mbd --real_stats --interpolate --guard --w_consist 30
 """
 import os
 
@@ -47,10 +47,10 @@ def run(args):
     import numpy as np
     import torch
 
-    from vlm_mpc import sim_free_core as core
-    from vlm_mpc import minimal_base_cost
-    from vlm_mpc.droid_env import DroidEnv
-    from vlm_mpc import overlay
+    from vlm_base import sim_free_core as core
+    from vlm_base import minimal_base_cost
+    from sim_common.droid_env import DroidEnv
+    from sim_common import overlay
     from rekep.video import write_video_h264
 
     DEV = "cuda:0"
