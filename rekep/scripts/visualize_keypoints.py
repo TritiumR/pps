@@ -4,7 +4,7 @@ Proposes keypoints at reset, registers them to the scene's rigid bodies, then st
 with a gentle arm wave while overlaying the live-tracked keypoints (numbered dots) on the
 table camera. Useful for checking the projection / tracking / overlay before a full rollout.
 
-    /isaac-sim/python.sh rekep/scripts/visualize_keypoints.py --task Isaac-Tea-Droid-Visuomotor-v0 --task_key tea
+    python rekep/scripts/visualize_keypoints.py --task Isaac-Tea-Droid-Visuomotor-v0 --task_key tea
 """
 
 import argparse

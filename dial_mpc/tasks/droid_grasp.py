@@ -74,7 +74,7 @@ def run(args):
     from rekep.keypoint_tracking import KeypointTracker
     from rekep.utils import load_default_config
     from rekep.video import write_video_h264
-    from sim_common.droid_env import DroidEnv, ROBOTIQ_GRASP_OFFSET
+    from sim_common.envs.droid import DroidEnv, ROBOTIQ_GRASP_OFFSET
     from dial_mpc.sampler import make_accel_sampler
     from dial_mpc.costs import make_grasp_cost, make_rekep_cost, fixed_reach
     from sim_common import overlay

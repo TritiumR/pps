@@ -1,10 +1,9 @@
-"""Shared launch scaffolding for the vlm_mpc task drivers.
+"""Shared launch scaffolding for the standalone driver scripts.
 
-Every driver needs the same two things before it can touch IsaacLab: the bundled IsaacLab packages on
-``sys.path``, and a booted Isaac Sim app. ``main.py`` calls these in order
-(``bootstrap_syspath`` -> ``add_launcher_args`` -> ``boot``); task modules then do their heavy imports
-inside ``run()``, after the app is live. This replaces the ~15-line bootstrap header that used to be
-copy-pasted into every standalone driver.
+Before a driver can touch IsaacLab it needs the bundled IsaacLab packages on ``sys.path`` and a booted
+Isaac Sim app. ``run_standalone`` does that dance -- ``bootstrap_syspath`` -> ``add_launcher_args`` -> ``boot``
+-> run -> force-exit -- so each entrypoint's ``__main__`` stays a few lines. The Isaac imports live inside the
+functions because ``sys.path`` is only set up by ``bootstrap_syspath``.
 """
 import os
 import sys
@@ -35,6 +34,36 @@ def add_launcher_args(parser):
 
 def boot(args):
     """Boot the Isaac Sim app and return the ``simulation_app`` (close it in a ``finally``)."""
-    import pinocchio  # noqa: F401  -- imported before Isaac Sim (load-order quirk the drivers relied on)
+    import pinocchio  # noqa: F401  -- import before Isaac Sim (load-order requirement)
     from isaaclab.app import AppLauncher
     return AppLauncher(args).app
+
+
+def run_standalone(add_args, run, description=None):
+    """Boot Isaac and run one ``(add_args, run)`` entrypoint as a standalone script.
+
+    The boilerplate every entrypoint's ``__main__`` needs -- bootstrap sys.path, parse its args + the launcher
+    args, boot, run, and force-exit to free the GPU on the shared machine -- kept here so scripts don't
+    copy-paste it. Used by the base runner (``vlm_base/main.py``) and the diagnostics alike.
+    """
+    import argparse
+
+    bootstrap_syspath()
+    parser = argparse.ArgumentParser(description=description)
+    add_args(parser)
+    add_launcher_args(parser)
+    args = parser.parse_args()
+    app = boot(args)
+    ok = False
+    try:
+        run(args)
+        ok = True
+    except BaseException:
+        import traceback
+        traceback.print_exc()
+    finally:
+        try:
+            app.close()
+        except Exception:
+            pass
+        os._exit(0 if ok else 1)

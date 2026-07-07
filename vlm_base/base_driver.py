@@ -2,8 +2,8 @@
 
 Grounding-agnostic -- it consumes only the ``Grounding`` contract (obstacles + stages) plus an already
 built sim_free MPC, so front-ends (ReKep / VoxPoser / MOKA / GT) and controllers vary independently. The
-loop is the vetted recipe: SDEdit warm start, B-spline-smoothed chunks, a consistency reference, a general
-proximity gripper, and per-stage advance on a committed grasp.
+loop: SDEdit warm start, B-spline-smoothed chunks, a consistency reference, a proximity gripper, and
+per-stage advance on a committed grasp.
 """
 from __future__ import annotations
 
@@ -14,8 +14,9 @@ import torch
 
 from rekep.video import write_video_h264
 from sim_common import overlay
+from vlm_base import metrics
 from vlm_base import sim_free_core as core
-from sim_common.droid_env import ROBOTIQ_GRASP_OFFSET
+from sim_common.envs.droid import ROBOTIQ_GRASP_OFFSET
 
 
 def _capture_held(env, grounding, held_idx):
@@ -45,20 +46,6 @@ def _ctx_from_stage(env, grounding, stage, root_pos, root_quat, plan_ref, held_o
         ctx["held_idx"] = stage.held_idx
         ctx["held_offset"] = held_offset
     return ctx
-
-
-def _task_flags(env):
-    """Current env ``subtask_terms`` flags (actual task progress, e.g. ``grasp_pear``/``pear_on_scale``).
-
-    These reflect real task state -- a grasp flag is the gripper closed near the object, a place flag is
-    the object at its placement -- so a failed grasp/place leaves the flag False and the stage persists,
-    and re-planning is the retry. Empty when the env exposes no such group (e.g. GT grounding tasks).
-    """
-    try:
-        group = env.env.observation_manager.compute_group("subtask_terms")
-        return {key: bool(val.detach().flatten()[0].item()) for key, val in group.items()}
-    except Exception:
-        return {}
 
 
 def _should_advance(stage, flags, hold, commit_hold):
@@ -118,10 +105,8 @@ def run_base(env, grounding, *, mpc, policy, state_stats, cfg, args, out_dir):
         it_start = 0
         if args.init == "warm" and x_carry is not None:   # SDEdit warm start (temporal coherence)
             it_start = max(0, args.denoise_iters - args.warm_steps)
-            ab, _ = core.ddim_iteration_alphas(iteration=it_start, num_iterations=args.denoise_iters,
-                                               num_train_timesteps=cfg.ddim_num_train_timesteps)
-            ab_t = torch.tensor(float(ab), device=dev, dtype=torch.float32)
-            x_init = torch.sqrt(ab_t) * x_carry + torch.sqrt(1.0 - ab_t) * torch.randn(1, H, 8, device=dev)
+            x_init = core.sdedit_warm_start(x_carry, it_start, args.denoise_iters,
+                                            cfg.ddim_num_train_timesteps, H, dev)
         else:
             x_init = torch.randn(1, H, 8, device=dev, dtype=torch.float32)
         x0 = core.plan_chunk(mpc, x_init, pin, ctx, mode=args.mode, update=args.update,
@@ -138,7 +123,7 @@ def run_base(env, grounding, *, mpc, policy, state_stats, cfg, args, out_dir):
             grip_open = _gripper_open(env, stage, stage.target(), args.seat_dist)  # live target per step
             if stage.gripper == "close" and not grip_open:
                 hold += 1
-            if stage.gripper == "place" and grip_open:   # object let go (env defines placement as on-scale + released)
+            if stage.gripper == "place" and grip_open:   # gripper opened on a place stage -> object released
                 released = True
             env.apply_arm(real[t][:7], grip_open=grip_open)
             q_hist.append(env.q0().detach().cpu().numpy())
@@ -146,7 +131,7 @@ def run_base(env, grounding, *, mpc, policy, state_stats, cfg, args, out_dir):
             dist_hist.append(d_now)
             frames.append(_frame(env, grounding, stage, chunk, t, d_now, grip_open))
 
-        advance = _should_advance(stage, _task_flags(env), hold, args.commit_hold)
+        advance = _should_advance(stage, core.read_subtask_flags(env), hold, args.commit_hold)
         if stage.gripper == "place":
             advance = advance and released   # don't advance a place until the object is actually released
         if advance and stage_idx + 1 < len(grounding.stages):
@@ -171,18 +156,16 @@ def _report(env, grounding, obj_gt0, q_hist, dist_hist):
     perception centroids the controller uses carry a top-surface bias that must not enter the metric.
     """
     print("[base] --- RESULT ---", flush=True)
-    q = np.array(q_hist)
-    if len(q) > 2:
-        jerk = np.linalg.norm(q[2:] - 2 * q[1:-1] + q[:-2], axis=1).mean()
-        speed = np.linalg.norm(np.diff(q, axis=0), axis=1).mean()
-        print(f"[base] jerk(2nd-diff)={jerk * 1e3:.2f}e-3 speed={speed * 1e3:.1f}e-3 over {len(q)} steps", flush=True)
-    d = np.array(dist_hist)
-    if len(d):
-        print(f"[base] reach(TCP->target): min={d.min():.3f}m final={d[-1]:.3f}m", flush=True)
-    obstacles = [o for o in grounding.objects if o.name not in grounding.manipulated]
-    moved = [float(np.linalg.norm(env.object_pose(o.name)[0] - obj_gt0[o.name])) for o in obstacles]
-    print(f"[base] scene_disturbance({[o.name for o in obstacles]}): sum={sum(moved) * 100:.1f}cm "
-          f"max={max(moved) * 100 if moved else 0:.1f}cm", flush=True)
+    sm = metrics.motion_smoothness(q_hist)
+    if sm:
+        print(f"[base] jerk(2nd-diff)={sm['jerk'] * 1e3:.2f}e-3 speed={sm['speed'] * 1e3:.1f}e-3 "
+              f"over {sm['n']} steps", flush=True)
+    rs = metrics.reach_stats(dist_hist)
+    if rs:
+        print(f"[base] reach(TCP->target): min={rs['min']:.3f}m final={rs['final']:.3f}m", flush=True)
+    obstacles = [o.name for o in grounding.objects if o.name not in grounding.manipulated]
+    _, tot, mx = metrics.scene_disturbance(env, obj_gt0, obstacles)
+    print(f"[base] scene_disturbance({obstacles}): sum={tot * 100:.1f}cm max={mx * 100:.1f}cm", flush=True)
     for g in [s.grasp_obj for s in grounding.stages if s.grasp_obj and s.gripper == "close"]:
         dz = (env.object_pose(g)[0][2] - obj_gt0[g][2]) * 100
         print(f"[base] grasp_obj {g}: dz={dz:+.1f}cm grasped={'Y' if dz > 3.0 else 'N'}", flush=True)

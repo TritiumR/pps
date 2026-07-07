@@ -1,25 +1,21 @@
-# Single config for the minimal_base pipeline (--task minimal_base --config vlm_mpc/configs/base.yaml).
-# All tunable parameters live here; the task reads them. Per-run overrides on the CLI: --exp_name/--seed/--ground.
+# Pipeline config for the VLM-DP base runner (vlm_base/main.py).
+# All tunable parameters live here; the runner reads them. Scene + front-end + per-run knobs are CLI:
+# --task weight|pot|tea|capsule, --ground gt|rekep_fake|rekep_real, --exp_name/--seed/--joint_delta_clip.
 # Copy this file for a variant (e.g. base_ddim.yaml) rather than editing in place.
 
 run:
-  exp_name: minimal_base
   seed: 1
   max_chunks: 50
   fps: 20
 
-grounding:
-  source: gt            # gt | rekep_fake
-  grasp_obj: pear       # gt grounding: object to grasp
-  place_obj: scale      # object to place onto
-  task_key: weight      # perception/VLM grounding task
+grounding:                 # agnostic tuning only; scene objects (grasp/place) live in task_prompts.json
   seat_dist: 0.03       # gripper closes when TCP within this of the target (m)
   commit_hold: 5        # closed frames before a grasp commits to the next stage
   clearance: 0.015      # rekep: placement clearance above the surface (m)
   release_tol: 0.05     # rekep: place-stage advance tolerance (m)
 
 engine:
-  real_stats: true      # faithful pi05_droid_jointpos quantile decode
+  real_stats: true      # exact pi05_droid_jointpos quantile decode
   interpolate: true     # coarse-knot horizon interpolation
   horizon: 15
   exec_knot: 8          # chunk steps executed before re-planning
@@ -39,15 +35,22 @@ sampler:
   noise: 0.35
   temperature: 0.15     # DIAL softmax temperature
 
-cost:                   # weights (soft by design) + gripper/collision geometry (m)
-  orientation: 3.0
-  consistency: 30.0
-  straddle: 15.0
-  collision: 20.0
-  floor: 40.0
-  task: 25.0            # ReKep relational constraint (J_task) weight
-  path: 200.0           # running path-constraint weight
-  ee_r: 0.035           # gripper collision radius
-  coll_clear: 0.02      # keepout margin beyond the object extent
-  finger_r: 0.012       # fingertip radius
-  open_half: 0.04       # gripper half-span
+cost:                   # config-driven composite: {term: weight} + gripper/collision geometry (m)
+  terms:                # each term is a function in cost_terms.py -- add / drop / reweight here
+    reach: 25.0         # J_task: mean squared TCP->target (non-constraint stage)
+    terminal_reach: 40.0
+    rekep_subgoal: 25.0 # J_task: ReKep relational subgoal (constraint stage)
+    rekep_path: 200.0   # ReKep running path constraints
+    smooth: 0.08        # consecutive-joint smoothness
+    joint_delta: 0.005  # trust region (stay near current joints)
+    orientation: 3.0    # downward tool axis
+    consistency: 30.0   # stay near the warm-started previous plan
+    straddle: 15.0      # fingertips bracket the grasp point
+    collision: 20.0     # keepout from non-target objects
+    floor: 40.0         # stay above the table plane
+  geometry:
+    ee_r: 0.035         # gripper collision radius
+    coll_clear: 0.02    # keepout margin beyond the object extent
+    finger_r: 0.012     # fingertip radius
+    open_half: 0.04     # gripper half-span
+    tool_back: 0.06     # collision point set back up the tool axis from the TCP

@@ -7,7 +7,7 @@ the rollout is recorded with the live keypoint overlay. Execution is position-pr
 small orientation gain (the solver omits ReKep's collision/IK terms -- IsaacLab's IK handles
 reachability). ``--plan-only`` stops after grounding; ``--use_cached`` reuses a prior run.
 
-    /isaac-sim/python.sh rekep/scripts/run_rekep.py --task Isaac-Tea-Droid-Visuomotor-IK-Rel-v0 --task_key tea
+    python rekep/scripts/run_rekep.py --task Isaac-Tea-Droid-Visuomotor-IK-Rel-v0 --task_key tea
 """
 
 import argparse

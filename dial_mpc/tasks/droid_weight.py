@@ -3,7 +3,7 @@
 Mirrors `rekep/run_rekep_rollout.py`'s structure -- metadata (stages + grasp/release) + per-stage
 relational keypoint constraints + KeypointTracker (movable = on the grasped body) -- but swaps ReKep's
 scipy SubgoalSolver for our DIAL sampler (cost = the subgoal constraint via `make_rekep_cost`) and runs
-on the Droid weight task. The VLM output is either stubbed (`weight_fake_vlm`) or generated live by
+on the Droid weight task. The VLM output is either stubbed (`fake_vlm`) or generated live by
 ReKep's `ConstraintGenerator` (`--vlm real`); both write the identical metadata + constraint files.
 
 Per stage: build the DIAL cost from the loaded subgoal constraint, plan->execute->replan until the
@@ -21,7 +21,7 @@ NAME = "droid_weight"
 def add_args(ap):
     ap.add_argument("--exp_name", type=str, default="weight_rekep_s0")
     ap.add_argument("--vlm", type=str, default="fake", choices=["fake", "real"],
-                    help="fake: weight_fake_vlm writes constraints from GT masks; real: ReKep ConstraintGenerator (GPT-4o)")
+                    help="fake: fake_vlm writes constraints from GT masks; real: ReKep ConstraintGenerator (GPT-4o)")
     ap.add_argument("--instruction", type=str, default=None,
                     help="task instruction for the real VLM (default: task_prompts.json weight prompt)")
     ap.add_argument("--tol", type=float, default=0.015, help="subgoal-constraint value (m) below which a stage is done")
@@ -62,11 +62,12 @@ def run(args):
     from rekep.keypoint_tracking import KeypointTracker
     from rekep.utils import get_callable_grasping_cost_fn, load_default_config
     from rekep.video import write_video_h264
-    from sim_common.droid_env import DroidEnv, ROBOTIQ_GRASP_OFFSET
+    from sim_common.envs.droid import DroidEnv, ROBOTIQ_GRASP_OFFSET
     from dial_mpc.sampler import make_accel_sampler
     from dial_mpc.costs import make_grasp_cost, make_rekep_cost
-    from sim_common.np_shim import TorchNumpyShim, load_torch_constraints, make_torch_constraint
-    from sim_common import weight_fake_vlm, overlay
+    from sim_common.constraints import TorchNumpyShim, load_torch_constraints, make_torch_constraint
+    from sim_common.grounding import fake_vlm, masks
+    from sim_common import overlay
     from dial_mpc import control
 
     DEV = "cuda:0"
@@ -104,12 +105,12 @@ def run(args):
     print(f"[weight-rekep] {len(keypoints)} keypoints", flush=True)
 
     # ---- VLM front-end -> metadata.json + per-stage constraint files ----
-    # fake: weight_fake_vlm writes them from GT masks. real: ReKep's ConstraintGenerator (GPT-4o)
+    # fake: fake_vlm writes them from GT masks. real: ReKep's ConstraintGenerator (GPT-4o)
     # writes the IDENTICAL artifacts from the keypoint-annotated image + instruction. The driver loads
     # them the same either way. The grasp center needs the object behind a keypoint: fake returns a role
     # table; real grounds the chosen keypoint to an object via GT masks (object_for_keypoint).
     if args.vlm == "fake":
-        metadata, roles = weight_fake_vlm.generate(vlm_dir, keypoints, grounded, E.env)
+        metadata, roles = fake_vlm.generate("weight", vlm_dir, keypoints, grounded, E.env)
         object_for_kp = lambda kp_idx: next((n for n, i in roles.items() if i == kp_idx), None)
     else:
         from rekep.constraint_generation import ConstraintGenerator
@@ -125,7 +126,7 @@ def run(args):
             task_dir=vlm_dir)
         with open(os.path.join(vlm_dir, "metadata.json"), "r", encoding="utf-8") as f:
             metadata = json.load(f)
-        object_for_kp = lambda kp_idx: weight_fake_vlm.object_for_keypoint(grounded, E.env, keypoints[kp_idx])
+        object_for_kp = lambda kp_idx: masks.object_for_keypoint(grounded, E.env, keypoints[kp_idx], names=list(getattr(E.env.scene, "rigid_objects", {}) or {}))
     print(f"[weight-rekep] metadata: num_stages={metadata['num_stages']} "
           f"grasp={metadata['grasp_keypoints']} release={metadata['release_keypoints']}", flush=True)
 
@@ -139,7 +140,7 @@ def run(args):
     fruit_c = {}
     for fname in ("pear", "apple", "mango", "cabbage"):
         try:
-            c = weight_fake_vlm.local_centroid(grounded, E.env, fname)
+            c = masks.local_centroid(grounded, E.env, fname)
         except Exception:
             c = None
         if c is not None:
@@ -223,7 +224,7 @@ def run(args):
             # ReKep keypoint SELECTS the object; the grasp targets its perception-derived local center
             # (not the surface keypoint) -- the grasp-module half ReKep keeps and we'd skipped.
             name = object_for_kp(grasp_kp)
-            center = weight_fake_vlm.local_centroid(grounded, E.env, name, near=keypoints[grasp_kp])
+            center = masks.local_centroid(grounded, E.env, name, near=keypoints[grasp_kp])
             center_t = torch.tensor(center, device=DEV, dtype=torch.float32)
             obstacles = [c for f, c in fruit_c.items() if f != name]  # avoid the other objects
             # No transit term for the grasp: it must descend straight onto the object (top-down is

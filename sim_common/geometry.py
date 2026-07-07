@@ -1,10 +1,19 @@
-"""USD bounding-box geometry helper shared by the grounding sources.
+"""Small scene/pose geometry helpers shared across sim_common.
 
-``usd_extents`` reads per-object half-extents ``(grip, keepout, half_height)`` straight from the
-simulator, so no per-object radii need hand-specifying. Lives in sim_common because both the base
-and native stacks' grounding consume it.
+``quat_wxyz_to_R`` converts an IsaacLab (w,x,y,z) quaternion to a rotation matrix; ``usd_extents`` reads
+per-object half-extents from the simulator's USD bounding boxes, falling back to ``DEFAULT_EXTENT``.
 """
 import numpy as np
+from scipy.spatial.transform import Rotation as _Rot
+
+# Fallback half-extents (grip, keepout, half_height) for an object with no measured USD extent.
+DEFAULT_EXTENT = (0.05, 0.05, 0.05)
+
+
+def quat_wxyz_to_R(q_wxyz):
+    """IsaacLab (w,x,y,z) quaternion -> 3x3 rotation matrix."""
+    q = np.asarray(q_wxyz)
+    return _Rot.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()
 
 
 def usd_extents(E, scene_objects):
@@ -20,7 +29,7 @@ def usd_extents(E, scene_objects):
         bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_, UsdGeom.Tokens.render],
                                        useExtentsHint=True)
     except Exception as exc:
-        print(f"[scene_extents] USD extents unavailable ({exc}); using defaults", flush=True)
+        print(f"[geometry] USD extents unavailable ({exc}); using defaults", flush=True)
         return {}
     extents = {}
     for name in scene_objects:

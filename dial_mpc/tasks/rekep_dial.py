@@ -58,11 +58,12 @@ def run(args):
     from rekep.keypoint_tracking import KeypointTracker
     from rekep.utils import get_callable_grasping_cost_fn, load_default_config
     from rekep.video import write_video_h264
-    from sim_common.droid_env import DroidEnv, ROBOTIQ_GRASP_OFFSET
+    from sim_common.envs.droid import DroidEnv, ROBOTIQ_GRASP_OFFSET
     from dial_mpc.sampler import make_accel_sampler
     from dial_mpc.costs import make_task_cost
-    from sim_common.np_shim import TorchNumpyShim, load_torch_constraints, make_torch_constraint
-    from sim_common import weight_fake_vlm, overlay
+    from sim_common.constraints import TorchNumpyShim, load_torch_constraints, make_torch_constraint
+    from sim_common.grounding import fake_vlm, masks
+    from sim_common import overlay
 
     DEV = "cuda:0"
     OFFSET = ROBOTIQ_GRASP_OFFSET
@@ -130,7 +131,7 @@ def run(args):
 
     # ---- VLM front-end -> metadata + per-stage constraints ----
     if args.vlm == "fake":
-        metadata, roles = weight_fake_vlm.generate(vlm_dir, keypoints, grounded, E.env)
+        metadata, roles = fake_vlm.generate(args.task_key, vlm_dir, keypoints, grounded, E.env)
         object_for_kp = lambda i: next((n for n, j in roles.items() if j == i), None)
     else:
         from rekep.constraint_generation import ConstraintGenerator
@@ -140,7 +141,7 @@ def run(args):
             metadata={"init_keypoint_positions": keypoints, "num_keypoints": len(keypoints)}, task_dir=vlm_dir)
         with open(os.path.join(vlm_dir, "metadata.json"), "r", encoding="utf-8") as f:
             metadata = json.load(f)
-        object_for_kp = lambda i: weight_fake_vlm.object_for_keypoint(grounded, E.env, keypoints[i], names=scene_objects)
+        object_for_kp = lambda i: masks.object_for_keypoint(grounded, E.env, keypoints[i], names=scene_objects)
     num_stages = metadata["num_stages"]
     print(f"[rekep-dial] metadata: num_stages={num_stages} grasp={metadata['grasp_keypoints']} "
           f"release={metadata['release_keypoints']}", flush=True)
@@ -149,7 +150,7 @@ def run(args):
     obj_c = {}
     for name in scene_objects:
         try:
-            c = weight_fake_vlm.local_centroid(grounded, E.env, name)
+            c = masks.local_centroid(grounded, E.env, name)
         except Exception:
             c = None
         if c is not None:
@@ -221,7 +222,7 @@ def run(args):
 
         if is_grasp:
             name = object_for_kp(grasp_kp)
-            center = weight_fake_vlm.local_centroid(grounded, E.env, name, near=keypoints[grasp_kp])
+            center = masks.local_centroid(grounded, E.env, name, near=keypoints[grasp_kp])
             obstacles = [c for n, c in obj_c.items() if n != name]
             cost = make_task_cost(E.fk, E.a_local, center, grasp_offset=OFFSET, target_axis=(0.0, 0.0, -1.0),
                                   grasp_center=center, obstacles=obstacles, obstacle_r=args.obstacle_r,

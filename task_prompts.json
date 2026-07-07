@@ -8,12 +8,16 @@
   "weight": {
     "task_id": "Isaac-Weight-Droid-Visuomotor-v0",
     "prompt": "put pear and apple on the scale",
+    "grasp_obj": "pear",
+    "place_obj": "scale",
     "task_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_weight_pi05_jointpos/task/24000",
     "ref_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_weight_pi05_jointpos/reference/20000"
   },
   "tea": {
     "task_id": "Isaac-Tea-Droid-Visuomotor-v0",
     "prompt": "pour the tea from the teapot into the cup",
+    "grasp_obj": "teapot",
+    "place_obj": "teacup",
     "task_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_tea_pi05_jointpos/task/32000",
     "ref_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_tea_pi05_jointpos/reference/20000"
   },

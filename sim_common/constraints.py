@@ -1,17 +1,10 @@
-"""np->torch shim for running GPT-authored ReKep constraints batched inside DIAL-MPC.
+"""numpy->torch shim for evaluating ReKep constraint code batched over sampler candidates.
 
-ReKep's ``ConstraintGenerator`` emits numpy constraint functions of the form
-``fn(end_effector(3,), keypoints(K,3)) -> cost`` and ``rekep.utils.load_functions_from_txt``
-execs them in a sandbox whose only injected name is ``np`` (see that loader). The cost
-sampler (DIAL) needs the *same* function evaluated over a batch of candidate TCPs
-``[K,H,3]`` instead of a single ``(3,)`` point.
-
-The bridge is to swap the sandbox's ``np`` for ``TorchNumpyShim``: a thin object exposing
-the numpy surface ReKep constraints use, dispatching to torch. The one convention that makes
-the upstream code batch-correct *unmodified* is that ``linalg.norm`` / ``dot`` / ``cross``
-default to ``axis=-1`` -- the constraints call ``np.linalg.norm(end_effector - keypoints[i])``
-with no axis (assuming a ``(3,)`` input), so last-axis reduction returns a scalar on ``(3,)``
-and ``[K,H]`` on ``[K,H,3]``. Prompts and generated code are untouched.
+ReKep's ``ConstraintGenerator`` emits numpy functions ``fn(end_effector(3,), keypoints(K,3)) -> cost``
+that a loader ``exec``s in a sandbox whose only injected name is ``np``. The sampler needs the same
+function over a batch of candidate TCPs ``[K,H,3]``. ``TorchNumpyShim`` is a torch-backed stand-in for
+that ``np`` surface; its reductions default to ``axis=-1``, so a constraint written for a ``(3,)`` vector
+returns a scalar on ``(3,)`` and ``[K,H]`` on ``[K,H,3]`` unchanged. Prompts and generated code untouched.
 """
 import os
 

@@ -1,15 +1,18 @@
-"""Run the collaborator's SimFreeMPC in our IsaacLab weight task with a checkpoint-free decode.
+"""Run the SimFreeMPC engine on the IsaacLab weight task with a checkpoint-free decode.
 
-The planner runs unchanged from ``sim_free_mpc`` (DIAL sampler, reverse update, knot interpolation,
-PriorityStateCost); the model-space-to-action decode that normally needs the pi0.5 checkpoint is served
-by a mock policy carrying only the decode norm-stats. This is the faithful reproduction harness, used to
-demonstrate the vetted position-space recipe on the real pipeline: B-spline knot smoothing, a consistency
-term, warm-start, a joint-delta rate limit, and a NaN guard. Phase flags come from the env's own
-``subtask_terms`` group.
+The planner runs unchanged from ``sim_free_mpc`` (DIAL sampler, reverse update, knot interpolation, builtin
+``PriorityStateCost``); the model-to-action decode that normally needs the pi0.5 checkpoint is served by a
+mock policy carrying only the decode norm-stats. Exercises the position-space recipe end to end: B-spline
+knot smoothing, an optional consistency term, warm-start, a joint-delta rate limit, and a NaN guard. Phase
+flags come from the env's ``subtask_terms`` group.
 
-    /isaac-sim/python.sh -m vlm_base.main --task sim_free_mbd --real_stats --interpolate --guard --w_consist 30
+    python vlm_base/diagnostics/sim_free_mbd.py --real_stats --interpolate --guard --w_consist 30
 """
 import os
+import sys
+
+import numpy as np
+import torch
 
 NAME = "sim_free_mbd"
 
@@ -29,7 +32,7 @@ def add_args(ap):
     ap.add_argument("--noise", type=float, default=0.35)
     ap.add_argument("--temperature", type=float, default=0.15)
     ap.add_argument("--joint_delta_clip", type=float, default=0.05, help="post-decode per-step joint-motion cap")
-    ap.add_argument("--real_stats", action="store_true", help="faithful pi05_droid_jointpos quantile decode")
+    ap.add_argument("--real_stats", action="store_true", help="exact pi05_droid_jointpos quantile decode")
     ap.add_argument("--action_std", type=float, default=0.1, help="stand-in action-norm std when --real_stats is off")
     ap.add_argument("--interpolate", action="store_true", help="coarse-knot horizon interpolation")
     ap.add_argument("--basis", type=str, default="bspline", choices=["linear", "cubic", "bspline", "rbf"],
@@ -44,12 +47,11 @@ def add_args(ap):
 
 
 def run(args):
-    import numpy as np
-    import torch
-
+    # Repo-local + Isaac imports: need the bootstrapped sys.path + a booted app (see runtime.run_standalone).
     from vlm_base import sim_free_core as core
-    from vlm_base import minimal_base_cost
-    from sim_common.droid_env import DroidEnv
+    from vlm_base import metrics
+    from vlm_base.cost_terms import TERMS, CostInputs
+    from sim_common.envs.droid import DroidEnv
     from sim_common import overlay
     from rekep.video import write_video_h264
 
@@ -74,11 +76,12 @@ def run(args):
 
         def __call__(self, *, real_actions, ee_pos, ee_quat=None, context):
             base = self._base(real_actions=real_actions, ee_pos=ee_pos, ee_quat=ee_quat, context=context)
-            return base + minimal_base_cost._consistency_cost(real_actions, context, self._weight)
+            inputs = CostInputs(real_actions, ee_pos, ee_quat, context, {}, None)
+            return base + self._weight * TERMS["consistency"](inputs)
 
     policy, state_stats = core.build_policy(args.real_stats, args.action_std)
     mpc, cfg = core.build_mpc(policy, num_samples=args.num_samples, iterations=args.iterations,
-                              noise=args.noise, temperature=args.temperature,
+                              noise=args.noise, temperature=args.temperature, task_name="weight",
                               joint_delta_clip=args.joint_delta_clip, interpolate=args.interpolate)
     core.apply_horizon_basis(mpc, args.basis, args.knots)
     if args.w_consist > 0:
@@ -96,11 +99,7 @@ def run(args):
     latched = {}
 
     def read_flags():
-        try:
-            group = E.env.observation_manager.compute_group("subtask_terms")
-            raw = {key: bool(val.detach().flatten()[0].item()) for key, val in group.items()}
-        except Exception:
-            raw = {}
+        raw = core.read_subtask_flags(E)
         if not args.latch:
             return raw
         for key, val in raw.items():  # once True, stays True, so the target does not flip back
@@ -141,10 +140,8 @@ def run(args):
         if args.init == "warm" and x_carry is not None:
             if args.mode == "denoise":  # SDEdit-style: forward-diffuse the carry, run only the last warm_steps
                 it_start = max(0, args.denoise_iters - args.warm_steps)
-                alpha_bar, _ = core.ddim_iteration_alphas(iteration=it_start, num_iterations=args.denoise_iters,
-                                                          num_train_timesteps=cfg.ddim_num_train_timesteps)
-                a = torch.tensor(float(alpha_bar), device=DEV, dtype=torch.float32)
-                x_init = torch.sqrt(a) * x_carry + torch.sqrt(1.0 - a) * torch.randn(1, H, 8, device=DEV)
+                x_init = core.sdedit_warm_start(x_carry, it_start, args.denoise_iters,
+                                                cfg.ddim_num_train_timesteps, H, DEV)
             else:
                 x_init = x_carry
         else:
@@ -178,27 +175,28 @@ def run(args):
             break
 
     print("[sim-free-mbd] --- RESULT ---", flush=True)
-    q = np.array(q_hist)
-    if len(q) > 2:
-        dq = np.diff(q, axis=0)
-        step = np.linalg.norm(dq, axis=1)
-        cos = (dq[1:] * dq[:-1]).sum(axis=1) / (step[1:] * step[:-1] + 1e-9)
-        jerk = np.linalg.norm(q[2:] - 2 * q[1:-1] + q[:-2], axis=1).mean()
-        tv = np.abs(dq).sum(axis=0)
-        print(f"[sim-free-mbd] smoothness(cos)={cos.mean():.3f} jerk(2nd-diff)={jerk * 1e3:.2f}e-3 "
-              f"speed={step.mean() * 1e3:.1f}e-3 over {len(q)} steps", flush=True)
-        print("[sim-free-mbd] per-joint TV(rad): " + " ".join(f"j{i}={t:.2f}" for i, t in enumerate(tv)), flush=True)
-    d = np.array(dist_hist)
-    if len(d):
-        print(f"[sim-free-mbd] reach(TCP->target): min={d.min():.3f}m final={d[-1]:.3f}m", flush=True)
+    sm = metrics.motion_smoothness(q_hist)
+    if sm:
+        print(f"[sim-free-mbd] smoothness(cos)={sm['cos']:.3f} jerk(2nd-diff)={sm['jerk'] * 1e3:.2f}e-3 "
+              f"speed={sm['speed'] * 1e3:.1f}e-3 over {sm['n']} steps", flush=True)
+        print("[sim-free-mbd] per-joint TV(rad): " + " ".join(f"j{i}={t:.2f}" for i, t in enumerate(sm['tv'])), flush=True)
+    rs = metrics.reach_stats(dist_hist)
+    if rs:
+        print(f"[sim-free-mbd] reach(TCP->target): min={rs['min']:.3f}m final={rs['final']:.3f}m", flush=True)
     obstacles = [n for n in ("board", "mango", "cabbage") if n in scene_objects]
-    moved = [float(np.linalg.norm(E.object_pose(n)[0] - obj_p0[n])) for n in obstacles]
+    moved, tot, mx = metrics.scene_disturbance(E, obj_p0, obstacles)
     if moved:
-        print(f"[sim-free-mbd] scene_disturbance({obstacles}): sum={sum(moved) * 100:.1f}cm "
-              f"max={max(moved) * 100:.1f}cm", flush=True)
+        print(f"[sim-free-mbd] scene_disturbance({obstacles}): sum={tot * 100:.1f}cm max={mx * 100:.1f}cm", flush=True)
 
     out_dir = os.path.join(repo, "results", "vlm_mpc", "sim_free_mbd")
     os.makedirs(out_dir, exist_ok=True)
     out = os.path.join(out_dir, f"{exp_name}.mp4")
     write_video_h264(frames, out, args.fps)
     print(f"[sim-free-mbd] DONE -> {out} ({len(frames)} frames)", flush=True)
+
+
+if __name__ == "__main__":
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    from sim_common import runtime
+
+    runtime.run_standalone(add_args, run, "sim_free_mbd: run the SimFreeMPC engine on the weight task")

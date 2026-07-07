@@ -47,8 +47,8 @@ def run(args):
     from rekep import grounding
     from rekep.constraint_generation import ConstraintGenerator
     from rekep.utils import load_default_config
-    import sim_common.lift_mug_task  # noqa: F401  -- registers Isaac-Lift-Mug-Franka-v0
-    from sim_common.isaac_env import look_at_quat_ros
+    import sim_common.envs.lift_mug  # noqa: F401  -- registers Isaac-Lift-Mug-Franka-v0
+    from sim_common.envs.lift import look_at_quat_ros
 
     _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     OBJ_XY = [0.55, 0.0]  # the object is teleported here (under the overhead camera)

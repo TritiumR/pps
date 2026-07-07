@@ -61,7 +61,7 @@ def run(args):
     from scipy.spatial.transform import Rotation as Rot
 
     from rekep.video import write_video_h264
-    from sim_common.isaac_env import LiftEnv, GRASP_OFFSET
+    from sim_common.envs.lift import LiftEnv, GRASP_OFFSET
     from dial_mpc.sampler import make_accel_sampler
     from dial_mpc.costs import make_rekep_cost, make_rekep_grasp_cost, fixed_reach
     from sim_common import overlay
@@ -139,7 +139,7 @@ def run(args):
         from rekep.constraint_generation import ConstraintGenerator
         from rekep.keypoint_tracking import KeypointTracker
         from rekep.utils import get_callable_grasping_cost_fn, load_default_config
-        from sim_common.np_shim import TorchNumpyShim, load_torch_constraints, make_torch_constraint
+        from sim_common.constraints import TorchNumpyShim, load_torch_constraints, make_torch_constraint
 
         out_dir = os.path.join(_REPO, "results", "vlm_mpc", "rekep", args.exp_name)
         os.makedirs(out_dir, exist_ok=True)

@@ -55,7 +55,7 @@ def run(args):
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
     from rekep.video import write_video_h264
-    from sim_common.isaac_env import LiftEnv, GRASP_OFFSET
+    from sim_common.envs.lift import LiftEnv, GRASP_OFFSET
     from dial_mpc.sampler import make_accel_sampler
     from dial_mpc.costs import make_rekep_cost
     from dial_mpc.voxposer_bridge import (affordance_region, build_costmap, make_voxposer_cost,

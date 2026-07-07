@@ -5,12 +5,16 @@ grasped keypoints) from sampled joint configs -- in the robot BASE frame (panda_
 Pure PyTorch, no warp, so it runs in-process with Isaac Sim (no cuRobo / no warp clash).
 
 The cost is planned on this FK and executed on Isaac, so the two MUST be the same
-kinematics -- ``_fk_sanity.py`` verifies FK(q) == Isaac's panda_hand pose to ~mm.
+kinematics -- the ``fk_sanity`` task verifies FK(q) == Isaac's panda_hand pose to ~mm.
+
+``WorldFK`` composes ``FrankaFK`` (base frame) with the robot base pose for a rotated, off-origin base.
 """
 import os
 
 import torch
 import pytorch_kinematics as pk
+
+from sim_common.geometry import quat_wxyz_to_R
 
 _URDF = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                      "assets", "franka", "franka_panda.urdf")
@@ -51,3 +55,23 @@ class FrankaFK:
         pos, rot = self.fk(q)
         off = torch.as_tensor(offset, device=self.device, dtype=self.dtype)
         return pos + torch.einsum("bij,j->bi", rot, off), rot
+
+
+class WorldFK:
+    """``FrankaFK`` (base frame) composed with the robot base SE3 -> world-frame FK.
+
+    Exposes the same ``grasp_point(q[B,7], offset) -> (pos_w[B,3], R_w[B,3,3])`` contract as ``FrankaFK``,
+    so the costs work unchanged on a rotated, off-origin base (e.g. the Droid arm in the kitchen).
+    """
+
+    def __init__(self, fk, base_pos, base_quat_wxyz, device="cuda:0"):
+        self._fk = fk
+        self.device = device
+        self.Rb = torch.tensor(quat_wxyz_to_R(base_quat_wxyz), device=device, dtype=torch.float32)   # [3,3]
+        self.tb = torch.tensor(base_pos, device=device, dtype=torch.float32)                          # [3]
+
+    def grasp_point(self, q, offset):
+        pos_b, R_b = self._fk.grasp_point(q, offset)          # base frame: [B,3], [B,3,3]
+        pos_w = pos_b @ self.Rb.T + self.tb                   # [B,3]
+        R_w = torch.einsum("ij,bjk->bik", self.Rb, R_b)       # [B,3,3]
+        return pos_w, R_w

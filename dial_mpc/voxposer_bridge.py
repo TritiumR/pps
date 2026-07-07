@@ -1,4 +1,4 @@
-"""VoxPoser affordance map -> DIAL-MPC cost (the VoxPoser analog of vlm_mpc.np_shim/costs).
+"""VoxPoser affordance map -> DIAL-MPC cost (the VoxPoser analog of sim_common.constraints / dial_mpc.costs).
 
 VoxPoser's LMP composes a dense `affordance_map` (+ optional `avoidance_map`); its planner turns
 those into a smooth scalar **cost field** (rekep/voxposer planners.py:37-43):

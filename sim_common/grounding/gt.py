@@ -1,15 +1,13 @@
-"""Ground-truth grounding: targets and obstacles from the simulator's object poses.
+"""Ground-truth grounding: two-stage pick-and-place from the simulator's object poses.
 
-The pre-ReKep baseline -- a two-stage pick-and-place (grasp an object, place it on a location) with
-geometry read from the USD bounding boxes. It reproduces the original ``minimal_base`` behaviour and
-serves as the reference a perception/VLM front-end is swapped in against.
+Grasp an object then place it on a location, with obstacles + geometry read straight from the USD
+bounding boxes. The privileged baseline a perception/VLM front-end is compared against.
 """
 from __future__ import annotations
 
-from sim_common.grounding.api import Grounding, SceneObject, Stage
-from sim_common.scene_extents import usd_extents
+from sim_common.grounding import Grounding, SceneObject, Stage
+from sim_common.geometry import DEFAULT_EXTENT as _DEFAULT_EXTENT, usd_extents
 
-_DEFAULT_EXTENT = (0.05, 0.05, 0.05)
 _PLACE_CLEARANCE = 0.10   # hover height above the place surface (m)
 
 

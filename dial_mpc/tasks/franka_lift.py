@@ -56,7 +56,7 @@ def run(args):
     from scipy.spatial.transform import Rotation as Rot
 
     from rekep.video import write_video_h264
-    from sim_common.isaac_env import LiftCubeEnv, GRASP_OFFSET
+    from sim_common.envs.lift import LiftCubeEnv, GRASP_OFFSET
     from dial_mpc.sampler import make_accel_sampler
     from dial_mpc.costs import make_reach_cost, make_grasp_cost, make_lift_cost
     from sim_common import overlay

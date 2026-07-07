@@ -36,7 +36,7 @@ _S_Q99 = np.array([0.899652, 1.38547, 0.692028, -0.454204, 1.7321, 3.4673, 2.198
 def build_policy(real_stats: bool, action_std: float):
     """Mock policy carrying only the decode norm-stats (no checkpoint). Returns ``(policy, state_stats)``.
 
-    ``real_stats``: use the real pi05_droid_jointpos quantile norm (faithful decode). Otherwise an
+    ``real_stats``: use the pi05_droid_jointpos quantile norm (exact decode). Otherwise an
     identity/``action_std`` stand-in (arm delta = model * action_std + current joints).
     """
     if real_stats:
@@ -58,8 +58,13 @@ def build_policy(real_stats: bool, action_std: float):
 
 
 def build_mpc(policy, *, num_samples, iterations, noise, temperature, joint_delta_clip, interpolate,
-              task_name="weight", action_dims=8):
-    """Construct the ``SimFreeMPC`` and its config. Returns ``(mpc, cfg)``."""
+              task_name="auto", action_dims=8):
+    """Construct the ``SimFreeMPC`` and its config. Returns ``(mpc, cfg)``.
+
+    ``task_name`` only selects the engine's builtin cost; drivers that replace ``mpc.cost`` (the base's
+    ``CompositeCost``) leave it ``"auto"`` -- only the ``sim_free_mbd`` diagnostic, which keeps the builtin
+    weight cost, passes ``"weight"``.
+    """
     cfg = SimFreeMPCConfig(task_name=task_name, num_samples=num_samples, iterations=iterations,
                            noise=noise, temperature=temperature, action_dims=action_dims,
                            joint_delta_clip=joint_delta_clip, interpolate=interpolate)
@@ -166,3 +171,29 @@ def plan_chunk(mpc, x_init, pin, ctx, *, mode, update, denoise_iters, score_scal
             flow, _ = mpc.step(x, pin, ctx, dt=dt)
             x = x - flow * dt
     return x
+
+
+def sdedit_warm_start(x_carry, it_start, denoise_iters, num_train_timesteps, H, device, noise=None):
+    """SDEdit warm start: forward-diffuse ``x_carry`` to step ``it_start`` (``sqrt(ab)*carry + sqrt(1-ab)*noise``).
+
+    The reverse loop then runs only the last ``denoise_iters - it_start`` steps, for temporal coherence.
+    ``noise`` defaults to fresh Gaussian noise of shape ``[1, H, 8]``.
+    """
+    ab, _ = ddim_iteration_alphas(iteration=it_start, num_iterations=denoise_iters,
+                                  num_train_timesteps=num_train_timesteps)
+    ab_t = torch.tensor(float(ab), device=device, dtype=torch.float32)
+    if noise is None:
+        noise = torch.randn(1, H, 8, device=device)
+    return torch.sqrt(ab_t) * x_carry + torch.sqrt(1.0 - ab_t) * noise
+
+
+def read_subtask_flags(env):
+    """Current env ``subtask_terms`` flags (task progress, e.g. ``grasp_pear`` / ``pear_on_scale``).
+
+    Returns ``{flag: bool}`` from the env's observation manager; empty when the env exposes no such group.
+    """
+    try:
+        group = env.env.observation_manager.compute_group("subtask_terms")
+        return {key: bool(val.detach().flatten()[0].item()) for key, val in group.items()}
+    except Exception:
+        return {}

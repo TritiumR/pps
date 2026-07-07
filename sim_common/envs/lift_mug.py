@@ -1,11 +1,10 @@
-"""A separate Lift-Mug task (Franka + mug) -- registered as ``Isaac-Lift-Mug-Franka-v0``.
+"""Lift-Mug task (Franka + mug) -- registered as ``Isaac-Lift-Mug-Franka-v0``.
 
-Subclasses the stock ``FrankaCubeLiftEnvCfg`` and swaps ONLY the object to a mug (local USD),
-reusing the whole lift framework without touching upstream IsaacLab. A mug has distinct parts
-(handle / rim / body) -> several ReKep keypoints + a real grasp-which-part affordance, unlike
-the symmetric cube (which gives a single keypoint).
+Subclasses the stock ``FrankaCubeLiftEnvCfg`` and swaps only the object to a mug, reusing the whole lift
+framework without touching upstream IsaacLab. A mug's distinct parts (handle / rim / body) give several
+ReKep keypoints and a real grasp-which-part affordance, unlike the symmetric cube's single keypoint.
 
-Import this module AFTER AppLauncher has booted (it imports IsaacLab) to register the task.
+Import AFTER AppLauncher has booted (it imports IsaacLab) to register the task.
 """
 import gymnasium as gym
 
@@ -19,9 +18,8 @@ from isaaclab_tasks.manager_based.manipulation.lift.config.franka.joint_pos_env_
     FrankaCubeLiftEnvCfg,
 )
 
-# IsaacLab's nucleus mug (properly textured). The repo-local IsaacLab/assets/mug/mug.usd is
-# broken -- it references textures via an absolute path to another user's home, so it renders
-# untextured and DINOv2 finds no features.
+# Nucleus mug (properly textured); the repo-local mug USD references textures by an absolute path, so it
+# renders untextured and DINOv2 finds no features.
 _MUG_USD = f"{ISAACLAB_NUCLEUS_DIR}/Objects/Mug/mug.usd"
 
 
@@ -29,8 +27,7 @@ _MUG_USD = f"{ISAACLAB_NUCLEUS_DIR}/Objects/Mug/mug.usd"
 class FrankaMugLiftEnvCfg(FrankaCubeLiftEnvCfg):
     def __post_init__(self):
         super().__post_init__()
-        # Swap the DexCube for the mug; spawn a bit high so it settles onto the table
-        # regardless of the USD's origin convention.
+        # swap the cube for the mug; spawn slightly high so it settles onto the table regardless of origin
         self.scene.object = RigidObjectCfg(
             prim_path="{ENV_REGEX_NS}/Object",
             init_state=RigidObjectCfg.InitialStateCfg(pos=[0.55, 0.0, 0.10], rot=[1.0, 0.0, 0.0, 0.0]),

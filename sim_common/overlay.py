@@ -1,8 +1,8 @@
-"""Frame capture for the vlm_mpc drivers.
+"""Camera-frame overlays for rollout videos.
 
-The table-cam + tracked-keypoint overlay (``camera_overlay_frame``) was copy-pasted into all six Droid
-drivers; the plain-RGB fallback (``plain_frame``) covered the no-tracker case. Import after the Isaac
-app has booted -- ``rekep.rekep_viz`` pulls in IsaacLab math.
+``camera_overlay_frame`` / ``constraint_overlay_frame`` project tracked keypoints (and relational-
+constraint links) onto a camera's RGB; ``plain_frame`` is the no-tracker fallback. Import after the
+Isaac app has booted -- ``rekep.rekep_viz`` pulls in IsaacLab math.
 """
 import cv2
 import numpy as np

@@ -14,13 +14,18 @@ literature flags as the collapse knobs (``score_space`` vs ``ddim``, the flow-ma
 Nothing is executed during a probe; the state is frozen. Metrics JSON + a figure land in
 ``results/vlm_mpc/probe/``.
 
-    /isaac-sim/python.sh -m vlm_base.main --task probe_steerability --grasp_obj pear
+    python vlm_base/diagnostics/probe_steerability.py --grasp_obj pear
 """
+import json
 import os
+import sys
+
+import numpy as np
+import torch
 
 NAME = "probe_steerability"
 
-# Fixed engine choices, matching the base task (faithful decode + B-spline smoother).
+# Fixed engine choices matching the base runner (quantile decode + B-spline smoother).
 _REAL_STATS = True
 _INTERPOLATE = True
 
@@ -53,15 +58,11 @@ def add_args(ap):
 
 
 def run(args):
-    import json
-
-    import numpy as np
-    import torch
-
+    # Repo-local + Isaac imports: need the bootstrapped sys.path + a booted app (see runtime.run_standalone).
     from vlm_base import sim_free_core as core
-    from vlm_base.minimal_base_cost import MinimalBaseCost
-    from sim_common.scene_extents import usd_extents
-    from sim_common.droid_env import DroidEnv
+    from vlm_base.base_cost import CompositeCost
+    from sim_common.geometry import DEFAULT_EXTENT, usd_extents
+    from sim_common.envs.droid import DroidEnv
 
     DEV = "cuda:0"
     repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -79,7 +80,7 @@ def run(args):
                               noise=args.noise, temperature=args.temperature,
                               joint_delta_clip=args.joint_delta_clip, interpolate=_INTERPOLATE)
     core.apply_horizon_basis(mpc, args.basis, args.knots)
-    mpc.cost = core.guard_cost(MinimalBaseCost(extents))
+    mpc.cost = core.guard_cost(CompositeCost(extents=extents))
 
     def state_ctx(ref=None):
         """Context at the current physical state; ``ref`` sets the warm-start consistency reference."""
@@ -91,7 +92,7 @@ def run(args):
                 continue
             objs[n] = {"pos": torch.as_tensor(pos, device=DEV, dtype=torch.float32)}
         target = E.object_pose(args.grasp_obj)[0].copy()
-        zs = [float(objs[n]["pos"][2]) - extents.get(n, (0.05, 0.05, 0.05))[2] for n in objs]
+        zs = [float(objs[n]["pos"][2]) - extents.get(n, DEFAULT_EXTENT)[2] for n in objs]
         return {"objects": objs, "joint_pos": E.q0(), "robot_root_pos": root_pos, "robot_root_quat": root_quat,
                 "target": target, "grasp_obj": args.grasp_obj, "payload": None,
                 "z_table": (min(zs) if zs else None), "plan_ref": ref}
@@ -132,11 +133,8 @@ def run(args):
         if carry is None:
             return (lambda z=None: z if z is not None else noise()), 0
         it_start = max(0, args.denoise_iters - args.warm_steps)
-        ab, _ = core.ddim_iteration_alphas(iteration=it_start, num_iterations=args.denoise_iters,
-                                           num_train_timesteps=cfg.ddim_num_train_timesteps)
-        ab_t = torch.tensor(float(ab), device=DEV, dtype=torch.float32)
-        return (lambda z=None: torch.sqrt(ab_t) * carry
-                + torch.sqrt(1.0 - ab_t) * (z if z is not None else noise())), it_start
+        return (lambda z=None: core.sdedit_warm_start(carry, it_start, args.denoise_iters,
+                                                      cfg.ddim_num_train_timesteps, H, DEV, noise=z)), it_start
 
     def run_probes(update, x_init_fn, ctx, it_start):
         pin = core.policy_inputs(E, state_stats, _REAL_STATS)
@@ -272,3 +270,10 @@ def _figure(out_dir, name, results):
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, f"{name}.png"), dpi=110)
     print(f"[probe] figure -> {out_dir}/{name}.png", flush=True)
+
+
+if __name__ == "__main__":
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    from sim_common import runtime
+
+    runtime.run_standalone(add_args, run, "probe_steerability: base steerability diagnostics")

@@ -40,7 +40,7 @@ def run(args):
     from voxposer.interfaces import setup_LMP
     from voxposer.utils import set_lmp_objects
     from voxposer.envs.isaac_env import VoxPoserIsaacEnv, _RIG_NAMES
-    import sim_common.lift_mug_task  # noqa: F401  -- registers Isaac-Lift-Mug-Franka-v0
+    import sim_common.envs.lift_mug  # noqa: F401  -- registers Isaac-Lift-Mug-Franka-v0
 
     _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     OBJ_XY = [0.55, 0.0]
