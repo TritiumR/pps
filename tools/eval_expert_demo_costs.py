@@ -18,6 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from sim_free_mpc.costs_grasp_flow import GraspFlowStateCost  # noqa: E402
 from sim_free_mpc.costs_ref_style import RefStyleStateCost  # noqa: E402
 
 
@@ -46,6 +47,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stride", type=int, default=1, help="Stride between scored windows.")
     parser.add_argument("--max_demos", type=int, default=None, help="Limit number of demos.")
     parser.add_argument("--device", default="cpu", help="Torch device.")
+    parser.add_argument(
+        "--cost",
+        choices=("ref_style", "grasp_flow"),
+        default="ref_style",
+        help="Cost function used to score expert windows.",
+    )
     parser.add_argument("--output_csv", default=None, help="Optional per-demo/per-subtask summary CSV path.")
     parser.add_argument(
         "--allow_missing_subtasks",
@@ -159,7 +166,7 @@ def subtask_terms_at(
 ) -> dict[str, torch.Tensor]:
     names = ("grasp_pear", "pear_on_scale", "grasp_apple")
     terms = {
-        name: torch.as_tensor(read_signal(signals, name, length)[index], device=device)
+        name: torch.as_tensor(bool(read_signal(signals, name, length)[index]), device=device)
         for name in names
     }
     if overrides:
@@ -243,6 +250,14 @@ def summarize(values: list[float]) -> dict[str, float]:
     }
 
 
+def make_cost_fn(name: str):
+    if name == "ref_style":
+        return RefStyleStateCost("weight")
+    if name == "grasp_flow":
+        return GraspFlowStateCost("weight")
+    raise ValueError(f"Unsupported cost: {name}")
+
+
 def score_range(
     demo: h5py.Group,
     *,
@@ -296,7 +311,7 @@ def score_range(
 def main() -> int:
     args = parse_args()
     device = torch.device(args.device)
-    cost_fn = RefStyleStateCost("weight")
+    cost_fn = make_cost_fn(args.cost)
     rows = []
 
     with h5py.File(args.data_file, "r") as dataset:
@@ -340,7 +355,7 @@ def main() -> int:
                 row = {
                     "demo": demo_name,
                     "task": "weight",
-                    "cost": "ref_style",
+                    "cost": args.cost,
                     "subtask": subtask,
                     **stats,
                 }

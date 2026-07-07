@@ -3,10 +3,12 @@ set -euo pipefail
 
 ROOT="${ROOT:-/home/chuanruo/yixuan/pps}"
 ISAACLAB_DIR="${ROOT}/IsaacLab"
-DATA_DIR="${DATA_DIR:-${ROOT}/data/weight}"
+DATA_DIR="${DATA_DIR:-/home/chuanruo/diffusion_policy/data/weight}"
+ARTIFACT_DIR="${ARTIFACT_DIR:-${ROOT}/data/weight}"
 NUM_DEMOS="${NUM_DEMOS:-5}"
 NUM_TRIALS="${NUM_TRIALS:-50}"
 SEED="${SEED:-42}"
+COST_NAME="${COST_NAME:-ref_style}"
 
 # The pps conda env may have another IsaacLab checkout on sys.path. Prefer this
 # repo's bundled IsaacLab so asset paths resolve through ${ISAACLAB_DIR}/assets.
@@ -15,12 +17,18 @@ export PYTHONPATH="${ISAACLAB_DIR}/source/isaaclab:${ISAACLAB_DIR}/source/isaacl
 RAW_DATA="${DATA_DIR}/data.hdf5"
 ANNOTATED_DATA="${DATA_DIR}/annotated_dataset.hdf5"
 GENERATED_DATA="${DATA_DIR}/generated_dataset.hdf5"
-VIDEO_DIR="${DATA_DIR}/videos"
-COST_CSV="${DATA_DIR}/expert_demo_costs.csv"
+VIDEO_DIR="${ARTIFACT_DIR}/videos"
+if [[ -z "${COST_CSV:-}" ]]; then
+  if [[ "${COST_NAME}" == "ref_style" ]]; then
+    COST_CSV="${ARTIFACT_DIR}/expert_demo_costs.csv"
+  else
+    COST_CSV="${ARTIFACT_DIR}/expert_demo_${COST_NAME}_costs.csv"
+  fi
+fi
 
 stage="${1:-all}"
 
-mkdir -p "${DATA_DIR}"
+mkdir -p "${DATA_DIR}" "${ARTIFACT_DIR}"
 
 run_record() {
   cd "${ISAACLAB_DIR}"
@@ -74,6 +82,7 @@ run_score() {
   echo "[weight_demo_pipeline] scoring expert demos to ${COST_CSV}"
   python tools/eval_expert_demo_costs.py \
     --data_file "${ANNOTATED_DATA}" \
+    --cost "${COST_NAME}" \
     --grasp_object both \
     --horizon 8 \
     --stride 1 \
@@ -106,6 +115,7 @@ case "${stage}" in
   *)
     echo "Usage: $0 {record|annotate|generate|videos|score|all}" >&2
     echo "DATA_DIR=${DATA_DIR}" >&2
+    echo "ARTIFACT_DIR=${ARTIFACT_DIR}" >&2
     exit 2
     ;;
 esac
