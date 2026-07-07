@@ -34,10 +34,21 @@ def _load_checkpoint_norm_stats(
     checkpoint_dir: pathlib.Path,
     asset_id: str | None,
 ) -> dict[str, transforms.NormStats] | None:
+    norm_stats, _ = _load_checkpoint_norm_stats_with_source(checkpoint_dir, asset_id)
+    return norm_stats
+
+
+def _load_checkpoint_norm_stats_with_source(
+    checkpoint_dir: pathlib.Path,
+    asset_id: str | None,
+) -> tuple[dict[str, transforms.NormStats] | None, str | None]:
     assets_dir = checkpoint_dir / "assets"
     if asset_id is not None:
         try:
-            return _checkpoints.load_norm_stats(assets_dir, asset_id)
+            norm_stats_dir = assets_dir / asset_id
+            return _checkpoints.load_norm_stats(assets_dir, asset_id), str(
+                norm_stats_dir / "norm_stats.json"
+            )
         except FileNotFoundError:
             logging.warning(
                 "Norm stats were not found in checkpoint assets at %s; scanning checkpoint assets.",
@@ -48,14 +59,16 @@ def _load_checkpoint_norm_stats(
     if len(norm_stat_paths) == 1:
         norm_stats_dir = norm_stat_paths[0].parent
         logging.info("Loading norm stats from discovered checkpoint path %s", norm_stats_dir)
-        return _checkpoints.load_norm_stats(norm_stats_dir=str(norm_stats_dir))
+        return _checkpoints.load_norm_stats(norm_stats_dir=str(norm_stats_dir)), str(
+            norm_stat_paths[0]
+        )
     if len(norm_stat_paths) > 1:
         logging.warning(
             "Found multiple norm_stats.json files under %s; falling back to config assets. Paths: %s",
             assets_dir,
             norm_stat_paths,
         )
-    return None
+    return None, None
 
 
 def create_trained_policy(
@@ -110,10 +123,13 @@ def create_trained_policy(
             _model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16)
         )
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
+    norm_stats_source = "provided"
     if norm_stats is None:
         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
         # that the policy is using the same normalization stats as the original training process.
-        norm_stats = _load_checkpoint_norm_stats(checkpoint_dir, data_config.asset_id)
+        norm_stats, norm_stats_source = _load_checkpoint_norm_stats_with_source(
+            checkpoint_dir, data_config.asset_id
+        )
 
         if norm_stats is None and train_config.data.norm_stats_dir is not None:
             project_root = Path(__file__).parent.parent.parent.parent
@@ -121,6 +137,7 @@ def create_trained_policy(
             norm_stats = _checkpoints.load_norm_stats(
                 norm_stats_dir=str(norm_stats_dir)
             )
+            norm_stats_source = str(norm_stats_dir / "norm_stats.json")
         elif norm_stats is None:
             if data_config.asset_id is None:
                 raise ValueError(
@@ -128,6 +145,9 @@ def create_trained_policy(
                 )
             norm_stats = _checkpoints.load_norm_stats(
                 checkpoint_dir / "assets", data_config.asset_id
+            )
+            norm_stats_source = str(
+                checkpoint_dir / "assets" / data_config.asset_id / "norm_stats.json"
             )
 
     # Determine the device to use for PyTorch models
@@ -166,5 +186,11 @@ def create_trained_policy(
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
     )
+    policy._metadata = {
+        **policy._metadata,
+        "output_norm_stats": output_norm_stats,
+        "output_norm_stats_source": norm_stats_source,
+        "use_quantile_norm": data_config.use_quantile_norm,
+    }
     logging.info("Policy wrapper created.")
     return policy

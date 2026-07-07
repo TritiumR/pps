@@ -31,6 +31,9 @@ openpi/pyproject.toml
 
 **/.DS_Store
 
+# Local reference-only sim-free MPC files
+sim_free_mpc/sampler_for_ref.py
+
 # results
 results
 
