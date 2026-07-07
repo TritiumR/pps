@@ -7,6 +7,7 @@ import torch
 
 from .costs import PriorityStateCost
 from .costs_explore import ExploreStateCost
+from .costs_grasp_flow import GraspFlowStateCost
 from .costs_ref_style import RefStyleStateCost
 from .ddim import ddim_clean_sample_std_scale, ddim_iteration_alphas
 from .dial_sampler import DIALSampler, DIALSamplerConfig
@@ -55,6 +56,8 @@ class AccelActionMPC:
             self.cost = RefStyleStateCost(config.task_name)
         elif config.cost_style == "explore":
             self.cost = ExploreStateCost(config.task_name)
+        elif config.cost_style == "grasp_flow":
+            self.cost = GraspFlowStateCost(config.task_name)
         elif config.cost_style == "priority":
             self.cost = PriorityStateCost(config.task_name)
         else:
@@ -194,9 +197,27 @@ class AccelActionMPC:
             )
         real_actions = torch.cat([q_traj, gripper[..., :1]], dim=-1)
         ee_pos, ee_quat = self._world_fk(q_traj, context)
-        if self.config.cost_style in ("ref_style", "explore"):
+        if self.config.cost_style in ("ref_style", "explore", "grasp_flow"):
             return self.cost(real_actions=real_actions, tcp_pos=ee_pos, tcp_quat=ee_quat, context=context)
         return self.cost(real_actions=real_actions, ee_pos=ee_pos, ee_quat=ee_quat, context=context)
+
+    def _last_cost_term_diagnostics(self, result) -> dict[str, Any]:
+        cost = getattr(self, "cost", None)
+        terms = getattr(cost, "last_terms", None)
+        if not terms:
+            return {}
+        best_idx = int(torch.argmin(result.costs).detach().cpu())
+        diagnostics: dict[str, Any] = {}
+        stage = getattr(cost, "last_stage", None)
+        if stage is not None:
+            diagnostics["cost_stage"] = stage
+        for name, values in terms.items():
+            if values.ndim != 1 or values.shape[0] != result.costs.shape[0]:
+                continue
+            values = values.to(device=result.weights.device, dtype=result.weights.dtype)
+            diagnostics[f"term_{name}_best"] = float(values[best_idx].detach().cpu())
+            diagnostics[f"term_{name}_weighted"] = float(torch.sum(values * result.weights).detach().cpu())
+        return diagnostics
 
     @staticmethod
     def _initial_hybrid_mean(horizon: int, gripper_traj: torch.Tensor, *, device, dtype) -> torch.Tensor:
@@ -252,6 +273,7 @@ class AccelActionMPC:
             "cost_style": self.config.cost_style,
             "optimize_space": "accel_action",
         }
+        diagnostics.update(self._last_cost_term_diagnostics(result))
         return action_chunk, diagnostics
 
     def plan_mbd_score(
@@ -352,4 +374,5 @@ class AccelActionMPC:
             "cost_style": self.config.cost_style,
             "optimize_space": "accel_action",
         }
+        diagnostics.update(self._last_cost_term_diagnostics(last_result))
         return action_chunk, diagnostics

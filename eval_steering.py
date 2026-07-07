@@ -75,6 +75,8 @@ _SOUND_AUDIO_ATTENUATION_POWER = 2.0
 _SOUND_AUDIO_REFERENCE_DISTANCE = 1.0
 _SOUND_AUDIO_MIN_DISTANCE = 1e-3
 _LAST_INFERENCE_RUNTIME = {}
+_WEIGHT_SCALE_CENTER_OFFSET_DEBUG = (-0.0470425, 0.0, 0.0272255)
+_WEIGHT_SCALE_TOP_OFFSET_Z_DEBUG = 0.0523800
 
 
 def _phone_ringtone_path():
@@ -814,7 +816,13 @@ def _infer_actions_eager(
         "proxy_task_shape": None,
         "proxy_ref_shape": None,
         "mpc_last": None,
+        "mpc_trace": [],
     }
+
+    def record_mpc_stats(stats):
+        runtime_stats["mpc_last"] = stats
+        if args.mpc_debug:
+            runtime_stats["mpc_trace"].append(_mpc_debug_stats(stats))
 
     if _uses_accel_action_mpc(args):
         if not disable_steering:
@@ -869,8 +877,8 @@ def _infer_actions_eager(
             .numpy()
         )
         runtime_stats["score_shape"] = tuple(planned_actions.shape)
-        runtime_stats["mpc_last"] = geom_stats
-        if args.mpc_debug:
+        record_mpc_stats(geom_stats)
+        if args.mpc_debug_stdout:
             print(
                 f"vlm_mpc_{geom_stats['update_mode']} "
                 f"cost_min={geom_stats['cost_min']:.4f} "
@@ -878,7 +886,8 @@ def _infer_actions_eager(
                 f"cost_weighted={geom_stats['cost_weighted']:.4f} "
                 f"target_delta_norm={geom_stats['target_delta_norm']:.4f} "
                 f"accel_norm={geom_stats['accel_norm']:.4f} "
-                f"score_norm={geom_stats.get('score_norm', 0.0):.4f}",
+                f"score_norm={geom_stats.get('score_norm', 0.0):.4f}"
+                f"{_format_mpc_term_debug(geom_stats)}",
                 flush=True,
             )
         _LAST_INFERENCE_RUNTIME = runtime_stats
@@ -926,15 +935,16 @@ def _infer_actions_eager(
                     step_scale=args.gamma_base,
                 )
             runtime_stats["score_shape"] = tuple(x_t.shape)
-            runtime_stats["mpc_last"] = geom_stats
-            if args.mpc_debug:
+            record_mpc_stats(geom_stats)
+            if args.mpc_debug_stdout:
                 print(
                     f"vlm_mpc_{geom_stats['update_mode']} "
                     f"cost_min={geom_stats['cost_min']:.4f} "
                     f"cost_mean={geom_stats['cost_mean']:.4f} "
                     f"cost_weighted={geom_stats['cost_weighted']:.4f} "
                     f"target_delta_norm={geom_stats['target_delta_norm']:.4f} "
-                    f"score_norm={geom_stats['score_norm']:.4f}",
+                    f"score_norm={geom_stats['score_norm']:.4f}"
+                    f"{_format_mpc_term_debug(geom_stats)}",
                     flush=True,
                 )
             mpc_denoise_iteration += 1
@@ -954,14 +964,15 @@ def _infer_actions_eager(
                     f"got {tuple(base_v_t.shape)} vs {tuple(x_t.shape)}."
                 )
             runtime_stats["v_vlm_shape"] = tuple(base_v_t.shape)
-            runtime_stats["mpc_last"] = geom_stats
-            if args.mpc_debug:
+            record_mpc_stats(geom_stats)
+            if args.mpc_debug_stdout:
                 print(
                     "vlm_mpc_base "
                     f"cost_min={geom_stats['cost_min']:.4f} "
                     f"cost_mean={geom_stats['cost_mean']:.4f} "
                     f"cost_weighted={geom_stats['cost_weighted']:.4f} "
-                    f"target_delta_norm={geom_stats['target_delta_norm']:.4f}",
+                    f"target_delta_norm={geom_stats['target_delta_norm']:.4f}"
+                    f"{_format_mpc_term_debug(geom_stats)}",
                     flush=True,
                 )
         else:
@@ -1309,6 +1320,238 @@ def build_mpc_context(env, env_obs_dict, args):
     return context
 
 
+def _format_mpc_term_debug(stats: dict[str, Any], *, limit: int = 8) -> str:
+    terms = []
+    suffix = "_weighted"
+    for key, value in stats.items():
+        if not (key.startswith("term_") and key.endswith(suffix)):
+            continue
+        name = key[len("term_") : -len(suffix)]
+        try:
+            terms.append((name, float(value)))
+        except (TypeError, ValueError):
+            continue
+    if not terms:
+        return ""
+    terms.sort(key=lambda item: abs(item[1]), reverse=True)
+    text = ",".join(f"{name}:{value:.4g}" for name, value in terms[:limit])
+    return f" terms={text}"
+
+
+def _jsonable_debug_value(value):
+    if torch.is_tensor(value):
+        value = value.detach().cpu()
+        if value.numel() == 1:
+            scalar = value.reshape(-1)[0].item()
+            if isinstance(scalar, (bool, np.bool_)):
+                return bool(scalar)
+            if isinstance(scalar, (int, np.integer)):
+                return int(scalar)
+            return float(scalar)
+        return value.tolist()
+    if isinstance(value, np.ndarray):
+        if value.size == 1:
+            return _jsonable_debug_value(value.reshape(-1)[0])
+        return value.tolist()
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, dict):
+        return {str(key): _jsonable_debug_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_debug_value(item) for item in value]
+    return value
+
+
+def _debug_subtasks(env_obs_dict) -> dict[str, bool]:
+    return {
+        key: bool(_jsonable_debug_value(value))
+        for key, value in _extract_subtasks(env_obs_dict).items()
+    }
+
+
+def _debug_phase_from_subtasks(task_name: str, subtasks: dict[str, bool]) -> str:
+    if "weight" not in task_name.lower():
+        return "unknown"
+    if subtasks.get("grasp_apple", False):
+        return "place_apple"
+    if subtasks.get("pear_on_scale", False):
+        return "grasp_apple"
+    if subtasks.get("grasp_pear", False):
+        return "place_pear"
+    return "grasp_pear"
+
+
+def _mpc_debug_stats(stats: dict[str, Any] | None) -> dict[str, Any]:
+    if not stats:
+        return {}
+    keys = (
+        "update_mode",
+        "cost_style",
+        "cost_stage",
+        "optimize_space",
+        "cost_min",
+        "cost_mean",
+        "cost_weighted",
+        "target_delta_norm",
+        "accel_norm",
+        "score_norm",
+        "gripper_mean",
+    )
+    payload = {key: _jsonable_debug_value(stats[key]) for key in keys if key in stats}
+    best_terms = {}
+    weighted_terms = {}
+    for key, value in stats.items():
+        if not key.startswith("term_"):
+            continue
+        if key.endswith("_best"):
+            best_terms[key[len("term_") : -len("_best")]] = _jsonable_debug_value(value)
+        elif key.endswith("_weighted"):
+            weighted_terms[key[len("term_") : -len("_weighted")]] = _jsonable_debug_value(value)
+    if weighted_terms:
+        payload["terms_weighted"] = dict(
+            sorted(weighted_terms.items(), key=lambda item: abs(float(item[1])), reverse=True)
+        )
+    if best_terms:
+        payload["terms_best"] = dict(
+            sorted(best_terms.items(), key=lambda item: abs(float(item[1])), reverse=True)
+        )
+    return payload
+
+
+def _write_mpc_debug_log(handle, event: str, **payload) -> None:
+    if handle is None:
+        return
+    record = {
+        "time": time.time(),
+        "event": event,
+        **payload,
+    }
+    handle.write(json.dumps(_jsonable_debug_value(record), sort_keys=True) + "\n")
+    handle.flush()
+
+
+def _debug_action_gripper(action_step) -> float | None:
+    action = np.asarray(action_step).reshape(-1)
+    if action.shape[0] <= 7:
+        return None
+    return float(action[7])
+
+
+def _collect_mpc_debug_frames(env, *, axis_length: float = 0.08):
+    try:
+        pear = env.scene["pear"]
+        ee_frame = env.scene["ee_frame"]
+        ee_frame.update(0.0, force_recompute=True)
+
+        pear_pos = pear.data.root_pos_w[:1]
+        pear_quat = pear.data.root_quat_w[:1]
+        ee_pos = ee_frame.data.target_pos_w[:1]
+        ee_quat = ee_frame.data.target_quat_w[:1]
+
+        frames = [
+            ("pear", pear_pos[0], pear_quat[0]),
+            ("ee", ee_pos[0, 0], ee_quat[0, 0]),
+        ]
+        try:
+            scale = env.scene["scale"]
+            scale_pos = scale.data.root_pos_w[:1]
+            scale_quat = scale.data.root_quat_w[:1]
+            scale_top_offset = torch.tensor(
+                [
+                    _WEIGHT_SCALE_CENTER_OFFSET_DEBUG[0],
+                    _WEIGHT_SCALE_CENTER_OFFSET_DEBUG[1],
+                    _WEIGHT_SCALE_CENTER_OFFSET_DEBUG[2] + _WEIGHT_SCALE_TOP_OFFSET_Z_DEBUG,
+                ],
+                device=scale_pos.device,
+                dtype=scale_pos.dtype,
+            ).view(1, 3)
+            scale_top_pos = scale_pos + _quat_apply_wxyz(scale_quat, scale_top_offset)
+            frames.append(("scale_top", scale_top_pos[0], scale_quat[0]))
+        except Exception:
+            pass
+        if ee_pos.shape[1] >= 3:
+            frames.extend(
+                [
+                    ("rf", ee_pos[0, 1], ee_quat[0, 1]),
+                    ("lf", ee_pos[0, 2], ee_quat[0, 2]),
+                ]
+            )
+
+        axes = {}
+        local_axes = torch.eye(3, device=ee_pos.device, dtype=ee_pos.dtype)
+        for name, pos, quat in frames:
+            endpoints = [pos]
+            for axis in local_axes:
+                endpoints.append(pos + axis_length * _quat_apply_wxyz(quat, axis))
+            axes[name] = torch.stack(endpoints, dim=0).detach()
+        return axes
+    except Exception as exc:
+        print(f"mpc_debug_video_overlay collect failed: {exc}", flush=True)
+        return {}
+
+
+def _project_world_points_to_camera(points_w: torch.Tensor, camera) -> np.ndarray:
+    data = camera.data
+    cam_pos = data.pos_w[:1].to(device=points_w.device, dtype=points_w.dtype)
+    cam_quat = data.quat_w_ros[:1].to(device=points_w.device, dtype=points_w.dtype)
+    intr = data.intrinsic_matrices[0].to(device=points_w.device, dtype=points_w.dtype)
+    points_cam = _quat_apply_inverse_wxyz(cam_quat, points_w - cam_pos).reshape(-1, 3)
+    z = points_cam[:, 2]
+    pixels = torch.full((points_cam.shape[0], 2), float("nan"), device=points_w.device, dtype=points_w.dtype)
+    valid = z > 1e-4
+    if valid.any():
+        pixels[valid, 0] = intr[0, 0] * points_cam[valid, 0] / z[valid] + intr[0, 2]
+        pixels[valid, 1] = intr[1, 1] * points_cam[valid, 1] / z[valid] + intr[1, 2]
+    return pixels.detach().cpu().numpy()
+
+
+def _draw_projected_debug_axes(image: np.ndarray, env, camera_name: str, axes: dict[str, torch.Tensor]) -> np.ndarray:
+    if not axes:
+        return image
+    try:
+        camera = env.scene[camera_name]
+    except Exception:
+        return image
+    out = image.copy()
+    height, width = out.shape[:2]
+    axis_colors = ((255, 0, 0), (0, 255, 0), (0, 0, 255))
+    label_colors = {
+        "pear": (255, 255, 255),
+        "scale_top": (128, 255, 128),
+        "ee": (255, 255, 0),
+        "rf": (255, 0, 255),
+        "lf": (0, 255, 255),
+    }
+    for name, points in axes.items():
+        pixels = _project_world_points_to_camera(points, camera)
+        if not np.isfinite(pixels[0]).all():
+            continue
+        origin = tuple(np.round(pixels[0]).astype(int))
+        if not (0 <= origin[0] < width and 0 <= origin[1] < height):
+            continue
+        cv2.circle(out, origin, 3, label_colors.get(name, (255, 255, 255)), -1, lineType=cv2.LINE_AA)
+        cv2.putText(
+            out,
+            name,
+            (origin[0] + 4, origin[1] - 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.35,
+            label_colors.get(name, (255, 255, 255)),
+            1,
+            cv2.LINE_AA,
+        )
+        for axis_idx, color in enumerate(axis_colors, start=1):
+            if not np.isfinite(pixels[axis_idx]).all():
+                continue
+            end = tuple(np.round(pixels[axis_idx]).astype(int))
+            cv2.line(out, origin, end, color, 2, lineType=cv2.LINE_AA)
+    return out
+
+
 def _to_uint8_image(image):
     image = _to_numpy_unbatched(image)
     image = np.asarray(image)
@@ -1473,6 +1716,12 @@ def _quat_apply_wxyz(quat, vec):
     return vec + quat_w * t + torch.cross(quat_xyz, t, dim=-1)
 
 
+def _quat_apply_inverse_wxyz(quat, vec):
+    quat_inv = quat.clone()
+    quat_inv[..., 1:] = -quat_inv[..., 1:]
+    return _quat_apply_wxyz(quat_inv, vec)
+
+
 def _get_gripper_mic_distances(env, mic_spacing=0.25, mic_axis=(0.0, 1.0, 0.0)):
     try:
         ee_frame = env.scene["ee_frame"]
@@ -1612,7 +1861,7 @@ def _overlay_thermal_on_rgb(rgb_image, thermal_image, alpha=0.45):
     return cv2.addWeighted(rgb_image, 1.0 - alpha, thermal_image, alpha, 0.0)
 
 
-def _build_rollout_frame(obs, use_thermal_overlay=False):
+def _build_rollout_frame(obs, use_thermal_overlay=False, debug_overlay=None):
     table_image = _to_uint8_image(obs["observation/exterior_image_1_left"])
     wrist_image = _to_uint8_image(obs["observation/wrist_image_left"])
 
@@ -1623,6 +1872,12 @@ def _build_rollout_frame(obs, use_thermal_overlay=False):
         wrist_image = _overlay_thermal_on_rgb(
             wrist_image, obs["observation/thermal_wrist_image_left"]
         )
+
+    if debug_overlay is not None:
+        env = debug_overlay.get("env")
+        axes = debug_overlay.get("axes", {})
+        table_image = _draw_projected_debug_axes(table_image, env, "table_cam", axes)
+        wrist_image = _draw_projected_debug_axes(wrist_image, env, "wrist_cam", axes)
 
     frame = np.concatenate((table_image, wrist_image), axis=1)
     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -2010,7 +2265,7 @@ def parse_args():
     )
     parser.add_argument(
         "--mpc_cost",
-        choices=("priority", "ref_style", "explore"),
+        choices=("priority", "ref_style", "explore", "grasp_flow"),
         default="priority",
         help="Cost function used by sim-free MPC.",
     )
@@ -2062,6 +2317,11 @@ def parse_args():
         ),
     )
     parser.add_argument("--mpc_debug", action="store_true")
+    parser.add_argument(
+        "--mpc_debug_stdout",
+        action="store_true",
+        help="Also print detailed MPC debug iterations to stdout. By default --mpc_debug writes them to a jsonl log.",
+    )
     parser.add_argument("--task_debug", action="store_true")
     parser.add_argument(
         "--debug_hold_pear",
@@ -2076,6 +2336,20 @@ def parse_args():
         type=float,
         default=0.10,
         help="Half-width in meters of the debug pear XY guard window around the reset position.",
+    )
+    parser.add_argument(
+        "--mpc_debug_axis_length",
+        type=float,
+        default=0.08,
+        help="Axis length in meters for --mpc_debug_video_overlay.",
+    )
+    parser.add_argument(
+        "--mpc_debug_video_overlay",
+        action="store_true",
+        help=(
+            "Debug-only: draw projected pear/EE/finger axes directly on "
+            "the saved rollout videos. Works in headless mode."
+        ),
     )
     parser.add_argument(
         "--dry_run",
@@ -2404,6 +2678,26 @@ print(
     f"{args.task_num_steps / CONTROL_FREQUENCY:.1f}s",
     flush=True,
 )
+mpc_debug_log_file = None
+mpc_debug_log_path = None
+if args.mpc_debug:
+    mpc_debug_log_path = os.path.join(output_path, f"{video_run_id}_mpc_debug.jsonl")
+    mpc_debug_log_file = open(mpc_debug_log_path, "w", encoding="utf-8")
+    print(f"MPC debug log: {mpc_debug_log_path}", flush=True)
+    _write_mpc_debug_log(
+        mpc_debug_log_file,
+        "run_start",
+        run_id=video_run_id,
+        task=args.task,
+        prompt=args.prompt,
+        mpc_cost=args.mpc_cost,
+        mpc_update=args.mpc_update,
+        mpc_optimize_space=args.mpc_optimize_space,
+        seed_start=args.seed_start,
+        seed_end=args.seed_end,
+        steps_per_inference=steps_per_inference,
+        task_num_steps=args.task_num_steps,
+    )
 for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
     success = None
     episode_comparison_stats = {
@@ -2445,6 +2739,19 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
             )
         )
 
+    current_subtasks = _debug_subtasks(env_obs_dict)
+    current_phase = _debug_phase_from_subtasks(args.task, current_subtasks)
+    print(f"phase seed={seed} step=0 {current_phase} subtasks={current_subtasks}", flush=True)
+    _write_mpc_debug_log(
+        mpc_debug_log_file,
+        "rollout_start",
+        seed=seed,
+        rollout_idx=rollout_idx,
+        step=0,
+        phase=current_phase,
+        subtasks=current_subtasks,
+    )
+
     pear_guard_state = (
         _capture_debug_object_xy_guard(
             env,
@@ -2472,13 +2779,21 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
     # ========== policy control loop ==============
     step_idx = 0
     success = False
+    force_replan = False
+    action_start_step = -steps_per_inference
+    actions = None
     for step_idx in tqdm(range(args.task_num_steps), desc="Policy Control Loop"):
         try:
-            if step_idx % steps_per_inference == 0:
+            if (
+                actions is None
+                or force_replan
+                or step_idx - action_start_step >= steps_per_inference
+            ):
                 # print('predict_action')
                 # run inference
                 with torch.no_grad():
                     infer_start = time.perf_counter()
+                    mpc_context = build_mpc_context(env, env_obs_dict, args)
                     actions, compare_stats = infer_actions_with_mpc(
                         base_policy,
                         task_policy,
@@ -2486,13 +2801,26 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                         copy.deepcopy(obs),
                         args,
                         mpc_planner=mpc_planner,
-                        mpc_context=build_mpc_context(env, env_obs_dict, args),
+                        mpc_context=mpc_context,
                     )
                     infer_elapsed = time.perf_counter() - infer_start
+                    if args.mpc_debug:
+                        _write_mpc_debug_log(
+                            mpc_debug_log_file,
+                            "inference",
+                            seed=seed,
+                            step=step_idx,
+                            phase=current_phase,
+                            subtasks=current_subtasks,
+                            elapsed_s=infer_elapsed,
+                            mpc=_mpc_debug_stats(_LAST_INFERENCE_RUNTIME.get("mpc_last")),
+                            mpc_trace=_LAST_INFERENCE_RUNTIME.get("mpc_trace", []),
+                        )
                     episode_inference_time_s += infer_elapsed
                     episode_inference_calls += 1
                     total_inference_time_s += infer_elapsed
                     total_inference_calls += 1
+                    force_replan = False
                     if args.compare_difference and compare_stats:
                         episode_comparison_observation_steps += 1
                         for path_name, path_stats in compare_stats.items():
@@ -2510,8 +2838,9 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                 start_idx = 0
                 end_idx = start_idx + steps_per_inference
                 actions = actions[start_idx:end_idx]
+                action_start_step = step_idx
 
-            action_step = actions[step_idx % steps_per_inference]
+            action_step = actions[step_idx - action_start_step]
 
             # perform step
             env_obs_dict, rewards, terminated, truncated, extras = env.step(
@@ -2531,6 +2860,36 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                 if pose_changed:
                     env_obs_dict = env.observation_manager.compute(update_history=True)
 
+            next_subtasks = _debug_subtasks(env_obs_dict)
+            next_phase = _debug_phase_from_subtasks(args.task, next_subtasks)
+            if next_phase != current_phase:
+                print(
+                    f"phase_transition seed={seed} step={step_idx + 1} "
+                    f"{current_phase}->{next_phase} subtasks={next_subtasks}",
+                    flush=True,
+                )
+                _write_mpc_debug_log(
+                    mpc_debug_log_file,
+                    "phase_transition",
+                    seed=seed,
+                    step=step_idx + 1,
+                    from_phase=current_phase,
+                    to_phase=next_phase,
+                    subtasks=next_subtasks,
+                )
+                force_replan = True
+            current_phase = next_phase
+            current_subtasks = next_subtasks
+            _write_mpc_debug_log(
+                mpc_debug_log_file,
+                "step",
+                seed=seed,
+                step=step_idx + 1,
+                phase=current_phase,
+                subtasks=current_subtasks,
+                action_gripper=_debug_action_gripper(action_step),
+            )
+
             obs = get_pi_observation(env_obs_dict["policy"])
             obs["prompt"] = args.prompt
 
@@ -2538,7 +2897,20 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
             task_success = bool(success_term.func(env, **success_term.params)[0])
 
             # save visualization
-            vis_image = _build_rollout_frame(obs, use_thermal_overlay=False)
+            debug_overlay = None
+            if args.mpc_debug_video_overlay:
+                debug_overlay = {
+                    "env": env,
+                    "axes": _collect_mpc_debug_frames(
+                        env,
+                        axis_length=args.mpc_debug_axis_length,
+                    ),
+                }
+            vis_image = _build_rollout_frame(
+                obs,
+                use_thermal_overlay=False,
+                debug_overlay=debug_overlay,
+            )
             excute_frames.append(_add_video_header(vis_image, video_header_lines))
             if _has_sound_observation(obs):
                 sound_audio_frame = _build_stereo_sound_audio_frame(
@@ -2551,7 +2923,11 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
             if _has_thermal_observation(obs):
                 thermal_overlay_frames.append(
                     _add_video_header(
-                        _build_rollout_frame(obs, use_thermal_overlay=True),
+                        _build_rollout_frame(
+                            obs,
+                            use_thermal_overlay=True,
+                            debug_overlay=debug_overlay,
+                        ),
                         video_header_lines,
                     )
                 )
@@ -2569,6 +2945,17 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                     )
                 print("terminated or truncated or task completed")
                 success = task_success
+                _write_mpc_debug_log(
+                    mpc_debug_log_file,
+                    "done",
+                    seed=seed,
+                    step=step_idx,
+                    phase=current_phase,
+                    subtasks=current_subtasks,
+                    terminated=terminated,
+                    truncated=truncated,
+                    task_success=task_success,
+                )
                 break
 
         except KeyboardInterrupt:
@@ -2625,6 +3012,17 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
         thermal_out.release()
 
     print("video saved")
+    _write_mpc_debug_log(
+        mpc_debug_log_file,
+        "rollout_end",
+        seed=seed,
+        rollout_idx=rollout_idx,
+        steps=step_idx,
+        phase=current_phase,
+        subtasks=current_subtasks,
+        success=success,
+        video_path=video_path,
+    )
     if episode_inference_calls:
         avg_infer_ms = 1000.0 * episode_inference_time_s / episode_inference_calls
         print(
@@ -2713,6 +3111,15 @@ if total_inference_calls:
         f"overall infer_actions avg latency: {avg_infer_ms:.2f} ms "
         f"over {total_inference_calls} calls"
     )
+
+_write_mpc_debug_log(
+    mpc_debug_log_file,
+    "run_end",
+    total_inference_calls=total_inference_calls,
+    total_inference_time_s=total_inference_time_s,
+)
+if mpc_debug_log_file is not None:
+    mpc_debug_log_file.close()
 
 # Close the simulation app after environment is closed
 simulation_app.close()
