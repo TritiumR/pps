@@ -61,11 +61,16 @@ from tqdm import tqdm
 from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
 from sim_free_mpc import AccelActionMPC, AccelMPCConfig, SimFreeMPC, SimFreeMPCConfig
 from sim_free_mpc.action_space import clamp_real_action_chunk
+from sim_free_mpc.ddim import ddim_iteration_alphas
+from sim_free_mpc.mbd_score_action_prox import (
+    estimate_mbd_score_action_prox,
+    step_mbd_score_action_prox,
+)
 
 
 DEFAULT_BASE_CHECKPOINT_DIR = "openpi/checkpoints/pytorch/pi05_droid_jointpos"
-DEFAULT_TASK_CHECKPOINT_DIR = "openpi/checkpoints/proxy_isaaclab_droid_weight_pi05_jointpos/task/24000"
-DEFAULT_REF_CHECKPOINT_DIR = "openpi/checkpoints/proxy_isaaclab_droid_weight_pi05_jointpos/reference/20000"
+DEFAULT_TASK_CHECKPOINT_DIR = "openpi/checkpoints/proxy_score_mpc_weight_jointpos/task/30000"
+DEFAULT_REF_CHECKPOINT_DIR = "openpi/checkpoints/proxy_score_mpc_weight_jointpos/reference/30000"
 
 _SOUND_VIDEO_SCALE = None
 _SOUND_VIDEO_MAX_DISTANCE_M = 0.05
@@ -77,6 +82,12 @@ _SOUND_AUDIO_MIN_DISTANCE = 1e-3
 _LAST_INFERENCE_RUNTIME = {}
 _WEIGHT_SCALE_CENTER_OFFSET_DEBUG = (-0.0470425, 0.0, 0.0272255)
 _WEIGHT_SCALE_TOP_OFFSET_Z_DEBUG = 0.0523800
+
+
+def _score_update_mode_for_mpc_update(update_mode: str) -> str:
+    if update_mode == "mbd_score_action_prox":
+        return "mbd_score"
+    return update_mode
 
 
 def _phone_ringtone_path():
@@ -134,6 +145,7 @@ def _validate_policy_environment_inputs(policy, raw_obs: dict, role: str) -> Non
         _model.ModelType.PI0,
         _model.ModelType.PI05,
         _model.ModelType.PROXY,
+        _model.ModelType.PROXY_SCORE,
         _model.ModelType.PROXY_SOUND,
         _model.ModelType.RESIDUAL,
     ) and not has_rgb:
@@ -251,6 +263,73 @@ def _warn_if_norm_mismatch(
                     break
 
 
+def _assert_score_space_compatibility(base_policy, task_policy, ref_policy, args) -> None:
+    if not _uses_vlm_mpc_base(args):
+        return
+    if not (
+        _is_score_proxy(task_policy._model)
+        or _is_score_proxy(ref_policy._model)
+    ):
+        return
+    if not (_is_score_proxy(task_policy._model) and _is_score_proxy(ref_policy._model)):
+        raise ValueError(
+            "Score-space VLM/MPC steering requires both task and ref policies "
+            "to be ProxyScore checkpoints."
+        )
+
+    expected_timesteps = int(args.mpc_ddim_train_timesteps)
+    for role, model in (("task", task_policy._model), ("ref", ref_policy._model)):
+        actual = int(getattr(model.config, "ddim_num_train_timesteps", -1))
+        if actual != expected_timesteps:
+            raise ValueError(
+                f"{role} ProxyScore DDIM train timesteps ({actual}) do not match "
+                f"--mpc_ddim_train_timesteps ({expected_timesteps})."
+            )
+
+    policies = {
+        "base": base_policy,
+        "task": task_policy,
+        "ref": ref_policy,
+    }
+    norm_info = {role: _policy_input_norm_stats(policy) for role, policy in policies.items()}
+    base_stats, base_use_quantiles = norm_info["base"]
+    if base_stats is None:
+        raise ValueError("Base policy has no input norm_stats; score-space MPC cannot decode a shared action space.")
+
+    for role in ("task", "ref"):
+        role_stats, role_use_quantiles = norm_info[role]
+        if role_stats is None:
+            raise ValueError(f"{role} ProxyScore policy has no input norm_stats.")
+        if base_use_quantiles != role_use_quantiles:
+            raise ValueError(
+                "Score-space policy normalization mode mismatch: "
+                f"base use_quantiles={base_use_quantiles}, {role} use_quantiles={role_use_quantiles}."
+            )
+        for key in ("state", "actions"):
+            if key not in base_stats or key not in role_stats:
+                raise ValueError(f"Missing {key!r} norm_stats in base or {role} policy.")
+            action_dim = min(
+                int(getattr(base_policy._model.config, "action_dim", 8)),
+                int(getattr(task_policy._model.config, "action_dim", 8)),
+                int(getattr(ref_policy._model.config, "action_dim", 8)),
+            )
+            compare_dim = action_dim if key == "actions" else min(action_dim, 8)
+            base_values = _stat_values_for_compare(base_stats[key], base_use_quantiles)
+            role_values = _stat_values_for_compare(role_stats[key], role_use_quantiles)
+            for base_value, role_value in zip(base_values, role_values, strict=False):
+                dims = min(compare_dim, base_value.shape[-1], role_value.shape[-1])
+                if not np.allclose(
+                    base_value[..., :dims],
+                    role_value[..., :dims],
+                    rtol=1e-4,
+                    atol=1e-5,
+                ):
+                    raise ValueError(
+                        "Score-space normalized steering space mismatch: "
+                        f"base and {role} {key} norm_stats differ in the first {dims} dims."
+                    )
+
+
 def _run_sequence_proxy_expert(
     model,
     prefix_embs,
@@ -289,7 +368,7 @@ def _run_sequence_proxy_expert(
 def _prepare_proxy_steering(model, observation):
     model_type = model.config.model_type
 
-    if model_type == _model.ModelType.PROXY:
+    if model_type in (_model.ModelType.PROXY, _model.ModelType.PROXY_SCORE):
         images, img_masks, state = model._preprocess_observation(observation, train=False)
         prefix_embs, prefix_pad_masks, _ = model.embed_prefix(images, img_masks)
         return {
@@ -368,6 +447,42 @@ def _predict_proxy_flow(prepared_proxy, model, x_t_path, time_cond):
         suffix_embs,
         suffix_pad_masks,
         adarms_cond,
+    )
+
+
+def _is_score_proxy(model) -> bool:
+    return model.config.model_type == _model.ModelType.PROXY_SCORE
+
+
+def _proxy_score_time_cond(args, iteration: int, device, dtype) -> torch.Tensor:
+    ddim_iteration_alphas(
+        iteration=iteration,
+        num_iterations=args.num_steps + 1,
+        num_train_timesteps=args.mpc_ddim_train_timesteps,
+    )
+    step_ratio = int(args.mpc_ddim_train_timesteps) // int(args.num_steps + 1)
+    timestep = int((int(args.num_steps + 1) - 1 - int(iteration)) * step_ratio)
+    value = timestep / max(float(args.mpc_ddim_train_timesteps - 1), 1.0)
+    return torch.as_tensor(value, device=device, dtype=dtype)
+
+
+def _predict_proxy_score(prepared_proxy, model, x_t_path, time_cond):
+    if not _is_score_proxy(model):
+        raise ValueError(
+            "Score-space PPS steering requires task/ref checkpoints with "
+            f"model_type={_model.ModelType.PROXY_SCORE.value!r}; got "
+            f"{model.config.model_type.value!r}."
+        )
+    action_dim = model.config.action_dim
+    x_t_model = x_t_path[:, :, :action_dim]
+    if prepared_proxy["kind"] != "sequence":
+        raise ValueError("ProxyScorePytorch currently supports sequence image proxies only.")
+    return model.predict_score_from_prefix(
+        prepared_proxy["state"],
+        prepared_proxy["prefix_embs"],
+        prepared_proxy["prefix_pad_masks"],
+        x_t_model,
+        time_cond,
     )
 
 
@@ -779,6 +894,13 @@ def _infer_actions_eager(
         ref_obs, _ = _obs_to_input_checked(ref_policy, raw_obs, "ref")
         prepared_task = _prepare_proxy_steering(task_model, task_obs)
         prepared_ref = _prepare_proxy_steering(ref_model, ref_obs)
+        if (not use_vlm_mpc_base) and (
+            _is_score_proxy(task_model) or _is_score_proxy(ref_model)
+        ):
+            raise ValueError(
+                "ProxyScore checkpoints are only supported with --vlm_base score-space steering. "
+                "Use velocity proxy checkpoints for pi-checkpoint base steering."
+            )
     else:
         prepared_task = None
         prepared_ref = None
@@ -830,7 +952,7 @@ def _infer_actions_eager(
         if args.mpc_update not in ("legacy_score", "mbd_score"):
             raise ValueError(
                 "Acceleration action-space MPC supports --mpc_update legacy_score or mbd_score. "
-                "DDIM without the MBD score path is not implemented for this direct-action planner."
+                "DDIM/action-prox variants are score-space only for this direct-action planner."
             )
         base_outputs = base_policy.infer(raw_obs)
         base_actions = np.asarray(base_outputs["actions"], dtype=np.float32)
@@ -925,6 +1047,16 @@ def _infer_actions_eager(
                     num_iterations=mpc_denoise_iterations,
                     score_scale=args.gamma_base,
                 )
+            elif args.mpc_update == "mbd_score_action_prox":
+                x_t, geom_stats = step_mbd_score_action_prox(
+                    mpc_planner,
+                    x_t,
+                    base_inputs,
+                    mpc_context,
+                    iteration=mpc_denoise_iteration,
+                    num_iterations=mpc_denoise_iterations,
+                    score_scale=args.gamma_base,
+                )
             else:
                 x_t, geom_stats = mpc_planner.step_ddim(
                     x_t,
@@ -944,6 +1076,121 @@ def _infer_actions_eager(
                     f"cost_weighted={geom_stats['cost_weighted']:.4f} "
                     f"target_delta_norm={geom_stats['target_delta_norm']:.4f} "
                     f"score_norm={geom_stats['score_norm']:.4f}"
+                    f"{_format_mpc_term_debug(geom_stats)}",
+                    flush=True,
+                )
+            mpc_denoise_iteration += 1
+            denoise_time += dt
+            continue
+
+        if use_vlm_mpc_base and need_task_ref and (
+            _is_score_proxy(task_model) or _is_score_proxy(ref_model)
+        ):
+            if not (_is_score_proxy(task_model) and _is_score_proxy(ref_model)):
+                raise ValueError(
+                    "Score-space VLM/MPC steering requires both task and ref policies "
+                    "to be ProxyScore checkpoints."
+                )
+            if args.mpc_update == "legacy_score":
+                raise ValueError(
+                    "Score-space task/ref steering supports --mpc_update ddim or mbd_score, "
+                    "not legacy_score."
+                )
+
+            if args.mpc_update == "mbd_score_action_prox":
+                base_score, geom_stats = estimate_mbd_score_action_prox(
+                    mpc_planner,
+                    x_t,
+                    base_inputs,
+                    mpc_context,
+                    iteration=mpc_denoise_iteration,
+                    num_iterations=mpc_denoise_iterations,
+                )
+            else:
+                base_score, geom_stats = mpc_planner.estimate_mbd_score(
+                    x_t,
+                    base_inputs,
+                    mpc_context,
+                    iteration=mpc_denoise_iteration,
+                    num_iterations=mpc_denoise_iterations,
+                )
+            score_time = _proxy_score_time_cond(
+                args,
+                mpc_denoise_iteration,
+                device,
+                x_t.dtype,
+            ).expand(bsize)
+            task_score = _predict_proxy_score(
+                prepared_task,
+                task_model,
+                x_t,
+                score_time,
+            )
+            ref_score = _predict_proxy_score(
+                prepared_ref,
+                ref_model,
+                x_t,
+                score_time,
+            )
+            if task_score.shape != ref_score.shape:
+                raise ValueError(
+                    "task/ref score shapes must match: "
+                    f"task={tuple(task_score.shape)}, ref={tuple(ref_score.shape)}."
+                )
+            if task_score.shape[:2] != x_t.shape[:2] or task_score.shape[-1] > x_t.shape[-1]:
+                raise ValueError(
+                    "task/ref score shape is incompatible with x_t: "
+                    f"task={tuple(task_score.shape)}, x_t={tuple(x_t.shape)}."
+                )
+
+            task_full_score = torch.zeros_like(x_t)
+            ref_full_score = torch.zeros_like(x_t)
+            task_full_score[:, :, : task_score.shape[-1]] = task_score
+            ref_full_score[:, :, : ref_score.shape[-1]] = ref_score
+            if args.only_steer:
+                combined_score = task_full_score
+            else:
+                combined_score = (
+                    args.gamma_base * base_score
+                    + args.steer_scale * (task_full_score - ref_full_score)
+                )
+
+            active_dims = int(geom_stats.get("active_dims", task_score.shape[-1]))
+            x_t = mpc_planner.step_from_score(
+                x_t,
+                combined_score,
+                iteration=mpc_denoise_iteration,
+                num_iterations=mpc_denoise_iterations,
+                update_mode=_score_update_mode_for_mpc_update(args.mpc_update),
+                score_scale=1.0,
+                active_dims=active_dims,
+            )
+
+            runtime_stats["score_shape"] = tuple(combined_score.shape)
+            runtime_stats["proxy_task_shape"] = tuple(task_score.shape)
+            runtime_stats["proxy_ref_shape"] = tuple(ref_score.shape)
+            runtime_stats["v_task_shape"] = None
+            runtime_stats["v_ref_shape"] = None
+            runtime_stats["checked_vlm_task_ref_shapes"] = True
+            geom_stats = dict(geom_stats)
+            geom_stats.update(
+                {
+                    "update_mode": f"{args.mpc_update}_score_steer",
+                    "score_task_norm": float(torch.linalg.vector_norm(task_full_score.detach()).cpu()),
+                    "score_ref_norm": float(torch.linalg.vector_norm(ref_full_score.detach()).cpu()),
+                    "score_combined_norm": float(torch.linalg.vector_norm(combined_score.detach()).cpu()),
+                    "proxy_score_time": float(score_time[0].detach().cpu()),
+                }
+            )
+            record_mpc_stats(geom_stats)
+            if args.mpc_debug_stdout:
+                print(
+                    f"vlm_mpc_{geom_stats['update_mode']} "
+                    f"cost_min={geom_stats['cost_min']:.4f} "
+                    f"cost_mean={geom_stats['cost_mean']:.4f} "
+                    f"cost_weighted={geom_stats['cost_weighted']:.4f} "
+                    f"base_score_norm={geom_stats['score_norm']:.4f} "
+                    f"combined_score_norm={geom_stats['score_combined_norm']:.4f}"
                     f"{_format_mpc_term_debug(geom_stats)}",
                     flush=True,
                 )
@@ -2259,7 +2506,7 @@ def parse_args():
     parser.add_argument("--mpc_temperature", type=float, default=0.15)
     parser.add_argument(
         "--mpc_update",
-        choices=("ddim", "mbd_score", "legacy_score"),
+        choices=("ddim", "mbd_score", "mbd_score_action_prox", "legacy_score"),
         default="ddim",
         help="Update rule for --vlm_base --no_steer sim-free MPC.",
     )
@@ -2372,7 +2619,7 @@ if _uses_accel_action_mpc(args):
     if args.mpc_update not in ("legacy_score", "mbd_score"):
         raise ValueError(
             "Acceleration action-space MPC supports --mpc_update legacy_score or mbd_score. "
-            "DDIM without the MBD score path is not implemented for this direct-action planner."
+            "DDIM/action-prox variants are score-space only for this direct-action planner."
         )
 if args.steps_per_inference <= 0:
     raise ValueError("--steps_per_inference must be positive.")
@@ -2575,6 +2822,7 @@ _warn_if_norm_mismatch(
     ref_policy,
     action_dim=task_policy._model.config.action_dim,
 )
+_assert_score_space_compatibility(base_policy, task_policy, ref_policy, args)
 
 steps_per_inference = int(args.steps_per_inference)
 print(

@@ -11,6 +11,7 @@ torch = pytest.importorskip("torch")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sim_free_mpc import SimFreeMPC, SimFreeMPCConfig  # noqa: E402
+from sim_free_mpc.mbd_score_action_prox import step_mbd_score_action_prox  # noqa: E402
 
 
 def test_bspline_basis_is_partition_of_unity():
@@ -137,3 +138,62 @@ def test_step_mbd_score_updates_only_active_dims(monkeypatch):
     assert torch.allclose(next_x[:, :, 2:], x_t[:, :, 2:])
     assert torch.isfinite(next_x).all()
     assert diagnostics["update_mode"] == "mbd_score"
+
+
+def test_action_prox_mbd_score_samples_around_current_xt():
+    planner = object.__new__(SimFreeMPC)
+    planner.config = SimFreeMPCConfig(action_dims=2, noise=0.25, flow_eps=1e-6)
+    captured = {}
+
+    class FakeSampler:
+        def optimize_with_noise_scale(self, initial_mean, _cost_fn, *, noise_scale):
+            captured["initial_mean"] = initial_mean.detach().clone()
+            captured["noise_scale"] = float(noise_scale)
+            return SimpleNamespace(
+                mean=initial_mean + 0.05,
+                costs=torch.tensor([1.0, 2.0], dtype=initial_mean.dtype),
+                weights=torch.tensor([0.75, 0.25], dtype=initial_mean.dtype),
+                samples=initial_mean.unsqueeze(0),
+                noise_scale=torch.full((initial_mean.shape[0],), float(noise_scale), dtype=initial_mean.dtype),
+            )
+
+    planner.sampler = FakeSampler()
+
+    x_t = torch.tensor([[[0.2, -0.4, 1.5], [0.3, -0.5, 1.7]]], dtype=torch.float32)
+    next_x, diagnostics = step_mbd_score_action_prox(
+        planner,
+        x_t,
+        {},
+        {},
+        iteration=1,
+        num_iterations=3,
+        score_scale=1.0,
+    )
+
+    assert torch.allclose(captured["initial_mean"], x_t[0, :, :2])
+    assert captured["noise_scale"] == pytest.approx(0.25)
+    assert next_x.shape == x_t.shape
+    assert torch.allclose(next_x[:, :, 2:], x_t[:, :, 2:])
+    assert diagnostics["update_mode"] == "mbd_score_action_prox"
+    assert diagnostics["proposal_center"] == "current_noisy_action"
+
+
+def test_step_from_score_mbd_matches_base_score_numerator_update():
+    planner = object.__new__(SimFreeMPC)
+    planner.config = SimFreeMPCConfig(action_dims=2, flow_eps=1e-6)
+    x_t = torch.tensor([[[0.2, -0.4, 1.5], [0.3, -0.5, 1.7]]], dtype=torch.float32)
+    score = torch.zeros_like(x_t)
+    score[:, :, :2] = torch.tensor([[[0.1, -0.2], [0.3, -0.4]]], dtype=torch.float32)
+
+    next_x = planner.step_from_score(
+        x_t,
+        score,
+        iteration=1,
+        num_iterations=3,
+        update_mode="mbd_score",
+        active_dims=2,
+    )
+
+    assert next_x.shape == x_t.shape
+    assert torch.allclose(next_x[:, :, 2:], x_t[:, :, 2:])
+    assert torch.isfinite(next_x).all()

@@ -22,6 +22,26 @@ T_co = TypeVar("T_co", covariant=True)
 _POINTCLOUD_NORM_STATS_CACHE: dict[tuple[str, tuple[int, ...] | None], _normalize.NormStats] = {}
 
 
+def _patch_datasets_array_extension_to_pylist():
+    try:
+        import datasets.features.features as _hf_features
+    except Exception:
+        return
+
+    to_pylist = getattr(_hf_features.ArrayExtensionArray, "to_pylist", None)
+    if to_pylist is None or getattr(to_pylist, "_openpi_accepts_pyarrow_kwargs", False):
+        return
+
+    def _to_pylist_compat(self, *args, **kwargs):
+        return to_pylist(self)
+
+    _to_pylist_compat._openpi_accepts_pyarrow_kwargs = True
+    _hf_features.ArrayExtensionArray.to_pylist = _to_pylist_compat
+
+
+_patch_datasets_array_extension_to_pylist()
+
+
 class Dataset(Protocol[T_co]):
     """Interface for a dataset with random access."""
 

@@ -20,6 +20,7 @@ import torch
 from openpi.models_pytorch import pi0_pytorch
 from openpi.models_pytorch import proxy_dp3_pytorch
 from openpi.models_pytorch import proxy_pytorch
+from openpi.models_pytorch import proxy_score_pytorch
 from openpi.models_pytorch import proxy_sound_pytorch
 
 # from openpi.models.pi0_config import Pi0Config
@@ -40,6 +41,7 @@ class ModelType(enum.Enum):
     PI0_FAST = "pi0_fast"
     PI05 = "pi05"
     PROXY = "proxy"
+    PROXY_SCORE = "proxy_score"
     PROXY_POINTCLOUD = "proxy_pointcloud"
     PROXY_DP3 = "proxy_dp3"
     PROXY_SOUND = "proxy_sound"
@@ -333,6 +335,8 @@ class BaseModelConfig(abc.ABC):
             model = pi0_pytorch.PI0Pytorch(config=train_config.model)
         elif train_config.model.model_type == ModelType.PROXY:
             model = proxy_pytorch.ProxyPytorch(config=train_config.model)
+        elif train_config.model.model_type == ModelType.PROXY_SCORE:
+            model = proxy_score_pytorch.ProxyScorePytorch(config=train_config.model)
         elif train_config.model.model_type == ModelType.PROXY_SOUND:
             model = proxy_sound_pytorch.ProxySoundPytorch(config=train_config.model)
         elif train_config.model.model_type == ModelType.PROXY_DP3:

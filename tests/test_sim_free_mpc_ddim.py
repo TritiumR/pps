@@ -52,6 +52,18 @@ def test_score_formula_matches_weighted_clean_estimate_equation():
     assert score == (-0.7 + 0.6 * 0.2) / 0.64
 
 
+def test_score_target_matches_vp_noising_epsilon():
+    alpha_bar = 0.36
+    x0 = 0.2
+    eps = -0.5
+    y_t = math.sqrt(alpha_bar) * x0 + math.sqrt(1.0 - alpha_bar) * eps
+
+    score_from_clean = (math.sqrt(alpha_bar) * x0 - y_t) / (1.0 - alpha_bar)
+    score_from_eps = -eps / math.sqrt(1.0 - alpha_bar)
+
+    assert score_from_clean == score_from_eps
+
+
 def test_zero_epsilon_ddim_step_scales_clean_estimate():
     x0_hat = 0.25
     alpha_bar = 0.25
