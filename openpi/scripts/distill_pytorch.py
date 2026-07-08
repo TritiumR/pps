@@ -32,7 +32,6 @@ import time
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
-import jax
 import numpy as np
 import safetensors.torch
 import torch
@@ -160,6 +159,26 @@ def set_seed(seed: int, local_rank: int):
     np.random.seed(seed + local_rank)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed + local_rank)
+
+
+def move_to_device(value, device: torch.device):
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    if dataclasses.is_dataclass(value):
+        return dataclasses.replace(
+            value,
+            **{
+                field.name: move_to_device(getattr(value, field.name), device)
+                for field in dataclasses.fields(value)
+            },
+        )
+    if isinstance(value, dict):
+        return {key: move_to_device(item, device) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(move_to_device(item, device) for item in value)
+    if isinstance(value, list):
+        return [move_to_device(item, device) for item in value]
+    return value
 
 
 @dataclasses.dataclass(frozen=True)
@@ -488,6 +507,7 @@ def _needs_image_teacher_tokenization_loader(
 ) -> bool:
     return student_model_config.model_type in (
         _model.ModelType.PROXY,
+        _model.ModelType.PROXY_SCORE,
         _model.ModelType.PROXY_SOUND,
     ) and teacher_model_config.model_type in (
         _model.ModelType.PI0,
@@ -1169,10 +1189,8 @@ def train_loop(config: _config.TrainConfig):
             if global_step >= config.num_train_steps:
                 break
 
-            # The unified data loader returns (observation, actions, noise) tuple
-            observation = jax.tree.map(
-                lambda x: x.to(device), observation
-            )  # noqa: PLW2901
+            # The unified data loader returns (observation, actions, noise) tuple.
+            observation = move_to_device(observation, device)  # noqa: PLW2901
             teacher_observation = observation
             student_observation = (
                 _overlay_thermal_student_observation(

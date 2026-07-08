@@ -28,12 +28,13 @@ import numpy as np
 
 # Third-party imports
 import os
+import subprocess
 
 import cv2
 
 # Constants
-DEFAULT_VIDEO_HEIGHT = 720 / 4
-DEFAULT_VIDEO_WIDTH = 1280 / 4
+DEFAULT_VIDEO_HEIGHT = 720 // 4
+DEFAULT_VIDEO_WIDTH = 1280 // 4
 DEFAULT_INPUT_KEYS = [
     "table_cam",
     "wrist_cam",
@@ -89,10 +90,36 @@ def parse_args():
         default=DEFAULT_FRAMERATE,
         help="Frames per second for the output video.",
     )
+    parser.add_argument(
+        "--codec",
+        choices=["h264", "mp4v"],
+        default="h264",
+        help="Output video codec. h264 uses ffmpeg for broad player compatibility.",
+    )
 
     args = parser.parse_args()
 
     return args
+
+
+def _encode_h264(input_path, output_path):
+    """Transcode an intermediate video to browser-friendly H.264 MP4."""
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        input_path,
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        output_path,
+    ]
+    subprocess.run(cmd, check=True)
 
 
 def write_demo_to_mp4(
@@ -104,6 +131,7 @@ def write_demo_to_mp4(
     video_height,
     video_width,
     framerate=DEFAULT_FRAMERATE,
+    codec="h264",
 ):
     """Convert frames from an HDF5 file to an MP4 video.
 
@@ -125,16 +153,28 @@ def write_demo_to_mp4(
         else:
             frames = f[frames_path + "/" + input_key]
 
-        # Setup video writer
         output_path = os.path.join(output_dir, f"demo_{demo_id}_{input_key}.mp4")
+        writer_path = output_path
+        if codec == "h264":
+            writer_path = os.path.join(output_dir, f"demo_{demo_id}_{input_key}.tmp.mp4")
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         if "depth" in input_key:
-            video = cv2.VideoWriter(output_path, fourcc, framerate, (video_width, video_height), isColor=False)
+            video = cv2.VideoWriter(writer_path, fourcc, framerate, (video_width, video_height), isColor=False)
         else:
-            video = cv2.VideoWriter(output_path, fourcc, framerate, (video_width, video_height))
+            video = cv2.VideoWriter(writer_path, fourcc, framerate, (video_width, video_height))
+        if not video.isOpened():
+            raise RuntimeError(f"Failed to open video writer for {writer_path}")
 
         # Process and write frames
+        first_frame = None
+        saw_changed_frame = False
         for ix, frame in enumerate(frames):
+            if first_frame is None:
+                first_frame = np.asarray(frame).copy()
+            elif not saw_changed_frame and ix % 10 == 0:
+                diff = np.mean(np.abs(np.asarray(frame).astype(np.int16) - first_frame.astype(np.int16)))
+                saw_changed_frame = diff > 0.5
+
             # Convert normal maps to uint8 if needed
             if "normals" in input_key:
                 frame = (frame * 255.0).astype(np.uint8)
@@ -162,6 +202,14 @@ def write_demo_to_mp4(
             video.write(frame)
 
         video.release()
+        if not saw_changed_frame:
+            print(
+                f"WARNING: demo_{demo_id}/{input_key} appears static; "
+                "the HDF5 camera frames may all match the first frame."
+            )
+        if codec == "h264":
+            _encode_h264(writer_path, output_path)
+            os.remove(writer_path)
 
 
 def get_num_demos(hdf5_file):
@@ -202,6 +250,7 @@ def main():
                 args.video_height,
                 args.video_width,
                 args.framerate,
+                args.codec,
             )
 
 

@@ -25,6 +25,18 @@ if [[ -z "${COST_CSV:-}" ]]; then
     COST_CSV="${ARTIFACT_DIR}/expert_demo_${COST_NAME}_costs.csv"
   fi
 fi
+if [[ -z "${COST_REPORT:-}" ]]; then
+  COST_REPORT="${COST_CSV%.csv}.md"
+fi
+if [[ -z "${SCORE_VIDEO_DIR:-}" ]]; then
+  SCORE_VIDEO_DIR="${ARTIFACT_DIR}/score_overlay_videos/${COST_NAME}"
+fi
+if [[ -z "${PLOT_DEMO:-}" ]]; then
+  PLOT_DEMO="demo_0"
+fi
+if [[ -z "${COST_PLOT:-}" ]]; then
+  COST_PLOT="${ARTIFACT_DIR}/expert_demo_${COST_NAME}_cost_curve_${PLOT_DEMO}.png"
+fi
 
 stage="${1:-all}"
 
@@ -80,13 +92,31 @@ run_videos() {
 run_score() {
   cd "${ROOT}"
   echo "[weight_demo_pipeline] scoring expert demos to ${COST_CSV}"
+  score_args=()
+  if [[ -n "${GRASP_FLOW_LIFT_HEIGHT:-}" ]]; then
+    score_args+=(--grasp_flow_lift_height "${GRASP_FLOW_LIFT_HEIGHT}")
+  fi
+  if [[ -n "${GRASP_FLOW_TAIL_COST:-}" ]]; then
+    score_args+=(--grasp_flow_tail_cost "${GRASP_FLOW_TAIL_COST}")
+  fi
+  if [[ -n "${SCORE_VIDEO_DIR:-}" && "${SCORE_VIDEO_DIR}" != "none" ]]; then
+    score_args+=(--output_video_dir "${SCORE_VIDEO_DIR}")
+  fi
+  if [[ -n "${PLOT_DEMO:-}" ]]; then
+    score_args+=(--plot_demo "${PLOT_DEMO}" --plot_path "${COST_PLOT}")
+    if [[ "${PLOT_MERGE_TAIL:-0}" == "1" ]]; then
+      score_args+=(--plot_merge_tail)
+    fi
+  fi
   python tools/eval_expert_demo_costs.py \
     --data_file "${ANNOTATED_DATA}" \
     --cost "${COST_NAME}" \
     --grasp_object both \
     --horizon 8 \
     --stride 1 \
-    --output_csv "${COST_CSV}"
+    --output_csv "${COST_CSV}" \
+    --output_markdown "${COST_REPORT}" \
+    "${score_args[@]}"
 }
 
 case "${stage}" in
