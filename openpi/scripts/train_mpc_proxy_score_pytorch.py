@@ -4,7 +4,7 @@ This is the score-space replacement for the old policy distillation path.  The
 reference target is not a pi0/pi05 teacher action.  Instead, labels are generated
 by querying the same FK/cost MPC score estimator used at evaluation time:
 
-    s_ref(x_t, o, t) = estimate_mbd_score_action_prox(MPC, x_t, o, context, t)
+    s_ref(x_t, o, t) = MPC.estimate_mbd_score_action_prox(x_t, o, context, t)
 
 The script has two explicit stages so expensive MPC labels can be inspected and
 reused:
@@ -61,7 +61,6 @@ import openpi.training.config as _config
 from openpi.shared import normalize as _normalize
 from sim_free_mpc import SimFreeMPC, SimFreeMPCConfig
 from sim_free_mpc.ddim import ddim_iteration_alphas
-from sim_free_mpc.mbd_score_action_prox import estimate_mbd_score_action_prox
 
 from train_proxy_score_pytorch import (
     cleanup_ddp,
@@ -390,8 +389,7 @@ def generate_cache(args: argparse.Namespace) -> None:
                 task=args.task,
                 subtask_mode=args.subtask_mode,
             )
-            score, diagnostics = estimate_mbd_score_action_prox(
-                planner,
+            score, diagnostics = planner.estimate_mbd_score_action_prox(
                 x_t,
                 base_inputs,
                 context,

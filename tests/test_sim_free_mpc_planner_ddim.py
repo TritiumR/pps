@@ -11,7 +11,6 @@ torch = pytest.importorskip("torch")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sim_free_mpc import SimFreeMPC, SimFreeMPCConfig  # noqa: E402
-from sim_free_mpc.mbd_score_action_prox import step_mbd_score_action_prox  # noqa: E402
 
 
 def test_bspline_basis_is_partition_of_unity():
@@ -160,8 +159,7 @@ def test_action_prox_mbd_score_samples_around_current_xt():
     planner.sampler = FakeSampler()
 
     x_t = torch.tensor([[[0.2, -0.4, 1.5], [0.3, -0.5, 1.7]]], dtype=torch.float32)
-    next_x, diagnostics = step_mbd_score_action_prox(
-        planner,
+    next_x, diagnostics = planner.step_mbd_score_action_prox(
         x_t,
         {},
         {},

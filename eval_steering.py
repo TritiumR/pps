@@ -62,10 +62,6 @@ from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
 from sim_free_mpc import AccelActionMPC, AccelMPCConfig, SimFreeMPC, SimFreeMPCConfig
 from sim_free_mpc.action_space import clamp_real_action_chunk
 from sim_free_mpc.ddim import ddim_iteration_alphas
-from sim_free_mpc.mbd_score_action_prox import (
-    estimate_mbd_score_action_prox,
-    step_mbd_score_action_prox,
-)
 
 
 DEFAULT_BASE_CHECKPOINT_DIR = "openpi/checkpoints/pytorch/pi05_droid_jointpos"
@@ -1048,8 +1044,7 @@ def _infer_actions_eager(
                     score_scale=args.gamma_base,
                 )
             elif args.mpc_update == "mbd_score_action_prox":
-                x_t, geom_stats = step_mbd_score_action_prox(
-                    mpc_planner,
+                x_t, geom_stats = mpc_planner.step_mbd_score_action_prox(
                     x_t,
                     base_inputs,
                     mpc_context,
@@ -1098,8 +1093,7 @@ def _infer_actions_eager(
                 )
 
             if args.mpc_update == "mbd_score_action_prox":
-                base_score, geom_stats = estimate_mbd_score_action_prox(
-                    mpc_planner,
+                base_score, geom_stats = mpc_planner.estimate_mbd_score_action_prox(
                     x_t,
                     base_inputs,
                     mpc_context,
