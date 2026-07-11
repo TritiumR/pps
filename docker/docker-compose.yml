@@ -1,0 +1,118 @@
+# pps (Proxy Policy Steering) dev environment (matsuolab virtual_desktop pattern).
+#
+# Usage (run from this docker/ directory so .env is picked up):
+#   cp .env.example .env          # set PPS_USER and a unique DESKTOP_PORT
+#   docker compose build
+#   docker compose up -d                  # start desktop + pps
+#   docker compose exec pps bash          # enter the container
+#   docker compose down                   # stop
+#
+# Inside the container, `python` aliases to Isaac Sim's interpreter. Run eval, e.g.:
+#   python eval_steering.py --task Isaac-Pot-Droid-Visuomotor-v0 \
+#     --base_checkpoint_dir ... --task_checkpoint_dir ... --ref_checkpoint_dir ... \
+#     --prompt "remove the lid of the pot and put egg in it" --exp_name demo
+#
+# REQUIRED on the host before any task runs (bind-mounted in via the repo, NOT baked
+# into the image): IsaacLab/assets/ (scene/object USDs), openpi/checkpoints/...
+# (base + proxy weights), openpi/dinov3/checkpoints/ (DINO weights).
+#
+# Eval renders headless (AppLauncher headless=True). The desktop service is only
+# needed if you want a GUI; view it at http://<host>:${DESKTOP_PORT:-6084}.
+
+# Per-user compose project -> isolated network/containers/volumes on this shared
+# host (this dir is the generic docker/, which would otherwise collide).
+name: pps-${PPS_USER:-default}
+
+services:
+  desktop:
+    image: ghcr.io/matsuolab/virtual_desktop:latest
+    runtime: nvidia
+    container_name: pps-desktop-${PPS_USER:-default}
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - DISPLAY=:12
+    ports:
+      - "${DESKTOP_PORT:-6084}:6080"
+    volumes:
+      - "/tmp/.X11-unix:/tmp/.X11-unix:rw"
+    security_opt:
+      - seccomp:unconfined
+    restart: unless-stopped
+
+  pps:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: pps:${PPS_USER:-default}
+    container_name: pps-${PPS_USER:-default}
+    depends_on:
+      - desktop
+    runtime: nvidia
+    stdin_open: true
+    tty: true
+    shm_size: '16gb'  # Isaac Sim + multi-GPU physics/render workers are memory hungry
+    security_opt:
+      - seccomp:unconfined
+    env_file:
+      - .env
+    environment:
+      - ACCEPT_EULA=Y
+      - OMNI_KIT_ACCEPT_EULA=YES
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=graphics,utility,compute
+      - DISPLAY=:12                              # render to the desktop's X server
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}       # for ReKep GPT-4o constraint generation
+    volumes:
+      - ..:/workspace/pps                        # live source (same path as build)
+      - "/tmp/.X11-unix:/tmp/.X11-unix:rw"       # share X server with desktop
+      # Isaac Sim caches -- persist across runs to avoid re-download / shader recompile.
+      - pps-isaac-kit:/isaac-sim/kit/cache
+      - pps-isaac-ov:/root/.cache/ov
+      - pps-isaac-pip:/root/.cache/pip
+      - pps-isaac-glcache:/root/.cache/nvidia/GLCache
+      - pps-isaac-computecache:/root/.nv/ComputeCache
+      - pps-isaac-logs:/root/.nvidia-omniverse/logs
+      - pps-isaac-config:/root/.nvidia-omniverse/config
+      - pps-isaac-ovdata:/root/.local/share/ov/data
+      - pps-isaac-documents:/root/Documents
+      # Model weights fetched at runtime (DINOv3 via torch.hub, HF backbones).
+      - pps-torch-hub:/root/.cache/torch
+      - pps-hf:/root/.cache/huggingface
+    working_dir: /workspace/pps
+    restart: unless-stopped
+    command: sleep infinity
+
+volumes:
+  pps-isaac-kit:
+    name: pps-isaac-kit-${PPS_USER:-default}
+  pps-isaac-ov:
+    name: pps-isaac-ov-${PPS_USER:-default}
+  pps-isaac-pip:
+    name: pps-isaac-pip-${PPS_USER:-default}
+  pps-isaac-glcache:
+    name: pps-isaac-glcache-${PPS_USER:-default}
+  pps-isaac-computecache:
+    name: pps-isaac-computecache-${PPS_USER:-default}
+  pps-isaac-logs:
+    name: pps-isaac-logs-${PPS_USER:-default}
+  pps-isaac-config:
+    name: pps-isaac-config-${PPS_USER:-default}
+  pps-isaac-ovdata:
+    name: pps-isaac-ovdata-${PPS_USER:-default}
+  pps-isaac-documents:
+    name: pps-isaac-documents-${PPS_USER:-default}
+  pps-torch-hub:
+    name: pps-torch-hub-${PPS_USER:-default}
+  pps-hf:
+    name: pps-hf-${PPS_USER:-default}
+
+# This host's default Docker address pools are exhausted, so auto-allocating a
+# network fails ("all predefined address pools have been fully subnetted"). Pin our
+# network to an explicit free subnet. Change PPSNET_SUBNET in .env if it clashes
+# (10.201.0.0/24 and 10.202.0.0/24 are taken by VoxPoser / ReKep).
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${PPSNET_SUBNET:-10.203.0.0/24}

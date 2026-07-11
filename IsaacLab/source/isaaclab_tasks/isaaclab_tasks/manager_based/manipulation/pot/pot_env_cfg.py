@@ -41,6 +41,12 @@ ROOM_INIT_ROT = (1.0, 0.0, 0.0, 0.0)
 
 POT_INIT_POS = PEN_TASK_TARGET_POT_POS
 POT_INIT_ROT = (1.0, 0.0, 0.0, 0.0)
+# The pot + cover wrap nested kitchen prims whose captured rigid-body pose is desynced
+# ~0.52m in x from their room-shifted USD geometry (which is at POT_INIT_POS). Without an
+# explicit init_state the dynamic cover snaps to that wrong pose and the lid floats off to
+# the side. Pin both to the geometry: pot at the target, cover seated just on top.
+COVER_INIT_POS = (POT_INIT_POS[0], POT_INIT_POS[1], POT_INIT_POS[2] - 0.042)
+COVER_INIT_ROT = (1.0, 0.0, 0.0, 0.0)
 EGG_INIT_POS = (POT_INIT_POS[0] + 0.85, POT_INIT_POS[1] - 0.05, POT_INIT_POS[2] - 0.03)
 EGG_INIT_ROT = (1.0, 0.0, 0.0, 0.0)
 
@@ -114,6 +120,7 @@ class PotSceneCfg(InteractiveSceneCfg):
                 collision_enabled=True,
             ),
         ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=list(POT_INIT_POS), rot=list(POT_INIT_ROT)),
     )
 
     cover = RigidObjectCfg(
@@ -128,6 +135,7 @@ class PotSceneCfg(InteractiveSceneCfg):
             ),
             collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
         ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=list(COVER_INIT_POS), rot=list(COVER_INIT_ROT)),
     )
 
     egg = RigidObjectCfg(

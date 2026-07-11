@@ -1,12 +1,12 @@
-"""Shared driver core for the ``sim_free_mpc``-based tasks.
+"""Shared driver core for the sim_free_mpc-based tasks.
 
-Provides what a driver needs to run ``SimFreeMPC`` without the pi0.5 checkpoint: a mock policy that
+Provides what a driver needs to run SimFreeMPC without the pi0.5 checkpoint: a mock policy that
 supplies only the decode norm-stats, the MPC construction, the B-spline horizon smoother, a NaN guard,
-and the per-chunk plan/decode helpers. The engine (``SimFreeMPC``, the decode, ddim, FK, DIAL sampler)
-is imported unchanged from ``sim_free_mpc``.
+and the per-chunk plan/decode helpers. The engine (SimFreeMPC, the decode, ddim, FK, DIAL sampler)
+is imported unchanged from sim_free_mpc.
 
-Heavy imports stay at module top: this module is only imported from inside a task's ``run()``, i.e.
-after the Isaac app has booted (see ``vlm_base/main.py``).
+Heavy imports stay at module top: this module is only imported from inside a task's run(), i.e.
+after the Isaac app has booted (see vlm_base/main.py).
 """
 from __future__ import annotations
 
@@ -34,10 +34,10 @@ _S_Q99 = np.array([0.899652, 1.38547, 0.692028, -0.454204, 1.7321, 3.4673, 2.198
 
 
 def build_policy(real_stats: bool, action_std: float):
-    """Mock policy carrying only the decode norm-stats (no checkpoint). Returns ``(policy, state_stats)``.
+    """Mock policy carrying only the decode norm-stats (no checkpoint). Returns (policy, state_stats).
 
-    ``real_stats``: use the pi05_droid_jointpos quantile norm (exact decode). Otherwise an
-    identity/``action_std`` stand-in (arm delta = model * action_std + current joints).
+    real_stats: use the pi05_droid_jointpos quantile norm (exact decode). Otherwise an
+    identity/action_std stand-in (arm delta = model * action_std + current joints).
     """
     if real_stats:
         actions_stats = _Stats(q01=_A_Q01, q99=_A_Q99)
@@ -58,16 +58,17 @@ def build_policy(real_stats: bool, action_std: float):
 
 
 def build_mpc(policy, *, num_samples, iterations, noise, temperature, joint_delta_clip, interpolate,
-              task_name="auto", action_dims=8):
-    """Construct the ``SimFreeMPC`` and its config. Returns ``(mpc, cfg)``.
+              task_name="auto", cost_style="priority", action_dims=8):
+    """Construct the SimFreeMPC and its config. Returns (mpc, cfg).
 
-    ``task_name`` only selects the engine's builtin cost; drivers that replace ``mpc.cost`` (the base's
-    ``CompositeCost``) leave it ``"auto"`` -- only the ``sim_free_mbd`` diagnostic, which keeps the builtin
-    weight cost, passes ``"weight"``.
+    task_name + cost_style select the engine's builtin cost (e.g. cost_style="grasp_flow" ->
+    the full grasp+lift+place GraspFlowStateCost). Drivers that replace mpc.cost (the base's
+    CompositeCost) leave both at their defaults; the sim_free_mbd diagnostic passes them to run a
+    builtin cost directly.
     """
-    cfg = SimFreeMPCConfig(task_name=task_name, num_samples=num_samples, iterations=iterations,
-                           noise=noise, temperature=temperature, action_dims=action_dims,
-                           joint_delta_clip=joint_delta_clip, interpolate=interpolate)
+    cfg = SimFreeMPCConfig(task_name=task_name, cost_style=cost_style, num_samples=num_samples,
+                           iterations=iterations, noise=noise, temperature=temperature,
+                           action_dims=action_dims, joint_delta_clip=joint_delta_clip, interpolate=interpolate)
     return SimFreeMPC(policy, cfg), cfg
 
 
@@ -141,8 +142,29 @@ def guard_cost(cost):
     return _Guarded(cost)
 
 
+def apply_arm_only_smoothing(mpc):
+    """Smooth the arm control points but keep the gripper channel (dim 7) sharp.
+
+    The engine reduces the chunk to control points and B-spline-expands them; that smoothing keeps the
+    arm stable but flattens the gripper's close into a curve the sampler cannot push past ~0.35. Expanding
+    the gripper channel linearly instead lets it step closed at the grasp instant while the arm keeps the
+    smooth basis. Assumes the engine's interpolation is on (so there is a control-point reduction to expand).
+    """
+    cls = type(mpc)
+
+    def interp(sequence, output_horizon):
+        smoothed = cls._bspline_resample(sequence, output_horizon)   # arm: smooth (stable)
+        if sequence.shape[-1] > 7:
+            sharp = cls._linear_resample(sequence, output_horizon)   # gripper: linear (can snap closed)
+            smoothed = smoothed.clone()
+            smoothed[..., 7] = sharp[..., 7]
+        return smoothed
+
+    mpc._interpolate_control_points = interp
+
+
 def policy_inputs(E, state_stats, real_stats: bool):
-    """Build the decode's ``policy_inputs`` (a normalized current-state so the unnormalize round-trips)."""
+    """Build the decode's policy_inputs (a normalized current-state so the unnormalize round-trips)."""
     st = torch.zeros(8, device=E.device, dtype=torch.float32)
     if real_stats:
         q01 = torch.as_tensor(state_stats.q01, device=E.device, dtype=torch.float32)
@@ -154,7 +176,7 @@ def policy_inputs(E, state_stats, real_stats: bool):
 
 
 def plan_chunk(mpc, x_init, pin, ctx, *, mode, update, denoise_iters, score_scale, dt, it_start=0):
-    """Produce the model-space chunk ``x_0`` to decode and execute (reverse update, or DIAL mean)."""
+    """Produce the model-space chunk x_0 to decode and execute (reverse update, or DIAL mean)."""
     if mode == "mean":
         target, _, _ = mpc._optimize_chunk(x_init, pin, ctx)  # single DIAL optimize, no reverse update
         return target
@@ -174,10 +196,10 @@ def plan_chunk(mpc, x_init, pin, ctx, *, mode, update, denoise_iters, score_scal
 
 
 def sdedit_warm_start(x_carry, it_start, denoise_iters, num_train_timesteps, H, device, noise=None):
-    """SDEdit warm start: forward-diffuse ``x_carry`` to step ``it_start`` (``sqrt(ab)*carry + sqrt(1-ab)*noise``).
+    """SDEdit warm start: forward-diffuse x_carry to step it_start (sqrt(ab)*carry + sqrt(1-ab)*noise).
 
-    The reverse loop then runs only the last ``denoise_iters - it_start`` steps, for temporal coherence.
-    ``noise`` defaults to fresh Gaussian noise of shape ``[1, H, 8]``.
+    The reverse loop then runs only the last denoise_iters - it_start steps, for temporal coherence.
+    noise defaults to fresh Gaussian noise of shape [1, H, 8].
     """
     ab, _ = ddim_iteration_alphas(iteration=it_start, num_iterations=denoise_iters,
                                   num_train_timesteps=num_train_timesteps)
@@ -188,9 +210,9 @@ def sdedit_warm_start(x_carry, it_start, denoise_iters, num_train_timesteps, H, 
 
 
 def read_subtask_flags(env):
-    """Current env ``subtask_terms`` flags (task progress, e.g. ``grasp_pear`` / ``pear_on_scale``).
+    """Current env subtask_terms flags (task progress, e.g. grasp_pear / pear_on_scale).
 
-    Returns ``{flag: bool}`` from the env's observation manager; empty when the env exposes no such group.
+    Returns {flag: bool} from the env's observation manager; empty when the env exposes no such group.
     """
     try:
         group = env.env.observation_manager.compute_group("subtask_terms")

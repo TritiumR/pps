@@ -1,0 +1,2 @@
+# Never commit the real environment file (it holds per-user / host-specific values).
+.env

@@ -1,5 +1,7 @@
-# Data directories.
-assets/
+# Data directories. `assets/` is anchored so it ignores only a top-level data
+# dir, not in-tree python packages named `assets` (see the IsaacLab/.gitignore
+# fix: an unanchored rule there had excluded isaaclab's core `assets` package).
+/assets/
 checkpoints/
 data/
 wandb/

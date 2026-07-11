@@ -1,0 +1,92 @@
+# Project README
+
+Whole-project context for an AI coding agent. This explains the goal, how the main pieces (hydrax, ReKep, DexMimicGen, PPS) relate, the precise end-state system we are building, the directions worth trying, and the risks that shape them. It is background and orientation, not a task list. A companion file, `RESEARCH.md`, gives narrower context for working inside specific codebases; this file is the level above that.
+
+Deeper detail lives in: `math_formulation_vlm_diffusion_mpc.md` (the problem formulation and notation), `project_idea_vlm_dialmpc_pps.md` (the idea and its framing), `cost_function_design_v0.md` (the cost template and the executed single-arm costs), `challenges_and_open_questions.md` (the full risk register), and `research_and_writing_timeline.md` (the schedule).
+
+> Note for the agent: the cost backbone is **ReKep**, and the cost is evaluated **geometrically** (no forward-dynamics rollout). Earlier companion docs that describe a VoxPoser value map optimized over a physics rollout are out of date; this README is the current source of truth on those two points.
+
+## 1. Goal
+
+Build a training-free, open-vocabulary manipulation policy, and adapt it cheaply without retraining it. Two stages:
+
+- **The base, VLM-DP.** A vision-language model writes the task cost directly from a free-form instruction (ReKep-style relational keypoint constraints), and a sampling-based controller (DIAL-MPC) optimizes that cost. The cost is evaluated **geometrically**, keypoints are placed by forward kinematics (v1) or a rigid transform (v2), so there is **no forward-dynamics rollout**. This is what we mean by sim-free. Because the sampler is a model-based diffusion process, it exposes a score, so it behaves like a diffusion or flow policy without any trained weights. We call this policy VLM-DP (the VLM-grounded, DIAL-MPC-based policy).
+- **The adaptation, PPS-style.** A small, demonstration-learned residual steers the frozen VLM-DP base at every denoising step, in **score space**. The residual does not inject generic "precision." It supplies three task-scoped things: the contact and dynamics behavior the kinematic cost structurally omits, a correction for systematic cost or perception bias, and a selector within deliberately widened regions. Its value is an empirical question, large only on tasks where a geometric cost genuinely falls short of demonstrations, and negligible where demonstrations add nothing.
+
+The single architecture we are pursuing is **VLM-DP as the steered base**: PPS-style steering acts on VLM-DP directly. The final target domain is **bimanual dexterous manipulation** (two arms with multi-fingered hands). The single-arm work is the proving ground; the design is meant to scale to the bimanual dexterous setting.
+
+## 2. The pieces and how they relate
+
+The pipeline, end to end: a language instruction goes to a VLM (ReKep-style) that writes a relational keypoint cost; DIAL-MPC inside hydrax optimizes that cost by sampling and evaluating it geometrically, which is VLM-DP; PPS-style steering then nudges VLM-DP with two small proxy policies trained from a few task demonstrations; the target domain is bimanual dexterous, where DexMimicGen supplies the task structure.
+
+- **hydrax** is the controller substrate. It is a JAX and MuJoCo MJX library of sampling-based MPC controllers, with DIAL-MPC already implemented and a clean `running_cost` and `terminal_cost` interface, and it runs thousands of parallel evaluations on a GPU. VLM-DP is built and run here. MJX is used as a kinematics and collision engine (forward kinematics, signed distances), not as a forward-dynamics roller, the cost is a geometric function of the action chunk. The prototype climbs from simple predictive sampling to MPPI to DIAL-MPC, which is a controller class swap rather than a rewrite.
+- **ReKep** is the grounding backbone. A VLM writes the per-stage cost as relational constraints over keypoints (free-form Python). It is the only front-end whose cost is both relational (expresses relations *between* keypoints, which is what carries multi-step structure) and analytic, so it is cheap enough to evaluate inside a sampler. We keep ReKep's relational cost, its stage decomposition, its transition and backtracking logic, and its keypoint tracking, and we replace its two gradient solvers (sub-goal and path) with a single annealed sampler over the whole chunk.
+- **VoxPoser and MOKA** are reference front-ends we borrow ideas from, not the cost source. From VoxPoser we take the *region idea*, writing a grasp or sub-goal over a bounded region rather than a single point, but as an analytic formula, not a dense voxel value map and not its planner. From MOKA we take the *selection mechanism*, marked multiple-choice VQA for picking which keypoint, used only on the selection sub-problem and only if measured VLM selection error justifies it. Neither hosts the controller.
+- **DexMimicGen** is the bimanual dexterous task reference. It contributes the task taxonomy, parallel, coordination, and sequential subtasks, which is the scaffold for designing the bimanual dexterous task suite that is the target domain, and it runs in MuJoCo, which aligns with the stack. It is the canonical reference for what bimanual dexterous tasks look like and how the two arms divide work.
+- **PPS** is the adaptation method, and Section 4 spells out exactly how it attaches to DIAL-MPC. In brief: it steers a frozen base with a residual built from two small proxies, treating the base as query-only, so a weightless base like VLM-DP can slot in. We apply it in score space, which is why we label our version "PPS-style" rather than "PPS."
+
+## 3. How VLM-DP is built (ReKep cost + DIAL-MPC, evaluated geometrically)
+
+VLM-DP is a ReKep relational cost turned into a sampling target that DIAL-MPC draws from, with the cost evaluated geometrically rather than by rolling dynamics. The policy is π(a | o) ∝ exp(−J(a)/λ). Four steps:
+
+1. **The VLM writes the cost (ReKep-style).** From the instruction ℓ and observation o, the VLM writes the per-stage cost as code over keypoints. The cost splits into a VLM-authored task term and a fixed feasibility term:
+
+   J(a) = J_task(a) + J_feas(a)
+
+   J_task is the relational keypoint objective for the current stage (a terminal sub-goal constraint, plus a path or running constraint where needed). J_feas is a fixed, task-independent set: collision, floor and joint or workspace limits, a reachability term (only when the decision variable is task-space poses), a smoothness term, and a nominal-pose regularizer. Only J_task changes across stages; J_feas is shared.
+
+2. **Evaluate the cost geometrically on the action chunk.** The decision variable is an action chunk a = a_{t:t+H}, a sequence of joint configurations (v1) or end-effector poses (v2), not a control sequence rolled through dynamics. Keypoints are placed by forward kinematics (v1) or by a rigid transform that carries a grasped keypoint with the end-effector (v2), and the cost is read off that geometry. There is no `x_{t+1} = f(x_t, u_t)` dynamics rollout. This is the whole sim-free claim: the cost is a cheap, jittable, geometric function of the chunk, so it can sit inside thousands of parallel evaluations.
+
+3. **DIAL-MPC samples the cost-induced distribution.** The cost defines a target p(a) ∝ exp(−J(a)/λ), which DIAL-MPC draws from by annealed MPPI: sample perturbed action chunks, evaluate the geometric cost on each, take the cost-weighted average, and anneal the sampling covariance from coarse to fine. That annealing loop is a denoising process. The sampler is swappable in principle, DIAL-MPC by default (stochastic, tolerant of the noisy sampled score, what the executed work uses) or DDIM as a faster option, but DDIM's large deterministic steps amplify the noisy score and sharpen mode collapse, so it is a speed-only fallback, not a free swap, and its clean interchangeability with the annealed sampler is unverified.
+
+4. **VLM-DP is the resulting policy**, run receding-horizon (execute a sub-chunk, re-ground keypoints, re-solve). It is training-free and open-vocabulary, since a new instruction is a new cost with no code change, and it is diffusion-structured, since the cost-weighted mean ā plus the Tweedie or MBD identity exposes a score s(a) ≈ (ā − a) / σ². That score is the hook PPS attaches to in the next section, but it is not needed to define VLM-DP itself.
+
+Two conditions make this run, and they are the two gating risks: J_task must be dense, pulling from far away rather than flat except at the goal, and the grasp or sub-goal must be written over a **region** rather than a single keypoint, because a single-point objective makes p(a) sharply peaked and therefore un-steerable. Caveat, tested: a region alone is not sufficient, it buys optionality, not a decision, and without a selector the grasp drifts to the wrong end of the region and fails (the spoon result). The region must be paired with a selector, a place relation now or the demo residual later.
+
+## 4. The end goal: PPS-style steering of VLM-DP, step by step
+
+What we are building toward is a single inference-time loop in which DIAL-MPC's denoising and the steering residual happen together, at every step, in score space. To see how they correlate, take each in turn.
+
+**DIAL-MPC is already a denoising process.** It samples from the distribution the VLM cost induces, p(a) ∝ exp(−J(a)/λ), by annealing the sampling covariance from coarse to fine. At each annealing level it perturbs the current action chunk, evaluates the geometric cost on the perturbations, and takes the cost-weighted average, which is a Monte-Carlo estimate of the score of the cost-induced distribution at that noise level. So DIAL-MPC already produces, step by step, a base score that denoises a noisy action toward the cost optimum. That base score is the only thing the steering residual needs from the base.
+
+**The steering residual is a denoising process of the same shape, in score space.** It adapts the frozen base by adding a residual at every denoising step:
+
+  s = s_base + α (s_task − s_ref)
+
+where s_task and s_ref are two small proxy policies. The reference proxy s_ref is distilled from the base on the task's own states, so it models what the base already does. The task proxy s_task is the reference fine-tuned on a small set of task demonstrations (on the order of 50), so it models what the base's behavior becomes under task supervision. Their difference is a calibrated residual that pushes toward the task where demonstrations change behavior and cancels where they agree. The residual is the only learned, demonstration-specific part; the base is queried for s_base and never modified. The proxies are small, on the order of 1% of a learned base in the original PPS.
+
+**Why score space, and the work that makes it real.** The base natively outputs a score, so we add the residual directly in score space and do not convert to a flow velocity. This is a deliberate change from the original velocity-space PPS form: score and velocity space are equal only in an ideal limit (exact proxies and a per-noise-level rescaled gain), and once α is a constant and the proxies are learned the velocity form applies an effective, noise-level-dependent gain and a velocity-trained proxy has a different error profile. Steering in score space avoids that conversion entirely. The required work is aligning DIAL-MPC's annealing levels with the proxies' noise schedule and sharing an action representation, not a score-to-velocity bridge.
+
+**So the end goal is one integrated sampler.** Starting from noise, it denoises a bimanual dexterous action chunk over a schedule, and at each step the update is DIAL-MPC's cost-driven base score plus the demonstration-learned residual, in score space. Nothing in the base is trained; only the two small proxies are. The output is an action that is both cost-consistent, from DIAL-MPC optimizing the VLM cost, and corrected, from the residual supplying contact and dynamics the geometric cost omits and selecting within widened regions. That integrated steered sampler, running on bimanual dexterous tasks, is the system to build toward.
+
+## 5. Directions worth trying
+
+1. Stand up the control stack in hydrax with a hand-written **geometric** cost on a single arm, no VLM, and confirm a sampling MPC can drive a manipulation task through geometric cost evaluation (using geometric surrogates for contact, for example a clearance term, since the kinematic cost cannot express contact directly). This retires the first gating risk and is independent of everything else.
+2. Extract a ReKep cost as a portable, jittable callable and drive DIAL-MPC with it, forming VLM-DP end to end on one task, and **close the full loop before adding terms** (per the team steer: ReKep is the starting point, get the pipeline closed first). Characterize whether the generated cost is dense and steerable enough for an annealed sampler, which is the second gating risk, and define the MVP cost, do we actually need every feasibility term for an initial success.
+3. Show open-vocabulary breadth: several instructions change the behavior with no code edits.
+4. Build the PPS-style layer in score space: align DIAL-MPC's score to the proxies' schedule (no score-to-velocity bridge needed), distill the reference proxy from VLM-DP on-policy, train the task proxy on a few demonstrations, and compose the residual into the sampler so each step is s_base + α(s_task − s_ref).
+5. Scale to bimanual dexterous, using DexMimicGen's parallel, coordination, and sequential taxonomy to design the task suite.
+6. Try the bootstrap: feed steered rollouts back to warm-start the controller or retrain the task proxy, a loop that can compound a one-shot gain.
+
+Open question, under discussion, not decided: a high-level / low-level variant in which the learned side jointly denoises the low-level action chunk and a high-level representation (for instance a demo-derived sub-goal pose), with the cost scoring the high-level representation for task completion and the action for physical feasibility. This is attractive (it gives the cost a clean target to score) but it would reintroduce a trained joint diffusion model into the base, shifting the method away from "training-free base plus thin residual." Decide consciously before adopting; the first step is to measure whether jointly denoised sub-goals and chunks stay consistent without an explicit alignment term.
+
+The intended order proves the controller and the cost first, on a single arm, then the adaptation, then scales to bimanual dexterous. The single-arm result is also the fallback paper if the adaptation layer does not come together.
+
+## 6. Risks that shape the plan
+
+Kept brief here; the full register is in `challenges_and_open_questions.md`.
+
+- **A sampling controller with a geometric, contact-free cost is unproven for contact-rich manipulation.** The geometric cost structurally omits contact dynamics, so contact-rich success rests on the bet that base plus residual recovers the contact and force behavior the cost cannot express (the residual supplies what the kinematic cost omits). This is the foundational gating risk and is testable now with a hand-written geometric cost, before any VLM or PPS work. Sampling MPC for contact-rich manipulation is also historically hard in its own right.
+- **The ReKep cost may not be dense or steerable enough** for an annealed sampler, or may not stay a cheap jittable geometric function. Also gating, also testable now. The narrow-distribution problem (a single-keypoint objective is sharply peaked and un-steerable) is the known instance; the region formulation is the fix, with the tested caveat that a region needs a selector.
+- **The adaptation's payoff is in tension with optimizing the base.** The residual helps most when the base leaves a real gap, and that gap shrinks as the cost and controller improve, so the gain could be modest. The base should still be optimized for performance; the honest consequence is that the residual's value is then an empirical question, large only on tasks where a geometric cost genuinely falls short of demonstrations. Note also that PPS's original mode-selection justification does not transfer, the base is mode-seeking and has no modes to select among, so the residual's role is the three task-scoped ones above, not mode selection.
+- **The action-and-schedule alignment is required work.** The base and proxies must share an action representation and noise schedule. Steering in score space removes the score-to-velocity bridge that the velocity form would have needed, but the schedule and representation alignment remain.
+- **Distilling the reference proxy off a sampling base is unproven.** PPS is validated on a neural base; our base is a sampling-MPC process, and distilling s_ref means querying it along denoising trajectories, where each query to VLM-DP is a sampling-MPC solve rather than a forward pass. So this is both unproven (the base is not a neural network) and expensive (bounded by the rollout budget). Derisk this early.
+
+## 7. Glossary and pointers
+
+- **VLM-DP**: our base policy, the VLM-grounded, DIAL-MPC-based controller, with a ReKep relational cost evaluated geometrically (sim-free), and the policy the residual steers.
+- **DIAL-MPC**: the annealed sampling MPC used as the controller; runs in hydrax; supplies the base score s_base.
+- **PPS / PPS-style**: the proxy-residual steering method that adapts the frozen base by adding α(s_task − s_ref) at each denoising step; we apply it in score space, hence "PPS-style."
+- **sim-free**: the cost is evaluated geometrically (forward kinematics or rigid transform), with no forward-dynamics rollout. Not "no simulator", MJX still provides kinematics and collision.
+- Codebases: hydrax (controller, where VLM-DP is built), ReKep (cost backbone, relational keypoint constraints), VoxPoser and MOKA (reference front-ends, region idea and selection mechanism borrowed, not the cost source), DexMimicGen (bimanual dexterous task taxonomy and suite), PPS (the method to implement).
+- Companion docs: `RESEARCH.md`, `math_formulation_vlm_diffusion_mpc.md`, `project_idea_vlm_dialmpc_pps.md`, `cost_function_design_v0.md`, `challenges_and_open_questions.md`, `research_and_writing_timeline.md`.

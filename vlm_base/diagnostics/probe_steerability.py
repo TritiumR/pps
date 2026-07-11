@@ -7,12 +7,12 @@ field rather than collapsing to a point. Three probes measure that at a frozen s
   P2 ESS vs denoise step  effective sample size + plan change over the reverse loop -> commitment timing
   P3 latent interpolation terminal EE as the initial noise is interpolated -> behaviour-manifold smoothness
 
-Steerability is state-dependent, so the probes run across regimes -- ``far_fresh`` (approach, fresh noise),
-``near_fresh`` (driven up to the object, fresh noise), ``near_warm`` (up close, warm-started from the
-previous plan, the normal operating point) -- and across the reverse-update modes the diffusion/flow
-literature flags as the collapse knobs (``score_space`` vs ``ddim``, the flow-matching Euler sampler).
+Steerability is state-dependent, so the probes run across regimes: far_fresh (approach, fresh noise),
+near_fresh (driven up to the object, fresh noise), near_warm (up close, warm-started from the
+previous plan, the normal operating point). They also run across the reverse-update modes the diffusion/flow
+literature flags as the collapse knobs (score_space vs ddim, the flow-matching Euler sampler).
 Nothing is executed during a probe; the state is frozen. Metrics JSON + a figure land in
-``results/vlm_mpc/probe/``.
+results/vlm_mpc/probe/.
 
     python vlm_base/diagnostics/probe_steerability.py --grasp_obj pear
 """
@@ -83,7 +83,7 @@ def run(args):
     mpc.cost = core.guard_cost(CompositeCost(extents=extents))
 
     def state_ctx(ref=None):
-        """Context at the current physical state; ``ref`` sets the warm-start consistency reference."""
+        """Context at the current physical state; ref sets the warm-start consistency reference."""
         objs = {}
         for n in scene_objects:
             try:
@@ -110,7 +110,7 @@ def run(args):
         return ((torch.sin((1 - t) * omega) / so) * af + (torch.sin(t * omega) / so) * bf).view_as(a)
 
     def reverse(pin, ctx, update, x_init, it_start=0, log=None):
-        """One reverse (denoise) trajectory from ``it_start``; optionally records the plan per step."""
+        """One reverse (denoise) trajectory from it_start; optionally records the plan per step."""
         x = x_init
         for it in range(it_start, args.denoise_iters):
             if update == "ddim":
@@ -129,7 +129,7 @@ def run(args):
         return joints.detach(), mpc.fk.forward(joints).ee_pos.detach()  # base frame; spread is frame-invariant
 
     def warm_init_fn(carry):
-        """Build the SDEdit x_init generator for a regime; returns ``(fn(noise=None), it_start)``."""
+        """Build the SDEdit x_init generator for a regime; returns (fn(noise=None), it_start)."""
         if carry is None:
             return (lambda z=None: z if z is not None else noise()), 0
         it_start = max(0, args.denoise_iters - args.warm_steps)
@@ -139,7 +139,7 @@ def run(args):
     def run_probes(update, x_init_fn, ctx, it_start):
         pin = core.policy_inputs(E, state_stats, _REAL_STATS)
 
-        # P1 -- diversity of independent plans from the same state.
+        # P1: diversity of independent plans from the same state.
         x0 = torch.cat([reverse(pin, ctx, update, x_init_fn(), it_start=it_start) for _ in range(args.n_plans)], 0)
         joints, ee = decode_ee(pin, x0)
         term = ee[:, -1]
@@ -148,7 +148,7 @@ def run(args):
               "p1_excursion_m": float(torch.linalg.vector_norm(ee[:, -1] - ee[:, 0], dim=-1).mean()),
               "p1_joint_spread_rad": float(joints.std(0).mean())}
 
-        # P2 -- ESS + plan change across the reverse loop (weights captured from either sampler path).
+        # P2: ESS + plan change across the reverse loop (weights captured from either sampler path).
         wlog, patched = [], {}
         for m in ("optimize", "optimize_with_noise_scale"):
             orig = getattr(mpc.sampler, m, None)
@@ -168,7 +168,7 @@ def run(args):
         p2 = {"p2_ess_frac": [float(1.0 / w.pow(2).sum()) / args.num_samples for w in wlog],
               "p2_plan_delta": [float((xs[i] - xs[i - 1]).norm() / (xs[i].norm() + 1e-9)) for i in range(1, len(xs))]}
 
-        # P3 -- terminal EE traced as the initial noise is interpolated (behaviour-manifold navigability).
+        # P3: terminal EE traced as the initial noise is interpolated (behaviour-manifold navigability).
         za, zb = noise(), noise()
         path = []
         for b in np.linspace(0.0, 1.0, args.n_beta):

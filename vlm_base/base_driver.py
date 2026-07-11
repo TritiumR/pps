@@ -1,6 +1,6 @@
-"""Shared base-controller driver: runs a ``Grounding`` on the sim_free engine and records a rollout video.
+"""Shared base-controller driver: runs a Grounding on the sim_free engine and records a rollout video.
 
-Grounding-agnostic -- it consumes only the ``Grounding`` contract (obstacles + stages) plus an already
+Grounding-agnostic: it consumes only the Grounding contract (obstacles + stages) plus an already
 built sim_free MPC, so front-ends (ReKep / VoxPoser / MOKA / GT) and controllers vary independently. The
 loop: SDEdit warm start, B-spline-smoothed chunks, a consistency reference, a proximity gripper, and
 per-stage advance on a committed grasp.
@@ -38,6 +38,8 @@ def _ctx_from_stage(env, grounding, stage, root_pos, root_quat, plan_ref, held_o
     ctx = {"objects": objs, "joint_pos": env.q0(), "robot_root_pos": root_pos, "robot_root_quat": root_quat,
            "target": np.asarray(stage.target(), dtype=np.float32), "grasp_obj": stage.grasp_obj,
            "payload": stage.payload, "place_target": stage.place_target,
+           "eef_pos": np.asarray(env.tcp(), dtype=np.float32),   # current TCP (grasp_flow cost reads this)
+           "subtasks": core.read_subtask_flags(env),   # env grasp/place flags (grasp_flow cost re-grasps on slip)
            "z_table": (min(z_bottoms) if z_bottoms else None), "plan_ref": plan_ref}
     if stage.constraint is not None:              # ReKep constraint-as-cost stage
         ctx["keypoints"] = np.asarray(grounding.keypoints(), dtype=np.float32)
@@ -70,8 +72,8 @@ def _frame(env, grounding, stage, chunk, t, dist, grip_open):
     """Rollout frame: live tracked keypoints + the stage's relational constraint drawn on the cam.
 
     ReKep grounding exposes live keypoints, so draw them (numbered, indices matching the VLM) plus the
-    subgoal constraint as a line between its operands -- TCP -> grasp keypoint for a grasp, or the held
-    keypoint -> placement point for a place. Falls back to a plain labelled frame for keypoint-less (GT)
+    subgoal constraint as a line between its operands: TCP to the grasp keypoint for a grasp, or the held
+    keypoint to the placement point for a place. Falls back to a plain labelled frame for keypoint-less (GT)
     grounding.
     """
     text = [stage.name, f"ch{chunk}.{t} d={dist:.2f}m grip={'open' if grip_open else 'closed'}"]
@@ -85,7 +87,7 @@ def _frame(env, grounding, stage, chunk, t, dist, grip_open):
 
 
 def run_base(env, grounding, *, mpc, policy, state_stats, cfg, args, out_dir):
-    """Drive the grounded stages with the sim_free MPC; write ``<exp_name>.mp4`` and print metrics."""
+    """Drive the grounded stages with the sim_free MPC; write <exp_name>.mp4 and print metrics."""
     dev = env.device
     H = args.horizon
     k = min(args.exec_knot, H)
@@ -95,7 +97,7 @@ def run_base(env, grounding, *, mpc, policy, state_stats, cfg, args, out_dir):
     plan_ref = {"v": None}                       # warm-started previous plan (the consistency reference)
     frames, q_hist, dist_hist = [], [], []
     obj_gt0 = {o.name: env.object_pose(o.name)[0].copy() for o in grounding.objects}   # GT initial poses (report)
-    stage_idx, hold, x_carry, released = 0, 0, None, False
+    stage_idx, hold, x_carry, released, advance_streak = 0, 0, None, False, 0
     held_offset = _capture_held(env, grounding, grounding.stages[0].held_idx)
 
     for chunk in range(args.max_chunks):
@@ -119,8 +121,12 @@ def run_base(env, grounding, *, mpc, policy, state_stats, cfg, args, out_dir):
         plan_ref["v"] = torch.cat([rj[k:], rj[-1:].expand(k, 7)], dim=0)   # shift forward = warm reference
 
         target = ctx["target"]
+        cost_gripper = getattr(args, "gripper_source", "latch") == "cost"   # grasp_flow cost drives the gripper
         for t in range(k):
-            grip_open = _gripper_open(env, stage, stage.target(), args.seat_dist)  # live target per step
+            if cost_gripper or (getattr(args, "gripper_in_loop", False) and stage.gripper == "close"):
+                grip_open = float(real[t][7]) < 0.5   # follow the decoded (cost-driven) gripper channel
+            else:
+                grip_open = _gripper_open(env, stage, stage.target(), args.seat_dist)  # live target per step
             if stage.gripper == "close" and not grip_open:
                 hold += 1
             if stage.gripper == "place" and grip_open:   # gripper opened on a place stage -> object released
@@ -131,15 +137,20 @@ def run_base(env, grounding, *, mpc, policy, state_stats, cfg, args, out_dir):
             dist_hist.append(d_now)
             frames.append(_frame(env, grounding, stage, chunk, t, d_now, grip_open))
 
-        advance = _should_advance(stage, core.read_subtask_flags(env), hold, args.commit_hold)
+        flags = core.read_subtask_flags(env)
+        signal = _should_advance(stage, flags, hold, args.commit_hold)
         if stage.gripper == "place":
-            advance = advance and released   # don't advance a place until the object is actually released
-        if advance and stage_idx + 1 < len(grounding.stages):
-            stage_idx, hold, released = stage_idx + 1, 0, False
+            signal = signal and released   # don't advance a place until the object is actually released
+        advance_streak = advance_streak + 1 if signal else 0   # debounce: a stable signal, not a one-chunk flicker
+        if advance_streak >= getattr(args, "advance_persist", 2) and stage_idx + 1 < len(grounding.stages):
+            stage_idx, hold, released, advance_streak = stage_idx + 1, 0, False, 0
             held_offset = _capture_held(env, grounding, grounding.stages[stage_idx].held_idx)
             print(f"[base] stage -> {grounding.stages[stage_idx].name} at chunk {chunk}", flush=True)
-        if chunk % 10 == 0:
-            print(f"[base]   chunk {chunk}: stage={stage.name} dist={d_now:.3f}m", flush=True)
+        gobj = stage.grasp_obj or stage.payload   # grasp/lift diagnostic: does the object rise (grasped) or stay/slip?
+        gz = f" {gobj}_z={float(env.object_pose(gobj)[0][2]):.3f}" if gobj else ""
+        grip = float(real[:k, 7].mean()) if real.shape[-1] > 7 else float("nan")   # decoded gripper channel (cost-driven)
+        print(f"[base]   chunk {chunk}: stage={stage.name} dist={d_now:.3f}m grip={grip:.2f} hold={hold}{gz} "
+              f"flags={flags}", flush=True)
 
     _report(env, grounding, obj_gt0, q_hist, dist_hist)
     os.makedirs(out_dir, exist_ok=True)
@@ -149,10 +160,10 @@ def run_base(env, grounding, *, mpc, policy, state_stats, cfg, args, out_dir):
 
 
 def _report(env, grounding, obj_gt0, q_hist, dist_hist):
-    """Print motion smoothness, reach, scene disturbance, and grasp lift -- all from GT object poses.
+    """Print motion smoothness, reach, scene disturbance, and grasp lift, all from GT object poses.
 
-    Reads ground-truth poses (``env.object_pose`` + the GT initial snapshot ``obj_gt0``) for both the
-    disturbance and the grasp lift, so the two ends of every delta share one authoritative frame -- the
+    Reads ground-truth poses (env.object_pose + the GT initial snapshot obj_gt0) for both the
+    disturbance and the grasp lift, so the two ends of every delta share one authoritative frame. The
     perception centroids the controller uses carry a top-surface bias that must not enter the metric.
     """
     print("[base] --- RESULT ---", flush=True)
@@ -166,6 +177,6 @@ def _report(env, grounding, obj_gt0, q_hist, dist_hist):
     obstacles = [o.name for o in grounding.objects if o.name not in grounding.manipulated]
     _, tot, mx = metrics.scene_disturbance(env, obj_gt0, obstacles)
     print(f"[base] scene_disturbance({obstacles}): sum={tot * 100:.1f}cm max={mx * 100:.1f}cm", flush=True)
-    for g in [s.grasp_obj for s in grounding.stages if s.grasp_obj and s.gripper == "close"]:
+    for g in sorted({s.grasp_obj for s in grounding.stages if s.grasp_obj}):   # any stage that grasps an object
         dz = (env.object_pose(g)[0][2] - obj_gt0[g][2]) * 100
         print(f"[base] grasp_obj {g}: dz={dz:+.1f}cm grasped={'Y' if dz > 3.0 else 'N'}", flush=True)

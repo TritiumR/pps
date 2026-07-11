@@ -23,6 +23,8 @@ from sim_common.geometry import DEFAULT_EXTENT as _DEFAULT_EXTENT, usd_extents
 from sim_common.constraints import TorchNumpyShim, load_torch_constraints, make_torch_constraint
 
 _PLACE_HOVER = (0.0, 0.0, 0.10)   # reference height above the placement (gripper proximity + place-release)
+_LIFT_HEIGHT = 0.15               # raise the grasped object this high before the place (m)
+_LIFT_CONFIRM = 0.05              # the object must rise at least this much for the lift to be done (m)
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
@@ -58,19 +60,35 @@ class RekepGrounding:
         if bad:                                   # untrusted VLM output -- fail fast, not with an IndexError mid-rollout
             raise SystemExit(f"[rekep] VLM referenced out-of-range keypoint(s) {bad} (have {len(keypoints)})")
 
-        # Live per-object center for collision/straddle: its nearest tracked keypoint moved to the
-        # perception centroid by a fixed offset (keypoint tracks motion; the offset removes the
-        # surface-keypoint bias off the object center). GT pose as fallback when no masked points.
+        # Live per-object graspable center: its nearest tracked keypoint moved by a fixed offset to a
+        # geometry-based center (keypoint tracks motion; the offset removes the surface bias). The center
+        # is the xy bounding-box center (robust to the visible-near-side bias in the point mean) at a
+        # base + half-height grasp depth. GT pose as fallback when no masked points.
         kp_of, centroid_off = {}, {}
         for name in scene_objects:
             pts = masks._masked_points(grounded, env.env, name)
             if pts is not None:
                 kp = masks._nearest_kp(keypoints, pts.mean(axis=0))
-                kp_of[name], centroid_off[name] = kp, pts.mean(axis=0) - keypoints[kp]
+                bbox_xy = (pts[:, :2].min(axis=0) + pts[:, :2].max(axis=0)) / 2.0   # extent center (robust to near-side bias)
+                # single-cam depth sees the top surface down to the silhouette edge (the widest visible cross-section,
+                # ~the object center + best grasp height); the point-MEAN sits ~1cm high on the top shell. Use a low
+                # percentile of z (~the silhouette edge) instead.
+                grasp_z = float(np.percentile(pts[:, 2], 15))
+                grasp_center = np.array([bbox_xy[0], bbox_xy[1], grasp_z], dtype=np.float64)
+                if name in ("pear", "apple"):   # z-estimate candidates vs GT root (pick the one nearest gt)
+                    z = pts[:, 2]; gz = float(env.object_pose(name)[0][2])
+                    print(f"[z-cand] {name}: gt={gz:.3f} mean={z.mean():.3f} p10={np.percentile(z,10):.3f} "
+                          f"p15={np.percentile(z,15):.3f} p25={np.percentile(z,25):.3f} min={z.min():.3f}", flush=True)
+                kp_of[name], centroid_off[name] = kp, grasp_center - keypoints[kp]
 
         def obj_pos(name):
             kp = kp_of.get(name)
             return tracker.get_positions()[kp] + centroid_off[name] if kp is not None else env.object_pose(name)[0]
+
+        for _n in ("pear", "apple"):   # grasp-center check: new estimate vs GT (diagnostic)
+            if _n in kp_of:
+                print(f"[rekep-dbg] {_n}: grasp_center={np.round(obj_pos(_n), 3)} "
+                      f"gt_pose={np.round(env.object_pose(_n)[0], 3)}", flush=True)
 
         objects = [SceneObject(name=n, pos=(lambda n=n: obj_pos(n)), extents=extents.get(n, _DEFAULT_EXTENT))
                    for n in scene_objects]
@@ -93,22 +111,39 @@ class RekepGrounding:
                 return float(subgoal(tcp, kps).reshape(-1)[0]) < self.release_tol
             return _done
 
+        def name_for(kp_idx):
+            """Object owning keypoint kp_idx: the tracker's nearest-center assignment (object root within
+            0.35m), robust to boundary depth-bleed and to the large support surface that fool a
+            nearest-masked-point lookup; falls back to nearest masked-point only when the tracker left it
+            unowned."""
+            return tracker.owners[kp_idx] or masks.object_for_keypoint(
+                grounded, env.env, keypoints[kp_idx], names=tuple(scene_objects))
+
         stages, manipulated, grasped_body = [], {self.place_obj}, None
         for i in range(metadata["num_stages"]):
             grasp_kp, release_kp = metadata["grasp_keypoints"][i], metadata["release_keypoints"][i]
             held = tuple(j for j, o in enumerate(tracker.owners) if grasped_body is not None and o == grasped_body)
             subgoal, path_fns = load_stage(i, held)
             if grasp_kp >= 0:
-                name = masks.object_for_keypoint(grounded, env.env, keypoints[grasp_kp],
-                                                           names=tuple(scene_objects))
+                name = name_for(grasp_kp)
+                _alt = masks.object_for_keypoint(grounded, env.env, keypoints[grasp_kp], names=tuple(scene_objects))
+                if _alt != name:   # the boundary/support-surface mis-map this fix corrects (e.g. pear -> "cabbage"/"board")
+                    print(f"[rekep] grasp_kp={grasp_kp} -> {name} (nearest-surface would mis-say '{_alt}')", flush=True)
                 manipulated.add(name)
                 stages.append(Stage(name=f"grasp {name}", gripper="close", grasp_obj=name, payload=None,
-                                    held_idx=held, target=(lambda gk=grasp_kp: tracker.get_positions()[gk]),
-                                    constraint=subgoal, path_fns=path_fns, done_flag=f"grasp_{name}"))
+                                    held_idx=held, target=(lambda nm=name: obj_pos(nm)),
+                                    done_flag=f"grasp_{name}"))   # reach the object centroid (graspable), like GT
                 grasped_body = tracker.owners[grasp_kp]
+                # Lift the just-grasped object before the carry (grasp_flow's grasp -> lift -> place). Reaches a
+                # fixed point above the grasp with the gripper held closed; done once the object physically rises.
+                held_after = tuple(j for j, o in enumerate(tracker.owners) if o == grasped_body)
+                lift_pos = keypoints[grasp_kp] + np.asarray([0.0, 0.0, _LIFT_HEIGHT], dtype=np.float64)
+                z0 = float(env.object_pose(name)[0][2])
+                stages.append(Stage(name=f"lift {name}", gripper="hold", grasp_obj=name, payload=name,
+                                    held_idx=held_after, target=(lambda lp=lift_pos: lp),
+                                    done=(lambda n=name, z=z0: float(env.object_pose(n)[0][2]) > z + _LIFT_CONFIRM)))
             elif release_kp >= 0:
-                name = masks.object_for_keypoint(grounded, env.env, keypoints[release_kp],
-                                                           names=tuple(scene_objects))
+                name = name_for(release_kp)
                 manipulated.add(name)
                 place_ref = scale_kp if scale_kp is not None else release_kp   # place-onto kp, else the held kp
                 stages.append(Stage(name=f"place {name}", gripper="place", grasp_obj=None, payload=name,

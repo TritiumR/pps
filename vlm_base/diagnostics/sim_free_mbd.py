@@ -1,14 +1,15 @@
 """Run the SimFreeMPC engine on the IsaacLab weight task with a checkpoint-free decode.
 
-The planner runs unchanged from ``sim_free_mpc`` (DIAL sampler, reverse update, knot interpolation, builtin
-``PriorityStateCost``); the model-to-action decode that normally needs the pi0.5 checkpoint is served by a
+The planner runs unchanged from sim_free_mpc (DIAL sampler, reverse update, knot interpolation, builtin
+PriorityStateCost); the model-to-action decode that normally needs the pi0.5 checkpoint is served by a
 mock policy carrying only the decode norm-stats. Exercises the position-space recipe end to end: B-spline
 knot smoothing, an optional consistency term, warm-start, a joint-delta rate limit, and a NaN guard. Phase
-flags come from the env's ``subtask_terms`` group.
+flags come from the env's subtask_terms group.
 
     python vlm_base/diagnostics/sim_free_mbd.py --real_stats --interpolate --guard --w_consist 30
 """
 import os
+import random
 import sys
 
 import numpy as np
@@ -21,6 +22,9 @@ def add_args(ap):
     ap.add_argument("--exp_name", type=str, default=None)
     ap.add_argument("--mode", type=str, default="denoise", choices=["denoise", "mean"])
     ap.add_argument("--update", type=str, default="score_space", choices=["mbd_score", "score_space", "ddim", "flow"])
+    ap.add_argument("--cost_style", type=str, default="priority",
+                    choices=["priority", "explore", "ref_style", "grasp_flow"],
+                    help="builtin sim_free cost (grasp_flow = the full grasp+lift+place weight cost)")
     ap.add_argument("--init", type=str, default="warm", choices=["noise", "warm"])
     ap.add_argument("--warm_steps", type=int, default=6, help="denoise+warm: run only the last N reverse steps")
     ap.add_argument("--score_scale", type=float, default=0.3)
@@ -38,6 +42,10 @@ def add_args(ap):
     ap.add_argument("--basis", type=str, default="bspline", choices=["linear", "cubic", "bspline", "rbf"],
                     help="knot-interpolation basis (bspline: approximating C2, no overshoot)")
     ap.add_argument("--knots", type=int, default=4)
+    ap.add_argument("--arm_only_smooth", action="store_true",
+                    help="smooth the arm control points but keep the gripper channel sharp (full-res close)")
+    ap.add_argument("--grip_scale", type=float, default=1.0,
+                    help="scale grasp_flow gripper weights (close/lift/place) for a firmer hold; 1.0 = her defaults")
     ap.add_argument("--w_consist", type=float, default=0.0, help="consistency weight toward the previous plan; 0 disables")
     ap.add_argument("--latch", action="store_true", help="monotonic phase flags (a stationary target per phase)")
     ap.add_argument("--guard", action="store_true", help="NaN-guard the cost before the sampler softmax")
@@ -54,9 +62,12 @@ def run(args):
     from sim_common.envs.droid import DroidEnv
     from sim_common import overlay
     from rekep.video import write_video_h264
+    from sim_free_mpc.costs_ref_style import _WEIGHT_OBJECT_HORIZONTAL_RADIUS
 
     DEV = "cuda:0"
     repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    random.seed(args.seed)          # match eval_steering: seed all three RNGs before the env reset
+    np.random.seed(args.seed)       # so the scene (object poses) is deterministic, like her seed-1 run
     torch.manual_seed(args.seed)
     exp_name = args.exp_name or f"{args.mode}_{args.update}_{args.init}_ek{args.exec_knot}"
 
@@ -82,8 +93,23 @@ def run(args):
     policy, state_stats = core.build_policy(args.real_stats, args.action_std)
     mpc, cfg = core.build_mpc(policy, num_samples=args.num_samples, iterations=args.iterations,
                               noise=args.noise, temperature=args.temperature, task_name="weight",
-                              joint_delta_clip=args.joint_delta_clip, interpolate=args.interpolate)
-    core.apply_horizon_basis(mpc, args.basis, args.knots)
+                              cost_style=args.cost_style, joint_delta_clip=args.joint_delta_clip,
+                              interpolate=(True if args.arm_only_smooth else args.interpolate))
+    if args.arm_only_smooth:                       # arm knots smoothed, gripper channel kept sharp
+        core.apply_arm_only_smoothing(mpc)
+    else:
+        core.apply_horizon_basis(mpc, args.basis, args.knots)
+    if args.cost_style == "grasp_flow" and args.grip_scale != 1.0:   # firmer hold: scale the gripper weights
+        import dataclasses
+        from sim_free_mpc.costs_grasp_flow import GraspFlowStateCost, GraspFlowCostWeights
+        bw = GraspFlowCostWeights()
+        w = dataclasses.replace(bw, close_gripper=bw.close_gripper * args.grip_scale,
+                                lift_gripper=bw.lift_gripper * args.grip_scale,
+                                place_gripper=bw.place_gripper * args.grip_scale)
+        mpc.cost = GraspFlowStateCost("weight", weights=w)
+        print(f"[sim-free-mbd] grip_scale={args.grip_scale}: close={w.close_gripper:.1f} "
+              f"lift={w.lift_gripper:.1f} place={w.place_gripper:.1f}", flush=True)
+    grasp_cost = mpc.cost if args.cost_style == "grasp_flow" else None  # raw cost: read last_stage after each plan
     if args.w_consist > 0:
         mpc.cost = _ConsistencyCost(mpc.cost, args.w_consist)
     if args.guard:
@@ -93,8 +119,8 @@ def run(args):
     scene_objects = list(getattr(E.env.scene, "rigid_objects", {}) or {})
     root_pos = E.robot.data.body_pos_w[0, E.l0].detach()
     root_quat = E.robot.data.body_quat_w[0, E.l0].detach()
-    print(f"[sim-free-mbd] mode={args.mode} update={args.update} init={args.init} basis={args.basis} "
-          f"w_consist={args.w_consist} scene={scene_objects}", flush=True)
+    print(f"[sim-free-mbd] cost={args.cost_style} mode={args.mode} update={args.update} init={args.init} "
+          f"basis={args.basis} w_consist={args.w_consist} scene={scene_objects}", flush=True)
 
     latched = {}
 
@@ -114,10 +140,22 @@ def run(args):
             except Exception:
                 continue
             objects[name] = {"pos": torch.as_tensor(pos, device=DEV, dtype=torch.float32)}
+        flags = read_flags()
         ctx = {"objects": objects, "joint_pos": E.q0(), "robot_root_pos": root_pos,
-               "robot_root_quat": root_quat, "plan_ref": plan_ref["v"]}
-        ctx.update(read_flags())
+               "robot_root_quat": root_quat, "plan_ref": plan_ref["v"], "subtasks": flags,
+               "eef_pos": torch.as_tensor(E.tcp(), device=DEV, dtype=torch.float32)}
+        ctx.update(flags)   # also expose flags at top level (PriorityStateCost / _flag fallback)
         return ctx
+
+    def readout_target(flags):
+        """A live target for the distance readout only (grasp_flow exposes no single cost target)."""
+        for flag, name in (("grasp_pear", "pear"), ("pear_on_scale", "scale"), ("grasp_apple", "apple")):
+            if not flags.get(flag, False) and name in scene_objects:
+                try:
+                    return E.object_pose(name)[0]
+                except Exception:
+                    break
+        return E.tcp()
 
     def on_scale(name):
         try:
@@ -127,6 +165,22 @@ def run(args):
             return False
         return float(np.linalg.norm(obj[:2] - scale[:2])) < 0.10
 
+    def close_gate(tcp, obj_pos, radius):
+        """Grasp-stage close_gate for the executed tip; mirrors GraspFlowStateCost._grasp_terms.
+
+        gate = exp(-center_excess^2 / xy_scale^2 - z_excess^2 / z_scale^2), with center_err the 3D
+        tip-to-object distance and z_off the vertical offset. Returns (gate, center_err, z_off).
+        """
+        d = np.asarray(tcp, dtype=np.float64) - np.asarray(obj_pos, dtype=np.float64)
+        center_err = float(np.linalg.norm(d))
+        z_off = float(abs(d[2]))
+        center_radius = 0.40 * radius            # _GRASP_FLOW_CENTER_REGION_RADIUS_SCALE
+        center_excess = max(center_err - center_radius, 0.0)
+        z_excess = max(z_off - 0.025, 0.0)       # gripper_close_z_scale
+        xy_scale = max(center_radius, 1e-3)
+        gate = float(np.exp(-center_excess ** 2 / xy_scale ** 2 - z_excess ** 2 / 0.025 ** 2))
+        return gate, center_err, z_off
+
     H = args.horizon
     k = min(args.exec_knot, H)
     frames, q_hist, dist_hist = [], [], []
@@ -135,7 +189,10 @@ def run(args):
     for chunk in range(args.max_chunks):
         ctx = build_context()
         pin = core.policy_inputs(E, state_stats, args.real_stats)
-        target = mpc.cost.target(ctx, DEV, torch.float32).detach().cpu().numpy()
+        try:
+            target = mpc.cost.target(ctx, DEV, torch.float32).detach().cpu().numpy()
+        except AttributeError:                     # grasp_flow etc. expose no single target
+            target = np.asarray(readout_target(ctx.get("subtasks", {})), dtype=np.float32)
         it_start = 0
         if args.init == "warm" and x_carry is not None:
             if args.mode == "denoise":  # SDEdit-style: forward-diffuse the carry, run only the last warm_steps
@@ -156,6 +213,7 @@ def run(args):
         plan_ref["v"] = torch.cat([joints[k:], joints[-1:].expand(k, 7)], dim=0)
         flags = {}
         dist = 0.0
+        gate_best = None   # closest approach to the pick object: (center_err, gate, z_off, gripper, pick)
         for t in range(min(args.exec_knot, H)):
             action = real[t]
             E.apply_arm(action[:7], grip_open=float(action[7]) < 0.5)  # gripper from the decoded channel
@@ -163,13 +221,27 @@ def run(args):
             dist = float(np.linalg.norm(E.tcp() - target))
             dist_hist.append(dist)
             flags = read_flags()
+            pick = "pear" if not flags.get("grasp_pear", False) else "apple"   # current grasp-stage target
+            if pick in scene_objects:
+                gate, cerr, zoff = close_gate(E.tcp(), E.object_pose(pick)[0],
+                                              _WEIGHT_OBJECT_HORIZONTAL_RADIUS.get(pick, 0.05))
+                if gate_best is None or cerr < gate_best[0]:
+                    gate_best = (cerr, gate, zoff, float(action[7]), pick)
             frames.append(overlay.plain_frame(
                 E.rgb(),
                 f"SimFreeMPC[{args.mode}/{args.update}/{args.init}] ch{chunk}.{t} d={dist:.2f}m "
                 f"pear={int(flags.get('grasp_pear', 0))} onScale={int(flags.get('pear_on_scale', 0))} "
                 f"apple={int(flags.get('grasp_apple', 0))}"))
-        if chunk % 10 == 0:
-            print(f"[sim-free-mbd]   chunk {chunk}: dist_to_target={dist:.3f}m flags={flags}", flush=True)
+        g = real[:min(args.exec_knot, H), 7]   # decoded gripper channel over the executed steps
+        gate_str = ""
+        if gate_best is not None:   # localize the grasp-stall: low gate = arm imprecise, high gate + low grip = weak weight
+            cerr, gate, zoff, grip_at, pick = gate_best
+            gate_str = (f" | {pick}@closest cerr={cerr * 1000:.0f}mm zoff={zoff * 1000:.0f}mm "
+                        f"gate={gate:.2f} grip={grip_at:.2f}")
+        stage = getattr(grasp_cost, "last_stage", "?") if grasp_cost is not None else "?"
+        pear_z = float(E.object_pose("pear")[0][2]) if "pear" in scene_objects else float("nan")
+        print(f"[sim-free-mbd]   chunk {chunk}: dist={dist:.3f}m stage={stage} pear_z={pear_z:.3f} "
+              f"grip[mn/mx]={float(g.min()):.2f}/{float(g.max()):.2f}{gate_str} flags={flags}", flush=True)
         if on_scale("pear") and on_scale("apple"):
             print(f"[sim-free-mbd]   both objects on scale at chunk {chunk}", flush=True)
             break

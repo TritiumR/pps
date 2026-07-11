@@ -38,7 +38,7 @@ python rekep/scripts/visualize_keypoints.py --task Isaac-Tea-Droid-Visuomotor-v0
 Output: `results/rekep/<exp_name>/` — proposed-keypoint images, per-stage constraint `.txt` files,
 `metadata.json`, and `<exp_name>_rekep_rollout.mp4` (`exp_name` defaults to `--task_key`).
 
-> **jeremy**: enter the container first — `cd docker && docker compose exec pps bash` — then run the commands as-is (inside, `python` is aliased to Isaac Sim's interpreter).
+> **jeremy**: `cd docker && docker compose exec pps bash`, then `unset DISPLAY` (headless EGL — the container's `DISPLAY=:12` makes Isaac try GLX and fail with `GLXBadFBConfig`), then run the commands (`python` is aliased to Isaac Sim's interpreter).
 
 ## Layout
 

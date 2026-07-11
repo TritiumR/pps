@@ -73,9 +73,11 @@ tests/
 .isaac-lab-docker-history
 
 
-# Assets
-asset/
-assets/
+# Assets (anchored to the IsaacLab root: only the large top-level USD asset dirs.
+# An unanchored `assets/` also ignores in-tree python packages such as
+# source/isaaclab/isaaclab/assets, which made IsaacLab fail to import.)
+/asset/
+/assets/
 
 # Droid
 /droid/

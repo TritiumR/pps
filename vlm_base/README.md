@@ -26,7 +26,7 @@ Output: `results/vlm_mpc/vlm_base/<task>/<exp_name>.mp4` + printed metrics (`exp
 `<task>_<ground>`). All parameters live in `configs/base.yaml`; the CLI adds `--exp_name` / `--seed` /
 `--joint_delta_clip` overrides. Object identity (grasp/place objects) is task metadata in `task_prompts.json`.
 
-> **jeremy**: enter the container first — `cd docker && docker compose exec pps bash` — then run the commands as-is (inside, `python` is aliased to Isaac Sim's interpreter).
+> **jeremy**: `cd docker && docker compose exec pps bash`, then `unset DISPLAY` (headless EGL — the container's `DISPLAY=:12` makes Isaac try GLX and fail with `GLXBadFBConfig`), then run the commands (`python` is aliased to Isaac Sim's interpreter).
 
 ## Layout
 

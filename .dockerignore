@@ -1,0 +1,30 @@
+# Keep the Docker build context small. The repo is bind-mounted into the
+# container at runtime (see docker/docker-compose.yml), so large/generated
+# artifacts do not need to be COPYed into the image at build time.
+
+.git
+**/__pycache__
+**/*.pyc
+
+# Eval / training outputs (gitignored, regenerated at runtime).
+results
+data
+videos
+**/*.mp4
+**/*.wav
+
+# Large weights / assets are provided on the host via the bind mount, not baked in.
+openpi/checkpoints
+openpi/dinov3/checkpoints
+IsaacLab/assets
+
+# Bulky caches and the bundled IsaacLab docs build.
+IsaacLab/docs/_build
+IsaacLab/logs
+**/.pytest_cache
+
+# Stray debug artifact in the real-robot tree.
+droid/gripper_debug_*.txt
+
+# Docker scaffolding itself (not needed inside the image).
+docker/.env

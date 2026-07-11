@@ -26,5 +26,11 @@
     "prompt": "open the coffee maker lid and put the pod inside",
     "task_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_capsule_pi05_jointpos/task/32000",
     "ref_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_capsule_pi05_jointpos/reference/20000"
+  },
+  "utensil": {
+    "task_id": "Isaac-Utensil-Droid-Visuomotor-v0",
+    "prompt": "put the knife in the holder",
+    "grasp_obj": "knife",
+    "place_obj": "holder"
   }
 }

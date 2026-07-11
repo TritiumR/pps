@@ -7,10 +7,10 @@ import numpy as np
 
 
 def motion_smoothness(q_hist):
-    """Executed-joint history -> ``dict(jerk, speed, cos, tv, n)``; empty dict for < 3 steps.
+    """Executed-joint history -> dict(jerk, speed, cos, tv, n); empty dict for < 3 steps.
 
-    ``jerk`` = mean |2nd difference|, ``speed`` = mean step norm, ``cos`` = mean direction consistency of
-    consecutive steps (1 = smooth), ``tv`` = per-joint total variation.
+    jerk = mean |2nd difference|, speed = mean step norm, cos = mean direction consistency of
+    consecutive steps (1 = smooth), tv = per-joint total variation.
     """
     q = np.array(q_hist)
     if len(q) <= 2:
@@ -24,13 +24,13 @@ def motion_smoothness(q_hist):
 
 
 def scene_disturbance(env, obj0, names):
-    """GT displacement of each of ``names`` from the initial snapshot ``obj0`` -> ``(moved, sum, max)`` (m)."""
+    """GT displacement of each of names from the initial snapshot obj0 -> (moved, sum, max) (m)."""
     moved = [float(np.linalg.norm(env.object_pose(n)[0] - obj0[n])) for n in names]
     return moved, sum(moved), (max(moved) if moved else 0.0)
 
 
 def reach_stats(dist_hist):
-    """TCP->target distance history -> ``dict(min, final)`` (m); ``None`` if empty."""
+    """TCP->target distance history -> dict(min, final) (m); None if empty."""
     if not dist_hist:
         return None
     d = np.array(dist_hist)
