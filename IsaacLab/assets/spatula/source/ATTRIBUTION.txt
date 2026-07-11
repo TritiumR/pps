@@ -1,0 +1,5 @@
+Cooking Spatula
+Author: Kenney (https://kenney.nl)
+Source: https://poly.pizza/m/VMluJiBnkx
+License: CC0 1.0 Universal (Public Domain) -- no attribution required; recorded for provenance.
+Downloaded GLB: https://static.poly.pizza/5dd09d41-14cf-4875-a571-4fad5fb23853.glb
