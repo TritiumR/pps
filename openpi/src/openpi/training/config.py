@@ -18,6 +18,7 @@ import tyro
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.proxy_config as proxy_config
+import openpi.models.proxy_score_config as proxy_score_config
 import openpi.models.proxy_sound_config as proxy_sound_config
 import openpi.models.proxy_dp3_config as proxy_dp3_config
 import openpi.models.residual_config as residual_config
@@ -187,7 +188,7 @@ class ModelTransformFactory(GroupFactory):
                 return _transforms.Group(
                     inputs=inputs,
                 )
-            case _model.ModelType.PROXY | _model.ModelType.PROXY_SOUND:
+            case _model.ModelType.PROXY | _model.ModelType.PROXY_SCORE | _model.ModelType.PROXY_SOUND:
                 # return _transforms.Group(
                 #     inputs=[
                 #         _transforms.ResizeImages(224, 224),
@@ -301,6 +302,7 @@ class DataConfigFactory(abc.ABC):
             not in (
                 _model.ModelType.PI0,
                 _model.ModelType.PROXY,
+                _model.ModelType.PROXY_SCORE,
                 _model.ModelType.PROXY_SOUND,
                 _model.ModelType.RESIDUAL,
             ),
@@ -5473,6 +5475,80 @@ _CONFIGS = [
         batch_size=32,
     ),
     TrainConfig(
+        name="proxy_score_isaaclab_droid_weight_pi05_jointpos",
+        model=proxy_score_config.ProxyScoreConfig(
+            action_horizon=15,
+            action_dim=8,
+            action_expert_variant="gemma_12m",
+            dino_model_name="facebook/dinov3-vits16-pretrain-lvd1689m",
+            ddim_num_train_timesteps=100,
+        ),
+        data=ProxyLeRobotDROIDJointPosDataConfig(
+            repo_id="cn356/isaaclab_weight",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="cn356/isaaclab_weight"),
+            norm_stats_dir="checkpoints/pytorch/pi05_droid_jointpos/assets/droid",
+            use_quantile_norm=True,
+        ),
+        batch_size=32,
+    ),
+    TrainConfig(
+        name="proxy_score_local_isaaclab_weight_pi05_jointpos",
+        model=proxy_score_config.ProxyScoreConfig(
+            action_horizon=15,
+            action_dim=8,
+            action_expert_variant="gemma_12m",
+            dino_model_name="facebook/dinov3-vits16-pretrain-lvd1689m",
+            ddim_num_train_timesteps=100,
+        ),
+        data=ProxyLeRobotDROIDJointPosDataConfig(
+            repo_id="local/isaaclab_weight_score",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="local/isaaclab_weight_score"),
+            norm_stats_dir="checkpoints/pytorch/pi05_droid_jointpos/assets/droid",
+            use_quantile_norm=True,
+        ),
+        batch_size=32,
+    ),
+    TrainConfig(
+        name="proxy_score_mpc_weight_jointpos",
+        model=proxy_score_config.ProxyScoreConfig(
+            action_horizon=15,
+            action_dim=8,
+            action_expert_variant="gemma_12m",
+            dino_model_name="facebook/dinov3-vits16-pretrain-lvd1689m",
+            ddim_num_train_timesteps=100,
+        ),
+        data=ProxyLeRobotDROIDJointPosDataConfig(
+            repo_id="cn356/isaaclab_weight",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="cn356/isaaclab_weight"),
+            # Shared MPC/base action coordinate stats.  These are intentionally
+            # reused for both task IL and MPC-ref score distillation.
+            norm_stats_dir="checkpoints/pytorch/pi05_droid_jointpos/assets/droid",
+            use_quantile_norm=True,
+        ),
+        batch_size=32,
+    ),
+    TrainConfig(
+        name="proxy_score_local_mpc_weight_jointpos",
+        model=proxy_score_config.ProxyScoreConfig(
+            action_horizon=15,
+            action_dim=8,
+            action_expert_variant="gemma_12m",
+            dino_model_name="facebook/dinov3-vits16-pretrain-lvd1689m",
+            ddim_num_train_timesteps=100,
+        ),
+        data=ProxyLeRobotDROIDJointPosDataConfig(
+            repo_id="local/isaaclab_weight_score",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="local/isaaclab_weight_score"),
+            norm_stats_dir="checkpoints/pytorch/pi05_droid_jointpos/assets/droid",
+            use_quantile_norm=True,
+        ),
+        batch_size=32,
+    ),
+    TrainConfig(
         name="proxy_isaaclab_droid_weight_pi05_jointpos_vits16plus_40m",
         model=proxy_config.ProxyConfig(
             action_horizon=15,
@@ -6234,11 +6310,27 @@ _CONFIGS = [
             repo_id="cn356/isaaclab_tea",
             base_config=DataConfig(prompt_from_task=True),
             assets=AssetsConfig(asset_id="cn356/isaaclab_tea"),
-            norm_stats_dir="checkpoints/pi05_droid_jointpos/assets/droid",
+            norm_stats_dir="checkpoints/pytorch/pi05_droid_jointpos/assets/droid",
             use_quantile_norm=True,
         ),
-        num_train_steps=10_001,
-        save_interval=10_000,
+        batch_size=32,
+    ),
+    TrainConfig(
+        name="proxy_score_isaaclab_droid_tea_pi05_jointpos",
+        model=proxy_score_config.ProxyScoreConfig(
+            action_horizon=15,
+            action_dim=8,
+            action_expert_variant="gemma_12m",
+            dino_model_name="facebook/dinov3-vits16-pretrain-lvd1689m",
+            ddim_num_train_timesteps=100,
+        ),
+        data=ProxyLeRobotDROIDJointPosDataConfig(
+            repo_id="cn356/isaaclab_tea",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="cn356/isaaclab_tea"),
+            norm_stats_dir="checkpoints/pytorch/pi05_droid_jointpos/assets/droid",
+            use_quantile_norm=True,
+        ),
         batch_size=32,
     ),
     TrainConfig(
@@ -7057,11 +7149,27 @@ _CONFIGS = [
             repo_id="cn356/isaaclab_capsule",
             base_config=DataConfig(prompt_from_task=True),
             assets=AssetsConfig(asset_id="cn356/isaaclab_capsule"),
-            norm_stats_dir="checkpoints/pi05_droid_jointpos/assets/droid",
+            norm_stats_dir="checkpoints/pytorch/pi05_droid_jointpos/assets/droid",
             use_quantile_norm=True,
         ),
-        num_train_steps=10_001,
-        save_interval=10_000,
+        batch_size=32,
+    ),
+    TrainConfig(
+        name="proxy_score_isaaclab_droid_capsule_pi05_jointpos",
+        model=proxy_score_config.ProxyScoreConfig(
+            action_horizon=15,
+            action_dim=8,
+            action_expert_variant="gemma_12m",
+            dino_model_name="facebook/dinov3-vits16-pretrain-lvd1689m",
+            ddim_num_train_timesteps=100,
+        ),
+        data=ProxyLeRobotDROIDJointPosDataConfig(
+            repo_id="cn356/isaaclab_capsule",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="cn356/isaaclab_capsule"),
+            norm_stats_dir="checkpoints/pytorch/pi05_droid_jointpos/assets/droid",
+            use_quantile_norm=True,
+        ),
         batch_size=32,
     ),
     TrainConfig(

@@ -395,6 +395,55 @@ class SimFreeMPC:
         diagnostics.update(self._last_cost_term_diagnostics(result))
         return diagnostics
 
+    def _optimize_action_prox_chunk(
+        self,
+        x_t: torch.Tensor,
+        policy_inputs: dict[str, Any],
+        context: dict[str, Any],
+    ):
+        """Optimize clean action candidates around the current noisy action.
+
+        Unlike `_optimize_ddim_clean_chunk`, this proposal rule does not center
+        samples at `x_t / sqrt(alpha_bar)`. It searches locally around the
+        current normalized action and then converts the selected clean estimate
+        into a DDIM/MBD score.
+        """
+        if x_t.shape[0] != 1:
+            raise ValueError("MBD action-prox sampler currently expects batch size 1.")
+        if self.config.optimize_space != "action":
+            raise ValueError("mbd_score_action_prox only supports action optimize_space.")
+
+        active_dims = min(self.config.action_dims, x_t.shape[-1])
+        horizon = x_t.shape[1]
+        opt_horizon = self._interpolation_knot_count(horizon)
+        proposal_center = self._control_point_resample(
+            x_t.detach()[0, :, :active_dims],
+            opt_horizon,
+        )
+        proposal_std = float(self.config.noise)
+
+        def cost_from_positions(samples: torch.Tensor) -> torch.Tensor:
+            full_horizon_samples = self._interpolate_control_points(samples, horizon)
+            return self._cost_active_samples(
+                full_horizon_samples,
+                x_t,
+                active_dims,
+                policy_inputs,
+                context,
+            )
+
+        result = self.sampler.optimize_with_noise_scale(
+            proposal_center,
+            cost_from_positions,
+            noise_scale=proposal_std,
+        )
+        x0_hat = x_t.detach().clone()
+        x0_hat[:, :, :active_dims] = self._interpolate_control_points(
+            result.mean,
+            horizon,
+        ).unsqueeze(0)
+        return x0_hat, result, active_dims, proposal_std
+
     def step(
         self,
         x_t: torch.Tensor,
@@ -591,3 +640,225 @@ class SimFreeMPC:
             }
         )
         return next_x, diagnostics
+
+    def step_mbd_score_action_prox(
+        self,
+        x_t: torch.Tensor,
+        policy_inputs: dict[str, Any],
+        context: dict[str, Any],
+        *,
+        iteration: int,
+        num_iterations: int,
+        score_scale: float = 1.0,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        alpha_bar, alpha_bar_prev = ddim_iteration_alphas(
+            iteration=iteration,
+            num_iterations=num_iterations,
+            num_train_timesteps=self.config.ddim_num_train_timesteps,
+        )
+        x0_hat, result, active_dims, proposal_std = self._optimize_action_prox_chunk(
+            x_t,
+            policy_inputs,
+            context,
+        )
+
+        alpha = torch.as_tensor(alpha_bar, device=x_t.device, dtype=x_t.dtype)
+        alpha_prev = torch.as_tensor(alpha_bar_prev, device=x_t.device, dtype=x_t.dtype)
+        beta = torch.clamp(1.0 - alpha, min=self.config.flow_eps)
+        sqrt_alpha = torch.sqrt(torch.clamp(alpha, min=self.config.flow_eps))
+
+        active_x = x_t.detach()[:, :, :active_dims]
+        active_x0 = x0_hat[:, :, :active_dims]
+        score_numerator = sqrt_alpha * active_x0 - active_x
+        score = torch.zeros_like(x_t)
+        score[:, :, :active_dims] = score_numerator / beta
+
+        alpha_step = torch.clamp(
+            alpha / torch.clamp(alpha_prev, min=self.config.flow_eps),
+            min=self.config.flow_eps,
+        )
+        active_prev = (
+            active_x + float(score_scale) * score_numerator
+        ) / torch.sqrt(alpha_step)
+
+        next_x = x_t.detach().clone()
+        next_x[:, :, :active_dims] = active_prev
+
+        diagnostics = self._diagnostics(result=result, target=x0_hat, x_t=x_t, score=score)
+        diagnostics.update(
+            {
+                "update_mode": "mbd_score_action_prox",
+                "ddim_iteration": int(iteration),
+                "ddim_num_iterations": int(num_iterations),
+                "alpha_bar": float(alpha_bar),
+                "alpha_bar_prev": float(alpha_bar_prev),
+                "active_dims": int(active_dims),
+                "proposal_center": "current_noisy_action",
+                "proposal_noise_scale": float(proposal_std),
+                "clean_sample_std": float(proposal_std),
+                "score_scale": float(score_scale),
+                "mbd_step_delta_norm": float(torch.linalg.vector_norm((next_x - x_t).detach()).cpu()),
+            }
+        )
+        return next_x, diagnostics
+
+    def estimate_mbd_score(
+        self,
+        x_t: torch.Tensor,
+        policy_inputs: dict[str, Any],
+        context: dict[str, Any],
+        *,
+        iteration: int,
+        num_iterations: int,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        alpha_bar, alpha_bar_prev = ddim_iteration_alphas(
+            iteration=iteration,
+            num_iterations=num_iterations,
+            num_train_timesteps=self.config.ddim_num_train_timesteps,
+        )
+        x0_hat, result, active_dims, clean_std = self._optimize_ddim_clean_chunk(
+            x_t,
+            policy_inputs,
+            context,
+            alpha_bar=alpha_bar,
+        )
+
+        alpha = torch.as_tensor(alpha_bar, device=x_t.device, dtype=x_t.dtype)
+        beta = torch.clamp(1.0 - alpha, min=self.config.flow_eps)
+        sqrt_alpha = torch.sqrt(torch.clamp(alpha, min=self.config.flow_eps))
+
+        score = torch.zeros_like(x_t)
+        active_x = x_t.detach()[:, :, :active_dims]
+        active_x0 = x0_hat[:, :, :active_dims]
+
+        if self.config.optimize_space == "accel":
+            horizon = x_t.shape[1]
+            opt_horizon = self._interpolation_knot_count(horizon)
+            active_x_opt = self._control_point_resample(active_x[0], opt_horizon)
+            active_code = self._trajectory_to_accel_code(active_x_opt)
+            clean_code = result.mean.to(device=x_t.device, dtype=x_t.dtype)
+            score_code = (sqrt_alpha * clean_code - active_code) / beta
+            score[:, :, :active_dims] = self._interpolate_control_points(
+                self._accel_code_to_trajectory(score_code.unsqueeze(0))[0],
+                horizon,
+            ).unsqueeze(0)
+        else:
+            score[:, :, :active_dims] = (sqrt_alpha * active_x0 - active_x) / beta
+
+        diagnostics = self._diagnostics(result=result, target=x0_hat, x_t=x_t, score=score)
+        diagnostics.update(
+            {
+                "update_mode": "estimate_mbd_score",
+                "ddim_iteration": int(iteration),
+                "ddim_num_iterations": int(num_iterations),
+                "alpha_bar": float(alpha_bar),
+                "alpha_bar_prev": float(alpha_bar_prev),
+                "active_dims": int(active_dims),
+                "clean_sample_std": float(clean_std),
+            }
+        )
+        return score, diagnostics
+
+    def estimate_mbd_score_action_prox(
+        self,
+        x_t: torch.Tensor,
+        policy_inputs: dict[str, Any],
+        context: dict[str, Any],
+        *,
+        iteration: int,
+        num_iterations: int,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        alpha_bar, alpha_bar_prev = ddim_iteration_alphas(
+            iteration=iteration,
+            num_iterations=num_iterations,
+            num_train_timesteps=self.config.ddim_num_train_timesteps,
+        )
+        x0_hat, result, active_dims, proposal_std = self._optimize_action_prox_chunk(
+            x_t,
+            policy_inputs,
+            context,
+        )
+
+        alpha = torch.as_tensor(alpha_bar, device=x_t.device, dtype=x_t.dtype)
+        beta = torch.clamp(1.0 - alpha, min=self.config.flow_eps)
+        sqrt_alpha = torch.sqrt(torch.clamp(alpha, min=self.config.flow_eps))
+
+        score = torch.zeros_like(x_t)
+        active_x = x_t.detach()[:, :, :active_dims]
+        active_x0 = x0_hat[:, :, :active_dims]
+        score[:, :, :active_dims] = (sqrt_alpha * active_x0 - active_x) / beta
+
+        diagnostics = self._diagnostics(result=result, target=x0_hat, x_t=x_t, score=score)
+        diagnostics.update(
+            {
+                "update_mode": "estimate_mbd_score_action_prox",
+                "ddim_iteration": int(iteration),
+                "ddim_num_iterations": int(num_iterations),
+                "alpha_bar": float(alpha_bar),
+                "alpha_bar_prev": float(alpha_bar_prev),
+                "active_dims": int(active_dims),
+                "proposal_center": "current_noisy_action",
+                "proposal_noise_scale": float(proposal_std),
+                "clean_sample_std": float(proposal_std),
+            }
+        )
+        return score, diagnostics
+
+    def step_from_score(
+        self,
+        x_t: torch.Tensor,
+        score: torch.Tensor,
+        *,
+        iteration: int,
+        num_iterations: int,
+        update_mode: str,
+        score_scale: float = 1.0,
+        active_dims: int | None = None,
+    ) -> torch.Tensor:
+        alpha_bar, alpha_bar_prev = ddim_iteration_alphas(
+            iteration=iteration,
+            num_iterations=num_iterations,
+            num_train_timesteps=self.config.ddim_num_train_timesteps,
+        )
+        if score.shape != x_t.shape:
+            raise ValueError(
+                f"score shape must match x_t shape, got {tuple(score.shape)} vs {tuple(x_t.shape)}"
+            )
+        if active_dims is None:
+            active_dims = min(self.config.action_dims, x_t.shape[-1])
+        active_dims = min(int(active_dims), x_t.shape[-1])
+
+        alpha = torch.as_tensor(alpha_bar, device=x_t.device, dtype=x_t.dtype)
+        alpha_prev = torch.as_tensor(alpha_bar_prev, device=x_t.device, dtype=x_t.dtype)
+        beta = torch.clamp(1.0 - alpha, min=self.config.flow_eps)
+
+        active_x = x_t.detach()[:, :, :active_dims]
+        active_score = score[:, :, :active_dims]
+        next_x = x_t.detach().clone()
+
+        if update_mode == "mbd_score":
+            alpha_step = torch.clamp(
+                alpha / torch.clamp(alpha_prev, min=self.config.flow_eps),
+                min=self.config.flow_eps,
+            )
+            active_prev = (
+                active_x + float(score_scale) * beta * active_score
+            ) / torch.sqrt(alpha_step)
+        elif update_mode == "ddim":
+            sqrt_alpha = torch.sqrt(torch.clamp(alpha, min=self.config.flow_eps))
+            sqrt_beta = torch.sqrt(beta)
+            x0_hat = (active_x + beta * active_score) / sqrt_alpha
+            eps_hat = -sqrt_beta * active_score
+            active_prev = (
+                torch.sqrt(torch.clamp(alpha_prev, min=0.0)) * x0_hat
+                + torch.sqrt(torch.clamp(1.0 - alpha_prev, min=0.0)) * eps_hat
+            )
+            active_prev = active_x + float(score_scale) * (active_prev - active_x)
+        else:
+            raise ValueError(
+                "External score updates support update_mode='ddim' or 'mbd_score', "
+                f"got {update_mode!r}."
+            )
+
+        next_x[:, :, :active_dims] = active_prev
+        return next_x

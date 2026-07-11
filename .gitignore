@@ -4,6 +4,8 @@ wandb
 outputs
 data
 data_local
+slurm
+.secrets/
 core
 core.*
 .vscode

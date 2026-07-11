@@ -109,6 +109,7 @@ class DroidInputs(transforms.DataTransformFn):
                 _model.ModelType.PI0
                 | _model.ModelType.PI05
                 | _model.ModelType.PROXY
+                | _model.ModelType.PROXY_SCORE
                 | _model.ModelType.PROXY_SOUND
                 | _model.ModelType.RESIDUAL
             ):
