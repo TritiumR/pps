@@ -7,6 +7,18 @@ DATA_FILE="${DATA_FILE:-${ROOT}/data/weight/generated_dataset.hdf5}"
 DATASET_DIR="${HF_LEROBOT_HOME:-${HOME}/.cache/huggingface/lerobot}/local/isaaclab_weight_score"
 GPU_NUM="${1:-${GPU_NUM:-1}}"
 BATCH_SIZE="${2:-${BATCH_SIZE:-32}}"
+if [[ -n "${3:-}" ]]; then
+    NUM_WORKERS="${3}"
+elif [[ -z "${NUM_WORKERS:-}" ]]; then
+    if [[ -n "${SLURM_CPUS_PER_TASK:-}" ]]; then
+        threads_per_rank=$((SLURM_CPUS_PER_TASK / GPU_NUM))
+        NUM_WORKERS=$((threads_per_rank - ${OMP_NUM_THREADS:-1}))
+        (( NUM_WORKERS > 24 )) && NUM_WORKERS=24
+        (( NUM_WORKERS < 1 )) && NUM_WORKERS=1
+    else
+        NUM_WORKERS=8
+    fi
+fi
 
 if [[ ! "${GPU_NUM}" =~ ^[1-9][0-9]*$ ]]; then
     echo "GPU_NUM must be a positive integer, got: ${GPU_NUM}" >&2
@@ -14,6 +26,10 @@ if [[ ! "${GPU_NUM}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if [[ ! "${BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
     echo "BATCH_SIZE must be a positive integer, got: ${BATCH_SIZE}" >&2
+    exit 2
+fi
+if [[ ! "${NUM_WORKERS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "NUM_WORKERS must be a positive integer, got: ${NUM_WORKERS}" >&2
     exit 2
 fi
 if (( BATCH_SIZE % GPU_NUM != 0 )); then
@@ -90,11 +106,12 @@ if [[ "${resuming}" == false ]]; then
     init+=(--pytorch_weight_path "${ref_checkpoint_dir}")
 fi
 
-echo "[score_task] global batch=${BATCH_SIZE}, per-GPU batch=$((BATCH_SIZE / GPU_NUM)), GPUs=${GPU_NUM}"
+echo "[score_task] global batch=${BATCH_SIZE}, per-GPU batch=$((BATCH_SIZE / GPU_NUM)), GPUs=${GPU_NUM}, workers/rank=${NUM_WORKERS}"
 PYTHONUNBUFFERED=1 conda run --no-capture-output -n pps \
     "${train_launcher[@]}" scripts/train_proxy_score_pytorch.py \
     score_task_weight \
     --batch_size "${BATCH_SIZE}" \
+    --num_workers "${NUM_WORKERS}" \
     --exp_name task \
     "${init[@]}" \
     "${mode[@]}"

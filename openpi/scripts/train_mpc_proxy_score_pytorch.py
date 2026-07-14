@@ -737,6 +737,7 @@ def train(args: argparse.Namespace) -> None:
         pin_memory=torch.cuda.is_available(),
         drop_last=True,
         collate_fn=_collate_cache_batch,
+        persistent_workers=args.num_workers > 0,
     )
     data_config = dataset.data_config
 

@@ -12,6 +12,18 @@ CACHE_FILE="${CACHE_FILE:-${ROOT}/data/weight/ref_action_prox_reverse_${MPC_NUM_
 stage="${1:-all}"
 GPU_NUM="${2:-${GPU_NUM:-1}}"
 BATCH_SIZE="${3:-${BATCH_SIZE:-32}}"
+if [[ -n "${4:-}" ]]; then
+    NUM_WORKERS="${4}"
+elif [[ -z "${NUM_WORKERS:-}" ]]; then
+    if [[ -n "${SLURM_CPUS_PER_TASK:-}" ]]; then
+        threads_per_rank=$((SLURM_CPUS_PER_TASK / GPU_NUM))
+        NUM_WORKERS=$((threads_per_rank - ${OMP_NUM_THREADS:-1}))
+        (( NUM_WORKERS > 24 )) && NUM_WORKERS=24
+        (( NUM_WORKERS < 1 )) && NUM_WORKERS=1
+    else
+        NUM_WORKERS=8
+    fi
+fi
 
 if [[ ! "${GPU_NUM}" =~ ^[1-9][0-9]*$ ]]; then
     echo "GPU_NUM must be a positive integer, got: ${GPU_NUM}" >&2
@@ -19,6 +31,10 @@ if [[ ! "${GPU_NUM}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if [[ ! "${BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
     echo "BATCH_SIZE must be a positive integer, got: ${BATCH_SIZE}" >&2
+    exit 2
+fi
+if [[ ! "${NUM_WORKERS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "NUM_WORKERS must be a positive integer, got: ${NUM_WORKERS}" >&2
     exit 2
 fi
 if [[ "${stage}" != "cache" ]] && (( BATCH_SIZE % GPU_NUM != 0 )); then
@@ -80,13 +96,14 @@ train_ref() {
     else
         mode+=(--overwrite)
     fi
-    echo "[score_ref] global batch=${BATCH_SIZE}, per-GPU batch=$((BATCH_SIZE / GPU_NUM)), GPUs=${GPU_NUM}"
+    echo "[score_ref] global batch=${BATCH_SIZE}, per-GPU batch=$((BATCH_SIZE / GPU_NUM)), GPUs=${GPU_NUM}, workers/rank=${NUM_WORKERS}"
     PYTHONUNBUFFERED=1 conda run --no-capture-output -n pps \
         "${train_launcher[@]}" scripts/train_mpc_proxy_score_pytorch.py train \
         --config score_ref_weight \
         --hdf5_path "${DATA_FILE}" \
         --cache_path "${CACHE_FILE}" \
         --batch_size "${BATCH_SIZE}" \
+        --num_workers "${NUM_WORKERS}" \
         --exp_name ref \
         "${mode[@]}"
 }
@@ -110,7 +127,7 @@ case "${stage}" in
         train_ref
         ;;
     *)
-        echo "usage: $0 [cache|train|all] [gpu_num] [global_batch_size]" >&2
+        echo "usage: $0 [cache|train|all] [gpu_num] [global_batch_size] [workers_per_rank]" >&2
         exit 2
         ;;
 esac
