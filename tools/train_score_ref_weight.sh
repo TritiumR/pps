@@ -11,9 +11,18 @@ MPC_TEMPERATURE="${MPC_TEMPERATURE:-0.1}"
 CACHE_FILE="${CACHE_FILE:-${ROOT}/data/weight/ref_action_prox_reverse_${MPC_NUM_SAMPLES}x${MPC_ITERATIONS}_n${MPC_NOISE}.npz}"
 stage="${1:-all}"
 GPU_NUM="${2:-${GPU_NUM:-1}}"
+BATCH_SIZE="${3:-${BATCH_SIZE:-32}}"
 
 if [[ ! "${GPU_NUM}" =~ ^[1-9][0-9]*$ ]]; then
     echo "GPU_NUM must be a positive integer, got: ${GPU_NUM}" >&2
+    exit 2
+fi
+if [[ ! "${BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "BATCH_SIZE must be a positive integer, got: ${BATCH_SIZE}" >&2
+    exit 2
+fi
+if [[ "${stage}" != "cache" ]] && (( BATCH_SIZE % GPU_NUM != 0 )); then
+    echo "BATCH_SIZE=${BATCH_SIZE} must be divisible by GPU_NUM=${GPU_NUM}" >&2
     exit 2
 fi
 
@@ -71,11 +80,13 @@ train_ref() {
     else
         mode+=(--overwrite)
     fi
+    echo "[score_ref] global batch=${BATCH_SIZE}, per-GPU batch=$((BATCH_SIZE / GPU_NUM)), GPUs=${GPU_NUM}"
     PYTHONUNBUFFERED=1 conda run --no-capture-output -n pps \
         "${train_launcher[@]}" scripts/train_mpc_proxy_score_pytorch.py train \
         --config score_ref_weight \
         --hdf5_path "${DATA_FILE}" \
         --cache_path "${CACHE_FILE}" \
+        --batch_size "${BATCH_SIZE}" \
         --exp_name ref \
         "${mode[@]}"
 }
@@ -99,7 +110,7 @@ case "${stage}" in
         train_ref
         ;;
     *)
-        echo "usage: $0 [cache|train|all] [gpu_num]" >&2
+        echo "usage: $0 [cache|train|all] [gpu_num] [global_batch_size]" >&2
         exit 2
         ;;
 esac

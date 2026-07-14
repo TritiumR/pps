@@ -6,9 +6,18 @@ ROOT="${ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 DATA_FILE="${DATA_FILE:-${ROOT}/data/weight/generated_dataset.hdf5}"
 DATASET_DIR="${HF_LEROBOT_HOME:-${HOME}/.cache/huggingface/lerobot}/local/isaaclab_weight_score"
 GPU_NUM="${1:-${GPU_NUM:-1}}"
+BATCH_SIZE="${2:-${BATCH_SIZE:-32}}"
 
 if [[ ! "${GPU_NUM}" =~ ^[1-9][0-9]*$ ]]; then
     echo "GPU_NUM must be a positive integer, got: ${GPU_NUM}" >&2
+    exit 2
+fi
+if [[ ! "${BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "BATCH_SIZE must be a positive integer, got: ${BATCH_SIZE}" >&2
+    exit 2
+fi
+if (( BATCH_SIZE % GPU_NUM != 0 )); then
+    echo "BATCH_SIZE=${BATCH_SIZE} must be divisible by GPU_NUM=${GPU_NUM}" >&2
     exit 2
 fi
 
@@ -81,9 +90,11 @@ if [[ "${resuming}" == false ]]; then
     init+=(--pytorch_weight_path "${ref_checkpoint_dir}")
 fi
 
+echo "[score_task] global batch=${BATCH_SIZE}, per-GPU batch=$((BATCH_SIZE / GPU_NUM)), GPUs=${GPU_NUM}"
 PYTHONUNBUFFERED=1 conda run --no-capture-output -n pps \
     "${train_launcher[@]}" scripts/train_proxy_score_pytorch.py \
     score_task_weight \
+    --batch_size "${BATCH_SIZE}" \
     --exp_name task \
     "${init[@]}" \
     "${mode[@]}"
