@@ -5,7 +5,7 @@ model learns denoising scores for the DDIM/MBD noising process used by the
 sim-free MPC sampler, not rectified-flow velocities.
 
 Usage:
-  python scripts/train_proxy_score_pytorch.py proxy_score_local_mpc_weight_jointpos --exp_name task
+  python scripts/train_proxy_score_pytorch.py score_task_weight --exp_name task
 """
 
 import dataclasses
@@ -104,7 +104,7 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
         wandb_id_path.write_text(wandb.run.id)
 
 
-def build_datasets(config: _config.TrainConfig):
+def build_loader(config: _config.TrainConfig):
     return _data.create_data_loader(config, framework="pytorch", shuffle=True)
 
 
@@ -184,8 +184,9 @@ def ensure_tensor_loss(losses, device):
 
 def train_loop(config: _config.TrainConfig):
     use_ddp, local_rank, device = setup_ddp()
-    is_main = local_rank == 0
-    set_seed(config.seed, local_rank)
+    rank = torch.distributed.get_rank() if use_ddp else 0
+    is_main = rank == 0
+    set_seed(config.seed, rank)
 
     if not isinstance(config.model, openpi.models.proxy_score_config.ProxyScoreConfig):
         raise ValueError(
@@ -200,11 +201,16 @@ def train_loop(config: _config.TrainConfig):
                 f"Experiment checkpoint directory {config.checkpoint_dir} does not exist for resume."
             )
         resuming = True
-    elif config.overwrite and config.checkpoint_dir.exists():
-        import shutil
-
+    elif config.overwrite and config.checkpoint_dir.exists() and is_main:
         shutil.rmtree(config.checkpoint_dir)
         logging.info("Overwriting checkpoint directory: %s", config.checkpoint_dir)
+    elif not config.overwrite and config.checkpoint_dir.exists():
+        raise FileExistsError(
+            f"Checkpoint directory {config.checkpoint_dir} already exists; use --resume or --overwrite."
+        )
+
+    if use_ddp:
+        torch.distributed.barrier()
 
     if is_main:
         config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -212,7 +218,7 @@ def train_loop(config: _config.TrainConfig):
     elif config.wandb_enabled:
         wandb.init(mode="disabled")
 
-    train_loader = build_datasets(config)
+    train_loader = build_loader(config)
     data_config = train_loader.data_config()
 
     model = openpi.models_pytorch.proxy_score_pytorch.ProxyScorePytorch(config.model).to(device)
@@ -224,7 +230,7 @@ def train_loop(config: _config.TrainConfig):
             find_unused_parameters=False,
         )
 
-    optim = torch.optim.AdamW(
+    optimizer = torch.optim.AdamW(
         get_model_parameters(model),
         lr=config.lr_schedule.peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
@@ -234,7 +240,7 @@ def train_loop(config: _config.TrainConfig):
 
     global_step = 0
     if resuming:
-        global_step = load_checkpoint(model, optim, config.checkpoint_dir, device)
+        global_step = load_checkpoint(model, optimizer, config.checkpoint_dir, device)
 
     def lr_schedule(step: int):
         warmup_steps = config.lr_schedule.warmup_steps
@@ -254,7 +260,7 @@ def train_loop(config: _config.TrainConfig):
         if is_main
         else None
     )
-    infos = []
+    metrics = []
     start_time = time.time()
     data_iter = iter(train_loader)
 
@@ -265,26 +271,26 @@ def train_loop(config: _config.TrainConfig):
         if noise is not None:
             noise = noise.to(torch.float32).to(device)
 
-        for pg in optim.param_groups:
-            pg["lr"] = lr_schedule(global_step)
+        for group in optimizer.param_groups:
+            group["lr"] = lr_schedule(global_step)
 
         losses = model(observation, actions, noise=noise)
         losses = ensure_tensor_loss(losses, device)
         loss = losses.mean()
 
-        optim.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
             get_model_parameters(model),
             max_norm=config.optimizer.clip_gradient_norm,
         )
-        optim.step()
-        optim.zero_grad(set_to_none=True)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
 
-        infos.append(
+        metrics.append(
             {
                 "loss": float(loss.detach().cpu()),
-                "lr": float(optim.param_groups[0]["lr"]),
+                "lr": float(optimizer.param_groups[0]["lr"]),
                 "grad_norm": float(grad_norm.detach().cpu())
                 if isinstance(grad_norm, torch.Tensor)
                 else float(grad_norm),
@@ -292,11 +298,11 @@ def train_loop(config: _config.TrainConfig):
         )
 
         completed_step = global_step + 1
-        if is_main and completed_step % config.log_interval == 0 and infos:
+        if is_main and completed_step % config.log_interval == 0 and metrics:
             elapsed = time.time() - start_time
-            avg_loss = sum(info["loss"] for info in infos) / len(infos)
-            avg_lr = sum(info["lr"] for info in infos) / len(infos)
-            avg_grad_norm = sum(info["grad_norm"] for info in infos) / len(infos)
+            avg_loss = sum(item["loss"] for item in metrics) / len(metrics)
+            avg_lr = sum(item["lr"] for item in metrics) / len(metrics)
+            avg_grad_norm = sum(item["grad_norm"] for item in metrics) / len(metrics)
             logging.info(
                 "step=%s score_loss=%.4f lr=%.2e grad_norm=%.2f time=%.1fs",
                 completed_step,
@@ -315,17 +321,17 @@ def train_loop(config: _config.TrainConfig):
                     },
                     step=completed_step,
                 )
-            infos = []
+            metrics = []
             start_time = time.time()
 
         global_step = completed_step
-        save_checkpoint(model, optim, global_step, config, is_main, data_config)
+        save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
         if pbar is not None:
             pbar.update(1)
             pbar.set_postfix(
                 {
                     "score_loss": f"{loss.item():.4f}",
-                    "lr": f"{optim.param_groups[0]['lr']:.2e}",
+                    "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
                 }
             )
 

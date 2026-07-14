@@ -65,8 +65,8 @@ from sim_free_mpc.ddim import ddim_iteration_alphas
 
 
 DEFAULT_BASE_CHECKPOINT_DIR = "openpi/checkpoints/pytorch/pi05_droid_jointpos"
-DEFAULT_TASK_CHECKPOINT_DIR = "openpi/checkpoints/proxy_score_mpc_weight_jointpos/task/30000"
-DEFAULT_REF_CHECKPOINT_DIR = "openpi/checkpoints/proxy_score_mpc_weight_jointpos/reference/30000"
+DEFAULT_TASK_CHECKPOINT_DIR = "openpi/checkpoints/score_task_weight/task/30000"
+DEFAULT_REF_CHECKPOINT_DIR = "openpi/checkpoints/score_ref_weight/ref/30000"
 
 _SOUND_VIDEO_SCALE = None
 _SOUND_VIDEO_MAX_DISTANCE_M = 0.05

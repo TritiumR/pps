@@ -400,6 +400,8 @@ class SimFreeMPC:
         x_t: torch.Tensor,
         policy_inputs: dict[str, Any],
         context: dict[str, Any],
+        *,
+        alpha_bar: float,
     ):
         """Optimize clean action candidates around the current noisy action.
 
@@ -420,7 +422,9 @@ class SimFreeMPC:
             x_t.detach()[0, :, :active_dims],
             opt_horizon,
         )
-        proposal_std = float(self.config.noise)
+        proposal_std = float(self.config.noise) * math.sqrt(
+            max(1.0 - float(alpha_bar), 0.0)
+        )
 
         def cost_from_positions(samples: torch.Tensor) -> torch.Tensor:
             full_horizon_samples = self._interpolate_control_points(samples, horizon)
@@ -660,6 +664,7 @@ class SimFreeMPC:
             x_t,
             policy_inputs,
             context,
+            alpha_bar=alpha_bar,
         )
 
         alpha = torch.as_tensor(alpha_bar, device=x_t.device, dtype=x_t.dtype)
@@ -777,6 +782,7 @@ class SimFreeMPC:
             x_t,
             policy_inputs,
             context,
+            alpha_bar=alpha_bar,
         )
 
         alpha = torch.as_tensor(alpha_bar, device=x_t.device, dtype=x_t.dtype)

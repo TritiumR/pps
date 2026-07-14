@@ -48,6 +48,7 @@ action `x_t`, evaluates each candidate with FK + geometric cost, forms a weighte
 clean estimate `x0_hat`, then converts it to a DDIM score:
 
 ```text
+proposal_std = mpc_noise * sqrt(1 - alpha_bar_t)
 score = (sqrt(alpha_bar_t) * x0_hat - x_t) / (1 - alpha_bar_t)
 ```
 

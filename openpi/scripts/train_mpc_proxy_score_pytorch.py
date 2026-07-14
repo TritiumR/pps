@@ -10,15 +10,15 @@ The script has two explicit stages so expensive MPC labels can be inspected and
 reused:
 
   python scripts/train_mpc_proxy_score_pytorch.py generate-cache \
-      --config proxy_score_mpc_weight_jointpos \
+      --config score_ref_weight \
       --hdf5_path /home/chuanruo/diffusion_policy/data/weight/generated_dataset.hdf5 \
-      --cache_path ../data/weight/mpc_score_ref_labels.npz
+      --cache_path ../data/weight/ref_scores.npz
 
   python scripts/train_mpc_proxy_score_pytorch.py train \
-      --config proxy_score_mpc_weight_jointpos \
+      --config score_ref_weight \
       --hdf5_path /home/chuanruo/diffusion_policy/data/weight/generated_dataset.hdf5 \
-      --cache_path ../data/weight/mpc_score_ref_labels.npz \
-      --exp_name reference --overwrite
+      --cache_path ../data/weight/ref_scores.npz \
+      --exp_name ref --overwrite
 """
 
 from __future__ import annotations
@@ -56,8 +56,8 @@ from openpi import transforms as _transforms
 from openpi.models import model as _model
 import openpi.models.proxy_score_config
 import openpi.models_pytorch.proxy_score_pytorch as _proxy_score
-from openpi.policies import policy_config
 import openpi.training.config as _config
+from openpi.training import checkpoints as _checkpoints
 from openpi.shared import normalize as _normalize
 from sim_free_mpc import SimFreeMPC, SimFreeMPCConfig
 from sim_free_mpc.ddim import ddim_iteration_alphas
@@ -84,6 +84,8 @@ DEFAULT_BASE_CHECKPOINT_DIR = os.path.join(
     "pi05_droid_jointpos",
 )
 DEFAULT_PROMPT = "put pear and apple on the scale"
+CACHE_FORMAT_VERSION = 2
+ACTION_PROX_NOISE_SCHEDULE = "mpc_noise_times_sqrt_one_minus_alpha_bar"
 
 
 def _norm_stats_fingerprint(norm_stats: dict[str, Any] | None) -> str | None:
@@ -106,7 +108,7 @@ def _norm_stats_fingerprint(norm_stats: dict[str, Any] | None) -> str | None:
     return digest.hexdigest()
 
 
-def _data_config_and_transform(config: _config.TrainConfig):
+def _build_data_pipeline(config: _config.TrainConfig):
     data_config = config.data.create(config.assets_dirs, config.model)
     if data_config.norm_stats is None and getattr(config.data, "norm_stats_dir", None):
         norm_stats_dir = pathlib.Path(getattr(config.data, "norm_stats_dir"))
@@ -136,7 +138,7 @@ def _data_config_and_transform(config: _config.TrainConfig):
     return data_config, input_transform
 
 
-def _raw_hdf5_sample(
+def _demo_sample(
     demo: h5py.Group,
     step_idx: int,
     *,
@@ -155,27 +157,24 @@ def _raw_hdf5_sample(
     }
 
 
-def _raw_policy_observation(
-    demo: h5py.Group,
-    step_idx: int,
-    *,
-    action_horizon: int,
-    prompt: str,
-) -> dict[str, Any]:
-    sample = _raw_hdf5_sample(
-        demo,
-        step_idx,
-        action_horizon=action_horizon,
-        prompt=prompt,
+class _ActionDecoder:
+    """Minimal policy interface needed by sim-free MPC action decoding."""
+
+    def __init__(self, norm_stats: dict[str, Any], *, use_quantile_norm: bool):
+        self._metadata = {
+            "output_norm_stats": {
+                key: value for key, value in norm_stats.items() if key in ("state", "actions")
+            },
+            "use_quantile_norm": use_quantile_norm,
+        }
+
+
+def _torch_inputs(input_transform, sample: dict[str, Any], device: torch.device):
+    inputs = input_transform(jax.tree.map(lambda x: x, sample))
+    return jax.tree.map(
+        lambda x: torch.from_numpy(np.asarray(x)).to(device)[None, ...],
+        inputs,
     )
-    return {
-        "observation/exterior_image_1_left": sample["exterior_image_1_left"],
-        "observation/wrist_image_left": sample["wrist_image_left"],
-        "observation/joint_position": sample["joint_position"],
-        "observation/gripper_position": sample["gripper_position"],
-        "actions": sample["actions"],
-        "prompt": prompt,
-    }
 
 
 def _pose(group: h5py.Group, path: str, step_idx: int) -> np.ndarray | None:
@@ -220,7 +219,7 @@ def _heuristic_weight_subtasks(objects: dict[str, dict[str, np.ndarray]], eef_po
     return subtasks
 
 
-def _mpc_context_from_hdf5(
+def _mpc_context(
     demo: h5py.Group,
     step_idx: int,
     *,
@@ -284,10 +283,10 @@ def _sample_indices(
         for demo_name in sorted(f["data"].keys()):
             demo = f["data"][demo_name]
             length = len(demo["obs/joint_actions"])
-            max_step = length - action_horizon - 1
-            if max_step <= 0:
+            num_windows = length - action_horizon
+            if num_windows <= 0:
                 continue
-            all_indices.extend((demo_name, step) for step in range(0, max_step, stride))
+            all_indices.extend((demo_name, step) for step in range(0, num_windows, stride))
     rng.shuffle(all_indices)
     if max_labels is not None:
         all_indices = all_indices[:max_labels]
@@ -302,21 +301,28 @@ def generate_cache(args: argparse.Namespace) -> None:
     device_name = args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu"
     device = torch.device(device_name)
     base_config = _config.get_config(args.base_config)
-    base_policy = policy_config.create_trained_policy(
-        base_config,
-        args.base_checkpoint_dir,
-        pytorch_device=device_name,
+    base_data_config = base_config.data.create(base_config.assets_dirs, base_config.model)
+    if base_data_config.asset_id is None:
+        raise ValueError(f"Base config {args.base_config!r} has no norm-stat asset_id.")
+    base_norm_stats = _checkpoints.load_norm_stats(
+        pathlib.Path(args.base_checkpoint_dir) / "assets",
+        base_data_config.asset_id,
     )
-    score_data_config, _ = _data_config_and_transform(config)
-    base_norm_stats = (getattr(base_policy, "_metadata", {}) or {}).get("output_norm_stats")
+    score_data_config, input_transform = _build_data_pipeline(config)
     if _norm_stats_fingerprint(base_norm_stats) != _norm_stats_fingerprint(score_data_config.norm_stats):
         raise ValueError(
             "Base policy and score config norm_stats differ. Use one shared norm_stats source "
             "before generating MPC score labels."
         )
+    if base_data_config.use_quantile_norm != score_data_config.use_quantile_norm:
+        raise ValueError("Base policy and score config use different normalization modes.")
+    action_decoder = _ActionDecoder(
+        base_norm_stats,
+        use_quantile_norm=base_data_config.use_quantile_norm,
+    )
 
     planner = SimFreeMPC(
-        base_policy,
+        action_decoder,
         SimFreeMPCConfig(
             task_name=args.task,
             num_samples=args.mpc_num_samples,
@@ -326,6 +332,7 @@ def generate_cache(args: argparse.Namespace) -> None:
             beta_opt_iter=args.mpc_beta_opt_iter,
             beta_horizon=args.mpc_beta_horizon,
             action_dims=config.model.action_dim,
+            joint_delta_clip=args.mpc_joint_delta_clip,
             cost_style=args.mpc_cost,
             optimize_space="action",
             ddim_num_train_timesteps=config.model.ddim_num_train_timesteps,
@@ -346,14 +353,17 @@ def generate_cache(args: argparse.Namespace) -> None:
         raise ValueError("No valid HDF5 windows found for MPC score label generation.")
 
     rng = np.random.default_rng(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
     demo_names: list[str] = []
     step_indices: list[int] = []
     iterations: list[int] = []
     times: list[float] = []
-    x_t_values: list[np.ndarray] = []
-    score_values: list[np.ndarray] = []
-    cost_min: list[float] = []
-    score_norm: list[float] = []
+    noisy_actions: list[np.ndarray] = []
+    scores: list[np.ndarray] = []
+    min_costs: list[float] = []
+    score_norms: list[float] = []
 
     num_iterations = int(args.num_steps) + 1
     if num_iterations > config.model.ddim_num_train_timesteps:
@@ -363,14 +373,14 @@ def generate_cache(args: argparse.Namespace) -> None:
         pbar = tqdm.tqdm(indices, desc="MPC score labels")
         for demo_name, step_idx in pbar:
             demo = f["data"][demo_name]
-            raw_obs = _raw_policy_observation(
+            sample = _demo_sample(
                 demo,
                 step_idx,
                 action_horizon=config.model.action_horizon,
                 prompt=args.prompt,
             )
-            base_obs, base_inputs = base_policy.obs_to_input(raw_obs)
-            clean_actions = base_inputs["actions"].to(device=device, dtype=torch.float32)
+            model_inputs = _torch_inputs(input_transform, sample, device)
+            clean_actions = model_inputs["actions"].to(dtype=torch.float32)
 
             iteration = int(rng.integers(0, num_iterations))
             alpha, _ = ddim_iteration_alphas(
@@ -383,7 +393,7 @@ def generate_cache(args: argparse.Namespace) -> None:
             noise = torch.randn_like(clean_actions, device=device)
             x_t = sqrt_alpha * clean_actions + sqrt_beta * noise
 
-            context = _mpc_context_from_hdf5(
+            context = _mpc_context(
                 demo,
                 step_idx,
                 task=args.task,
@@ -391,7 +401,7 @@ def generate_cache(args: argparse.Namespace) -> None:
             )
             score, diagnostics = planner.estimate_mbd_score_action_prox(
                 x_t,
-                base_inputs,
+                model_inputs,
                 context,
                 iteration=iteration,
                 num_iterations=num_iterations,
@@ -407,13 +417,16 @@ def generate_cache(args: argparse.Namespace) -> None:
                     num_train_timesteps=config.model.ddim_num_train_timesteps,
                 )
             )
-            x_t_values.append(x_t[0].detach().cpu().numpy().astype(np.float32))
-            score_values.append(score[0].detach().cpu().numpy().astype(np.float32))
-            cost_min.append(float(diagnostics.get("cost_min", np.nan)))
-            score_norm.append(float(diagnostics.get("score_norm", np.nan)))
-            pbar.set_postfix({"cost_min": f"{cost_min[-1]:.3f}", "score_norm": f"{score_norm[-1]:.2f}"})
+            noisy_actions.append(x_t[0].detach().cpu().numpy().astype(np.float32))
+            scores.append(score[0].detach().cpu().numpy().astype(np.float32))
+            min_costs.append(float(diagnostics.get("cost_min", np.nan)))
+            score_norms.append(float(diagnostics.get("score_norm", np.nan)))
+            pbar.set_postfix(
+                {"cost_min": f"{min_costs[-1]:.3f}", "score_norm": f"{score_norms[-1]:.2f}"}
+            )
 
     metadata = {
+        "cache_format_version": CACHE_FORMAT_VERSION,
         "label_type": "mpc_score_action_prox",
         "config": args.config,
         "base_config": args.base_config,
@@ -426,17 +439,20 @@ def generate_cache(args: argparse.Namespace) -> None:
         "ddim_num_train_timesteps": int(config.model.ddim_num_train_timesteps),
         "score_model_action_dim": int(config.model.action_dim),
         "score_model_action_horizon": int(config.model.action_horizon),
-        "stored_action_dim": int(x_t_values[0].shape[-1]) if x_t_values else None,
+        "stored_action_dim": int(noisy_actions[0].shape[-1]) if noisy_actions else None,
         "norm_stats_fingerprint": _norm_stats_fingerprint(score_data_config.norm_stats),
         "use_quantile_norm": bool(score_data_config.use_quantile_norm),
         "subtask_mode": args.subtask_mode,
         "mpc": {
             "num_samples": int(args.mpc_num_samples),
             "iterations": int(args.mpc_iterations),
+            "proposal_center": "current_noisy_action",
+            "noise_schedule": ACTION_PROX_NOISE_SCHEDULE,
             "noise": float(args.mpc_noise),
             "temperature": float(args.mpc_temperature),
             "beta_opt_iter": float(args.mpc_beta_opt_iter),
             "beta_horizon": float(args.mpc_beta_horizon),
+            "joint_delta_clip": float(args.mpc_joint_delta_clip),
             "cost_style": args.mpc_cost,
             "interpolate": bool(args.mpc_interpolate),
         },
@@ -449,16 +465,16 @@ def generate_cache(args: argparse.Namespace) -> None:
         step_index=np.asarray(step_indices, dtype=np.int64),
         iteration=np.asarray(iterations, dtype=np.int64),
         time=np.asarray(times, dtype=np.float32),
-        x_t=np.asarray(x_t_values, dtype=np.float32),
-        score=np.asarray(score_values, dtype=np.float32),
-        cost_min=np.asarray(cost_min, dtype=np.float32),
-        score_norm=np.asarray(score_norm, dtype=np.float32),
+        x_t=np.asarray(noisy_actions, dtype=np.float32),
+        score=np.asarray(scores, dtype=np.float32),
+        cost_min=np.asarray(min_costs, dtype=np.float32),
+        score_norm=np.asarray(score_norms, dtype=np.float32),
         metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
     )
     logging.info("Wrote %s MPC score labels to %s", len(demo_names), cache_path)
 
 
-class MpcScoreCacheDataset(torch.utils.data.Dataset):
+class MPCScoreDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         *,
@@ -471,15 +487,31 @@ class MpcScoreCacheDataset(torch.utils.data.Dataset):
         self.cache = np.load(cache_path, allow_pickle=False)
         self.demo_names = self.cache["demo_name"].astype(str)
         self.step_indices = self.cache["step_index"].astype(np.int64)
-        self.x_t = self.cache["x_t"].astype(np.float32)
-        self.score = self.cache["score"].astype(np.float32)
-        self.time = self.cache["time"].astype(np.float32)
+        self.noisy_actions = self.cache["x_t"].astype(np.float32)
+        self.scores = self.cache["score"].astype(np.float32)
+        self.times = self.cache["time"].astype(np.float32)
         self.prompt = prompt
         self.config = config
-        self.data_config, self.input_transform = _data_config_and_transform(config)
+        self.data_config, self.input_transform = _build_data_pipeline(config)
         self._h5 = None
 
         metadata = json.loads(str(self.cache["metadata_json"].item()))
+        if int(metadata.get("cache_format_version", -1)) != CACHE_FORMAT_VERSION:
+            raise ValueError(
+                "MPC score cache format is stale. Regenerate it with the current action-prox sampler."
+            )
+        if metadata.get("label_type") != "mpc_score_action_prox":
+            raise ValueError("MPC score cache was not generated by mbd_score_action_prox.")
+        mpc_metadata = metadata.get("mpc", {})
+        if mpc_metadata.get("proposal_center") != "current_noisy_action":
+            raise ValueError("MPC score cache does not use z_t as the action-prox proposal center.")
+        if mpc_metadata.get("noise_schedule") != ACTION_PROX_NOISE_SCHEDULE:
+            raise ValueError(
+                "MPC score cache does not use mpc_noise * sqrt(1 - alpha_bar) proposals."
+            )
+        proposal_noise = float(mpc_metadata.get("noise", float("nan")))
+        if not np.isfinite(proposal_noise) or proposal_noise < 0.0:
+            raise ValueError("MPC score cache has an invalid action-prox noise coefficient.")
         expected_fingerprint = _norm_stats_fingerprint(self.data_config.norm_stats)
         if metadata.get("norm_stats_fingerprint") != expected_fingerprint:
             raise ValueError(
@@ -488,9 +520,31 @@ class MpcScoreCacheDataset(torch.utils.data.Dataset):
             )
         if int(metadata.get("ddim_num_train_timesteps", -1)) != int(config.model.ddim_num_train_timesteps):
             raise ValueError("MPC score cache DDIM scheduler does not match this training config.")
+        expected_horizon = config.model.action_horizon
+        if self.noisy_actions.ndim != 3 or self.noisy_actions.shape[1] != expected_horizon:
+            raise ValueError(
+                "MPC score cache x_t must have shape [N, action_horizon, action_dim]; "
+                f"got {self.noisy_actions.shape}."
+            )
+        if self.noisy_actions.shape != self.scores.shape:
+            raise ValueError(
+                f"MPC score cache x_t/score shapes differ: {self.noisy_actions.shape} vs {self.scores.shape}."
+            )
+        if self.noisy_actions.shape[-1] < config.model.action_dim:
+            raise ValueError(
+                f"MPC score cache has {self.noisy_actions.shape[-1]} action dims; "
+                f"the model requires {config.model.action_dim}."
+            )
+        size = self.noisy_actions.shape[0]
+        if not (len(self.demo_names) == len(self.step_indices) == len(self.times) == size):
+            raise ValueError("MPC score cache arrays have inconsistent sample counts.")
+        if not np.isfinite(self.noisy_actions).all() or not np.isfinite(self.scores).all():
+            raise ValueError("MPC score cache contains non-finite x_t or score values.")
+        if not np.isfinite(self.times).all() or np.any((self.times < 0.0) | (self.times > 1.0)):
+            raise ValueError("MPC score cache contains invalid normalized diffusion times.")
 
     def __len__(self) -> int:
-        return int(self.x_t.shape[0])
+        return int(self.noisy_actions.shape[0])
 
     def _file(self):
         if self._h5 is None:
@@ -499,7 +553,7 @@ class MpcScoreCacheDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx: int):
         demo = self._file()["data"][self.demo_names[idx]]
-        raw = _raw_hdf5_sample(
+        raw = _demo_sample(
             demo,
             int(self.step_indices[idx]),
             action_horizon=self.config.model.action_horizon,
@@ -509,9 +563,9 @@ class MpcScoreCacheDataset(torch.utils.data.Dataset):
         inputs = jax.tree.map(lambda x: torch.from_numpy(np.asarray(x)), inputs)
         return (
             inputs,
-            torch.from_numpy(self.x_t[idx]),
-            torch.from_numpy(self.score[idx]),
-            torch.tensor(self.time[idx], dtype=torch.float32),
+            torch.from_numpy(self.noisy_actions[idx]),
+            torch.from_numpy(self.scores[idx]),
+            torch.tensor(self.times[idx], dtype=torch.float32),
         )
 
 
@@ -526,10 +580,16 @@ def _collate_cache_batch(batch):
     )
 
 
-def train_from_cache(args: argparse.Namespace) -> None:
+def train(args: argparse.Namespace) -> None:
     config = _config.get_config(args.config)
     if args.exp_name is not None:
         config = dataclasses.replace(config, exp_name=args.exp_name)
+    if args.train_steps is not None:
+        config = dataclasses.replace(config, num_train_steps=args.train_steps)
+    if args.batch_size is not None:
+        config = dataclasses.replace(config, batch_size=args.batch_size)
+    if args.checkpoint_base_dir is not None:
+        config = dataclasses.replace(config, checkpoint_base_dir=args.checkpoint_base_dir)
     config = dataclasses.replace(
         config,
         overwrite=bool(args.overwrite),
@@ -540,8 +600,10 @@ def train_from_cache(args: argparse.Namespace) -> None:
         raise ValueError(f"{args.config!r} must use ProxyScoreConfig.")
 
     use_ddp, local_rank, device = setup_ddp()
-    is_main = local_rank == 0
-    set_seed(config.seed, local_rank)
+    rank = torch.distributed.get_rank() if use_ddp else 0
+    world_size = torch.distributed.get_world_size() if use_ddp else 1
+    is_main = rank == 0
+    set_seed(config.seed, rank)
 
     resuming = False
     if config.resume:
@@ -550,9 +612,16 @@ def train_from_cache(args: argparse.Namespace) -> None:
                 f"Experiment checkpoint directory {config.checkpoint_dir} does not exist for resume."
             )
         resuming = True
-    elif config.overwrite and config.checkpoint_dir.exists():
+    elif config.overwrite and config.checkpoint_dir.exists() and is_main:
         shutil.rmtree(config.checkpoint_dir)
         logging.info("Overwriting checkpoint directory: %s", config.checkpoint_dir)
+    elif not config.overwrite and config.checkpoint_dir.exists():
+        raise FileExistsError(
+            f"Checkpoint directory {config.checkpoint_dir} already exists; use --resume or --overwrite."
+        )
+
+    if use_ddp:
+        torch.distributed.barrier()
 
     if is_main:
         config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -560,16 +629,31 @@ def train_from_cache(args: argparse.Namespace) -> None:
     elif config.wandb_enabled:
         wandb.init(mode="disabled")
 
-    dataset = MpcScoreCacheDataset(
+    dataset = MPCScoreDataset(
         hdf5_path=args.hdf5_path,
         cache_path=args.cache_path,
         config=config,
         prompt=args.prompt,
     )
+    if config.batch_size % world_size != 0:
+        raise ValueError(
+            f"batch_size={config.batch_size} must be divisible by world_size={world_size}."
+        )
+    local_batch_size = config.batch_size // world_size
+    if len(dataset) < local_batch_size * world_size:
+        raise ValueError(
+            f"MPC score cache has {len(dataset)} samples, fewer than global batch_size={config.batch_size}."
+        )
+    sampler = (
+        torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True, drop_last=True)
+        if use_ddp
+        else None
+    )
     train_loader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
+        batch_size=local_batch_size,
+        shuffle=sampler is None,
+        sampler=sampler,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
         drop_last=True,
@@ -586,7 +670,7 @@ def train_from_cache(args: argparse.Namespace) -> None:
             find_unused_parameters=False,
         )
 
-    optim = torch.optim.AdamW(
+    optimizer = torch.optim.AdamW(
         get_model_parameters(model),
         lr=config.lr_schedule.peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
@@ -594,7 +678,7 @@ def train_from_cache(args: argparse.Namespace) -> None:
         weight_decay=config.optimizer.weight_decay,
     )
 
-    global_step = load_checkpoint(model, optim, config.checkpoint_dir, device) if resuming else 0
+    global_step = load_checkpoint(model, optimizer, config.checkpoint_dir, device) if resuming else 0
 
     def lr_schedule(step: int):
         warmup_steps = config.lr_schedule.warmup_steps
@@ -614,13 +698,19 @@ def train_from_cache(args: argparse.Namespace) -> None:
         if is_main
         else None
     )
-    infos = []
+    metrics = []
     start_time = time.time()
+    epoch = 0
+    if sampler is not None:
+        sampler.set_epoch(epoch)
     data_iter = iter(train_loader)
     while global_step < config.num_train_steps:
         try:
             observation, x_t, score_target, time_cond = next(data_iter)
         except StopIteration:
+            epoch += 1
+            if sampler is not None:
+                sampler.set_epoch(epoch)
             data_iter = iter(train_loader)
             observation, x_t, score_target, time_cond = next(data_iter)
 
@@ -629,8 +719,8 @@ def train_from_cache(args: argparse.Namespace) -> None:
         score_target = score_target.to(torch.float32).to(device)
         time_cond = time_cond.to(torch.float32).to(device)
 
-        for pg in optim.param_groups:
-            pg["lr"] = lr_schedule(global_step)
+        for group in optimizer.param_groups:
+            group["lr"] = lr_schedule(global_step)
 
         losses = model(
             observation,
@@ -641,30 +731,30 @@ def train_from_cache(args: argparse.Namespace) -> None:
         losses = ensure_tensor_loss(losses, device)
         loss = losses.mean()
 
-        optim.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
             get_model_parameters(model),
             max_norm=config.optimizer.clip_gradient_norm,
         )
-        optim.step()
-        optim.zero_grad(set_to_none=True)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
 
-        infos.append(
+        metrics.append(
             {
                 "loss": float(loss.detach().cpu()),
-                "lr": float(optim.param_groups[0]["lr"]),
+                "lr": float(optimizer.param_groups[0]["lr"]),
                 "grad_norm": float(grad_norm.detach().cpu())
                 if isinstance(grad_norm, torch.Tensor)
                 else float(grad_norm),
             }
         )
         completed_step = global_step + 1
-        if is_main and completed_step % config.log_interval == 0 and infos:
+        if is_main and completed_step % config.log_interval == 0 and metrics:
             elapsed = time.time() - start_time
-            avg_loss = sum(info["loss"] for info in infos) / len(infos)
-            avg_lr = sum(info["lr"] for info in infos) / len(infos)
-            avg_grad_norm = sum(info["grad_norm"] for info in infos) / len(infos)
+            avg_loss = sum(item["loss"] for item in metrics) / len(metrics)
+            avg_lr = sum(item["lr"] for item in metrics) / len(metrics)
+            avg_grad_norm = sum(item["grad_norm"] for item in metrics) / len(metrics)
             logging.info(
                 "step=%s mpc_score_loss=%.4f lr=%.2e grad_norm=%.2f time=%.1fs",
                 completed_step,
@@ -683,17 +773,17 @@ def train_from_cache(args: argparse.Namespace) -> None:
                     },
                     step=completed_step,
                 )
-            infos = []
+            metrics = []
             start_time = time.time()
 
         global_step = completed_step
-        save_checkpoint(model, optim, global_step, config, is_main, data_config)
+        save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
         if pbar is not None:
             pbar.update(1)
             pbar.set_postfix(
                 {
                     "mpc_score_loss": f"{loss.item():.4f}",
-                    "lr": f"{optim.param_groups[0]['lr']:.2e}",
+                    "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
                 }
             )
 
@@ -712,43 +802,51 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    gen = subparsers.add_parser("generate-cache")
-    _add_config_arg(gen)
-    gen.add_argument("--hdf5_path", required=True)
-    gen.add_argument("--cache_path", required=True)
-    gen.add_argument("--base_config", default=DEFAULT_BASE_CONFIG)
-    gen.add_argument("--base_checkpoint_dir", default=DEFAULT_BASE_CHECKPOINT_DIR)
-    gen.add_argument("--prompt", default=DEFAULT_PROMPT)
-    gen.add_argument("--task", default="weight")
-    gen.add_argument("--device", default="cuda")
-    gen.add_argument("--seed", type=int, default=0)
-    gen.add_argument("--max_labels", type=int, default=None)
-    gen.add_argument("--stride", type=int, default=4)
-    gen.add_argument("--num_steps", type=int, default=10)
-    gen.add_argument("--subtask_mode", choices=("heuristic", "empty"), default="heuristic")
-    gen.add_argument("--mpc_num_samples", type=int, default=512)
-    gen.add_argument("--mpc_iterations", type=int, default=2)
-    gen.add_argument("--mpc_noise", type=float, default=0.35)
-    gen.add_argument("--mpc_temperature", type=float, default=0.15)
-    gen.add_argument("--mpc_beta_opt_iter", type=float, default=1.0)
-    gen.add_argument("--mpc_beta_horizon", type=float, default=1.0)
-    gen.add_argument("--mpc_cost", default="grasp_flow", choices=("priority", "ref_style", "explore", "grasp_flow"))
-    gen.add_argument("--mpc_interpolate", action="store_true")
-    gen.add_argument("--control_frequency", type=float, default=15.0)
-    gen.add_argument("--interpolate_frequency", type=float, default=5.0)
-    gen.set_defaults(func=generate_cache)
+    cache_parser = subparsers.add_parser("generate-cache")
+    _add_config_arg(cache_parser)
+    cache_parser.add_argument("--hdf5_path", required=True)
+    cache_parser.add_argument("--cache_path", required=True)
+    cache_parser.add_argument("--base_config", default=DEFAULT_BASE_CONFIG)
+    cache_parser.add_argument("--base_checkpoint_dir", default=DEFAULT_BASE_CHECKPOINT_DIR)
+    cache_parser.add_argument("--prompt", default=DEFAULT_PROMPT)
+    cache_parser.add_argument("--task", default="weight")
+    cache_parser.add_argument("--device", default="cuda")
+    cache_parser.add_argument("--seed", type=int, default=0)
+    cache_parser.add_argument("--max_labels", type=int, default=None)
+    cache_parser.add_argument("--stride", type=int, default=4)
+    cache_parser.add_argument("--num_steps", type=int, default=10)
+    cache_parser.add_argument("--subtask_mode", choices=("heuristic", "empty"), default="heuristic")
+    cache_parser.add_argument("--mpc_num_samples", type=int, default=512)
+    cache_parser.add_argument("--mpc_iterations", type=int, default=8)
+    cache_parser.add_argument("--mpc_noise", type=float, default=0.8)
+    cache_parser.add_argument("--mpc_temperature", type=float, default=0.1)
+    cache_parser.add_argument("--mpc_beta_opt_iter", type=float, default=1.0)
+    cache_parser.add_argument("--mpc_beta_horizon", type=float, default=1.0)
+    cache_parser.add_argument("--mpc_joint_delta_clip", type=float, default=0.15)
+    cache_parser.add_argument(
+        "--mpc_cost",
+        default="grasp_flow",
+        choices=("priority", "ref_style", "explore", "grasp_flow"),
+    )
+    cache_parser.add_argument("--mpc_interpolate", action="store_true")
+    cache_parser.add_argument("--control_frequency", type=float, default=40.0)
+    cache_parser.add_argument("--interpolate_frequency", type=float, default=5.0)
+    cache_parser.set_defaults(func=generate_cache)
 
-    train = subparsers.add_parser("train")
-    _add_config_arg(train)
-    train.add_argument("--hdf5_path", required=True)
-    train.add_argument("--cache_path", required=True)
-    train.add_argument("--prompt", default=DEFAULT_PROMPT)
-    train.add_argument("--exp_name", default="reference")
-    train.add_argument("--overwrite", action="store_true")
-    train.add_argument("--resume", action="store_true")
-    train.add_argument("--no_wandb", action="store_true")
-    train.add_argument("--num_workers", type=int, default=2)
-    train.set_defaults(func=train_from_cache)
+    train_parser = subparsers.add_parser("train")
+    _add_config_arg(train_parser)
+    train_parser.add_argument("--hdf5_path", required=True)
+    train_parser.add_argument("--cache_path", required=True)
+    train_parser.add_argument("--prompt", default=DEFAULT_PROMPT)
+    train_parser.add_argument("--exp_name", default="ref")
+    train_parser.add_argument("--overwrite", action="store_true")
+    train_parser.add_argument("--resume", action="store_true")
+    train_parser.add_argument("--no_wandb", action="store_true")
+    train_parser.add_argument("--num_workers", type=int, default=2)
+    train_parser.add_argument("--train_steps", type=int, default=None)
+    train_parser.add_argument("--batch_size", type=int, default=None)
+    train_parser.add_argument("--checkpoint_base_dir", default=None)
+    train_parser.set_defaults(func=train)
     return parser
 
 
