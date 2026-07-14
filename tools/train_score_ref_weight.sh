@@ -7,7 +7,7 @@ MPC_NUM_SAMPLES="${MPC_NUM_SAMPLES:-512}"
 MPC_ITERATIONS="${MPC_ITERATIONS:-8}"
 MPC_NOISE="${MPC_NOISE:-0.8}"
 MPC_TEMPERATURE="${MPC_TEMPERATURE:-0.1}"
-CACHE_FILE="${CACHE_FILE:-${ROOT}/data/weight/ref_action_prox_${MPC_NUM_SAMPLES}x${MPC_ITERATIONS}_n${MPC_NOISE}.npz}"
+CACHE_FILE="${CACHE_FILE:-${ROOT}/data/weight/ref_action_prox_reverse_${MPC_NUM_SAMPLES}x${MPC_ITERATIONS}_n${MPC_NOISE}.npz}"
 stage="${1:-all}"
 
 cd "${ROOT}/openpi"
@@ -22,8 +22,9 @@ fi
 
 generate_cache() {
     args=()
-    if [[ -n "${MAX_LABELS:-}" ]]; then
-        args+=(--max_labels "${MAX_LABELS}")
+    max_trajectories="${MAX_TRAJECTORIES:-}"
+    if [[ -n "${max_trajectories}" ]]; then
+        args+=(--max_trajectories "${max_trajectories}")
     fi
     PYTHONUNBUFFERED=1 conda run --no-capture-output -n pps \
         python scripts/train_mpc_proxy_score_pytorch.py generate-cache \

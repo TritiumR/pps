@@ -6,18 +6,23 @@ by querying the same FK/cost MPC score estimator used at evaluation time:
 
     s_ref(x_t, o, t) = MPC.estimate_mbd_score_action_prox(x_t, o, context, t)
 
+For each cached observation, generation starts at Gaussian action noise and
+follows the complete online ``mbd_score_action_prox`` reverse trajectory.  Each
+visited state is paired with its MPC score target.  Expert actions are not used
+to construct the diffusion states.
+
 The script has two explicit stages so expensive MPC labels can be inspected and
 reused:
 
   python scripts/train_mpc_proxy_score_pytorch.py generate-cache \
       --config score_ref_weight \
       --hdf5_path /home/chuanruo/diffusion_policy/data/weight/generated_dataset.hdf5 \
-      --cache_path ../data/weight/ref_scores.npz
+      --cache_path ../data/weight/ref_action_prox_reverse_512x8_n0.8.npz
 
   python scripts/train_mpc_proxy_score_pytorch.py train \
       --config score_ref_weight \
       --hdf5_path /home/chuanruo/diffusion_policy/data/weight/generated_dataset.hdf5 \
-      --cache_path ../data/weight/ref_scores.npz \
+      --cache_path ../data/weight/ref_action_prox_reverse_512x8_n0.8.npz \
       --exp_name ref --overwrite
 """
 
@@ -84,7 +89,9 @@ DEFAULT_BASE_CHECKPOINT_DIR = os.path.join(
     "pi05_droid_jointpos",
 )
 DEFAULT_PROMPT = "put pear and apple on the scale"
-CACHE_FORMAT_VERSION = 2
+CACHE_FORMAT_VERSION = 3
+CACHE_LABEL_TYPE = "mpc_score_action_prox_reverse_trajectory"
+CACHE_STATE_SOURCE = "action_prox_reverse_trajectory_from_gaussian"
 ACTION_PROX_NOISE_SCHEDULE = "mpc_noise_times_sqrt_one_minus_alpha_bar"
 
 
@@ -273,7 +280,7 @@ def _sample_indices(
     hdf5_path: pathlib.Path,
     *,
     action_horizon: int,
-    max_labels: int | None,
+    max_trajectories: int | None,
     stride: int,
     seed: int,
 ) -> list[tuple[str, int]]:
@@ -288,8 +295,8 @@ def _sample_indices(
                 continue
             all_indices.extend((demo_name, step) for step in range(0, num_windows, stride))
     rng.shuffle(all_indices)
-    if max_labels is not None:
-        all_indices = all_indices[:max_labels]
+    if max_trajectories is not None:
+        all_indices = all_indices[:max_trajectories]
     return all_indices
 
 
@@ -345,23 +352,23 @@ def generate_cache(args: argparse.Namespace) -> None:
     indices = _sample_indices(
         pathlib.Path(args.hdf5_path),
         action_horizon=config.model.action_horizon,
-        max_labels=args.max_labels,
+        max_trajectories=args.max_trajectories,
         stride=args.stride,
         seed=args.seed,
     )
     if not indices:
         raise ValueError("No valid HDF5 windows found for MPC score label generation.")
 
-    rng = np.random.default_rng(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
     demo_names: list[str] = []
     step_indices: list[int] = []
+    trajectory_ids: list[int] = []
     iterations: list[int] = []
     times: list[float] = []
-    noisy_actions: list[np.ndarray] = []
-    scores: list[np.ndarray] = []
+    diffusion_states: list[np.ndarray] = []
+    target_scores: list[np.ndarray] = []
     min_costs: list[float] = []
     score_norms: list[float] = []
 
@@ -370,8 +377,8 @@ def generate_cache(args: argparse.Namespace) -> None:
         raise ValueError("--num_steps + 1 must be <= ddim_num_train_timesteps.")
 
     with h5py.File(args.hdf5_path, "r") as f:
-        pbar = tqdm.tqdm(indices, desc="MPC score labels")
-        for demo_name, step_idx in pbar:
+        pbar = tqdm.tqdm(indices, desc="MPC reverse trajectories")
+        for trajectory_id, (demo_name, step_idx) in enumerate(pbar):
             demo = f["data"][demo_name]
             sample = _demo_sample(
                 demo,
@@ -380,18 +387,11 @@ def generate_cache(args: argparse.Namespace) -> None:
                 prompt=args.prompt,
             )
             model_inputs = _torch_inputs(input_transform, sample, device)
-            clean_actions = model_inputs["actions"].to(dtype=torch.float32)
-
-            iteration = int(rng.integers(0, num_iterations))
-            alpha, _ = ddim_iteration_alphas(
-                iteration=iteration,
-                num_iterations=num_iterations,
-                num_train_timesteps=config.model.ddim_num_train_timesteps,
+            x_t = torch.randn(
+                (1, config.model.action_horizon, config.model.action_dim),
+                device=device,
+                dtype=torch.float32,
             )
-            sqrt_alpha = float(np.sqrt(max(alpha, 1e-12)))
-            sqrt_beta = float(np.sqrt(max(1.0 - alpha, 1e-12)))
-            noise = torch.randn_like(clean_actions, device=device)
-            x_t = sqrt_alpha * clean_actions + sqrt_beta * noise
 
             context = _mpc_context(
                 demo,
@@ -399,35 +399,58 @@ def generate_cache(args: argparse.Namespace) -> None:
                 task=args.task,
                 subtask_mode=args.subtask_mode,
             )
-            score, diagnostics = planner.estimate_mbd_score_action_prox(
-                x_t,
-                model_inputs,
-                context,
-                iteration=iteration,
-                num_iterations=num_iterations,
-            )
+            with torch.no_grad():
+                for iteration in range(num_iterations):
+                    score, diagnostics = planner.estimate_mbd_score_action_prox(
+                        x_t,
+                        model_inputs,
+                        context,
+                        iteration=iteration,
+                        num_iterations=num_iterations,
+                    )
 
-            demo_names.append(demo_name)
-            step_indices.append(int(step_idx))
-            iterations.append(iteration)
-            times.append(
-                _time_from_iteration(
-                    iteration=iteration,
-                    num_iterations=num_iterations,
-                    num_train_timesteps=config.model.ddim_num_train_timesteps,
-                )
-            )
-            noisy_actions.append(x_t[0].detach().cpu().numpy().astype(np.float32))
-            scores.append(score[0].detach().cpu().numpy().astype(np.float32))
-            min_costs.append(float(diagnostics.get("cost_min", np.nan)))
-            score_norms.append(float(diagnostics.get("score_norm", np.nan)))
+                    demo_names.append(demo_name)
+                    step_indices.append(int(step_idx))
+                    trajectory_ids.append(trajectory_id)
+                    iterations.append(iteration)
+                    times.append(
+                        _time_from_iteration(
+                            iteration=iteration,
+                            num_iterations=num_iterations,
+                            num_train_timesteps=config.model.ddim_num_train_timesteps,
+                        )
+                    )
+                    diffusion_states.append(x_t[0].detach().cpu().numpy().astype(np.float32))
+                    target_scores.append(score[0].detach().cpu().numpy().astype(np.float32))
+                    min_costs.append(float(diagnostics.get("cost_min", np.nan)))
+                    score_norms.append(float(diagnostics.get("score_norm", np.nan)))
+
+                    if iteration + 1 < num_iterations:
+                        x_t = planner.step_from_score(
+                            x_t,
+                            score,
+                            iteration=iteration,
+                            num_iterations=num_iterations,
+                            update_mode="mbd_score",
+                            active_dims=config.model.action_dim,
+                        )
+
             pbar.set_postfix(
-                {"cost_min": f"{min_costs[-1]:.3f}", "score_norm": f"{score_norms[-1]:.2f}"}
+                {
+                    "labels": len(diffusion_states),
+                    "cost_min": f"{min_costs[-1]:.3f}",
+                    "score_norm": f"{score_norms[-1]:.2f}",
+                }
             )
 
     metadata = {
         "cache_format_version": CACHE_FORMAT_VERSION,
-        "label_type": "mpc_score_action_prox",
+        "label_type": CACHE_LABEL_TYPE,
+        "state_source": CACHE_STATE_SOURCE,
+        "initial_state_distribution": "standard_gaussian",
+        "trajectory_update": "mbd_score",
+        "num_trajectories": len(indices),
+        "labels_per_trajectory": int(num_iterations),
         "config": args.config,
         "base_config": args.base_config,
         "base_checkpoint_dir": str(args.base_checkpoint_dir),
@@ -439,7 +462,7 @@ def generate_cache(args: argparse.Namespace) -> None:
         "ddim_num_train_timesteps": int(config.model.ddim_num_train_timesteps),
         "score_model_action_dim": int(config.model.action_dim),
         "score_model_action_horizon": int(config.model.action_horizon),
-        "stored_action_dim": int(noisy_actions[0].shape[-1]) if noisy_actions else None,
+        "stored_action_dim": int(diffusion_states[0].shape[-1]) if diffusion_states else None,
         "norm_stats_fingerprint": _norm_stats_fingerprint(score_data_config.norm_stats),
         "use_quantile_norm": bool(score_data_config.use_quantile_norm),
         "subtask_mode": args.subtask_mode,
@@ -463,10 +486,11 @@ def generate_cache(args: argparse.Namespace) -> None:
         cache_path,
         demo_name=np.asarray(demo_names),
         step_index=np.asarray(step_indices, dtype=np.int64),
+        trajectory_id=np.asarray(trajectory_ids, dtype=np.int64),
         iteration=np.asarray(iterations, dtype=np.int64),
         time=np.asarray(times, dtype=np.float32),
-        x_t=np.asarray(noisy_actions, dtype=np.float32),
-        score=np.asarray(scores, dtype=np.float32),
+        x_t=np.asarray(diffusion_states, dtype=np.float32),
+        score=np.asarray(target_scores, dtype=np.float32),
         cost_min=np.asarray(min_costs, dtype=np.float32),
         score_norm=np.asarray(score_norms, dtype=np.float32),
         metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
@@ -487,8 +511,10 @@ class MPCScoreDataset(torch.utils.data.Dataset):
         self.cache = np.load(cache_path, allow_pickle=False)
         self.demo_names = self.cache["demo_name"].astype(str)
         self.step_indices = self.cache["step_index"].astype(np.int64)
-        self.noisy_actions = self.cache["x_t"].astype(np.float32)
-        self.scores = self.cache["score"].astype(np.float32)
+        self.trajectory_ids = self.cache["trajectory_id"].astype(np.int64)
+        self.iterations = self.cache["iteration"].astype(np.int64)
+        self.diffusion_states = self.cache["x_t"].astype(np.float32)
+        self.target_scores = self.cache["score"].astype(np.float32)
         self.times = self.cache["time"].astype(np.float32)
         self.prompt = prompt
         self.config = config
@@ -496,12 +522,19 @@ class MPCScoreDataset(torch.utils.data.Dataset):
         self._h5 = None
 
         metadata = json.loads(str(self.cache["metadata_json"].item()))
+        self.metadata = metadata
         if int(metadata.get("cache_format_version", -1)) != CACHE_FORMAT_VERSION:
             raise ValueError(
                 "MPC score cache format is stale. Regenerate it with the current action-prox sampler."
             )
-        if metadata.get("label_type") != "mpc_score_action_prox":
-            raise ValueError("MPC score cache was not generated by mbd_score_action_prox.")
+        if metadata.get("label_type") != CACHE_LABEL_TYPE:
+            raise ValueError("MPC score cache does not contain action-prox reverse trajectories.")
+        if metadata.get("state_source") != CACHE_STATE_SOURCE:
+            raise ValueError("MPC score cache x_t states were not sampled from base reverse denoising.")
+        if metadata.get("initial_state_distribution") != "standard_gaussian":
+            raise ValueError("MPC score cache trajectories do not start from standard Gaussian noise.")
+        if metadata.get("trajectory_update") != "mbd_score":
+            raise ValueError("MPC score cache does not use the online MBD reverse update.")
         mpc_metadata = metadata.get("mpc", {})
         if mpc_metadata.get("proposal_center") != "current_noisy_action":
             raise ValueError("MPC score cache does not use z_t as the action-prox proposal center.")
@@ -521,30 +554,69 @@ class MPCScoreDataset(torch.utils.data.Dataset):
         if int(metadata.get("ddim_num_train_timesteps", -1)) != int(config.model.ddim_num_train_timesteps):
             raise ValueError("MPC score cache DDIM scheduler does not match this training config.")
         expected_horizon = config.model.action_horizon
-        if self.noisy_actions.ndim != 3 or self.noisy_actions.shape[1] != expected_horizon:
+        if self.diffusion_states.ndim != 3 or self.diffusion_states.shape[1] != expected_horizon:
             raise ValueError(
                 "MPC score cache x_t must have shape [N, action_horizon, action_dim]; "
-                f"got {self.noisy_actions.shape}."
+                f"got {self.diffusion_states.shape}."
             )
-        if self.noisy_actions.shape != self.scores.shape:
+        if self.diffusion_states.shape != self.target_scores.shape:
             raise ValueError(
-                f"MPC score cache x_t/score shapes differ: {self.noisy_actions.shape} vs {self.scores.shape}."
+                "MPC score cache x_t/score shapes differ: "
+                f"{self.diffusion_states.shape} vs {self.target_scores.shape}."
             )
-        if self.noisy_actions.shape[-1] < config.model.action_dim:
+        if self.diffusion_states.shape[-1] < config.model.action_dim:
             raise ValueError(
-                f"MPC score cache has {self.noisy_actions.shape[-1]} action dims; "
+                f"MPC score cache has {self.diffusion_states.shape[-1]} action dims; "
                 f"the model requires {config.model.action_dim}."
             )
-        size = self.noisy_actions.shape[0]
-        if not (len(self.demo_names) == len(self.step_indices) == len(self.times) == size):
+        size = self.diffusion_states.shape[0]
+        if not (
+            len(self.demo_names)
+            == len(self.step_indices)
+            == len(self.trajectory_ids)
+            == len(self.iterations)
+            == len(self.times)
+            == size
+        ):
             raise ValueError("MPC score cache arrays have inconsistent sample counts.")
-        if not np.isfinite(self.noisy_actions).all() or not np.isfinite(self.scores).all():
+        labels_per_trajectory = int(metadata.get("labels_per_trajectory", -1))
+        num_trajectories = int(metadata.get("num_trajectories", -1))
+        if labels_per_trajectory <= 0 or num_trajectories <= 0:
+            raise ValueError("MPC score cache has invalid reverse-trajectory metadata.")
+        if labels_per_trajectory != int(metadata.get("num_iterations", -1)):
+            raise ValueError("MPC score cache trajectory length does not match num_iterations.")
+        if size != labels_per_trajectory * num_trajectories:
+            raise ValueError("MPC score cache does not contain every step of every reverse trajectory.")
+        expected_iterations = np.tile(np.arange(labels_per_trajectory), num_trajectories)
+        expected_trajectory_ids = np.repeat(np.arange(num_trajectories), labels_per_trajectory)
+        if not np.array_equal(self.iterations, expected_iterations):
+            raise ValueError("MPC score cache reverse iterations are incomplete or out of order.")
+        if not np.array_equal(self.trajectory_ids, expected_trajectory_ids):
+            raise ValueError("MPC score cache trajectory ids are incomplete or out of order.")
+        expected_times = np.asarray(
+            [
+                _time_from_iteration(
+                    iteration=iteration,
+                    num_iterations=labels_per_trajectory,
+                    num_train_timesteps=int(metadata["ddim_num_train_timesteps"]),
+                )
+                for iteration in range(labels_per_trajectory)
+            ],
+            dtype=np.float32,
+        )
+        if not np.allclose(self.times.reshape(num_trajectories, -1), expected_times[None, :]):
+            raise ValueError("MPC score cache diffusion times do not match reverse iterations.")
+        demo_grid = self.demo_names.reshape(num_trajectories, labels_per_trajectory)
+        step_grid = self.step_indices.reshape(num_trajectories, labels_per_trajectory)
+        if np.any(demo_grid != demo_grid[:, :1]) or np.any(step_grid != step_grid[:, :1]):
+            raise ValueError("MPC score cache changes observation inside a reverse trajectory.")
+        if not np.isfinite(self.diffusion_states).all() or not np.isfinite(self.target_scores).all():
             raise ValueError("MPC score cache contains non-finite x_t or score values.")
         if not np.isfinite(self.times).all() or np.any((self.times < 0.0) | (self.times > 1.0)):
             raise ValueError("MPC score cache contains invalid normalized diffusion times.")
 
     def __len__(self) -> int:
-        return int(self.noisy_actions.shape[0])
+        return int(self.diffusion_states.shape[0])
 
     def _file(self):
         if self._h5 is None:
@@ -563,8 +635,8 @@ class MPCScoreDataset(torch.utils.data.Dataset):
         inputs = jax.tree.map(lambda x: torch.from_numpy(np.asarray(x)), inputs)
         return (
             inputs,
-            torch.from_numpy(self.noisy_actions[idx]),
-            torch.from_numpy(self.scores[idx]),
+            torch.from_numpy(self.diffusion_states[idx]),
+            torch.from_numpy(self.target_scores[idx]),
             torch.tensor(self.times[idx], dtype=torch.float32),
         )
 
@@ -635,6 +707,13 @@ def train(args: argparse.Namespace) -> None:
         config=config,
         prompt=args.prompt,
     )
+    if is_main:
+        logging.info(
+            "Loaded reverse cache: trajectories=%s labels=%s labels_per_trajectory=%s",
+            dataset.metadata["num_trajectories"],
+            len(dataset),
+            dataset.metadata["labels_per_trajectory"],
+        )
     if config.batch_size % world_size != 0:
         raise ValueError(
             f"batch_size={config.batch_size} must be divisible by world_size={world_size}."
@@ -812,7 +891,12 @@ def build_parser() -> argparse.ArgumentParser:
     cache_parser.add_argument("--task", default="weight")
     cache_parser.add_argument("--device", default="cuda")
     cache_parser.add_argument("--seed", type=int, default=0)
-    cache_parser.add_argument("--max_labels", type=int, default=None)
+    cache_parser.add_argument(
+        "--max_trajectories",
+        type=int,
+        default=None,
+        help="Maximum number of observation-conditioned reverse trajectories.",
+    )
     cache_parser.add_argument("--stride", type=int, default=4)
     cache_parser.add_argument("--num_steps", type=int, default=10)
     cache_parser.add_argument("--subtask_mode", choices=("heuristic", "empty"), default="heuristic")

@@ -31,7 +31,40 @@ else
     mode+=(--overwrite)
 fi
 
+resuming=false
+for arg in "${mode[@]}"; do
+    if [[ "${arg}" == "--resume" ]]; then
+        resuming=true
+    fi
+done
+
+init=()
+if [[ "${resuming}" == false ]]; then
+    ref_checkpoint_dir="${REF_CHECKPOINT_DIR:-}"
+    if [[ -z "${ref_checkpoint_dir}" ]]; then
+        latest_step=-1
+        shopt -s nullglob
+        for candidate in checkpoints/score_ref_weight/ref/[0-9]*; do
+            [[ -d "${candidate}" ]] || continue
+            step="${candidate##*/}"
+            [[ "${step}" =~ ^[0-9]+$ ]] || continue
+            if (( 10#${step} > latest_step )); then
+                latest_step=$((10#${step}))
+                ref_checkpoint_dir="${candidate}"
+            fi
+        done
+        shopt -u nullglob
+    fi
+    if [[ -z "${ref_checkpoint_dir}" || ! -f "${ref_checkpoint_dir}/model.safetensors" ]]; then
+        echo "[score_task] no ref checkpoint found; train ref first or set REF_CHECKPOINT_DIR" >&2
+        exit 1
+    fi
+    echo "[score_task] initializing from ${ref_checkpoint_dir}"
+    init+=(--pytorch_weight_path "${ref_checkpoint_dir}")
+fi
+
 PYTHONUNBUFFERED=1 conda run --no-capture-output -n pps python scripts/train_proxy_score_pytorch.py \
     score_task_weight \
     --exp_name task \
+    "${init[@]}" \
     "${mode[@]}"

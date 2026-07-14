@@ -222,6 +222,14 @@ def train_loop(config: _config.TrainConfig):
     data_config = train_loader.data_config()
 
     model = openpi.models_pytorch.proxy_score_pytorch.ProxyScorePytorch(config.model).to(device)
+    if not resuming and config.pytorch_weight_path is not None:
+        init_path = os.fspath(config.pytorch_weight_path)
+        if os.path.isdir(init_path):
+            init_path = os.path.join(init_path, "model.safetensors")
+        if not os.path.isfile(init_path):
+            raise FileNotFoundError(f"Initial model checkpoint not found: {init_path}")
+        safetensors.torch.load_model(model, init_path, device=str(device))
+        logging.info("Initialized score proxy from %s", init_path)
     if use_ddp:
         model = torch.nn.parallel.DistributedDataParallel(
             model,
