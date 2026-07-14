@@ -7,7 +7,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from .action_space import decode_model_action_chunks
+from .action_space import decode_model_action_chunks, rebase_model_action_chunk
 from .costs import PriorityStateCost
 from .costs_explore import ExploreStateCost
 from .costs_grasp_flow import GraspFlowStateCost
@@ -55,6 +55,8 @@ class SimFreeMPC:
                 action_dims=config.action_dims,
             )
         )
+        self._warm_action: torch.Tensor | None = None
+        self._warm_state: torch.Tensor | None = None
         if config.cost_style == "ref_style":
             self.cost = RefStyleStateCost(config.task_name)
         elif config.cost_style == "explore":
@@ -67,6 +69,54 @@ class SimFreeMPC:
             raise ValueError(f"Unknown sim-free MPC cost_style: {config.cost_style!r}")
         if config.optimize_space not in ("action", "accel"):
             raise ValueError(f"Unknown sim-free MPC optimize_space: {config.optimize_space!r}")
+
+    def reset_action_warm(self) -> None:
+        self._warm_action = None
+        self._warm_state = None
+
+    def set_warm_action(
+        self,
+        action: torch.Tensor,
+        *,
+        state: torch.Tensor | None = None,
+    ) -> None:
+        if action.ndim != 3:
+            raise ValueError(f"Expected warm action [B,H,D], got {tuple(action.shape)}")
+        self._warm_action = action.detach().clone()
+        self._warm_state = None if state is None else torch.as_tensor(state).detach().clone()
+
+    def warm_start_noise(
+        self,
+        fallback_noise: torch.Tensor,
+        *,
+        shift_steps: int,
+        current_state: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, bool]:
+        """Shift and rebase the previous action as the next initial noise."""
+        warm_action = self._warm_action
+        if warm_action is None or warm_action.shape != fallback_noise.shape:
+            return fallback_noise, False
+
+        warm_action = warm_action.to(device=fallback_noise.device, dtype=fallback_noise.dtype)
+        horizon = warm_action.shape[1]
+        shift = min(max(int(shift_steps), 0), horizon)
+        if shift == 0:
+            shifted_action = warm_action.clone()
+        elif shift == horizon:
+            shifted_action = warm_action[:, -1:, :].expand_as(warm_action).clone()
+        else:
+            tail = warm_action[:, -1:, :].expand(-1, shift, -1)
+            shifted_action = torch.cat((warm_action[:, shift:, :], tail), dim=1)
+
+        warm_state = self._warm_state
+        if warm_state is not None and current_state is not None:
+            shifted_action = rebase_model_action_chunk(
+                self.policy,
+                shifted_action,
+                previous_state=warm_state,
+                current_state=current_state,
+            )
+        return shifted_action, True
 
     def _interpolation_knot_count(self, horizon: int) -> int:
         if not self.config.interpolate or horizon <= 1:
@@ -310,6 +360,14 @@ class SimFreeMPC:
             values = values.to(device=result.weights.device, dtype=result.weights.dtype)
             diagnostics[f"term_{name}_best"] = float(values[best_idx].detach().cpu())
             diagnostics[f"term_{name}_weighted"] = float(torch.sum(values * result.weights).detach().cpu())
+        debug_values = getattr(cost, "last_debug", None)
+        if debug_values:
+            for name, values in debug_values.items():
+                if values.ndim != 1 or values.shape[0] != result.costs.shape[0]:
+                    continue
+                values = values.to(device=result.weights.device, dtype=result.weights.dtype)
+                diagnostics[f"debug_{name}_best"] = float(values[best_idx].detach().cpu())
+                diagnostics[f"debug_{name}_weighted"] = float(torch.sum(values * result.weights).detach().cpu())
         return diagnostics
 
     def _optimize_ddim_clean_chunk(
@@ -403,17 +461,11 @@ class SimFreeMPC:
         *,
         alpha_bar: float,
     ):
-        """Optimize clean action candidates around the current noisy action.
-
-        Unlike `_optimize_ddim_clean_chunk`, this proposal rule does not center
-        samples at `x_t / sqrt(alpha_bar)`. It searches locally around the
-        current normalized action and then converts the selected clean estimate
-        into a DDIM/MBD score.
-        """
+        """Optimize action candidates directly around the current noisy action."""
         if x_t.shape[0] != 1:
-            raise ValueError("MBD action-prox sampler currently expects batch size 1.")
+            raise ValueError("MBD action-space sampler currently expects batch size 1.")
         if self.config.optimize_space != "action":
-            raise ValueError("mbd_score_action_prox only supports action optimize_space.")
+            raise ValueError("MBD action-prox/warm paths only support action optimize_space.")
 
         active_dims = min(self.config.action_dims, x_t.shape[-1])
         horizon = x_t.shape[1]
@@ -707,6 +759,28 @@ class SimFreeMPC:
         )
         return next_x, diagnostics
 
+    def step_mbd_score_action_warm(
+        self,
+        x_t: torch.Tensor,
+        policy_inputs: dict[str, Any],
+        context: dict[str, Any],
+        *,
+        iteration: int,
+        num_iterations: int,
+        score_scale: float = 1.0,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        next_x, diagnostics = self.step_mbd_score_action_prox(
+            x_t,
+            policy_inputs,
+            context,
+            iteration=iteration,
+            num_iterations=num_iterations,
+            score_scale=score_scale,
+        )
+        diagnostics = dict(diagnostics)
+        diagnostics["update_mode"] = "mbd_score_action_warm"
+        return next_x, diagnostics
+
     def estimate_mbd_score(
         self,
         x_t: torch.Tensor,
@@ -808,6 +882,26 @@ class SimFreeMPC:
                 "clean_sample_std": float(proposal_std),
             }
         )
+        return score, diagnostics
+
+    def estimate_mbd_score_action_warm(
+        self,
+        x_t: torch.Tensor,
+        policy_inputs: dict[str, Any],
+        context: dict[str, Any],
+        *,
+        iteration: int,
+        num_iterations: int,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        score, diagnostics = self.estimate_mbd_score_action_prox(
+            x_t,
+            policy_inputs,
+            context,
+            iteration=iteration,
+            num_iterations=num_iterations,
+        )
+        diagnostics = dict(diagnostics)
+        diagnostics["update_mode"] = "estimate_mbd_score_action_warm"
         return score, diagnostics
 
     def step_from_score(

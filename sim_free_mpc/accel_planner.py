@@ -217,6 +217,14 @@ class AccelActionMPC:
             values = values.to(device=result.weights.device, dtype=result.weights.dtype)
             diagnostics[f"term_{name}_best"] = float(values[best_idx].detach().cpu())
             diagnostics[f"term_{name}_weighted"] = float(torch.sum(values * result.weights).detach().cpu())
+        debug_values = getattr(cost, "last_debug", None)
+        if debug_values:
+            for name, values in debug_values.items():
+                if values.ndim != 1 or values.shape[0] != result.costs.shape[0]:
+                    continue
+                values = values.to(device=result.weights.device, dtype=result.weights.dtype)
+                diagnostics[f"debug_{name}_best"] = float(values[best_idx].detach().cpu())
+                diagnostics[f"debug_{name}_weighted"] = float(torch.sum(values * result.weights).detach().cpu())
         return diagnostics
 
     @staticmethod

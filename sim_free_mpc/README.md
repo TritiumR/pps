@@ -41,6 +41,13 @@ score, info = planner.estimate_mbd_score_action_prox(
 `planner.step_mbd_score_action_prox(...)` is the direct-step variant if you want it to
 return the next `x_t` instead of only the score.
 
+`mbd_score_action_warm` keeps `mbd_score_action_prox` unchanged, but initializes
+each replan after the first from the previous normalized action trajectory. The
+trajectory is shifted by the number of executed actions and padded by repeating
+its final action. Its arm deltas are then rebased from the previous joint state
+to the current joint state so the absolute joint targets stay unchanged; the
+first replan in each rollout still starts from Gaussian noise.
+
 ## What the module does
 
 `mbd_score_action_prox` samples clean action candidates around the current noisy
@@ -75,7 +82,8 @@ See `eval_steering.py::build_mpc_context` for the live IsaacLab version.
 ## Constraints
 
 - Batch size is currently 1.
-- `optimize_space` must be `"action"` for `mbd_score_action_prox`.
+- `optimize_space` must be `"action"` for `mbd_score_action_prox` and
+  `mbd_score_action_warm`.
 - MPC, task score policy, and ref score policy must share the same norm stats.
 - `ddim_num_train_timesteps` must match between MPC and score policies.
 

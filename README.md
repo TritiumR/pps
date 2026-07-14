@@ -64,7 +64,9 @@ python eval_steering.py \
   --task_num_steps 1200
 ```
 
-Rollout videos are written to `results/<task>/<exp_name>/<seed>_{success,fail}.mp4`.
+Each eval run is written to `results/<task>/<exp_name>/<run-id>_<config>/`, with
+`results.json` and short episode names such as `<seed>_success.mp4` or
+`<seed>_fail.mp4`.
 `--steer_scale` controls steering strength (0.4–0.8 typical); `--only_steer` uses
 the steer velocity alone.
 

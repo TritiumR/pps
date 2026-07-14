@@ -81,7 +81,7 @@ _WEIGHT_SCALE_TOP_OFFSET_Z_DEBUG = 0.0523800
 
 
 def _score_update_mode_for_mpc_update(update_mode: str) -> str:
-    if update_mode == "mbd_score_action_prox":
+    if update_mode in ("mbd_score_action_prox", "mbd_score_action_warm"):
         return "mbd_score"
     return update_mode
 
@@ -793,6 +793,7 @@ def infer_actions_with_mpc(
     *,
     mpc_planner=None,
     mpc_context=None,
+    warm_shift_steps=0,
 ):
     if _uses_vlm_mpc_base(args) and mpc_planner is None:
         raise ValueError("VLM/MPC base mode requires a SimFreeMPC planner.")
@@ -808,6 +809,7 @@ def infer_actions_with_mpc(
         args,
         mpc_planner=mpc_planner,
         mpc_context=mpc_context,
+        warm_shift_steps=warm_shift_steps,
     )
 
 
@@ -820,6 +822,7 @@ def _infer_actions_eager(
     *,
     mpc_planner=None,
     mpc_context=None,
+    warm_shift_steps=0,
 ):
     global _LAST_INFERENCE_RUNTIME
     base_obs, base_inputs = _obs_to_input_checked(base_policy, raw_obs, "base")
@@ -918,7 +921,15 @@ def _infer_actions_eager(
     dt = -1.0 / args.num_steps
     dt = torch.tensor(dt, dtype=torch.float32, device=device)
 
-    x_t = noise
+    action_warm_started = False
+    if use_vlm_mpc_base and args.mpc_update == "mbd_score_action_warm":
+        x_t, action_warm_started = mpc_planner.warm_start_noise(
+            noise,
+            shift_steps=warm_shift_steps,
+            current_state=base_inputs["state"],
+        )
+    else:
+        x_t = noise
     teacher_path_x_t = noise.clone() if need_compare else None
     denoise_time = torch.tensor(1.0, dtype=torch.float32, device=device)
     runtime_stats = {
@@ -935,9 +946,19 @@ def _infer_actions_eager(
         "proxy_ref_shape": None,
         "mpc_last": None,
         "mpc_trace": [],
+        "action_warm_started": bool(action_warm_started),
+        "action_warm_shift_steps": int(warm_shift_steps) if action_warm_started else 0,
     }
 
     def record_mpc_stats(stats):
+        if args.mpc_update == "mbd_score_action_warm":
+            stats = dict(stats)
+            stats.update(
+                {
+                    "action_warm_started": bool(action_warm_started),
+                    "action_warm_shift_steps": int(warm_shift_steps) if action_warm_started else 0,
+                }
+            )
         runtime_stats["mpc_last"] = stats
         if args.mpc_debug:
             runtime_stats["mpc_trace"].append(_mpc_debug_stats(stats))
@@ -1052,6 +1073,15 @@ def _infer_actions_eager(
                     num_iterations=mpc_denoise_iterations,
                     score_scale=args.gamma_base,
                 )
+            elif args.mpc_update == "mbd_score_action_warm":
+                x_t, geom_stats = mpc_planner.step_mbd_score_action_warm(
+                    x_t,
+                    base_inputs,
+                    mpc_context,
+                    iteration=mpc_denoise_iteration,
+                    num_iterations=mpc_denoise_iterations,
+                    score_scale=args.gamma_base,
+                )
             else:
                 x_t, geom_stats = mpc_planner.step_ddim(
                     x_t,
@@ -1088,12 +1118,19 @@ def _infer_actions_eager(
                 )
             if args.mpc_update == "legacy_score":
                 raise ValueError(
-                    "Score-space task/ref steering supports --mpc_update ddim or mbd_score, "
-                    "not legacy_score."
+                    "Score-space task/ref steering does not support --mpc_update legacy_score."
                 )
 
             if args.mpc_update == "mbd_score_action_prox":
                 base_score, geom_stats = mpc_planner.estimate_mbd_score_action_prox(
+                    x_t,
+                    base_inputs,
+                    mpc_context,
+                    iteration=mpc_denoise_iteration,
+                    num_iterations=mpc_denoise_iterations,
+                )
+            elif args.mpc_update == "mbd_score_action_warm":
+                base_score, geom_stats = mpc_planner.estimate_mbd_score_action_warm(
                     x_t,
                     base_inputs,
                     mpc_context,
@@ -1326,6 +1363,9 @@ def _infer_actions_eager(
         if need_compare:
             teacher_path_x_t = teacher_path_x_t + dt * teacher_base_v_t
         denoise_time += dt
+
+    if use_vlm_mpc_base and args.mpc_update == "mbd_score_action_warm":
+        mpc_planner.set_warm_action(x_t, state=base_inputs["state"])
 
     actions = base_policy.output_to_actions(base_inputs, x_t)
     if use_vlm_mpc_base:
@@ -1641,17 +1681,25 @@ def _mpc_debug_stats(stats: dict[str, Any] | None) -> dict[str, Any]:
         "accel_norm",
         "score_norm",
         "gripper_mean",
+        "proposal_center",
+        "proposal_noise_scale",
+        "action_warm_started",
+        "action_warm_shift_steps",
     )
     payload = {key: _jsonable_debug_value(stats[key]) for key in keys if key in stats}
     best_terms = {}
     weighted_terms = {}
+    best_debug = {}
+    weighted_debug = {}
     for key, value in stats.items():
-        if not key.startswith("term_"):
-            continue
-        if key.endswith("_best"):
+        if key.startswith("term_") and key.endswith("_best"):
             best_terms[key[len("term_") : -len("_best")]] = _jsonable_debug_value(value)
-        elif key.endswith("_weighted"):
+        elif key.startswith("term_") and key.endswith("_weighted"):
             weighted_terms[key[len("term_") : -len("_weighted")]] = _jsonable_debug_value(value)
+        elif key.startswith("debug_") and key.endswith("_best"):
+            best_debug[key[len("debug_") : -len("_best")]] = _jsonable_debug_value(value)
+        elif key.startswith("debug_") and key.endswith("_weighted"):
+            weighted_debug[key[len("debug_") : -len("_weighted")]] = _jsonable_debug_value(value)
     if weighted_terms:
         payload["terms_weighted"] = dict(
             sorted(weighted_terms.items(), key=lambda item: abs(float(item[1])), reverse=True)
@@ -1660,6 +1708,10 @@ def _mpc_debug_stats(stats: dict[str, Any] | None) -> dict[str, Any]:
         payload["terms_best"] = dict(
             sorted(best_terms.items(), key=lambda item: abs(float(item[1])), reverse=True)
         )
+    if weighted_debug:
+        payload["debug_weighted"] = dict(sorted(weighted_debug.items()))
+    if best_debug:
+        payload["debug_best"] = dict(sorted(best_debug.items()))
     return payload
 
 
@@ -2172,9 +2224,29 @@ def _video_config_slug(args) -> str:
     return _slugify("_".join(parts))
 
 
-def _episode_video_name(seed, success, *, args, run_id: str, suffix=""):
+def _experiment_output_name(args, *, run_id: str) -> str:
+    return f"{run_id}_{_video_config_slug(args)}"
+
+
+def _episode_video_name(seed, success, *, suffix=""):
     status = "success" if success else "fail"
-    return f"{seed}_{run_id}_{_video_config_slug(args)}{suffix}_{status}.mp4"
+    suffix = _slugify(str(suffix).strip("_")) if suffix else ""
+    suffix_part = f"_{suffix}" if suffix else ""
+    return f"{seed}_{status}{suffix_part}.mp4"
+
+
+def _write_experiment_results(path: str, payload: dict[str, Any]) -> None:
+    episodes = payload.get("episodes", [])
+    successes = sum(bool(episode.get("success")) for episode in episodes)
+    payload["summary"] = {
+        "num_episodes": len(episodes),
+        "num_successes": successes,
+        "success_rate": successes / len(episodes) if episodes else 0.0,
+    }
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(_jsonable_debug_value(payload), handle, indent=2, default=str)
+    os.replace(tmp_path, path)
 
 
 def _video_config_lines(args, *, seed: int) -> list[str]:
@@ -2500,7 +2572,13 @@ def parse_args():
     parser.add_argument("--mpc_temperature", type=float, default=0.15)
     parser.add_argument(
         "--mpc_update",
-        choices=("ddim", "mbd_score", "mbd_score_action_prox", "legacy_score"),
+        choices=(
+            "ddim",
+            "mbd_score",
+            "mbd_score_action_prox",
+            "mbd_score_action_warm",
+            "legacy_score",
+        ),
         default="ddim",
         help="Update rule for --vlm_base --no_steer sim-free MPC.",
     )
@@ -2915,15 +2993,29 @@ total_comparison_observation_steps = 0
 total_inference_time_s = 0.0
 total_inference_calls = 0
 video_run_id = time.strftime("%Y%m%d-%H%M%S") + f"-pid{os.getpid()}"
+experiment_output_path = os.path.join(
+    output_path,
+    _experiment_output_name(args, run_id=video_run_id),
+)
+os.makedirs(experiment_output_path, exist_ok=False)
+experiment_results_path = os.path.join(experiment_output_path, "results.json")
+experiment_results = {
+    "run_id": video_run_id,
+    "config_slug": _video_config_slug(args),
+    "command": sys.argv,
+    "config": vars(args),
+    "episodes": [],
+}
+_write_experiment_results(experiment_results_path, experiment_results)
 print(
-    f"Video run id: {video_run_id}; max rollout duration "
+    f"Experiment output: {experiment_output_path}; max rollout duration "
     f"{args.task_num_steps / CONTROL_FREQUENCY:.1f}s",
     flush=True,
 )
 mpc_debug_log_file = None
 mpc_debug_log_path = None
 if args.mpc_debug:
-    mpc_debug_log_path = os.path.join(output_path, f"{video_run_id}_mpc_debug.jsonl")
+    mpc_debug_log_path = os.path.join(experiment_output_path, "mpc_debug.jsonl")
     mpc_debug_log_file = open(mpc_debug_log_path, "w", encoding="utf-8")
     print(f"MPC debug log: {mpc_debug_log_path}", flush=True)
     _write_mpc_debug_log(
@@ -2957,6 +3049,9 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
+    if mpc_planner is not None and args.mpc_update == "mbd_score_action_warm":
+        mpc_planner.reset_action_warm()
 
     # Reset before starting
     if dataset_file is not None:
@@ -3036,6 +3131,9 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                 with torch.no_grad():
                     infer_start = time.perf_counter()
                     mpc_context = build_mpc_context(env, env_obs_dict, args)
+                    warm_shift_steps = (
+                        0 if actions is None else max(step_idx - action_start_step, 0)
+                    )
                     actions, compare_stats = infer_actions_with_mpc(
                         base_policy,
                         task_policy,
@@ -3044,6 +3142,7 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                         args,
                         mpc_planner=mpc_planner,
                         mpc_context=mpc_context,
+                        warm_shift_steps=warm_shift_steps,
                     )
                     infer_elapsed = time.perf_counter() - infer_start
                     if args.mpc_debug:
@@ -3205,19 +3304,19 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
             break
 
     # save excute_frames as video
-    video_name = _episode_video_name(seed, success, args=args, run_id=video_run_id)
+    video_name = _episode_video_name(seed, success)
     if success:
         print("success")
     else:
         print("fail")
 
-    video_path = os.path.join(output_path, video_name)
+    video_path = os.path.join(experiment_output_path, video_name)
     audio_path = _write_stereo_sound_audio(
-        os.path.join(output_path, f"{seed}_{video_run_id}_recording.wav"),
+        os.path.join(experiment_output_path, f"{seed}_recording.wav"),
         sound_audio_frames,
     )
     video_write_path = (
-        os.path.join(output_path, f"{seed}_{video_run_id}_recording.mp4")
+        os.path.join(experiment_output_path, f"{seed}_recording.mp4")
         if audio_path is not None
         else video_path
     )
@@ -3231,15 +3330,14 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
     if audio_path is not None:
         _mux_audio_into_video(video_write_path, video_path, audio_path, "rollout")
 
+    thermal_video_name = None
     if thermal_overlay_frames:
         thermal_video_name = _episode_video_name(
             seed,
             success,
-            args=args,
-            run_id=video_run_id,
-            suffix="_thermal_overlay",
+            suffix="thermal_overlay",
         )
-        thermal_video_path = os.path.join(output_path, thermal_video_name)
+        thermal_video_path = os.path.join(experiment_output_path, thermal_video_name)
         thermal_out = cv2.VideoWriter(
             thermal_video_path,
             fourcc,
@@ -3271,6 +3369,22 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
             f"seed {seed} infer_actions avg latency: {avg_infer_ms:.2f} ms "
             f"over {episode_inference_calls} calls"
         )
+    else:
+        avg_infer_ms = None
+
+    experiment_results["episodes"].append(
+        {
+            "rollout_index": rollout_idx,
+            "seed": seed,
+            "success": bool(success),
+            "steps": step_idx,
+            "video": video_name,
+            "thermal_video": thermal_video_name,
+            "inference_calls": episode_inference_calls,
+            "average_inference_ms": avg_infer_ms,
+        }
+    )
+    _write_experiment_results(experiment_results_path, experiment_results)
 
     if args.compare_difference:
         episode_summary = {
@@ -3314,7 +3428,7 @@ if dataset_file is not None:
 if args.compare_difference:
     comparison_summary = {
         "compare_difference": True,
-        "output_path": output_path,
+        "output_path": experiment_output_path,
         "episodes": episode_comparison_summaries,
         "overall": {
             "n_episodes": len(episode_comparison_summaries),
@@ -3342,10 +3456,11 @@ if args.compare_difference:
         if path_summary["comparisons"]:
             comparison_summary["overall"]["paths"][path_name] = path_summary
 
-    comparison_path = os.path.join(output_path, "compare_difference.json")
+    comparison_path = os.path.join(experiment_output_path, "compare_difference.json")
     with open(comparison_path, "w", encoding="utf-8") as f:
         json.dump(comparison_summary, f, indent=2)
     print(f"compare difference statistics saved to {comparison_path}")
+    experiment_results["compare_difference"] = os.path.basename(comparison_path)
 
 if total_inference_calls:
     avg_infer_ms = 1000.0 * total_inference_time_s / total_inference_calls
@@ -3353,6 +3468,10 @@ if total_inference_calls:
         f"overall infer_actions avg latency: {avg_infer_ms:.2f} ms "
         f"over {total_inference_calls} calls"
     )
+
+experiment_results["total_inference_calls"] = total_inference_calls
+experiment_results["total_inference_time_s"] = total_inference_time_s
+_write_experiment_results(experiment_results_path, experiment_results)
 
 _write_mpc_debug_log(
     mpc_debug_log_file,

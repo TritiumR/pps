@@ -85,6 +85,88 @@ def _unnormalize_torch(
         return values * (std + 1e-6) + mean
 
 
+def _normalize_torch(
+    values: torch.Tensor,
+    stats: Any,
+    *,
+    use_quantile_norm: bool,
+) -> torch.Tensor | None:
+    device = values.device
+    dtype = values.dtype
+    if use_quantile_norm:
+        q01 = _stats_tensor(stats, "q01", device, dtype)
+        q99 = _stats_tensor(stats, "q99", device, dtype)
+        if q01 is None or q99 is None:
+            return None
+        stats_dim = q01.shape[-1]
+        data_dim = values.shape[-1]
+        if stats_dim < data_dim:
+            head = 2.0 * (values[..., :stats_dim] - q01) / (q99 - q01 + 1e-6) - 1.0
+            return torch.cat((head, values[..., stats_dim:]), dim=-1)
+        q01 = q01[..., :data_dim]
+        q99 = q99[..., :data_dim]
+        return 2.0 * (values - q01) / (q99 - q01 + 1e-6) - 1.0
+
+    mean = _stats_tensor(stats, "mean", device, dtype)
+    std = _stats_tensor(stats, "std", device, dtype)
+    if mean is None or std is None:
+        return None
+    mean = _pad_to_dim_torch(mean, values.shape[-1], fill_value=0.0)
+    std = _pad_to_dim_torch(std, values.shape[-1], fill_value=1.0)
+    return (values - mean) / (std + 1e-6)
+
+
+def rebase_model_action_chunk(
+    policy: Any,
+    model_chunk: torch.Tensor,
+    *,
+    previous_state: torch.Tensor | np.ndarray,
+    current_state: torch.Tensor | np.ndarray,
+) -> torch.Tensor:
+    """Preserve absolute arm targets when moving a delta-action chunk to a new state."""
+    metadata = getattr(policy, "_metadata", {}) or {}
+    output_norm_stats = metadata.get("output_norm_stats")
+    if (
+        not output_norm_stats
+        or "actions" not in output_norm_stats
+        or "state" not in output_norm_stats
+    ):
+        raise ValueError("Action warm rebasing requires action and state normalization stats.")
+
+    device = model_chunk.device
+    dtype = model_chunk.dtype
+    use_quantile_norm = bool(metadata.get("use_quantile_norm", False))
+    actions = _unnormalize_torch(
+        model_chunk,
+        output_norm_stats["actions"],
+        use_quantile_norm=use_quantile_norm,
+    )
+    previous = _unnormalize_torch(
+        _state_for_sample({"state": previous_state}).to(device=device, dtype=dtype),
+        output_norm_stats["state"],
+        use_quantile_norm=use_quantile_norm,
+    )
+    current = _unnormalize_torch(
+        _state_for_sample({"state": current_state}).to(device=device, dtype=dtype),
+        output_norm_stats["state"],
+        use_quantile_norm=use_quantile_norm,
+    )
+    if actions is None or previous is None or current is None:
+        raise ValueError("Action warm rebasing could not apply the configured normalization.")
+
+    delta_dims = min(7, actions.shape[-1], previous.shape[-1], current.shape[-1])
+    actions = actions.clone()
+    actions[..., :delta_dims] += previous[:delta_dims] - current[:delta_dims]
+    rebased = _normalize_torch(
+        actions,
+        output_norm_stats["actions"],
+        use_quantile_norm=use_quantile_norm,
+    )
+    if rebased is None:
+        raise ValueError("Action warm rebasing could not restore normalized model actions.")
+    return rebased
+
+
 def _norm_stat_debug_head(stats: Any, field: str, *, count: int = 8) -> str:
     value = getattr(stats, field, None)
     if value is None:
