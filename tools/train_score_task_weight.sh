@@ -1,9 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${ROOT:-/home/chuanruo/yixuan/pps}"
-DATA_FILE="${DATA_FILE:-/home/chuanruo/diffusion_policy/data/weight/generated_dataset.hdf5}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+DATA_FILE="${DATA_FILE:-${ROOT}/data/weight/generated_dataset.hdf5}"
 DATASET_DIR="${HF_LEROBOT_HOME:-${HOME}/.cache/huggingface/lerobot}/local/isaaclab_weight_score"
+GPU_NUM="${1:-${GPU_NUM:-1}}"
+
+if [[ ! "${GPU_NUM}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "GPU_NUM must be a positive integer, got: ${GPU_NUM}" >&2
+    exit 2
+fi
+
+train_launcher=(python)
+if (( GPU_NUM > 1 )); then
+    train_launcher=(
+        torchrun
+        --standalone
+        --nnodes=1
+        --nproc_per_node="${GPU_NUM}"
+    )
+fi
+
 cd "${ROOT}/openpi"
 export PYTHONPATH="${PWD}/src${PYTHONPATH:+:${PYTHONPATH}}"
 
@@ -63,7 +81,8 @@ if [[ "${resuming}" == false ]]; then
     init+=(--pytorch_weight_path "${ref_checkpoint_dir}")
 fi
 
-PYTHONUNBUFFERED=1 conda run --no-capture-output -n pps python scripts/train_proxy_score_pytorch.py \
+PYTHONUNBUFFERED=1 conda run --no-capture-output -n pps \
+    "${train_launcher[@]}" scripts/train_proxy_score_pytorch.py \
     score_task_weight \
     --exp_name task \
     "${init[@]}" \

@@ -1,14 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${ROOT:-/home/chuanruo/yixuan/pps}"
-DATA_FILE="${DATA_FILE:-/home/chuanruo/diffusion_policy/data/weight/generated_dataset.hdf5}"
-MPC_NUM_SAMPLES="${MPC_NUM_SAMPLES:-512}"
-MPC_ITERATIONS="${MPC_ITERATIONS:-8}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+DATA_FILE="${DATA_FILE:-${ROOT}/data/weight/generated_dataset.hdf5}"
+MPC_NUM_SAMPLES="${MPC_NUM_SAMPLES:-4096}"
+MPC_ITERATIONS="${MPC_ITERATIONS:-1}"
 MPC_NOISE="${MPC_NOISE:-0.8}"
 MPC_TEMPERATURE="${MPC_TEMPERATURE:-0.1}"
 CACHE_FILE="${CACHE_FILE:-${ROOT}/data/weight/ref_action_prox_reverse_${MPC_NUM_SAMPLES}x${MPC_ITERATIONS}_n${MPC_NOISE}.npz}"
 stage="${1:-all}"
+GPU_NUM="${2:-${GPU_NUM:-1}}"
+
+if [[ ! "${GPU_NUM}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "GPU_NUM must be a positive integer, got: ${GPU_NUM}" >&2
+    exit 2
+fi
+
+train_launcher=(python)
+if (( GPU_NUM > 1 )); then
+    train_launcher=(
+        torchrun
+        --standalone
+        --nnodes=1
+        --nproc_per_node="${GPU_NUM}"
+    )
+fi
 
 cd "${ROOT}/openpi"
 export PYTHONPATH="${PWD}/src:${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -55,7 +72,7 @@ train_ref() {
         mode+=(--overwrite)
     fi
     PYTHONUNBUFFERED=1 conda run --no-capture-output -n pps \
-        python scripts/train_mpc_proxy_score_pytorch.py train \
+        "${train_launcher[@]}" scripts/train_mpc_proxy_score_pytorch.py train \
         --config score_ref_weight \
         --hdf5_path "${DATA_FILE}" \
         --cache_path "${CACHE_FILE}" \
@@ -74,12 +91,15 @@ case "${stage}" in
         if [[ -f "${CACHE_FILE}" ]]; then
             echo "[score_ref] reusing ${CACHE_FILE}"
         else
+            if (( GPU_NUM > 1 )); then
+                echo "[score_ref] cache generation uses one GPU; ${GPU_NUM} GPUs are used only for training"
+            fi
             generate_cache
         fi
         train_ref
         ;;
     *)
-        echo "usage: $0 [cache|train|all]" >&2
+        echo "usage: $0 [cache|train|all] [gpu_num]" >&2
         exit 2
         ;;
 esac
