@@ -24,6 +24,10 @@ reused:
       --hdf5_path /home/chuanruo/diffusion_policy/data/weight/generated_dataset.hdf5 \
       --cache_path ../data/weight/ref_action_prox_reverse_512x8_n0.8.npz \
       --exp_name ref --overwrite
+
+Training groups every reverse trajectory by observation.  Its 11 score labels
+share one DINO visual prefix, while a persistent mmap sidecar stores the
+once-resized uint8 observations for all DataLoader workers and DDP ranks.
 """
 
 from __future__ import annotations
@@ -93,6 +97,8 @@ CACHE_FORMAT_VERSION = 3
 CACHE_LABEL_TYPE = "mpc_score_action_prox_reverse_trajectory"
 CACHE_STATE_SOURCE = "action_prox_reverse_trajectory_from_gaussian"
 ACTION_PROX_NOISE_SCHEDULE = "mpc_noise_times_sqrt_one_minus_alpha_bar"
+OBSERVATION_CACHE_FORMAT_VERSION = 1
+OBSERVATION_IMAGE_KEYS = ("base_0_rgb", "left_wrist_0_rgb")
 
 
 def _norm_stats_fingerprint(norm_stats: dict[str, Any] | None) -> str | None:
@@ -506,6 +512,8 @@ class MPCScoreDataset(torch.utils.data.Dataset):
         cache_path: str,
         config: _config.TrainConfig,
         prompt: str,
+        observation_cache_path: str | None = None,
+        build_observation_cache: bool = True,
     ):
         self.hdf5_path = hdf5_path
         self.cache = np.load(cache_path, allow_pickle=False)
@@ -519,7 +527,6 @@ class MPCScoreDataset(torch.utils.data.Dataset):
         self.prompt = prompt
         self.config = config
         self.data_config, self.input_transform = _build_data_pipeline(config)
-        self._h5 = None
 
         metadata = json.loads(str(self.cache["metadata_json"].item()))
         self.metadata = metadata
@@ -615,29 +622,207 @@ class MPCScoreDataset(torch.utils.data.Dataset):
         if not np.isfinite(self.times).all() or np.any((self.times < 0.0) | (self.times > 1.0)):
             raise ValueError("MPC score cache contains invalid normalized diffusion times.")
 
+        self.labels_per_trajectory = labels_per_trajectory
+        self.num_trajectories = num_trajectories
+        self.trajectory_demo_names = demo_grid[:, 0]
+        self.trajectory_step_indices = step_grid[:, 0]
+        observation_keys: dict[tuple[str, int], int] = {}
+        observation_indices = []
+        unique_demo_names = []
+        unique_step_indices = []
+        for demo_name, step_idx in zip(
+            self.trajectory_demo_names,
+            self.trajectory_step_indices,
+            strict=True,
+        ):
+            key = (str(demo_name), int(step_idx))
+            observation_idx = observation_keys.get(key)
+            if observation_idx is None:
+                observation_idx = len(unique_demo_names)
+                observation_keys[key] = observation_idx
+                unique_demo_names.append(key[0])
+                unique_step_indices.append(key[1])
+            observation_indices.append(observation_idx)
+        self.trajectory_observation_indices = np.asarray(observation_indices, dtype=np.int64)
+        self.unique_demo_names = np.asarray(unique_demo_names)
+        self.unique_step_indices = np.asarray(unique_step_indices, dtype=np.int64)
+
+        if observation_cache_path is None:
+            observation_cache_path = f"{cache_path}.observations"
+        self.observation_cache_path = pathlib.Path(observation_cache_path)
+        expected_metadata = self._observation_cache_metadata()
+        if not self._observation_cache_matches(expected_metadata):
+            if not build_observation_cache:
+                raise FileNotFoundError(
+                    f"Shared observation cache is missing or stale: {self.observation_cache_path}"
+                )
+            self._build_observation_cache(expected_metadata)
+        self._load_observation_cache()
+
     def __len__(self) -> int:
+        return self.num_trajectories
+
+    @property
+    def num_labels(self) -> int:
         return int(self.diffusion_states.shape[0])
 
-    def _file(self):
-        if self._h5 is None:
-            self._h5 = h5py.File(self.hdf5_path, "r")
-        return self._h5
+    def _observation_cache_metadata(self) -> dict[str, Any]:
+        hdf5_stat = pathlib.Path(self.hdf5_path).stat()
+        digest = hashlib.sha256()
+        for demo_name, step_idx in zip(
+            self.unique_demo_names,
+            self.unique_step_indices,
+            strict=True,
+        ):
+            digest.update(str(demo_name).encode("utf-8"))
+            digest.update(np.asarray(step_idx, dtype=np.int64).tobytes())
+        return {
+            "format_version": OBSERVATION_CACHE_FORMAT_VERSION,
+            "hdf5_size": int(hdf5_stat.st_size),
+            "observation_key_fingerprint": digest.hexdigest(),
+            "num_observations": int(len(self.unique_demo_names)),
+            "prompt": self.prompt,
+            "norm_stats_fingerprint": _norm_stats_fingerprint(self.data_config.norm_stats),
+            "use_quantile_norm": bool(self.data_config.use_quantile_norm),
+            "image_keys": list(OBSERVATION_IMAGE_KEYS),
+            "image_shape": [224, 224, 3],
+        }
+
+    def _observation_cache_matches(self, expected_metadata: dict[str, Any]) -> bool:
+        metadata_path = self.observation_cache_path / "metadata.json"
+        if not metadata_path.exists():
+            return False
+        try:
+            metadata = json.loads(metadata_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return False
+        if metadata != expected_metadata:
+            return False
+        required_files = [
+            "images.npy",
+            "image_masks.npy",
+            "states.npy",
+            "tokenized_prompt.npy",
+            "tokenized_prompt_mask.npy",
+        ]
+        return all((self.observation_cache_path / name).exists() for name in required_files)
+
+    def _build_observation_cache(self, metadata: dict[str, Any]) -> None:
+        cache_path = self.observation_cache_path
+        tmp_path = cache_path.with_name(f"{cache_path.name}.tmp-{os.getpid()}")
+        if tmp_path.exists():
+            shutil.rmtree(tmp_path)
+        tmp_path.mkdir(parents=True)
+
+        num_observations = len(self.unique_demo_names)
+        images = np.lib.format.open_memmap(
+            tmp_path / "images.npy",
+            mode="w+",
+            dtype=np.uint8,
+            shape=(num_observations, len(OBSERVATION_IMAGE_KEYS), 224, 224, 3),
+        )
+        image_masks = np.lib.format.open_memmap(
+            tmp_path / "image_masks.npy",
+            mode="w+",
+            dtype=np.bool_,
+            shape=(num_observations, len(OBSERVATION_IMAGE_KEYS)),
+        )
+        states = np.lib.format.open_memmap(
+            tmp_path / "states.npy",
+            mode="w+",
+            dtype=np.float32,
+            shape=(num_observations, self.config.model.action_dim),
+        )
+        tokenized_prompt = None
+        tokenized_prompt_mask = None
+
+        logging.info(
+            "Building shared observation cache with %s unique observations at %s",
+            num_observations,
+            cache_path,
+        )
+        with h5py.File(self.hdf5_path, "r") as h5_file:
+            iterator = zip(self.unique_demo_names, self.unique_step_indices, strict=True)
+            iterator = tqdm.tqdm(iterator, total=num_observations, desc="Observation cache")
+            for observation_idx, (demo_name, step_idx) in enumerate(iterator):
+                demo = h5_file["data"][str(demo_name)]
+                raw = _demo_sample(
+                    demo,
+                    int(step_idx),
+                    action_horizon=self.config.model.action_horizon,
+                    prompt=self.prompt,
+                )
+                inputs = self.input_transform(jax.tree.map(lambda x: x, raw))
+                for image_idx, image_key in enumerate(OBSERVATION_IMAGE_KEYS):
+                    image = np.asarray(inputs["image"][image_key])
+                    if image.shape != (224, 224, 3) or image.dtype != np.uint8:
+                        raise ValueError(
+                            f"Expected uint8 224x224 image for {image_key}, got "
+                            f"shape={image.shape} dtype={image.dtype}."
+                        )
+                    images[observation_idx, image_idx] = image
+                    image_masks[observation_idx, image_idx] = bool(
+                        inputs["image_mask"][image_key]
+                    )
+                states[observation_idx] = np.asarray(inputs["state"], dtype=np.float32)
+                if tokenized_prompt is None:
+                    tokenized_prompt = np.asarray(inputs["tokenized_prompt"], dtype=np.int64)
+                    tokenized_prompt_mask = np.asarray(
+                        inputs["tokenized_prompt_mask"], dtype=np.bool_
+                    )
+
+        images.flush()
+        image_masks.flush()
+        states.flush()
+        if tokenized_prompt is None or tokenized_prompt_mask is None:
+            raise ValueError("Cannot build an empty observation cache.")
+        np.save(tmp_path / "tokenized_prompt.npy", tokenized_prompt)
+        np.save(tmp_path / "tokenized_prompt_mask.npy", tokenized_prompt_mask)
+        (tmp_path / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True))
+        if cache_path.exists():
+            shutil.rmtree(cache_path)
+        tmp_path.rename(cache_path)
+        logging.info("Finished shared observation cache: %s", cache_path)
+
+    def _load_observation_cache(self) -> None:
+        cache_path = self.observation_cache_path
+        # Copy-on-write mmap keeps the underlying pages shared across DDP ranks and
+        # DataLoader workers while allowing zero-copy torch views without warnings.
+        self.cached_images = np.load(cache_path / "images.npy", mmap_mode="c")
+        self.cached_image_masks = np.load(cache_path / "image_masks.npy", mmap_mode="c")
+        self.cached_states = np.load(cache_path / "states.npy", mmap_mode="c")
+        self.cached_tokenized_prompt = np.load(
+            cache_path / "tokenized_prompt.npy", mmap_mode="c"
+        )
+        self.cached_tokenized_prompt_mask = np.load(
+            cache_path / "tokenized_prompt_mask.npy", mmap_mode="c"
+        )
 
     def __getitem__(self, idx: int):
-        demo = self._file()["data"][self.demo_names[idx]]
-        raw = _demo_sample(
-            demo,
-            int(self.step_indices[idx]),
-            action_horizon=self.config.model.action_horizon,
-            prompt=self.prompt,
-        )
-        inputs = self.input_transform(jax.tree.map(lambda x: x, raw))
-        inputs = jax.tree.map(lambda x: torch.from_numpy(np.asarray(x)), inputs)
+        observation_idx = int(self.trajectory_observation_indices[idx])
+        inputs = {
+            "image": {
+                image_key: torch.from_numpy(self.cached_images[observation_idx, image_idx])
+                for image_idx, image_key in enumerate(OBSERVATION_IMAGE_KEYS)
+            },
+            "image_mask": {
+                image_key: torch.as_tensor(
+                    self.cached_image_masks[observation_idx, image_idx],
+                    dtype=torch.bool,
+                )
+                for image_idx, image_key in enumerate(OBSERVATION_IMAGE_KEYS)
+            },
+            "state": torch.from_numpy(self.cached_states[observation_idx]),
+            "tokenized_prompt": torch.from_numpy(self.cached_tokenized_prompt),
+            "tokenized_prompt_mask": torch.from_numpy(self.cached_tokenized_prompt_mask),
+        }
+        label_start = idx * self.labels_per_trajectory
+        label_end = label_start + self.labels_per_trajectory
         return (
             inputs,
-            torch.from_numpy(self.diffusion_states[idx]),
-            torch.from_numpy(self.target_scores[idx]),
-            torch.tensor(self.times[idx], dtype=torch.float32),
+            torch.from_numpy(self.diffusion_states[label_start:label_end]),
+            torch.from_numpy(self.target_scores[label_start:label_end]),
+            torch.from_numpy(self.times[label_start:label_end]),
         )
 
 
@@ -645,7 +830,7 @@ def _collate_cache_batch(batch):
     inputs, x_t, score, time_cond = zip(*batch, strict=True)
     inputs = torch.utils.data.default_collate(inputs)
     return (
-        _model.Observation.from_dict(inputs),
+        inputs,
         torch.stack(x_t, dim=0),
         torch.stack(score, dim=0),
         torch.stack(time_cond, dim=0),
@@ -701,27 +886,64 @@ def train(args: argparse.Namespace) -> None:
     elif config.wandb_enabled:
         wandb.init(mode="disabled")
 
-    dataset = MPCScoreDataset(
-        hdf5_path=args.hdf5_path,
-        cache_path=args.cache_path,
-        config=config,
-        prompt=args.prompt,
-    )
+    dataset = None
+    if is_main:
+        dataset = MPCScoreDataset(
+            hdf5_path=args.hdf5_path,
+            cache_path=args.cache_path,
+            config=config,
+            prompt=args.prompt,
+            observation_cache_path=args.observation_cache_path,
+            build_observation_cache=True,
+        )
+    if use_ddp:
+        torch.distributed.barrier()
+    if dataset is None:
+        dataset = MPCScoreDataset(
+            hdf5_path=args.hdf5_path,
+            cache_path=args.cache_path,
+            config=config,
+            prompt=args.prompt,
+            observation_cache_path=args.observation_cache_path,
+            build_observation_cache=False,
+        )
     if is_main:
         logging.info(
-            "Loaded reverse cache: trajectories=%s labels=%s labels_per_trajectory=%s",
+            "Loaded grouped reverse cache: trajectories=%s labels=%s labels_per_trajectory=%s "
+            "unique_observations=%s",
             dataset.metadata["num_trajectories"],
-            len(dataset),
+            dataset.num_labels,
             dataset.metadata["labels_per_trajectory"],
+            len(dataset.unique_demo_names),
         )
     if config.batch_size % world_size != 0:
         raise ValueError(
             f"batch_size={config.batch_size} must be divisible by world_size={world_size}."
         )
-    local_batch_size = config.batch_size // world_size
-    if len(dataset) < local_batch_size * world_size:
+    requested_local_label_batch = config.batch_size // world_size
+    labels_per_trajectory = dataset.labels_per_trajectory
+    local_observation_batch = max(
+        1,
+        (requested_local_label_batch + labels_per_trajectory // 2)
+        // labels_per_trajectory,
+    )
+    effective_global_label_batch = (
+        local_observation_batch * labels_per_trajectory * world_size
+    )
+    if len(dataset) < local_observation_batch * world_size:
         raise ValueError(
-            f"MPC score cache has {len(dataset)} samples, fewer than global batch_size={config.batch_size}."
+            f"MPC score cache has {len(dataset)} trajectories, fewer than the "
+            f"global observation batch={local_observation_batch * world_size}."
+        )
+    if is_main:
+        logging.info(
+            "Grouped batch: requested_labels=%s effective_labels=%s observations=%s "
+            "labels_per_observation=%s observations_per_rank=%s",
+            config.batch_size,
+            effective_global_label_batch,
+            local_observation_batch * world_size,
+            labels_per_trajectory,
+            local_observation_batch,
         )
     sampler = (
         torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True, drop_last=True)
@@ -730,7 +952,7 @@ def train(args: argparse.Namespace) -> None:
     )
     train_loader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=local_batch_size,
+        batch_size=local_observation_batch,
         shuffle=sampler is None,
         sampler=sampler,
         num_workers=args.num_workers,
@@ -786,15 +1008,19 @@ def train(args: argparse.Namespace) -> None:
     data_iter = iter(train_loader)
     while global_step < config.num_train_steps:
         try:
-            observation, x_t, score_target, time_cond = next(data_iter)
+            input_batch, x_t, score_target, time_cond = next(data_iter)
         except StopIteration:
             epoch += 1
             if sampler is not None:
                 sampler.set_epoch(epoch)
             data_iter = iter(train_loader)
-            observation, x_t, score_target, time_cond = next(data_iter)
+            input_batch, x_t, score_target, time_cond = next(data_iter)
 
-        observation = move_to_device(observation, device)
+        # Keep cached images as compact uint8 tensors through the worker/pinned-memory
+        # path. Conversion to float, channel permutation, and augmentations happen as
+        # one batched operation on the GPU.
+        input_batch = move_to_device(input_batch, device)
+        observation = _model.Observation.from_dict(input_batch)
         x_t = x_t.to(torch.float32).to(device)
         score_target = score_target.to(torch.float32).to(device)
         time_cond = time_cond.to(torch.float32).to(device)
@@ -922,6 +1148,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config_arg(train_parser)
     train_parser.add_argument("--hdf5_path", required=True)
     train_parser.add_argument("--cache_path", required=True)
+    train_parser.add_argument(
+        "--observation_cache_path",
+        default=None,
+        help="Shared mmap observation cache directory (default: <cache_path>.observations).",
+    )
     train_parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     train_parser.add_argument("--exp_name", default="ref")
     train_parser.add_argument("--overwrite", action="store_true")

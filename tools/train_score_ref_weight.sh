@@ -9,6 +9,7 @@ MPC_ITERATIONS="${MPC_ITERATIONS:-1}"
 MPC_NOISE="${MPC_NOISE:-0.8}"
 MPC_TEMPERATURE="${MPC_TEMPERATURE:-0.1}"
 CACHE_FILE="${CACHE_FILE:-${ROOT}/data/weight/ref_action_prox_reverse_${MPC_NUM_SAMPLES}x${MPC_ITERATIONS}_n${MPC_NOISE}.npz}"
+OBSERVATION_CACHE_FILE="${OBSERVATION_CACHE_FILE:-${CACHE_FILE}.observations}"
 stage="${1:-all}"
 GPU_NUM="${2:-${GPU_NUM:-1}}"
 BATCH_SIZE="${3:-${BATCH_SIZE:-32}}"
@@ -96,12 +97,14 @@ train_ref() {
     else
         mode+=(--overwrite)
     fi
-    echo "[score_ref] global batch=${BATCH_SIZE}, per-GPU batch=$((BATCH_SIZE / GPU_NUM)), GPUs=${GPU_NUM}, workers/rank=${NUM_WORKERS}"
+    echo "[score_ref] requested label batch=${BATCH_SIZE}, per-GPU=$((BATCH_SIZE / GPU_NUM)), GPUs=${GPU_NUM}, workers/rank=${NUM_WORKERS}"
+    echo "[score_ref] shared observation cache=${OBSERVATION_CACHE_FILE}"
     PYTHONUNBUFFERED=1 conda run --no-capture-output -n pps \
         "${train_launcher[@]}" scripts/train_mpc_proxy_score_pytorch.py train \
         --config score_ref_weight \
         --hdf5_path "${DATA_FILE}" \
         --cache_path "${CACHE_FILE}" \
+        --observation_cache_path "${OBSERVATION_CACHE_FILE}" \
         --batch_size "${BATCH_SIZE}" \
         --num_workers "${NUM_WORKERS}" \
         --exp_name ref \

@@ -318,14 +318,14 @@ class ProxyScorePytorch(nn.Module):
         if actions is None:
             raise ValueError("actions must be provided for score training.")
 
-        actions = actions[:, :, : self.config.action_dim]
+        actions = actions[..., : self.config.action_dim]
         images, img_masks, state = self._preprocess_observation(observation, train=True)
 
         if score_target is not None:
             if time is None:
                 raise ValueError("time must be provided when training from direct score targets.")
             x_t = actions
-            score_target = score_target[:, :, : self.config.action_dim].to(
+            score_target = score_target[..., : self.config.action_dim].to(
                 device=actions.device,
                 dtype=actions.dtype,
             )
@@ -354,6 +354,27 @@ class ProxyScorePytorch(nn.Module):
             score_target = -noise / sqrt_beta[:, None, None]
 
         prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks)
+        grouped_labels = x_t.ndim == 4
+        if grouped_labels:
+            if score_target.ndim != 4 or time.ndim != 2:
+                raise ValueError(
+                    "Grouped score targets require x_t/score shape [B, L, H, D] "
+                    "and time shape [B, L]."
+                )
+            batch_size, labels_per_observation = x_t.shape[:2]
+            if prefix_embs.shape[0] != batch_size:
+                raise ValueError("Observation batch does not match grouped score targets.")
+            # The expensive visual prefix is computed once per observation. Repeating
+            # the resulting embeddings preserves gradients from every score label
+            # without rerunning DINO for each reverse-diffusion state.
+            prefix_embs = prefix_embs.repeat_interleave(labels_per_observation, dim=0)
+            prefix_pad_masks = prefix_pad_masks.repeat_interleave(
+                labels_per_observation, dim=0
+            )
+            state = state.repeat_interleave(labels_per_observation, dim=0)
+            x_t = x_t.flatten(0, 1)
+            score_target = score_target.flatten(0, 1)
+            time = time.flatten(0, 1)
         score_pred = self.predict_score_from_prefix(
             state,
             prefix_embs,
@@ -361,7 +382,10 @@ class ProxyScorePytorch(nn.Module):
             x_t,
             time,
         )
-        return F.mse_loss(score_pred, score_target, reduction="none")
+        loss = F.mse_loss(score_pred, score_target, reduction="none")
+        if grouped_labels:
+            loss = loss.unflatten(0, (batch_size, labels_per_observation))
+        return loss
 
     @torch.no_grad()
     def sample_actions(
