@@ -469,6 +469,23 @@ def _proxy_score_time_cond(args, iteration: int, device, dtype) -> torch.Tensor:
     return torch.as_tensor(value, device=device, dtype=dtype)
 
 
+def _score_cosine(lhs: torch.Tensor, rhs: torch.Tensor) -> float:
+    return float(
+        F.cosine_similarity(
+            lhs.detach().reshape(1, -1),
+            rhs.detach().reshape(1, -1),
+            dim=-1,
+            eps=1e-8,
+        )[0].cpu()
+    )
+
+
+def _relative_score_error(target: torch.Tensor, prediction: torch.Tensor) -> float:
+    error_norm = torch.linalg.vector_norm((prediction - target).detach())
+    target_norm = torch.linalg.vector_norm(target.detach()).clamp_min(1e-8)
+    return float((error_norm / target_norm).cpu())
+
+
 def _predict_proxy_score(prepared_proxy, model, x_t_path, time_cond):
     if not _is_score_proxy(model):
         raise ValueError(
@@ -1308,6 +1325,13 @@ def _infer_actions_eager(
                 ref_score=ref_full_score,
                 base_scale=args.gamma_base,
             )
+            residual_score = (
+                task_full_score - ref_full_score
+                if ref_full_score is not None
+                else task_full_score
+            )
+            proxy_dims = task_score.shape[-1]
+            base_proxy_score = base_score[..., :proxy_dims]
 
             active_dims = int(geom_stats.get("active_dims", task_score.shape[-1]))
             x_t = mpc_planner.step_from_score(
@@ -1333,7 +1357,12 @@ def _infer_actions_eager(
                 {
                     "update_mode": f"{args.mpc_update}_score_steer",
                     "score_steering_mode": score_steering_mode,
+                    "score_base_norm": float(torch.linalg.vector_norm(base_score.detach()).cpu()),
+                    "score_base_proxy_norm": float(
+                        torch.linalg.vector_norm(base_proxy_score.detach()).cpu()
+                    ),
                     "score_task_norm": float(torch.linalg.vector_norm(task_full_score.detach()).cpu()),
+                    "score_residual_norm": float(torch.linalg.vector_norm(residual_score.detach()).cpu()),
                     "score_combined_norm": float(torch.linalg.vector_norm(combined_score.detach()).cpu()),
                     "proxy_score_time": float(score_time[0].detach().cpu()),
                 }
@@ -1342,6 +1371,30 @@ def _infer_actions_eager(
                 geom_stats["score_ref_norm"] = float(
                     torch.linalg.vector_norm(ref_full_score.detach()).cpu()
                 )
+                geom_stats["score_ref_base_cosine"] = _score_cosine(
+                    base_proxy_score, ref_score
+                )
+                geom_stats["score_ref_base_relative_error"] = _relative_score_error(
+                    base_proxy_score, ref_score
+                )
+                geom_stats["score_task_ref_cosine"] = _score_cosine(task_score, ref_score)
+            if combined_score.shape[-1] > 7:
+                score_components = {
+                    "base": base_score,
+                    "task": task_full_score,
+                    "residual": residual_score,
+                    "combined": combined_score,
+                }
+                if ref_full_score is not None:
+                    score_components["ref"] = ref_full_score
+                for component_name, component_score in score_components.items():
+                    gripper_score = component_score[..., 7].detach()
+                    geom_stats[f"score_{component_name}_gripper_mean"] = float(
+                        gripper_score.mean().cpu()
+                    )
+                    geom_stats[f"score_{component_name}_gripper_norm"] = float(
+                        torch.linalg.vector_norm(gripper_score).cpu()
+                    )
             record_mpc_stats(geom_stats)
             if args.mpc_debug_stdout:
                 print(
@@ -1853,6 +1906,26 @@ def _mpc_debug_stats(stats: dict[str, Any] | None) -> dict[str, Any]:
         "target_delta_norm",
         "accel_norm",
         "score_norm",
+        "score_base_norm",
+        "score_base_proxy_norm",
+        "score_task_norm",
+        "score_ref_norm",
+        "score_residual_norm",
+        "score_combined_norm",
+        "score_ref_base_cosine",
+        "score_ref_base_relative_error",
+        "score_task_ref_cosine",
+        "proxy_score_time",
+        "score_base_gripper_mean",
+        "score_base_gripper_norm",
+        "score_task_gripper_mean",
+        "score_task_gripper_norm",
+        "score_ref_gripper_mean",
+        "score_ref_gripper_norm",
+        "score_residual_gripper_mean",
+        "score_residual_gripper_norm",
+        "score_combined_gripper_mean",
+        "score_combined_gripper_norm",
         "gripper_mean",
         "proposal_center",
         "proposal_noise_scale",
