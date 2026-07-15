@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 DATA_FILE="${DATA_FILE:-${ROOT}/data/weight/generated_dataset.hdf5}"
 DATASET_DIR="${HF_LEROBOT_HOME:-${HOME}/.cache/huggingface/lerobot}/local/isaaclab_weight_score"
+TASK_CACHE_DIR="${TASK_CACHE_DIR:-${ROOT}/data/weight/score_task_weight.observations}"
 GPU_NUM="${1:-${GPU_NUM:-1}}"
 BATCH_SIZE="${2:-${BATCH_SIZE:-32}}"
 if [[ -n "${3:-}" ]]; then
@@ -105,6 +106,14 @@ if [[ "${resuming}" == false ]]; then
     echo "[score_task] initializing from ${ref_checkpoint_dir}"
     init+=(--pytorch_weight_path "${ref_checkpoint_dir}")
 fi
+
+echo "[score_task] shared training cache=${TASK_CACHE_DIR}"
+PYTHONUNBUFFERED=1 conda run --no-capture-output -n pps \
+    python scripts/train_proxy_score_pytorch.py prepare-task-cache \
+    --config score_task_weight \
+    --cache-path "${TASK_CACHE_DIR}" \
+    --num-workers "${NUM_WORKERS}"
+export SCORE_TASK_CACHE_PATH="${TASK_CACHE_DIR}"
 
 echo "[score_task] global batch=${BATCH_SIZE}, per-GPU batch=$((BATCH_SIZE / GPU_NUM)), GPUs=${GPU_NUM}, workers/rank=${NUM_WORKERS}"
 PYTHONUNBUFFERED=1 conda run --no-capture-output -n pps \

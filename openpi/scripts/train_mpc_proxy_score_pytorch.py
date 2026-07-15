@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import datetime
 import hashlib
 import json
 import logging
@@ -709,9 +710,9 @@ class MPCScoreDataset(torch.utils.data.Dataset):
 
     def _build_observation_cache(self, metadata: dict[str, Any]) -> None:
         cache_path = self.observation_cache_path
+        for stale_tmp_path in cache_path.parent.glob(f"{cache_path.name}.tmp-*"):
+            shutil.rmtree(stale_tmp_path)
         tmp_path = cache_path.with_name(f"{cache_path.name}.tmp-{os.getpid()}")
-        if tmp_path.exists():
-            shutil.rmtree(tmp_path)
         tmp_path.mkdir(parents=True)
 
         num_observations = len(self.unique_demo_names)
@@ -886,6 +887,16 @@ def train(args: argparse.Namespace) -> None:
     elif config.wandb_enabled:
         wandb.init(mode="disabled")
 
+    cache_sync_group = None
+    if use_ddp:
+        # Cache preparation can take longer than NCCL's 10-minute watchdog.
+        # Keep the default NCCL group idle and synchronize this one-time CPU job
+        # through a long-timeout Gloo group instead.
+        cache_sync_group = torch.distributed.new_group(
+            backend="gloo",
+            timeout=datetime.timedelta(hours=2),
+        )
+
     dataset = None
     if is_main:
         dataset = MPCScoreDataset(
@@ -896,8 +907,9 @@ def train(args: argparse.Namespace) -> None:
             observation_cache_path=args.observation_cache_path,
             build_observation_cache=True,
         )
-    if use_ddp:
-        torch.distributed.barrier()
+    if cache_sync_group is not None:
+        torch.distributed.barrier(group=cache_sync_group)
+        torch.distributed.destroy_process_group(cache_sync_group)
     if dataset is None:
         dataset = MPCScoreDataset(
             hdf5_path=args.hdf5_path,

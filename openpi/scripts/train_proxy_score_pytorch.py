@@ -8,9 +8,13 @@ Usage:
   python scripts/train_proxy_score_pytorch.py score_task_weight --exp_name task
 """
 
+import argparse
 import dataclasses
+import hashlib
+import json
 import logging
 import os
+import pathlib
 import shutil
 import sys
 import time
@@ -30,11 +34,303 @@ import torch.nn.parallel
 import tqdm
 import wandb
 
+from openpi.models import model as _model
 import openpi.models.proxy_score_config
 import openpi.models_pytorch.proxy_score_pytorch
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
+
+
+TASK_CACHE_FORMAT_VERSION = 1
+TASK_CACHE_IMAGE_KEYS = ("base_0_rgb", "left_wrist_0_rgb")
+TASK_CACHE_ENV = "SCORE_TASK_CACHE_PATH"
+
+
+def _norm_stats_fingerprint(norm_stats) -> str | None:
+    if norm_stats is None:
+        return None
+    digest = hashlib.sha256()
+    for key in sorted(norm_stats):
+        digest.update(key.encode("utf-8"))
+        stat = norm_stats[key]
+        for field in ("mean", "std", "q01", "q99"):
+            value = getattr(stat, field, None)
+            if value is None:
+                digest.update(f"{field}:None".encode("utf-8"))
+                continue
+            array = np.asarray(value)
+            digest.update(field.encode("utf-8"))
+            digest.update(str(array.shape).encode("utf-8"))
+            digest.update(str(array.dtype).encode("utf-8"))
+            digest.update(np.ascontiguousarray(array).tobytes())
+    return digest.hexdigest()
+
+
+def _task_cache_metadata(config, data_config, *, num_samples: int) -> dict:
+    return {
+        "format_version": TASK_CACHE_FORMAT_VERSION,
+        "config": config.name,
+        "repo_id": data_config.repo_id,
+        "num_samples": int(num_samples),
+        "action_horizon": int(config.model.action_horizon),
+        "action_dim": int(config.model.action_dim),
+        "norm_stats_fingerprint": _norm_stats_fingerprint(data_config.norm_stats),
+        "use_quantile_norm": bool(data_config.use_quantile_norm),
+        "image_keys": list(TASK_CACHE_IMAGE_KEYS),
+        "image_shape": [224, 224, 3],
+    }
+
+
+def _build_task_data_config(config):
+    data_config = config.data.create(config.assets_dirs, config.model)
+    if data_config.norm_stats is None and getattr(config.data, "norm_stats_dir", None):
+        norm_stats_dir = pathlib.Path(getattr(config.data, "norm_stats_dir"))
+        candidates = (
+            norm_stats_dir,
+            pathlib.Path(_OPENPI_DIR) / norm_stats_dir,
+            pathlib.Path(_OPENPI_DIR).parent / norm_stats_dir,
+        )
+        for candidate in candidates:
+            if (candidate / "norm_stats.json").exists():
+                data_config = dataclasses.replace(
+                    data_config,
+                    norm_stats=_normalize.load(candidate),
+                )
+                break
+    if data_config.norm_stats is None:
+        raise FileNotFoundError(
+            f"Normalization stats are required to build the {config.name!r} task cache."
+        )
+    return data_config
+
+
+def _task_cache_matches(cache_path: pathlib.Path, metadata: dict) -> bool:
+    metadata_path = cache_path / "metadata.json"
+    if not metadata_path.exists():
+        return False
+    try:
+        cached_metadata = json.loads(metadata_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    if cached_metadata != metadata:
+        return False
+    required_files = (
+        "images.npy",
+        "image_masks.npy",
+        "states.npy",
+        "actions.npy",
+        "tokenized_prompt.npy",
+        "tokenized_prompt_mask.npy",
+    )
+    return all((cache_path / filename).exists() for filename in required_files)
+
+
+def prepare_task_cache(config, cache_path: pathlib.Path, *, num_workers: int) -> None:
+    data_config = _build_task_data_config(config)
+    dataset = _data.create_torch_dataset(
+        data_config,
+        config.model.action_horizon,
+        config.model,
+    )
+    dataset = _data.transform_dataset(dataset, data_config)
+    metadata = _task_cache_metadata(config, data_config, num_samples=len(dataset))
+    if _task_cache_matches(cache_path, metadata):
+        logging.info("Reusing task score cache: %s", cache_path)
+        return
+
+    for stale_tmp_path in cache_path.parent.glob(f"{cache_path.name}.tmp-*"):
+        shutil.rmtree(stale_tmp_path)
+    tmp_path = cache_path.with_name(f"{cache_path.name}.tmp-{os.getpid()}")
+    tmp_path.mkdir(parents=True)
+
+    num_samples = len(dataset)
+    images = np.lib.format.open_memmap(
+        tmp_path / "images.npy",
+        mode="w+",
+        dtype=np.uint8,
+        shape=(num_samples, len(TASK_CACHE_IMAGE_KEYS), 224, 224, 3),
+    )
+    image_masks = np.lib.format.open_memmap(
+        tmp_path / "image_masks.npy",
+        mode="w+",
+        dtype=np.bool_,
+        shape=(num_samples, len(TASK_CACHE_IMAGE_KEYS)),
+    )
+    states = np.lib.format.open_memmap(
+        tmp_path / "states.npy",
+        mode="w+",
+        dtype=np.float32,
+        shape=(num_samples, config.model.action_dim),
+    )
+    actions = np.lib.format.open_memmap(
+        tmp_path / "actions.npy",
+        mode="w+",
+        dtype=np.float32,
+        shape=(num_samples, config.model.action_horizon, config.model.action_dim),
+    )
+    tokenized_prompt = np.lib.format.open_memmap(
+        tmp_path / "tokenized_prompt.npy",
+        mode="w+",
+        dtype=np.int64,
+        shape=(num_samples, config.model.max_token_len),
+    )
+    tokenized_prompt_mask = np.lib.format.open_memmap(
+        tmp_path / "tokenized_prompt_mask.npy",
+        mode="w+",
+        dtype=np.bool_,
+        shape=(num_samples, config.model.max_token_len),
+    )
+
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=64,
+        shuffle=False,
+        num_workers=num_workers,
+        multiprocessing_context="spawn" if num_workers > 0 else None,
+        persistent_workers=num_workers > 0,
+        worker_init_fn=_data._worker_init_fn if num_workers > 0 else None,
+        drop_last=False,
+    )
+    logging.info(
+        "Building task score cache with %s samples, workers=%s at %s",
+        num_samples,
+        num_workers,
+        cache_path,
+    )
+    cursor = 0
+    for batch in tqdm.tqdm(loader, total=len(loader), desc="Task observation cache"):
+        batch_size = int(batch["state"].shape[0])
+        batch_slice = slice(cursor, cursor + batch_size)
+        for image_idx, image_key in enumerate(TASK_CACHE_IMAGE_KEYS):
+            image_batch = batch["image"][image_key].numpy()
+            if image_batch.shape[1:] != (224, 224, 3) or image_batch.dtype != np.uint8:
+                raise ValueError(
+                    f"Expected uint8 [B, 224, 224, 3] images for {image_key}, got "
+                    f"shape={image_batch.shape} dtype={image_batch.dtype}."
+                )
+            images[batch_slice, image_idx] = image_batch
+            image_masks[batch_slice, image_idx] = batch["image_mask"][image_key].numpy()
+        states[batch_slice] = batch["state"].numpy().astype(np.float32, copy=False)
+        actions[batch_slice] = batch["actions"].numpy().astype(np.float32, copy=False)
+        tokenized_prompt[batch_slice] = batch["tokenized_prompt"].numpy()
+        tokenized_prompt_mask[batch_slice] = batch["tokenized_prompt_mask"].numpy()
+        cursor += batch_size
+
+    if cursor != num_samples:
+        raise RuntimeError(f"Cached {cursor} task samples, expected {num_samples}.")
+    for array in (
+        images,
+        image_masks,
+        states,
+        actions,
+        tokenized_prompt,
+        tokenized_prompt_mask,
+    ):
+        array.flush()
+    (tmp_path / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True))
+    if cache_path.exists():
+        shutil.rmtree(cache_path)
+    tmp_path.rename(cache_path)
+    logging.info("Finished task score cache: %s", cache_path)
+
+
+class TaskScoreCacheDataset(torch.utils.data.Dataset):
+    def __init__(self, cache_path: str, config, data_config):
+        self.cache_path = pathlib.Path(cache_path)
+        metadata = json.loads((self.cache_path / "metadata.json").read_text())
+        expected_fields = {
+            "format_version": TASK_CACHE_FORMAT_VERSION,
+            "config": config.name,
+            "repo_id": data_config.repo_id,
+            "action_horizon": int(config.model.action_horizon),
+            "action_dim": int(config.model.action_dim),
+            "norm_stats_fingerprint": _norm_stats_fingerprint(data_config.norm_stats),
+            "use_quantile_norm": bool(data_config.use_quantile_norm),
+        }
+        for key, expected_value in expected_fields.items():
+            if metadata.get(key) != expected_value:
+                raise ValueError(
+                    f"Task score cache field {key!r} is stale: "
+                    f"{metadata.get(key)!r} != {expected_value!r}."
+                )
+        self.num_samples = int(metadata["num_samples"])
+        self.images = np.load(self.cache_path / "images.npy", mmap_mode="c")
+        self.image_masks = np.load(self.cache_path / "image_masks.npy", mmap_mode="c")
+        self.states = np.load(self.cache_path / "states.npy", mmap_mode="c")
+        self.actions = np.load(self.cache_path / "actions.npy", mmap_mode="c")
+        self.tokenized_prompt = np.load(
+            self.cache_path / "tokenized_prompt.npy", mmap_mode="c"
+        )
+        self.tokenized_prompt_mask = np.load(
+            self.cache_path / "tokenized_prompt_mask.npy", mmap_mode="c"
+        )
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        inputs = {
+            "image": {
+                image_key: torch.from_numpy(self.images[idx, image_idx])
+                for image_idx, image_key in enumerate(TASK_CACHE_IMAGE_KEYS)
+            },
+            "image_mask": {
+                image_key: torch.as_tensor(
+                    bool(self.image_masks[idx, image_idx]), dtype=torch.bool
+                )
+                for image_idx, image_key in enumerate(TASK_CACHE_IMAGE_KEYS)
+            },
+            "state": torch.from_numpy(self.states[idx]),
+            "tokenized_prompt": torch.from_numpy(self.tokenized_prompt[idx]),
+            "tokenized_prompt_mask": torch.from_numpy(self.tokenized_prompt_mask[idx]),
+        }
+        return inputs, torch.from_numpy(self.actions[idx])
+
+
+class TaskScoreCacheLoader:
+    def __init__(self, config, cache_path: str):
+        self._data_config = _build_task_data_config(config)
+        dataset = TaskScoreCacheDataset(cache_path, config, self._data_config)
+        sampler = None
+        world_size = 1
+        if torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size()
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                dataset,
+                num_replicas=world_size,
+                rank=torch.distributed.get_rank(),
+                shuffle=True,
+                drop_last=True,
+            )
+        if config.batch_size % world_size != 0:
+            raise ValueError(
+                f"batch_size={config.batch_size} must be divisible by world_size={world_size}."
+            )
+        local_batch_size = config.batch_size // world_size
+        self._loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=local_batch_size,
+            shuffle=sampler is None,
+            sampler=sampler,
+            num_workers=config.num_workers,
+            persistent_workers=config.num_workers > 0,
+            pin_memory=torch.cuda.is_available(),
+            drop_last=True,
+        )
+
+    def data_config(self):
+        return self._data_config
+
+    def __iter__(self):
+        epoch = 0
+        while True:
+            sampler = self._loader.sampler
+            if isinstance(sampler, torch.utils.data.distributed.DistributedSampler):
+                sampler.set_epoch(epoch)
+            for inputs, actions in self._loader:
+                yield inputs, actions, None
+            epoch += 1
 
 
 def init_logging():
@@ -48,13 +344,16 @@ def init_logging():
 def setup_ddp():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     use_ddp = world_size > 1
-    if use_ddp and not torch.distributed.is_initialized():
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-        torch.distributed.init_process_group(backend=backend, init_method="env://")
     local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     if torch.cuda.is_available():
         torch.cuda.set_device(device)
+    if use_ddp and not torch.distributed.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        kwargs = {"backend": backend, "init_method": "env://"}
+        if device.type == "cuda":
+            kwargs["device_id"] = device
+        torch.distributed.init_process_group(**kwargs)
     return use_ddp, local_rank, device
 
 
@@ -105,6 +404,10 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
 
 
 def build_loader(config: _config.TrainConfig):
+    task_cache_path = os.environ.get(TASK_CACHE_ENV)
+    if task_cache_path:
+        logging.info("Using cached task score dataset: %s", task_cache_path)
+        return TaskScoreCacheLoader(config, task_cache_path)
     return _data.create_data_loader(config, framework="pytorch", shuffle=True)
 
 
@@ -275,6 +578,10 @@ def train_loop(config: _config.TrainConfig):
     while global_step < config.num_train_steps:
         observation, actions, noise = next(data_iter)
         observation = move_to_device(observation, device)
+        if isinstance(observation, dict):
+            # Cached uint8 images stay compact through DataLoader and are converted,
+            # permuted, and augmented as a single batch on the GPU.
+            observation = _model.Observation.from_dict(observation)
         actions = actions.to(torch.float32).to(device)
         if noise is not None:
             noise = noise.to(torch.float32).to(device)
@@ -352,6 +659,19 @@ def train_loop(config: _config.TrainConfig):
 
 def main():
     init_logging()
+    if len(sys.argv) > 1 and sys.argv[1] == "prepare-task-cache":
+        parser = argparse.ArgumentParser(description="Build the task score mmap cache.")
+        parser.add_argument("--config", required=True)
+        parser.add_argument("--cache-path", required=True)
+        parser.add_argument("--num-workers", type=int, default=8)
+        args = parser.parse_args(sys.argv[2:])
+        config = _config.get_config(args.config)
+        prepare_task_cache(
+            config,
+            pathlib.Path(args.cache_path),
+            num_workers=args.num_workers,
+        )
+        return
     config = _config.cli()
     train_loop(config)
 
