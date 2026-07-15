@@ -7,7 +7,8 @@ score-space PPS.  For the current path, focus on:
 - `action_space.py`: decodes normalized model actions to real robot joint actions.
 - `ddim.py`: DDIM alpha schedule used by MPC and score policies.
 - `dial_sampler.py`: MPPI/DIAL optimizer.
-- `costs_*.py`: geometric task costs.  For weight, `costs_grasp_flow.py` is the newest staged cost.
+- `costs_*.py`: geometric task costs. `costs_grasp_flow.py` implements the staged weight cost;
+  `costs_capsule_flow.py` implements the capsule open/grasp/place cost.
 
 ## Main API
 
@@ -76,6 +77,7 @@ _, policy_inputs = base_policy.obs_to_input(raw_obs)
 - `joint_pos`, `joint_vel`, `eef_pos`, `eef_quat`, `gripper_pos`
 - `robot_root_pos`, `robot_root_quat`
 - `objects`, e.g. `{"pear": {"pos": ..., "quat": ...}}`
+- Capsule flow additionally requires `objects["capsule_lid"]` and `capsule_lid_joint_pos`.
 
 See `eval_steering.py::build_mpc_context` for the live IsaacLab version.
 
@@ -95,17 +97,16 @@ No-steer MPC-only rollout with the action-proximity MBD score path:
 python eval_steering.py \
     --task Isaac-Weight-Droid-Visuomotor-v0 \
     --prompt "put pear and apple on the scale" \
-    --vlm_base \
-    --no_steer \
+    --vlm-base \
     --mpc_update mbd_score_action_prox \
     --mpc_cost grasp_flow \
     --mpc_optimize_space action \
     --gamma_base 1 \
     --num_steps 10 \
     --mpc_ddim_train_timesteps 100 \
-    --mpc_num_samples 512 \
-    --mpc_iterations 8 \
-    --mpc_noise 0.5 \
+    --mpc_num_samples 4096 \
+    --mpc_iterations 1 \
+    --mpc_noise 0.8 \
     --mpc_temperature 0.1 \
     --mpc_joint_delta_clip 0.15 \
     --task_num_steps 800 \
@@ -116,6 +117,18 @@ python eval_steering.py \
     --steps_per_inference 4 \
     --interpolate
 ```
+
+The three score-base selectors are mutually exclusive:
+
+```text
+--vlm-base:   s = gamma_base * s_base
+--full-steer: s = gamma_base * s_base + steer_scale * (s_task - s_ref)
+--task-steer: s = gamma_base * s_base + steer_scale * s_task
+```
+
+`--full-steer` loads base, task, and ref. `--task-steer` loads only base and
+task. Since the current Weight ref proxy was distilled from
+`mbd_score_action_prox`, use that same `--mpc_update` for full steering.
 
 Related external files:
 

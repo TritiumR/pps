@@ -62,11 +62,11 @@ from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
 from sim_free_mpc import AccelActionMPC, AccelMPCConfig, SimFreeMPC, SimFreeMPCConfig
 from sim_free_mpc.action_space import clamp_real_action_chunk
 from sim_free_mpc.ddim import ddim_iteration_alphas
+from sim_free_mpc.score_steering import combine_scores
 
 
 DEFAULT_BASE_CHECKPOINT_DIR = "openpi/checkpoints/pytorch/pi05_droid_jointpos"
-DEFAULT_TASK_CHECKPOINT_DIR = "openpi/checkpoints/score_task_weight/task/30000"
-DEFAULT_REF_CHECKPOINT_DIR = "openpi/checkpoints/score_ref_weight/ref/30000"
+TASK_PROMPTS_PATH = os.path.join(_REPO_DIR, "task_prompts.json")
 
 _SOUND_VIDEO_SCALE = None
 _SOUND_VIDEO_MAX_DISTANCE_M = 0.05
@@ -210,6 +210,7 @@ def _warn_if_norm_mismatch(
         "task": task_policy,
         "ref": ref_policy,
     }
+    policies = {role: policy for role, policy in policies.items() if policy is not None}
     norm_info = {
         role: _policy_input_norm_stats(policy)
         for role, policy in policies.items()
@@ -224,11 +225,15 @@ def _warn_if_norm_mismatch(
         if missing:
             print(f"WARNING: {role} policy is missing normalization stats for {missing}.")
 
+    if "base" not in norm_info:
+        return
     base_stats, base_use_quantiles = norm_info["base"]
     if base_stats is None:
         return
 
     for role in ("task", "ref"):
+        if role not in norm_info:
+            continue
         role_stats, role_use_quantiles = norm_info[role]
         if role_stats is None:
             continue
@@ -260,21 +265,28 @@ def _warn_if_norm_mismatch(
 
 
 def _assert_score_space_compatibility(base_policy, task_policy, ref_policy, args) -> None:
-    if not _uses_vlm_mpc_base(args):
+    score_mode = _score_steering_mode(args)
+    if score_mode not in ("full", "task"):
         return
-    if not (
-        _is_score_proxy(task_policy._model)
-        or _is_score_proxy(ref_policy._model)
-    ):
-        return
-    if not (_is_score_proxy(task_policy._model) and _is_score_proxy(ref_policy._model)):
-        raise ValueError(
-            "Score-space VLM/MPC steering requires both task and ref policies "
-            "to be ProxyScore checkpoints."
-        )
+
+    if base_policy is None or task_policy is None:
+        raise ValueError(f"{score_mode} score steering requires base and task policies.")
+    score_policies = {"task": task_policy}
+    if score_mode == "full":
+        if ref_policy is None:
+            raise ValueError("Full score steering requires a reference policy.")
+        score_policies["ref"] = ref_policy
+
+    for role, policy in score_policies.items():
+        if not _is_score_proxy(policy._model):
+            raise ValueError(
+                f"{score_mode} score steering requires {role} to be a ProxyScore checkpoint; "
+                f"got {policy._model.config.model_type.value!r}."
+            )
 
     expected_timesteps = int(args.mpc_ddim_train_timesteps)
-    for role, model in (("task", task_policy._model), ("ref", ref_policy._model)):
+    for role, policy in score_policies.items():
+        model = policy._model
         actual = int(getattr(model.config, "ddim_num_train_timesteps", -1))
         if actual != expected_timesteps:
             raise ValueError(
@@ -282,17 +294,17 @@ def _assert_score_space_compatibility(base_policy, task_policy, ref_policy, args
                 f"--mpc_ddim_train_timesteps ({expected_timesteps})."
             )
 
-    policies = {
-        "base": base_policy,
-        "task": task_policy,
-        "ref": ref_policy,
-    }
+    policies = {"base": base_policy, **score_policies}
     norm_info = {role: _policy_input_norm_stats(policy) for role, policy in policies.items()}
     base_stats, base_use_quantiles = norm_info["base"]
     if base_stats is None:
         raise ValueError("Base policy has no input norm_stats; score-space MPC cannot decode a shared action space.")
 
-    for role in ("task", "ref"):
+    action_dim = min(
+        int(getattr(policy._model.config, "action_dim", 8))
+        for policy in policies.values()
+    )
+    for role in score_policies:
         role_stats, role_use_quantiles = norm_info[role]
         if role_stats is None:
             raise ValueError(f"{role} ProxyScore policy has no input norm_stats.")
@@ -304,11 +316,6 @@ def _assert_score_space_compatibility(base_policy, task_policy, ref_policy, args
         for key in ("state", "actions"):
             if key not in base_stats or key not in role_stats:
                 raise ValueError(f"Missing {key!r} norm_stats in base or {role} policy.")
-            action_dim = min(
-                int(getattr(base_policy._model.config, "action_dim", 8)),
-                int(getattr(task_policy._model.config, "action_dim", 8)),
-                int(getattr(ref_policy._model.config, "action_dim", 8)),
-            )
             compare_dim = action_dim if key == "actions" else min(action_dim, 8)
             base_values = _stat_values_for_compare(base_stats[key], base_use_quantiles)
             role_values = _stat_values_for_compare(role_stats[key], role_use_quantiles)
@@ -643,8 +650,52 @@ def _get_compiled_eval_steer_forward():
     return _compiled_eval_steer_forward_all
 
 
+def _score_steering_mode(args) -> str | None:
+    if getattr(args, "full_steer", False):
+        return "full"
+    if getattr(args, "task_steer", False):
+        return "task"
+    if getattr(args, "vlm_base", False):
+        return "base"
+    return None
+
+
 def _uses_vlm_mpc_base(args) -> bool:
-    return bool(getattr(args, "vlm_base", False))
+    return _score_steering_mode(args) is not None
+
+
+def _standalone_policy_role(args) -> str | None:
+    if getattr(args, "ref_only", False):
+        return "ref"
+    if getattr(args, "task_only", False):
+        return "task"
+    return None
+
+
+def _required_policy_roles(args) -> set[str]:
+    standalone_role = _standalone_policy_role(args)
+    if standalone_role is not None:
+        return {standalone_role}
+
+    score_mode = _score_steering_mode(args)
+    if score_mode == "base" or getattr(args, "no_steer", False):
+        return {"base"}
+    if score_mode == "task":
+        return {"base", "task"}
+    return {"base", "task", "ref"}
+
+
+def _steering_mode_name(args) -> str:
+    score_mode = _score_steering_mode(args)
+    if score_mode == "base" or getattr(args, "no_steer", False):
+        return "base_only"
+    if score_mode == "full":
+        return "base_plus_task_minus_ref"
+    if score_mode == "task":
+        return "base_plus_task"
+    if getattr(args, "only_steer", False):
+        return "only_steer"
+    return "task_minus_ref"
 
 
 def _uses_accel_action_mpc(args) -> bool:
@@ -652,13 +703,19 @@ def _uses_accel_action_mpc(args) -> bool:
 
 
 def _base_source_name(args) -> str:
-    if not _uses_vlm_mpc_base(args):
+    standalone_role = _standalone_policy_role(args)
+    if standalone_role is not None:
+        return f"{standalone_role}_only"
+    score_mode = _score_steering_mode(args)
+    if score_mode is None:
         return "pi_checkpoint"
     if _uses_accel_action_mpc(args):
         return "accel_action_mppi"
-    if getattr(args, "no_steer", False):
-        return "vlm_mpc_score"
-    return "vlm_mpc_velocity"
+    if score_mode == "full":
+        return "mbd_full_steer"
+    if score_mode == "task":
+        return "mbd_task_steer"
+    return "mbd_base"
 
 
 def _can_use_compiled_infer(base_policy, task_policy, ref_policy, args) -> bool:
@@ -752,7 +809,7 @@ def _infer_actions_compiled(base_policy, task_policy, ref_policy, raw_obs, args)
     _LAST_INFERENCE_RUNTIME = {
         "base_source": "pi_checkpoint",
         "used_base_model_velocity": True,
-        "steering_mode": "none" if args.no_steer else ("only_steer" if args.only_steer else "task_minus_ref"),
+        "steering_mode": _steering_mode_name(args),
         "checked_vlm_task_ref_shapes": False,
         "x_t_shape": tuple(x_t.shape),
         "v_vlm_shape": None,
@@ -795,6 +852,47 @@ def infer_actions_with_mpc(
     mpc_context=None,
     warm_shift_steps=0,
 ):
+    global _LAST_INFERENCE_RUNTIME
+    standalone_role = _standalone_policy_role(args)
+    if standalone_role is not None:
+        standalone_policy = ref_policy if standalone_role == "ref" else task_policy
+        if standalone_policy is None:
+            raise ValueError(f"--{standalone_role}_only requires a {standalone_role} checkpoint.")
+        _validate_policy_environment_inputs(standalone_policy, raw_obs, standalone_role)
+        outputs = standalone_policy.infer(raw_obs)
+        actions = np.asarray(outputs["actions"], dtype=np.float32)
+        # Policy.infer() has already decoded and unnormalized the proxy output.
+        # Clamp in executable joint space: the first target is relative to the
+        # current robot state, and each later target is relative to the preceding
+        # clamped target in the chunk.
+        max_joint_delta = (
+            args.mpc_joint_delta_clip if args.mpc_joint_delta_clip > 0.0 else None
+        )
+        actions = (
+            clamp_real_action_chunk(
+                torch.as_tensor(actions, dtype=torch.float32),
+                current_joint_pos=raw_obs.get("observation/joint_position"),
+                max_joint_delta=max_joint_delta,
+            )
+            .cpu()
+            .numpy()
+        )
+        _LAST_INFERENCE_RUNTIME = {
+            "base_source": f"{standalone_role}_only",
+            "used_base_model_velocity": False,
+            "steering_mode": f"{standalone_role}_only",
+            "x_t_shape": None,
+            "v_vlm_shape": None,
+            "score_shape": None,
+            "v_task_shape": None,
+            "v_ref_shape": None,
+            "proxy_task_shape": None,
+            "proxy_ref_shape": None,
+            "output_action_shape": tuple(actions.shape),
+            "mpc_last": None,
+            "mpc_trace": [],
+        }
+        return actions, {}
     if _uses_vlm_mpc_base(args) and mpc_planner is None:
         raise ValueError("VLM/MPC base mode requires a SimFreeMPC planner.")
     if not _uses_vlm_mpc_base(args):
@@ -831,8 +929,18 @@ def _infer_actions_eager(
     device = base_obs.state.device
     need_compare = args.compare_difference
     use_vlm_mpc_base = _uses_vlm_mpc_base(args)
-    disable_steering = bool(getattr(args, "no_steer", False))
-    need_task_ref = (not disable_steering) or need_compare
+    score_steering_mode = _score_steering_mode(args)
+    disable_steering = bool(getattr(args, "no_steer", False)) or score_steering_mode == "base"
+    if score_steering_mode == "task":
+        need_task = True
+        need_ref = False
+    elif score_steering_mode == "full":
+        need_task = True
+        need_ref = True
+    else:
+        need_task = (not disable_steering) or need_compare
+        need_ref = need_task
+    need_task_and_ref = need_task and need_ref
     if need_compare and use_vlm_mpc_base:
         raise ValueError(
             "--compare_difference compares against the pi checkpoint base path and is "
@@ -842,11 +950,11 @@ def _infer_actions_eager(
         raise ValueError("VLM/MPC base mode requires mpc_planner and mpc_context.")
 
     base_model = base_policy._model
-    task_model = task_policy._model
-    ref_model = ref_policy._model
+    task_model = task_policy._model if task_policy is not None else None
+    ref_model = ref_policy._model if ref_policy is not None else None
 
     base_action_dim = base_model.config.action_dim
-    proxy_action_dim = task_model.config.action_dim if need_task_ref else None
+    proxy_action_dim = task_model.config.action_dim if need_task else None
     compare_action_dim = proxy_action_dim - 1 if need_compare else None
 
     actions_shape = (
@@ -888,17 +996,27 @@ def _infer_actions_eager(
             use_cache=True,
         )
 
-    if need_task_ref:
+    if need_task:
+        if task_policy is None or task_model is None:
+            raise ValueError("The selected steering mode requires a task policy.")
         task_obs, _ = _obs_to_input_checked(task_policy, raw_obs, "task")
-        ref_obs, _ = _obs_to_input_checked(ref_policy, raw_obs, "ref")
         prepared_task = _prepare_proxy_steering(task_model, task_obs)
-        prepared_ref = _prepare_proxy_steering(ref_model, ref_obs)
-        if (not use_vlm_mpc_base) and (
-            _is_score_proxy(task_model) or _is_score_proxy(ref_model)
-        ):
+        if need_ref:
+            if ref_policy is None or ref_model is None:
+                raise ValueError("The selected steering mode requires a reference policy.")
+            ref_obs, _ = _obs_to_input_checked(ref_policy, raw_obs, "ref")
+            prepared_ref = _prepare_proxy_steering(ref_model, ref_obs)
+        else:
+            prepared_ref = None
+        if (not use_vlm_mpc_base) and _is_score_proxy(task_model):
             raise ValueError(
-                "ProxyScore checkpoints are only supported with --vlm_base score-space steering. "
-                "Use velocity proxy checkpoints for pi-checkpoint base steering."
+                "ProxyScore checkpoints require --full_steer or --task_steer. "
+                "The default pi-checkpoint path operates in flow/velocity space."
+            )
+        if (not use_vlm_mpc_base) and need_ref and _is_score_proxy(ref_model):
+            raise ValueError(
+                "ProxyScore checkpoints require --full_steer or --task_steer. "
+                "The default pi-checkpoint path operates in flow/velocity space."
             )
     else:
         prepared_task = None
@@ -906,7 +1024,8 @@ def _infer_actions_eager(
 
     # if the DINO encoder is frozen and the model names are the same, use the same prefix embeddings for mimic
     if (
-        need_task_ref
+        need_task
+        and need_ref
         and
         getattr(task_model.config, "freeze_dino_encoder", False)
         and getattr(ref_model.config, "freeze_dino_encoder", False)
@@ -935,7 +1054,7 @@ def _infer_actions_eager(
     runtime_stats = {
         "base_source": _base_source_name(args),
         "used_base_model_velocity": False,
-        "steering_mode": "none" if disable_steering else ("only_steer" if args.only_steer else "task_minus_ref"),
+        "steering_mode": _steering_mode_name(args),
         "checked_vlm_task_ref_shapes": False,
         "x_t_shape": tuple(x_t.shape),
         "v_vlm_shape": None,
@@ -965,7 +1084,7 @@ def _infer_actions_eager(
 
     if _uses_accel_action_mpc(args):
         if not disable_steering:
-            raise ValueError("--mpc_optimize_space accel currently supports --vlm_base --no_steer only.")
+            raise ValueError("--mpc_optimize_space accel currently supports --vlm_base base-only mode.")
         if args.mpc_update not in ("legacy_score", "mbd_score"):
             raise ValueError(
                 "Acceleration action-space MPC supports --mpc_update legacy_score or mbd_score. "
@@ -1108,17 +1227,16 @@ def _infer_actions_eager(
             denoise_time += dt
             continue
 
-        if use_vlm_mpc_base and need_task_ref and (
-            _is_score_proxy(task_model) or _is_score_proxy(ref_model)
-        ):
-            if not (_is_score_proxy(task_model) and _is_score_proxy(ref_model)):
-                raise ValueError(
-                    "Score-space VLM/MPC steering requires both task and ref policies "
-                    "to be ProxyScore checkpoints."
-                )
+        if use_vlm_mpc_base and score_steering_mode in ("full", "task"):
+            if task_model is None or not _is_score_proxy(task_model):
+                raise ValueError("Score steering requires a ProxyScore task checkpoint.")
+            if score_steering_mode == "full" and (
+                ref_model is None or not _is_score_proxy(ref_model)
+            ):
+                raise ValueError("Full score steering requires a ProxyScore reference checkpoint.")
             if args.mpc_update == "legacy_score":
                 raise ValueError(
-                    "Score-space task/ref steering does not support --mpc_update legacy_score."
+                    "Score steering does not support --mpc_update legacy_score."
                 )
 
             if args.mpc_update == "mbd_score_action_prox":
@@ -1157,34 +1275,39 @@ def _infer_actions_eager(
                 x_t,
                 score_time,
             )
-            ref_score = _predict_proxy_score(
-                prepared_ref,
-                ref_model,
-                x_t,
-                score_time,
-            )
-            if task_score.shape != ref_score.shape:
-                raise ValueError(
-                    "task/ref score shapes must match: "
-                    f"task={tuple(task_score.shape)}, ref={tuple(ref_score.shape)}."
-                )
             if task_score.shape[:2] != x_t.shape[:2] or task_score.shape[-1] > x_t.shape[-1]:
                 raise ValueError(
-                    "task/ref score shape is incompatible with x_t: "
+                    "Task score shape is incompatible with x_t: "
                     f"task={tuple(task_score.shape)}, x_t={tuple(x_t.shape)}."
                 )
 
             task_full_score = torch.zeros_like(x_t)
-            ref_full_score = torch.zeros_like(x_t)
             task_full_score[:, :, : task_score.shape[-1]] = task_score
-            ref_full_score[:, :, : ref_score.shape[-1]] = ref_score
-            if args.only_steer:
-                combined_score = task_full_score
-            else:
-                combined_score = (
-                    args.gamma_base * base_score
-                    + args.steer_scale * (task_full_score - ref_full_score)
+            ref_score = None
+            ref_full_score = None
+            if score_steering_mode == "full":
+                ref_score = _predict_proxy_score(
+                    prepared_ref,
+                    ref_model,
+                    x_t,
+                    score_time,
                 )
+                if ref_score.shape != task_score.shape:
+                    raise ValueError(
+                        "task/ref score shapes must match: "
+                        f"task={tuple(task_score.shape)}, ref={tuple(ref_score.shape)}."
+                    )
+                ref_full_score = torch.zeros_like(x_t)
+                ref_full_score[:, :, : ref_score.shape[-1]] = ref_score
+
+            combined_score = combine_scores(
+                base_score,
+                task_full_score,
+                mode=score_steering_mode,
+                steer_scale=args.steer_scale,
+                ref_score=ref_full_score,
+                base_scale=args.gamma_base,
+            )
 
             active_dims = int(geom_stats.get("active_dims", task_score.shape[-1]))
             x_t = mpc_planner.step_from_score(
@@ -1199,7 +1322,9 @@ def _infer_actions_eager(
 
             runtime_stats["score_shape"] = tuple(combined_score.shape)
             runtime_stats["proxy_task_shape"] = tuple(task_score.shape)
-            runtime_stats["proxy_ref_shape"] = tuple(ref_score.shape)
+            runtime_stats["proxy_ref_shape"] = (
+                tuple(ref_score.shape) if ref_score is not None else None
+            )
             runtime_stats["v_task_shape"] = None
             runtime_stats["v_ref_shape"] = None
             runtime_stats["checked_vlm_task_ref_shapes"] = True
@@ -1207,12 +1332,16 @@ def _infer_actions_eager(
             geom_stats.update(
                 {
                     "update_mode": f"{args.mpc_update}_score_steer",
+                    "score_steering_mode": score_steering_mode,
                     "score_task_norm": float(torch.linalg.vector_norm(task_full_score.detach()).cpu()),
-                    "score_ref_norm": float(torch.linalg.vector_norm(ref_full_score.detach()).cpu()),
                     "score_combined_norm": float(torch.linalg.vector_norm(combined_score.detach()).cpu()),
                     "proxy_score_time": float(score_time[0].detach().cpu()),
                 }
             )
+            if ref_full_score is not None:
+                geom_stats["score_ref_norm"] = float(
+                    torch.linalg.vector_norm(ref_full_score.detach()).cpu()
+                )
             record_mpc_stats(geom_stats)
             if args.mpc_debug_stdout:
                 print(
@@ -1272,7 +1401,7 @@ def _infer_actions_eager(
             )
 
         if denoise_time >= 0.0:
-            if need_task_ref:
+            if need_task_and_ref:
                 task_v_t = _predict_proxy_flow(
                     prepared_task, task_model, x_t, expanded_time
                 )
@@ -1282,7 +1411,7 @@ def _infer_actions_eager(
             else:
                 task_v_t = None
                 ref_v_t = None
-            if need_task_ref:
+            if need_task_and_ref:
                 if task_v_t.shape != ref_v_t.shape:
                     raise ValueError(
                         "task/ref velocity shapes must match: "
@@ -1534,6 +1663,36 @@ def _extract_scene_objects(env, names, env_origin=None):
     return objects
 
 
+def _extract_capsule_mpc_state(env, env_origin=None):
+    """Extract the live lid link pose and joint position used by capsule_flow."""
+    try:
+        capsule = env.scene["capsule"]
+    except Exception:
+        return {}, None
+
+    lid_joint_pos = None
+    try:
+        lid_joint_ids, _ = capsule.find_joints(["RevoluteJoint_capsule_coffee_maker_3_up"])
+        if len(lid_joint_ids) == 1:
+            lid_joint_pos = _context_tensor(capsule.data.joint_pos[:, lid_joint_ids[0]])
+    except Exception:
+        pass
+
+    lid_objects = {}
+    try:
+        lid_body_ids, _ = capsule.find_bodies(["E_shell_8"])
+        if len(lid_body_ids) == 1:
+            lid_pos = _context_tensor(capsule.data.body_pos_w[:, lid_body_ids[0], :])
+            lid_quat = _context_tensor(capsule.data.body_quat_w[:, lid_body_ids[0], :])
+            if lid_pos is not None and env_origin is not None:
+                lid_pos = lid_pos - env_origin.to(device=lid_pos.device, dtype=lid_pos.dtype)
+            if lid_pos is not None and lid_quat is not None:
+                lid_objects["capsule_lid"] = {"pos": lid_pos, "quat": lid_quat}
+    except Exception:
+        pass
+    return lid_objects, lid_joint_pos
+
+
 def build_mpc_context(env, env_obs_dict, args):
     policy_obs = env_obs_dict["policy"]
     env_origin = None
@@ -1598,6 +1757,13 @@ def build_mpc_context(env, env_obs_dict, args):
         ),
         env_origin=env_origin,
     )
+    capsule_objects, capsule_lid_joint_pos = _extract_capsule_mpc_state(
+        env,
+        env_origin=env_origin,
+    )
+    context["objects"].update(capsule_objects)
+    if capsule_lid_joint_pos is not None:
+        context["capsule_lid_joint_pos"] = capsule_lid_joint_pos
     return context
 
 
@@ -1655,15 +1821,22 @@ def _debug_subtasks(env_obs_dict) -> dict[str, bool]:
 
 
 def _debug_phase_from_subtasks(task_name: str, subtasks: dict[str, bool]) -> str:
-    if "weight" not in task_name.lower():
-        return "unknown"
-    if subtasks.get("grasp_apple", False):
-        return "place_apple"
-    if subtasks.get("pear_on_scale", False):
-        return "grasp_apple"
-    if subtasks.get("grasp_pear", False):
-        return "place_pear"
-    return "grasp_pear"
+    task = task_name.lower()
+    if "weight" in task:
+        if subtasks.get("grasp_apple", False):
+            return "place_apple"
+        if subtasks.get("pear_on_scale", False):
+            return "grasp_apple"
+        if subtasks.get("grasp_pear", False):
+            return "place_pear"
+        return "grasp_pear"
+    if "capsule" in task:
+        if subtasks.get("grasp_pod", False):
+            return "place_pod"
+        if subtasks.get("open_coffee_lid", False):
+            return "grasp_pod"
+        return "open_lid"
+    return "unknown"
 
 
 def _mpc_debug_stats(stats: dict[str, Any] | None) -> dict[str, Any]:
@@ -1736,19 +1909,43 @@ def _debug_action_gripper(action_step) -> float | None:
 
 def _collect_mpc_debug_frames(env, *, axis_length: float = 0.08):
     try:
-        pear = env.scene["pear"]
         ee_frame = env.scene["ee_frame"]
         ee_frame.update(0.0, force_recompute=True)
 
-        pear_pos = pear.data.root_pos_w[:1]
-        pear_quat = pear.data.root_quat_w[:1]
         ee_pos = ee_frame.data.target_pos_w[:1]
         ee_quat = ee_frame.data.target_quat_w[:1]
 
-        frames = [
-            ("pear", pear_pos[0], pear_quat[0]),
-            ("ee", ee_pos[0, 0], ee_quat[0, 0]),
-        ]
+        frames = []
+        is_capsule_task = False
+        try:
+            coffee_maker = env.scene["capsule"]
+            pod = env.scene["can"]
+            is_capsule_task = True
+            frames.append(("gripper", ee_pos[0, 0], ee_quat[0, 0]))
+
+            pod_pos = pod.data.root_pos_w[:1]
+            pod_quat = pod.data.root_quat_w[:1]
+            frames.append(("capsule", pod_pos[0], pod_quat[0]))
+
+            lid_body_ids, _ = coffee_maker.find_bodies(["E_shell_8"])
+            if len(lid_body_ids) == 1:
+                lid_body_id = lid_body_ids[0]
+                lid_pos = coffee_maker.data.body_pos_w[:1, lid_body_id, :]
+                lid_quat = coffee_maker.data.body_quat_w[:1, lid_body_id, :]
+                frames.append(("lid", lid_pos[0], lid_quat[0]))
+        except Exception:
+            pass
+
+        if not is_capsule_task:
+            frames.append(("ee", ee_pos[0, 0], ee_quat[0, 0]))
+            try:
+                pear = env.scene["pear"]
+                pear_pos = pear.data.root_pos_w[:1]
+                pear_quat = pear.data.root_quat_w[:1]
+                frames.append(("pear", pear_pos[0], pear_quat[0]))
+            except Exception:
+                pass
+
         try:
             scale = env.scene["scale"]
             scale_pos = scale.data.root_pos_w[:1]
@@ -1816,6 +2013,9 @@ def _draw_projected_debug_axes(image: np.ndarray, env, camera_name: str, axes: d
         "pear": (255, 255, 255),
         "scale_top": (128, 255, 128),
         "ee": (255, 255, 0),
+        "gripper": (255, 255, 0),
+        "lid": (0, 165, 255),
+        "capsule": (255, 128, 255),
         "rf": (255, 0, 255),
         "lf": (0, 255, 255),
     }
@@ -2213,7 +2413,8 @@ def _slugify(text: str) -> str:
 
 def _video_config_slug(args) -> str:
     parts = [
-        args.mpc_update if _uses_vlm_mpc_base(args) else _base_source_name(args),
+        _base_source_name(args),
+        f"update-{args.mpc_update}" if _uses_vlm_mpc_base(args) else "update-flow",
         f"cost-{getattr(args, 'mpc_cost', 'na')}",
         f"space-{getattr(args, 'mpc_optimize_space', 'na')}",
         f"g{float(args.gamma_base):g}",
@@ -2492,7 +2693,12 @@ def parse_args():
         description="Evaluate the model on the real droid robot."
     )
     parser.add_argument("--task", type=str, required=True)
-    parser.add_argument("--prompt", type=str, default="water the plant with the cup")
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default=None,
+        help="Task prompt. Defaults to the matching task_prompts.json entry.",
+    )
     parser.add_argument("--exp_name", type=str, default="eval")
     parser.add_argument(
         "--output", type=str, default=None, help="Path to the output directory."
@@ -2522,16 +2728,36 @@ def parse_args():
     parser.add_argument(
         "--task_checkpoint_dir",
         type=str,
-        default=DEFAULT_TASK_CHECKPOINT_DIR,
-        help="Task proxy checkpoint directory. Defaults to the weight-task proxy checkpoint.",
+        default=None,
+        help="Task proxy checkpoint directory. Defaults to the matching task_prompts.json entry.",
     )
     parser.add_argument(
         "--ref_checkpoint_dir",
         type=str,
-        default=DEFAULT_REF_CHECKPOINT_DIR,
-        help="Reference proxy checkpoint directory. Defaults to the weight-task reference checkpoint.",
+        default=None,
+        help="Reference proxy checkpoint directory. Defaults to the matching task_prompts.json entry.",
     )
-    parser.add_argument("--steer_scale", type=float, default=0.4)
+    standalone_group = parser.add_mutually_exclusive_group()
+    standalone_group.add_argument(
+        "--ref_only",
+        "--ref-only",
+        dest="ref_only",
+        action="store_true",
+        help="Evaluate the reference proxy directly from noise, without base/MPC/task steering.",
+    )
+    standalone_group.add_argument(
+        "--task_only",
+        "--task-only",
+        dest="task_only",
+        action="store_true",
+        help="Evaluate the task proxy directly from noise, without base/MPC/ref steering.",
+    )
+    parser.add_argument(
+        "--steer_scale",
+        type=float,
+        default=0.4,
+        help="Lambda multiplying the task residual in full/task score steering.",
+    )
     parser.add_argument("--num_steps", type=int, default=10)
     parser.add_argument(
         "--task_num_steps",
@@ -2555,16 +2781,33 @@ def parse_args():
         help="Disable task/ref steering and use only the base path.",
     )
     parser.add_argument("--compare_difference", action="store_true")
-    parser.add_argument(
+    score_mode_group = parser.add_mutually_exclusive_group()
+    score_mode_group.add_argument(
         "--vlm_base",
+        "--vlm-base",
+        dest="vlm_base",
         action="store_true",
-        help="Replace the pi checkpoint base path with FK/cost sim-free MPC.",
+        help="Evaluate only the FK/cost MBD base score, without task/ref steering.",
+    )
+    score_mode_group.add_argument(
+        "--full_steer",
+        "--full-steer",
+        dest="full_steer",
+        action="store_true",
+        help="Run score-space MBD base + steer_scale * (task - ref).",
+    )
+    score_mode_group.add_argument(
+        "--task_steer",
+        "--task-steer",
+        dest="task_steer",
+        action="store_true",
+        help="Run score-space MBD base + steer_scale * task, without loading ref.",
     )
     parser.add_argument(
         "--gamma_base",
         type=float,
         default=1.0,
-        help="Scale for VLM/MPC base velocity in vlm_mpc base mode.",
+        help="Scale multiplying the MBD base score before score composition.",
     )
     parser.add_argument("--mpc_num_samples", type=int, default=512)
     parser.add_argument("--mpc_iterations", type=int, default=8)
@@ -2579,12 +2822,15 @@ def parse_args():
             "mbd_score_action_warm",
             "legacy_score",
         ),
-        default="ddim",
-        help="Update rule for --vlm_base --no_steer sim-free MPC.",
+        default="mbd_score_action_prox",
+        help=(
+            "Reverse update used by MBD base/full/task score modes. Defaults to "
+            "mbd_score_action_prox to match the current Weight ref distillation teacher."
+        ),
     )
     parser.add_argument(
         "--mpc_cost",
-        choices=("priority", "ref_style", "explore", "grasp_flow"),
+        choices=("priority", "ref_style", "explore", "grasp_flow", "capsule_flow"),
         default="priority",
         help="Cost function used by sim-free MPC.",
     )
@@ -2631,7 +2877,8 @@ def parse_args():
         type=float,
         default=0.15,
         help=(
-            "Clamp decoded MPC joint-position targets to this many radians per control step. "
+            "Clamp decoded MPC, --ref-only, or --task-only joint-position targets to this many "
+            "radians per control step. "
             "Set to 0 to disable the per-step delta clamp. Joint limits are still enforced."
         ),
     )
@@ -2666,8 +2913,9 @@ def parse_args():
         "--mpc_debug_video_overlay",
         action="store_true",
         help=(
-            "Debug-only: draw projected pear/EE/finger axes directly on "
-            "the saved rollout videos. Works in headless mode."
+            "Debug-only: draw projected task-object/gripper/finger axes directly "
+            "on saved rollout videos. Capsule adds lid/gripper/capsule axes. "
+            "Works in headless mode."
         ),
     )
     parser.add_argument(
@@ -2678,6 +2926,77 @@ def parse_args():
     return parser
 
 
+def _task_prompt_entry(task_name: str) -> dict[str, str] | None:
+    try:
+        with open(TASK_PROMPTS_PATH, encoding="utf-8") as handle:
+            entries = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Could not load task prompt config {TASK_PROMPTS_PATH}: {exc}") from exc
+
+    if not isinstance(entries, dict):
+        raise ValueError(f"Expected an object at the top level of {TASK_PROMPTS_PATH}.")
+
+    for entry in entries.values():
+        if isinstance(entry, dict) and entry.get("task_id") == task_name:
+            return entry
+
+    task_lower = task_name.lower()
+    key_matches = [
+        entry
+        for key, entry in entries.items()
+        if isinstance(entry, dict) and (key.lower() == task_lower or key.lower() in task_lower)
+    ]
+    if len(key_matches) == 1:
+        return key_matches[0]
+    return None
+
+
+def _repo_relative_path(value: str) -> str:
+    return value if os.path.isabs(value) else os.path.join(_REPO_DIR, value)
+
+
+def _apply_task_prompt_defaults(args, parser: argparse.ArgumentParser) -> None:
+    required_fields = ["prompt"]
+    required_roles = _required_policy_roles(args)
+    if "task" in required_roles:
+        required_fields.append("task_checkpoint_dir")
+    if "ref" in required_roles:
+        required_fields.append("ref_checkpoint_dir")
+    missing_fields = [
+        field
+        for field in required_fields
+        if getattr(args, field) is None
+    ]
+    if not missing_fields:
+        return
+
+    try:
+        entry = _task_prompt_entry(args.task)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if entry is None:
+        parser.error(
+            f"Task {args.task!r} has no matching entry in {TASK_PROMPTS_PATH}. "
+            f"Provide {', '.join('--' + field for field in required_fields)} explicitly."
+        )
+
+    for field in missing_fields:
+        entry_field = field
+        if field.endswith("_checkpoint_dir") and (
+            _score_steering_mode(args) in ("full", "task")
+            or _standalone_policy_role(args) is not None
+        ):
+            entry_field = f"score_{field}"
+        value = entry.get(entry_field)
+        if not isinstance(value, str) or not value:
+            parser.error(
+                f"Task {args.task!r} is missing a valid {entry_field!r} in {TASK_PROMPTS_PATH}."
+            )
+        if field.endswith("_checkpoint_dir"):
+            value = _repo_relative_path(value)
+        setattr(args, field, value)
+
+
 parser = parse_args()
 AppLauncher.add_app_launcher_args(parser)
 # Default the IsaacLab app to headless rendering with cameras enabled so these
@@ -2685,9 +3004,53 @@ AppLauncher.add_app_launcher_args(parser)
 parser.set_defaults(enable_cameras=True, headless=True)
 
 args = parser.parse_args()
+_apply_task_prompt_defaults(args, parser)
+standalone_role = _standalone_policy_role(args)
+if standalone_role is not None:
+    incompatible_flags = [
+        flag
+        for flag, enabled in (
+            ("--vlm_base", args.vlm_base),
+            ("--full_steer", args.full_steer),
+            ("--task_steer", args.task_steer),
+            ("--no_steer", args.no_steer),
+            ("--only_steer", args.only_steer),
+            ("--compare_difference", args.compare_difference),
+        )
+        if enabled
+    ]
+    if incompatible_flags:
+        parser.error(
+            f"--{standalone_role}_only directly evaluates one proxy and cannot be combined with "
+            + ", ".join(incompatible_flags)
+            + "."
+        )
+score_steering_mode = _score_steering_mode(args)
+if score_steering_mode in ("full", "task"):
+    incompatible_flags = [
+        flag
+        for flag, enabled in (
+            ("--no_steer", args.no_steer),
+            ("--only_steer", args.only_steer),
+            ("--compare_difference", args.compare_difference),
+        )
+        if enabled
+    ]
+    if incompatible_flags:
+        parser.error(
+            f"--{score_steering_mode}_steer already defines the score composition and cannot "
+            "be combined with " + ", ".join(incompatible_flags) + "."
+        )
+if score_steering_mode == "base" and (args.only_steer or args.compare_difference):
+    parser.error("--vlm_base is base-only and cannot be combined with --only_steer or --compare_difference.")
+if args.mpc_cost == "capsule_flow" and "capsule" not in args.task.lower():
+    parser.error(
+        "--mpc_cost capsule_flow requires a capsule task, for example "
+        "--task Isaac-Capsule-Droid-Visuomotor-v0."
+    )
 if _uses_accel_action_mpc(args):
-    if not args.no_steer:
-        raise ValueError("--mpc_optimize_space accel currently supports --vlm_base --no_steer only.")
+    if score_steering_mode != "base":
+        raise ValueError("--mpc_optimize_space accel currently supports --vlm_base base-only mode.")
     if args.mpc_update not in ("legacy_score", "mbd_score"):
         raise ValueError(
             "Acceleration action-space MPC supports --mpc_update legacy_score or mbd_score. "
@@ -2790,28 +3153,48 @@ base_checkpoint_dir = args.base_checkpoint_dir
 task_checkpoint_dir = args.task_checkpoint_dir
 ref_checkpoint_dir = args.ref_checkpoint_dir
 print("Resolving checkpoint configs...", flush=True)
-base_config = _config.get_config(_config_name_from_checkpoint_dir(base_checkpoint_dir))
-task_config = _config.get_config(_config_name_from_checkpoint_dir(task_checkpoint_dir))
-ref_config = _config.get_config(_config_name_from_checkpoint_dir(ref_checkpoint_dir))
-
-# Create the trained policies.
-print("Loading base policy checkpoint...", flush=True)
-base_policy = policy_config.create_trained_policy(base_config, base_checkpoint_dir)
-print("Loading task policy checkpoint...", flush=True)
-task_policy = policy_config.create_trained_policy(task_config, task_checkpoint_dir)
-print("Loading ref policy checkpoint...", flush=True)
-ref_policy = policy_config.create_trained_policy(ref_config, ref_checkpoint_dir)
+base_policy = None
+task_policy = None
+ref_policy = None
+required_policy_roles = _required_policy_roles(args)
+if "base" in required_policy_roles:
+    base_config = _config.get_config(_config_name_from_checkpoint_dir(base_checkpoint_dir))
+    print("Loading base policy checkpoint...", flush=True)
+    base_policy = policy_config.create_trained_policy(base_config, base_checkpoint_dir)
+if "task" in required_policy_roles:
+    task_config = _config.get_config(_config_name_from_checkpoint_dir(task_checkpoint_dir))
+    print("Loading task policy checkpoint...", flush=True)
+    task_policy = policy_config.create_trained_policy(
+        task_config,
+        task_checkpoint_dir,
+        sample_kwargs={"num_steps": args.num_steps} if standalone_role == "task" else None,
+    )
+if "ref" in required_policy_roles:
+    ref_config = _config.get_config(_config_name_from_checkpoint_dir(ref_checkpoint_dir))
+    print("Loading ref policy checkpoint...", flush=True)
+    ref_policy = policy_config.create_trained_policy(
+        ref_config,
+        ref_checkpoint_dir,
+        sample_kwargs={"num_steps": args.num_steps} if standalone_role == "ref" else None,
+    )
 
 base_source = _base_source_name(args)
 print(f"Base source: {base_source}", flush=True)
+loaded_model_types = {
+    role: policy._model.config.model_type.value
+    for role, policy in (
+        ("base", base_policy),
+        ("task", task_policy),
+        ("ref", ref_policy),
+    )
+    if policy is not None
+}
 print(
     "Loaded checkpoints: "
-    f"base={base_policy._model.config.model_type.value}, "
-    f"task={task_policy._model.config.model_type.value}, "
-    f"ref={ref_policy._model.config.model_type.value}",
+    + ", ".join(f"{role}={model_type}" for role, model_type in loaded_model_types.items()),
     flush=True,
 )
-if args.mpc_debug:
+if args.mpc_debug and base_policy is not None:
     base_policy._metadata = {
         **(getattr(base_policy, "_metadata", {}) or {}),
         "debug_torch_output_to_actions_norm_stats": True,
@@ -2878,23 +3261,43 @@ if args.load_init_from_dataset is not None:
             f"but {num_rollouts} rollouts were requested."
         )
 
-assert (
-    base_policy._model.config.action_horizon
-    == task_policy._model.config.action_horizon
-    == ref_policy._model.config.action_horizon
-), "Action horizon must be the same for all models"
+if standalone_role is None:
+    loaded_policies = {
+        role: policy
+        for role, policy in (
+            ("base", base_policy),
+            ("task", task_policy),
+            ("ref", ref_policy),
+        )
+        if policy is not None
+    }
+    horizons = {
+        role: int(policy._model.config.action_horizon)
+        for role, policy in loaded_policies.items()
+    }
+    if len(set(horizons.values())) > 1:
+        raise ValueError(f"Action horizon mismatch across loaded policies: {horizons}.")
+    if task_policy is not None and ref_policy is not None:
+        task_action_dim = int(task_policy._model.config.action_dim)
+        ref_action_dim = int(ref_policy._model.config.action_dim)
+        if task_action_dim != ref_action_dim:
+            raise ValueError(
+                "Action dimension mismatch between task/ref policies: "
+                f"task={task_action_dim}, ref={ref_action_dim}."
+            )
 
-assert (
-    task_policy._model.config.action_dim == ref_policy._model.config.action_dim
-), "Action dimension must be the same for proxy models"
-
-_warn_if_norm_mismatch(
-    base_policy,
-    task_policy,
-    ref_policy,
-    action_dim=task_policy._model.config.action_dim,
-)
-_assert_score_space_compatibility(base_policy, task_policy, ref_policy, args)
+    proxy_action_dims = [
+        int(policy._model.config.action_dim)
+        for policy in (task_policy, ref_policy)
+        if policy is not None
+    ]
+    _warn_if_norm_mismatch(
+        base_policy,
+        task_policy,
+        ref_policy,
+        action_dim=min(proxy_action_dims) if proxy_action_dims else 8,
+    )
+    _assert_score_space_compatibility(base_policy, task_policy, ref_policy, args)
 
 steps_per_inference = int(args.steps_per_inference)
 print(
@@ -2917,7 +3320,11 @@ with torch.no_grad():
         copy.deepcopy(obs),
         args,
         mpc_planner=mpc_planner,
-        mpc_context=build_mpc_context(env, env_obs_dict, args),
+        mpc_context=(
+            None
+            if standalone_role is not None
+            else build_mpc_context(env, env_obs_dict, args)
+        ),
     )
 print("Warmup policy inference finished.", flush=True)
 
@@ -2925,8 +3332,9 @@ if args.dry_run:
     print("Dry-run inference check passed", flush=True)
     print(
         "  checkpoints_loaded: "
-        f"task={task_policy._model.config.model_type.value}, "
-        f"ref={ref_policy._model.config.model_type.value}",
+        + ", ".join(
+            f"{role}={model_type}" for role, model_type in loaded_model_types.items()
+        ),
         flush=True,
     )
     print(f"  base_source: {_LAST_INFERENCE_RUNTIME.get('base_source')}", flush=True)
@@ -3130,7 +3538,11 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                 # run inference
                 with torch.no_grad():
                     infer_start = time.perf_counter()
-                    mpc_context = build_mpc_context(env, env_obs_dict, args)
+                    mpc_context = (
+                        None
+                        if standalone_role is not None
+                        else build_mpc_context(env, env_obs_dict, args)
+                    )
                     warm_shift_steps = (
                         0 if actions is None else max(step_idx - action_start_step, 0)
                     )

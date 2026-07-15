@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from .action_space import decode_model_action_chunks, rebase_model_action_chunk
 from .costs import PriorityStateCost
+from .costs_capsule_flow import CapsuleFlowStateCost
 from .costs_explore import ExploreStateCost
 from .costs_grasp_flow import GraspFlowStateCost
 from .costs_ref_style import RefStyleStateCost
@@ -63,6 +64,8 @@ class SimFreeMPC:
             self.cost = ExploreStateCost(config.task_name)
         elif config.cost_style == "grasp_flow":
             self.cost = GraspFlowStateCost(config.task_name)
+        elif config.cost_style == "capsule_flow":
+            self.cost = CapsuleFlowStateCost(config.task_name)
         elif config.cost_style == "priority":
             self.cost = PriorityStateCost(config.task_name)
         else:
@@ -340,7 +343,7 @@ class SimFreeMPC:
                 root_quat.to(device=ee_quat.device, dtype=ee_quat.dtype),
                 ee_quat,
             )
-        if self.config.cost_style in ("ref_style", "explore", "grasp_flow"):
+        if self.config.cost_style in ("ref_style", "explore", "grasp_flow", "capsule_flow"):
             return self.cost(real_actions=real, tcp_pos=ee_pos, tcp_quat=ee_quat, context=context)
         return self.cost(real_actions=real, ee_pos=ee_pos, ee_quat=ee_quat, context=context)
 
