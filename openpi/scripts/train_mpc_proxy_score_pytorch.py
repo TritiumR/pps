@@ -808,7 +808,7 @@ class MPCScoreDataset(torch.utils.data.Dataset):
             },
             "image_mask": {
                 image_key: torch.as_tensor(
-                    self.cached_image_masks[observation_idx, image_idx],
+                    bool(self.cached_image_masks[observation_idx, image_idx]),
                     dtype=torch.bool,
                 )
                 for image_idx, image_key in enumerate(OBSERVATION_IMAGE_KEYS)
@@ -962,16 +962,24 @@ def train(args: argparse.Namespace) -> None:
         if use_ddp
         else None
     )
+    # The mmap cache already contains training-ready tensors.  Forking loader
+    # workers after CUDA/NCCL initialization can leave one DDP rank waiting on
+    # its input queue while the other rank blocks in an all-reduce.  Loading
+    # these small mmap slices in the rank process is both cheaper and safer.
+    if args.num_workers != 0 and is_main:
+        logging.info(
+            "Shared mmap observation cache uses num_workers=0; ignoring requested num_workers=%s.",
+            args.num_workers,
+        )
     train_loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=local_observation_batch,
         shuffle=sampler is None,
         sampler=sampler,
-        num_workers=args.num_workers,
+        num_workers=0,
         pin_memory=torch.cuda.is_available(),
         drop_last=True,
         collate_fn=_collate_cache_batch,
-        persistent_workers=args.num_workers > 0,
     )
     data_config = dataset.data_config
 

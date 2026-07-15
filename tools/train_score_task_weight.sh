@@ -108,6 +108,7 @@ if [[ "${resuming}" == false ]]; then
 fi
 
 echo "[score_task] shared training cache=${TASK_CACHE_DIR}"
+echo "[score_task] cache-build workers=${NUM_WORKERS}; mmap training workers/rank=0"
 PYTHONUNBUFFERED=1 conda run --no-capture-output -n pps \
     python scripts/train_proxy_score_pytorch.py prepare-task-cache \
     --config score_task_weight \
@@ -115,12 +116,12 @@ PYTHONUNBUFFERED=1 conda run --no-capture-output -n pps \
     --num-workers "${NUM_WORKERS}"
 export SCORE_TASK_CACHE_PATH="${TASK_CACHE_DIR}"
 
-echo "[score_task] global batch=${BATCH_SIZE}, per-GPU batch=$((BATCH_SIZE / GPU_NUM)), GPUs=${GPU_NUM}, workers/rank=${NUM_WORKERS}"
+echo "[score_task] global batch=${BATCH_SIZE}, per-GPU batch=$((BATCH_SIZE / GPU_NUM)), GPUs=${GPU_NUM}, workers/rank=0"
 PYTHONUNBUFFERED=1 conda run --no-capture-output -n pps \
     "${train_launcher[@]}" scripts/train_proxy_score_pytorch.py \
     score_task_weight \
     --batch_size "${BATCH_SIZE}" \
-    --num_workers "${NUM_WORKERS}" \
+    --num_workers 0 \
     --exp_name task \
     "${init[@]}" \
     "${mode[@]}"

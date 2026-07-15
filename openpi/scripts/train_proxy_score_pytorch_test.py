@@ -61,6 +61,9 @@ def _synthetic_config():
 
 def test_task_cache_reuses_preprocessed_tensors(monkeypatch, tmp_path):
     config = _synthetic_config()
+    # Cached DDP training must not fork workers after CUDA/NCCL setup, even if
+    # the general training config requests workers for uncached data.
+    config.num_workers = 24
     dataset = _SyntheticTaskDataset()
     monkeypatch.setattr(train_score._data, "create_torch_dataset", lambda *_: dataset)
     monkeypatch.setattr(train_score._data, "transform_dataset", lambda value, *_: value)
@@ -82,6 +85,7 @@ def test_task_cache_reuses_preprocessed_tensors(monkeypatch, tmp_path):
     torch.testing.assert_close(actions, torch.ones(3, 2))
 
     loader = train_score.TaskScoreCacheLoader(config, str(cache_path))
+    assert loader._loader.num_workers == 0
     input_batch, action_batch, noise = next(iter(loader))
     assert noise is None
     assert tuple(input_batch["image"]["base_0_rgb"].shape) == (2, 224, 224, 3)

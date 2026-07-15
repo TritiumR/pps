@@ -308,13 +308,16 @@ class TaskScoreCacheLoader:
                 f"batch_size={config.batch_size} must be divisible by world_size={world_size}."
             )
         local_batch_size = config.batch_size // world_size
+        # Cached samples are already uint8/float tensors backed by mmap.  Keep
+        # reads in the DDP rank process: spawning/forking workers after CUDA
+        # initialization adds no preprocessing benefit and can deadlock one
+        # rank's input queue while its peers wait in an all-reduce.
         self._loader = torch.utils.data.DataLoader(
             dataset,
             batch_size=local_batch_size,
             shuffle=sampler is None,
             sampler=sampler,
-            num_workers=config.num_workers,
-            persistent_workers=config.num_workers > 0,
+            num_workers=0,
             pin_memory=torch.cuda.is_available(),
             drop_last=True,
         )

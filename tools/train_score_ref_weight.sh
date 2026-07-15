@@ -97,7 +97,8 @@ train_ref() {
     else
         mode+=(--overwrite)
     fi
-    echo "[score_ref] requested label batch=${BATCH_SIZE}, per-GPU=$((BATCH_SIZE / GPU_NUM)), GPUs=${GPU_NUM}, workers/rank=${NUM_WORKERS}"
+    echo "[score_ref] requested label batch=${BATCH_SIZE}, per-GPU=$((BATCH_SIZE / GPU_NUM)), GPUs=${GPU_NUM}"
+    echo "[score_ref] mmap training workers/rank=0 (requested ${NUM_WORKERS}; avoids post-CUDA worker deadlocks)"
     echo "[score_ref] shared observation cache=${OBSERVATION_CACHE_FILE}"
     PYTHONUNBUFFERED=1 conda run --no-capture-output -n pps \
         "${train_launcher[@]}" scripts/train_mpc_proxy_score_pytorch.py train \
@@ -106,7 +107,7 @@ train_ref() {
         --cache_path "${CACHE_FILE}" \
         --observation_cache_path "${OBSERVATION_CACHE_FILE}" \
         --batch_size "${BATCH_SIZE}" \
-        --num_workers "${NUM_WORKERS}" \
+        --num_workers 0 \
         --exp_name ref \
         "${mode[@]}"
 }
