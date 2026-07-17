@@ -709,7 +709,7 @@ def _steering_mode_name(args) -> str:
     if score_mode == "full":
         return "base_plus_task_minus_ref"
     if score_mode == "task":
-        return "base_plus_task"
+        return "base_to_task"
     if getattr(args, "only_steer", False):
         return "only_steer"
     return "task_minus_ref"
@@ -1325,10 +1325,11 @@ def _infer_actions_eager(
                 ref_score=ref_full_score,
                 base_scale=args.gamma_base,
             )
+            scaled_base_score = args.gamma_base * base_score
             residual_score = (
                 task_full_score - ref_full_score
                 if ref_full_score is not None
-                else task_full_score
+                else task_full_score - scaled_base_score
             )
             proxy_dims = task_score.shape[-1]
             base_proxy_score = base_score[..., :proxy_dims]
@@ -2874,7 +2875,10 @@ def parse_args():
         "--task-steer",
         dest="task_steer",
         action="store_true",
-        help="Run score-space MBD base + steer_scale * task, without loading ref.",
+        help=(
+            "Run score-space base + steer_scale * (task - base), without loading ref. "
+            "gamma_base scales the effective base before interpolation."
+        ),
     )
     parser.add_argument(
         "--gamma_base",

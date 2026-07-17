@@ -24,6 +24,7 @@ def combine_scores(
             f"base={tuple(base_score.shape)}, task={tuple(task_score.shape)}."
         )
 
+    scaled_base = float(base_scale) * base_score
     if mode == "full":
         if ref_score is None:
             raise ValueError("Full score steering requires a reference score.")
@@ -36,8 +37,8 @@ def combine_scores(
     elif mode == "task":
         if ref_score is not None:
             raise ValueError("Task score steering must not receive a reference score.")
-        residual = task_score
+        residual = task_score - scaled_base
     else:
         raise ValueError(f"Unknown score steering mode: {mode!r}.")
 
-    return float(base_scale) * base_score + float(steer_scale) * residual
+    return scaled_base + float(steer_scale) * residual

@@ -26,13 +26,29 @@ def test_full_score_steering_uses_task_minus_ref():
     assert torch.allclose(combined, base + 0.5 * (task - ref))
 
 
-def test_task_score_steering_does_not_require_ref():
+def test_task_score_steering_uses_base_as_ref():
     base = torch.tensor([[[1.0, 2.0]]])
     task = torch.tensor([[[4.0, 8.0]]])
 
     combined = combine_scores(base, task, mode="task", steer_scale=0.25)
 
-    assert torch.allclose(combined, base + 0.25 * task)
+    assert torch.allclose(combined, base + 0.25 * (task - base))
+
+
+def test_task_score_steering_interpolates_from_scaled_base():
+    base = torch.tensor([[[1.0, 2.0]]])
+    task = torch.tensor([[[4.0, 8.0]]])
+
+    combined = combine_scores(
+        base,
+        task,
+        mode="task",
+        steer_scale=0.25,
+        base_scale=2.0,
+    )
+
+    scaled_base = 2.0 * base
+    assert torch.allclose(combined, scaled_base + 0.25 * (task - scaled_base))
 
 
 def test_full_score_steering_requires_ref():
