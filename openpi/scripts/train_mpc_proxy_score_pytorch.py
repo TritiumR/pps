@@ -6,25 +6,35 @@ by querying the same FK/cost MPC score estimator used at evaluation time:
 
     s_ref(x_t, o, t) = MPC.estimate_mbd_score_action_prox(x_t, o, context, t)
 
+For each cached observation, generation starts at Gaussian action noise and
+follows the complete online ``mbd_score_action_prox`` reverse trajectory.  Each
+visited state is paired with its MPC score target.  Expert actions are not used
+to construct the diffusion states.
+
 The script has two explicit stages so expensive MPC labels can be inspected and
 reused:
 
   python scripts/train_mpc_proxy_score_pytorch.py generate-cache \
-      --config proxy_score_mpc_weight_jointpos \
+      --config score_ref_weight \
       --hdf5_path /home/chuanruo/diffusion_policy/data/weight/generated_dataset.hdf5 \
-      --cache_path ../data/weight/mpc_score_ref_labels.npz
+      --cache_path ../data/weight/ref_action_prox_reverse_512x8_n0.8.npz
 
   python scripts/train_mpc_proxy_score_pytorch.py train \
-      --config proxy_score_mpc_weight_jointpos \
+      --config score_ref_weight \
       --hdf5_path /home/chuanruo/diffusion_policy/data/weight/generated_dataset.hdf5 \
-      --cache_path ../data/weight/mpc_score_ref_labels.npz \
-      --exp_name reference --overwrite
+      --cache_path ../data/weight/ref_action_prox_reverse_512x8_n0.8.npz \
+      --exp_name ref --overwrite
+
+Training groups every reverse trajectory by observation.  Its 11 score labels
+share one DINO visual prefix, while a persistent mmap sidecar stores the
+once-resized uint8 observations for all DataLoader workers and DDP ranks.
 """
 
 from __future__ import annotations
 
 import argparse
 import dataclasses
+import datetime
 import hashlib
 import json
 import logging
@@ -56,8 +66,8 @@ from openpi import transforms as _transforms
 from openpi.models import model as _model
 import openpi.models.proxy_score_config
 import openpi.models_pytorch.proxy_score_pytorch as _proxy_score
-from openpi.policies import policy_config
 import openpi.training.config as _config
+from openpi.training import checkpoints as _checkpoints
 from openpi.shared import normalize as _normalize
 from sim_free_mpc import SimFreeMPC, SimFreeMPCConfig
 from sim_free_mpc.ddim import ddim_iteration_alphas
@@ -84,6 +94,12 @@ DEFAULT_BASE_CHECKPOINT_DIR = os.path.join(
     "pi05_droid_jointpos",
 )
 DEFAULT_PROMPT = "put pear and apple on the scale"
+CACHE_FORMAT_VERSION = 3
+CACHE_LABEL_TYPE = "mpc_score_action_prox_reverse_trajectory"
+CACHE_STATE_SOURCE = "action_prox_reverse_trajectory_from_gaussian"
+ACTION_PROX_NOISE_SCHEDULE = "mpc_noise_times_sqrt_one_minus_alpha_bar"
+OBSERVATION_CACHE_FORMAT_VERSION = 1
+OBSERVATION_IMAGE_KEYS = ("base_0_rgb", "left_wrist_0_rgb")
 
 
 def _norm_stats_fingerprint(norm_stats: dict[str, Any] | None) -> str | None:
@@ -106,7 +122,7 @@ def _norm_stats_fingerprint(norm_stats: dict[str, Any] | None) -> str | None:
     return digest.hexdigest()
 
 
-def _data_config_and_transform(config: _config.TrainConfig):
+def _build_data_pipeline(config: _config.TrainConfig):
     data_config = config.data.create(config.assets_dirs, config.model)
     if data_config.norm_stats is None and getattr(config.data, "norm_stats_dir", None):
         norm_stats_dir = pathlib.Path(getattr(config.data, "norm_stats_dir"))
@@ -136,7 +152,7 @@ def _data_config_and_transform(config: _config.TrainConfig):
     return data_config, input_transform
 
 
-def _raw_hdf5_sample(
+def _demo_sample(
     demo: h5py.Group,
     step_idx: int,
     *,
@@ -155,27 +171,24 @@ def _raw_hdf5_sample(
     }
 
 
-def _raw_policy_observation(
-    demo: h5py.Group,
-    step_idx: int,
-    *,
-    action_horizon: int,
-    prompt: str,
-) -> dict[str, Any]:
-    sample = _raw_hdf5_sample(
-        demo,
-        step_idx,
-        action_horizon=action_horizon,
-        prompt=prompt,
+class _ActionDecoder:
+    """Minimal policy interface needed by sim-free MPC action decoding."""
+
+    def __init__(self, norm_stats: dict[str, Any], *, use_quantile_norm: bool):
+        self._metadata = {
+            "output_norm_stats": {
+                key: value for key, value in norm_stats.items() if key in ("state", "actions")
+            },
+            "use_quantile_norm": use_quantile_norm,
+        }
+
+
+def _torch_inputs(input_transform, sample: dict[str, Any], device: torch.device):
+    inputs = input_transform(jax.tree.map(lambda x: x, sample))
+    return jax.tree.map(
+        lambda x: torch.from_numpy(np.asarray(x)).to(device)[None, ...],
+        inputs,
     )
-    return {
-        "observation/exterior_image_1_left": sample["exterior_image_1_left"],
-        "observation/wrist_image_left": sample["wrist_image_left"],
-        "observation/joint_position": sample["joint_position"],
-        "observation/gripper_position": sample["gripper_position"],
-        "actions": sample["actions"],
-        "prompt": prompt,
-    }
 
 
 def _pose(group: h5py.Group, path: str, step_idx: int) -> np.ndarray | None:
@@ -220,7 +233,7 @@ def _heuristic_weight_subtasks(objects: dict[str, dict[str, np.ndarray]], eef_po
     return subtasks
 
 
-def _mpc_context_from_hdf5(
+def _mpc_context(
     demo: h5py.Group,
     step_idx: int,
     *,
@@ -274,7 +287,7 @@ def _sample_indices(
     hdf5_path: pathlib.Path,
     *,
     action_horizon: int,
-    max_labels: int | None,
+    max_trajectories: int | None,
     stride: int,
     seed: int,
 ) -> list[tuple[str, int]]:
@@ -284,13 +297,13 @@ def _sample_indices(
         for demo_name in sorted(f["data"].keys()):
             demo = f["data"][demo_name]
             length = len(demo["obs/joint_actions"])
-            max_step = length - action_horizon - 1
-            if max_step <= 0:
+            num_windows = length - action_horizon
+            if num_windows <= 0:
                 continue
-            all_indices.extend((demo_name, step) for step in range(0, max_step, stride))
+            all_indices.extend((demo_name, step) for step in range(0, num_windows, stride))
     rng.shuffle(all_indices)
-    if max_labels is not None:
-        all_indices = all_indices[:max_labels]
+    if max_trajectories is not None:
+        all_indices = all_indices[:max_trajectories]
     return all_indices
 
 
@@ -302,21 +315,28 @@ def generate_cache(args: argparse.Namespace) -> None:
     device_name = args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu"
     device = torch.device(device_name)
     base_config = _config.get_config(args.base_config)
-    base_policy = policy_config.create_trained_policy(
-        base_config,
-        args.base_checkpoint_dir,
-        pytorch_device=device_name,
+    base_data_config = base_config.data.create(base_config.assets_dirs, base_config.model)
+    if base_data_config.asset_id is None:
+        raise ValueError(f"Base config {args.base_config!r} has no norm-stat asset_id.")
+    base_norm_stats = _checkpoints.load_norm_stats(
+        pathlib.Path(args.base_checkpoint_dir) / "assets",
+        base_data_config.asset_id,
     )
-    score_data_config, _ = _data_config_and_transform(config)
-    base_norm_stats = (getattr(base_policy, "_metadata", {}) or {}).get("output_norm_stats")
+    score_data_config, input_transform = _build_data_pipeline(config)
     if _norm_stats_fingerprint(base_norm_stats) != _norm_stats_fingerprint(score_data_config.norm_stats):
         raise ValueError(
             "Base policy and score config norm_stats differ. Use one shared norm_stats source "
             "before generating MPC score labels."
         )
+    if base_data_config.use_quantile_norm != score_data_config.use_quantile_norm:
+        raise ValueError("Base policy and score config use different normalization modes.")
+    action_decoder = _ActionDecoder(
+        base_norm_stats,
+        use_quantile_norm=base_data_config.use_quantile_norm,
+    )
 
     planner = SimFreeMPC(
-        base_policy,
+        action_decoder,
         SimFreeMPCConfig(
             task_name=args.task,
             num_samples=args.mpc_num_samples,
@@ -326,6 +346,7 @@ def generate_cache(args: argparse.Namespace) -> None:
             beta_opt_iter=args.mpc_beta_opt_iter,
             beta_horizon=args.mpc_beta_horizon,
             action_dims=config.model.action_dim,
+            joint_delta_clip=args.mpc_joint_delta_clip,
             cost_style=args.mpc_cost,
             optimize_space="action",
             ddim_num_train_timesteps=config.model.ddim_num_train_timesteps,
@@ -338,83 +359,105 @@ def generate_cache(args: argparse.Namespace) -> None:
     indices = _sample_indices(
         pathlib.Path(args.hdf5_path),
         action_horizon=config.model.action_horizon,
-        max_labels=args.max_labels,
+        max_trajectories=args.max_trajectories,
         stride=args.stride,
         seed=args.seed,
     )
     if not indices:
         raise ValueError("No valid HDF5 windows found for MPC score label generation.")
 
-    rng = np.random.default_rng(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
     demo_names: list[str] = []
     step_indices: list[int] = []
+    trajectory_ids: list[int] = []
     iterations: list[int] = []
     times: list[float] = []
-    x_t_values: list[np.ndarray] = []
-    score_values: list[np.ndarray] = []
-    cost_min: list[float] = []
-    score_norm: list[float] = []
+    diffusion_states: list[np.ndarray] = []
+    target_scores: list[np.ndarray] = []
+    min_costs: list[float] = []
+    score_norms: list[float] = []
 
     num_iterations = int(args.num_steps) + 1
     if num_iterations > config.model.ddim_num_train_timesteps:
         raise ValueError("--num_steps + 1 must be <= ddim_num_train_timesteps.")
 
     with h5py.File(args.hdf5_path, "r") as f:
-        pbar = tqdm.tqdm(indices, desc="MPC score labels")
-        for demo_name, step_idx in pbar:
+        pbar = tqdm.tqdm(indices, desc="MPC reverse trajectories")
+        for trajectory_id, (demo_name, step_idx) in enumerate(pbar):
             demo = f["data"][demo_name]
-            raw_obs = _raw_policy_observation(
+            sample = _demo_sample(
                 demo,
                 step_idx,
                 action_horizon=config.model.action_horizon,
                 prompt=args.prompt,
             )
-            base_obs, base_inputs = base_policy.obs_to_input(raw_obs)
-            clean_actions = base_inputs["actions"].to(device=device, dtype=torch.float32)
-
-            iteration = int(rng.integers(0, num_iterations))
-            alpha, _ = ddim_iteration_alphas(
-                iteration=iteration,
-                num_iterations=num_iterations,
-                num_train_timesteps=config.model.ddim_num_train_timesteps,
+            model_inputs = _torch_inputs(input_transform, sample, device)
+            x_t = torch.randn(
+                (1, config.model.action_horizon, config.model.action_dim),
+                device=device,
+                dtype=torch.float32,
             )
-            sqrt_alpha = float(np.sqrt(max(alpha, 1e-12)))
-            sqrt_beta = float(np.sqrt(max(1.0 - alpha, 1e-12)))
-            noise = torch.randn_like(clean_actions, device=device)
-            x_t = sqrt_alpha * clean_actions + sqrt_beta * noise
 
-            context = _mpc_context_from_hdf5(
+            context = _mpc_context(
                 demo,
                 step_idx,
                 task=args.task,
                 subtask_mode=args.subtask_mode,
             )
-            score, diagnostics = planner.estimate_mbd_score_action_prox(
-                x_t,
-                base_inputs,
-                context,
-                iteration=iteration,
-                num_iterations=num_iterations,
-            )
+            with torch.no_grad():
+                for iteration in range(num_iterations):
+                    score, diagnostics = planner.estimate_mbd_score_action_prox(
+                        x_t,
+                        model_inputs,
+                        context,
+                        iteration=iteration,
+                        num_iterations=num_iterations,
+                    )
 
-            demo_names.append(demo_name)
-            step_indices.append(int(step_idx))
-            iterations.append(iteration)
-            times.append(
-                _time_from_iteration(
-                    iteration=iteration,
-                    num_iterations=num_iterations,
-                    num_train_timesteps=config.model.ddim_num_train_timesteps,
-                )
+                    demo_names.append(demo_name)
+                    step_indices.append(int(step_idx))
+                    trajectory_ids.append(trajectory_id)
+                    iterations.append(iteration)
+                    times.append(
+                        _time_from_iteration(
+                            iteration=iteration,
+                            num_iterations=num_iterations,
+                            num_train_timesteps=config.model.ddim_num_train_timesteps,
+                        )
+                    )
+                    diffusion_states.append(x_t[0].detach().cpu().numpy().astype(np.float32))
+                    target_scores.append(score[0].detach().cpu().numpy().astype(np.float32))
+                    min_costs.append(float(diagnostics.get("cost_min", np.nan)))
+                    score_norms.append(float(diagnostics.get("score_norm", np.nan)))
+
+                    if iteration + 1 < num_iterations:
+                        x_t = planner.step_from_score(
+                            x_t,
+                            score,
+                            iteration=iteration,
+                            num_iterations=num_iterations,
+                            update_mode="mbd_score",
+                            active_dims=config.model.action_dim,
+                        )
+
+            pbar.set_postfix(
+                {
+                    "labels": len(diffusion_states),
+                    "cost_min": f"{min_costs[-1]:.3f}",
+                    "score_norm": f"{score_norms[-1]:.2f}",
+                }
             )
-            x_t_values.append(x_t[0].detach().cpu().numpy().astype(np.float32))
-            score_values.append(score[0].detach().cpu().numpy().astype(np.float32))
-            cost_min.append(float(diagnostics.get("cost_min", np.nan)))
-            score_norm.append(float(diagnostics.get("score_norm", np.nan)))
-            pbar.set_postfix({"cost_min": f"{cost_min[-1]:.3f}", "score_norm": f"{score_norm[-1]:.2f}"})
 
     metadata = {
-        "label_type": "mpc_score_action_prox",
+        "cache_format_version": CACHE_FORMAT_VERSION,
+        "label_type": CACHE_LABEL_TYPE,
+        "state_source": CACHE_STATE_SOURCE,
+        "initial_state_distribution": "standard_gaussian",
+        "trajectory_update": "mbd_score",
+        "num_trajectories": len(indices),
+        "labels_per_trajectory": int(num_iterations),
         "config": args.config,
         "base_config": args.base_config,
         "base_checkpoint_dir": str(args.base_checkpoint_dir),
@@ -426,17 +469,20 @@ def generate_cache(args: argparse.Namespace) -> None:
         "ddim_num_train_timesteps": int(config.model.ddim_num_train_timesteps),
         "score_model_action_dim": int(config.model.action_dim),
         "score_model_action_horizon": int(config.model.action_horizon),
-        "stored_action_dim": int(x_t_values[0].shape[-1]) if x_t_values else None,
+        "stored_action_dim": int(diffusion_states[0].shape[-1]) if diffusion_states else None,
         "norm_stats_fingerprint": _norm_stats_fingerprint(score_data_config.norm_stats),
         "use_quantile_norm": bool(score_data_config.use_quantile_norm),
         "subtask_mode": args.subtask_mode,
         "mpc": {
             "num_samples": int(args.mpc_num_samples),
             "iterations": int(args.mpc_iterations),
+            "proposal_center": "current_noisy_action",
+            "noise_schedule": ACTION_PROX_NOISE_SCHEDULE,
             "noise": float(args.mpc_noise),
             "temperature": float(args.mpc_temperature),
             "beta_opt_iter": float(args.mpc_beta_opt_iter),
             "beta_horizon": float(args.mpc_beta_horizon),
+            "joint_delta_clip": float(args.mpc_joint_delta_clip),
             "cost_style": args.mpc_cost,
             "interpolate": bool(args.mpc_interpolate),
         },
@@ -447,18 +493,19 @@ def generate_cache(args: argparse.Namespace) -> None:
         cache_path,
         demo_name=np.asarray(demo_names),
         step_index=np.asarray(step_indices, dtype=np.int64),
+        trajectory_id=np.asarray(trajectory_ids, dtype=np.int64),
         iteration=np.asarray(iterations, dtype=np.int64),
         time=np.asarray(times, dtype=np.float32),
-        x_t=np.asarray(x_t_values, dtype=np.float32),
-        score=np.asarray(score_values, dtype=np.float32),
-        cost_min=np.asarray(cost_min, dtype=np.float32),
-        score_norm=np.asarray(score_norm, dtype=np.float32),
+        x_t=np.asarray(diffusion_states, dtype=np.float32),
+        score=np.asarray(target_scores, dtype=np.float32),
+        cost_min=np.asarray(min_costs, dtype=np.float32),
+        score_norm=np.asarray(score_norms, dtype=np.float32),
         metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
     )
     logging.info("Wrote %s MPC score labels to %s", len(demo_names), cache_path)
 
 
-class MpcScoreCacheDataset(torch.utils.data.Dataset):
+class MPCScoreDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         *,
@@ -466,20 +513,46 @@ class MpcScoreCacheDataset(torch.utils.data.Dataset):
         cache_path: str,
         config: _config.TrainConfig,
         prompt: str,
+        observation_cache_path: str | None = None,
+        build_observation_cache: bool = True,
     ):
         self.hdf5_path = hdf5_path
         self.cache = np.load(cache_path, allow_pickle=False)
         self.demo_names = self.cache["demo_name"].astype(str)
         self.step_indices = self.cache["step_index"].astype(np.int64)
-        self.x_t = self.cache["x_t"].astype(np.float32)
-        self.score = self.cache["score"].astype(np.float32)
-        self.time = self.cache["time"].astype(np.float32)
+        self.trajectory_ids = self.cache["trajectory_id"].astype(np.int64)
+        self.iterations = self.cache["iteration"].astype(np.int64)
+        self.diffusion_states = self.cache["x_t"].astype(np.float32)
+        self.target_scores = self.cache["score"].astype(np.float32)
+        self.times = self.cache["time"].astype(np.float32)
         self.prompt = prompt
         self.config = config
-        self.data_config, self.input_transform = _data_config_and_transform(config)
-        self._h5 = None
+        self.data_config, self.input_transform = _build_data_pipeline(config)
 
         metadata = json.loads(str(self.cache["metadata_json"].item()))
+        self.metadata = metadata
+        if int(metadata.get("cache_format_version", -1)) != CACHE_FORMAT_VERSION:
+            raise ValueError(
+                "MPC score cache format is stale. Regenerate it with the current action-prox sampler."
+            )
+        if metadata.get("label_type") != CACHE_LABEL_TYPE:
+            raise ValueError("MPC score cache does not contain action-prox reverse trajectories.")
+        if metadata.get("state_source") != CACHE_STATE_SOURCE:
+            raise ValueError("MPC score cache x_t states were not sampled from base reverse denoising.")
+        if metadata.get("initial_state_distribution") != "standard_gaussian":
+            raise ValueError("MPC score cache trajectories do not start from standard Gaussian noise.")
+        if metadata.get("trajectory_update") != "mbd_score":
+            raise ValueError("MPC score cache does not use the online MBD reverse update.")
+        mpc_metadata = metadata.get("mpc", {})
+        if mpc_metadata.get("proposal_center") != "current_noisy_action":
+            raise ValueError("MPC score cache does not use z_t as the action-prox proposal center.")
+        if mpc_metadata.get("noise_schedule") != ACTION_PROX_NOISE_SCHEDULE:
+            raise ValueError(
+                "MPC score cache does not use mpc_noise * sqrt(1 - alpha_bar) proposals."
+            )
+        proposal_noise = float(mpc_metadata.get("noise", float("nan")))
+        if not np.isfinite(proposal_noise) or proposal_noise < 0.0:
+            raise ValueError("MPC score cache has an invalid action-prox noise coefficient.")
         expected_fingerprint = _norm_stats_fingerprint(self.data_config.norm_stats)
         if metadata.get("norm_stats_fingerprint") != expected_fingerprint:
             raise ValueError(
@@ -488,30 +561,269 @@ class MpcScoreCacheDataset(torch.utils.data.Dataset):
             )
         if int(metadata.get("ddim_num_train_timesteps", -1)) != int(config.model.ddim_num_train_timesteps):
             raise ValueError("MPC score cache DDIM scheduler does not match this training config.")
+        expected_horizon = config.model.action_horizon
+        if self.diffusion_states.ndim != 3 or self.diffusion_states.shape[1] != expected_horizon:
+            raise ValueError(
+                "MPC score cache x_t must have shape [N, action_horizon, action_dim]; "
+                f"got {self.diffusion_states.shape}."
+            )
+        if self.diffusion_states.shape != self.target_scores.shape:
+            raise ValueError(
+                "MPC score cache x_t/score shapes differ: "
+                f"{self.diffusion_states.shape} vs {self.target_scores.shape}."
+            )
+        if self.diffusion_states.shape[-1] < config.model.action_dim:
+            raise ValueError(
+                f"MPC score cache has {self.diffusion_states.shape[-1]} action dims; "
+                f"the model requires {config.model.action_dim}."
+            )
+        size = self.diffusion_states.shape[0]
+        if not (
+            len(self.demo_names)
+            == len(self.step_indices)
+            == len(self.trajectory_ids)
+            == len(self.iterations)
+            == len(self.times)
+            == size
+        ):
+            raise ValueError("MPC score cache arrays have inconsistent sample counts.")
+        labels_per_trajectory = int(metadata.get("labels_per_trajectory", -1))
+        num_trajectories = int(metadata.get("num_trajectories", -1))
+        if labels_per_trajectory <= 0 or num_trajectories <= 0:
+            raise ValueError("MPC score cache has invalid reverse-trajectory metadata.")
+        if labels_per_trajectory != int(metadata.get("num_iterations", -1)):
+            raise ValueError("MPC score cache trajectory length does not match num_iterations.")
+        if size != labels_per_trajectory * num_trajectories:
+            raise ValueError("MPC score cache does not contain every step of every reverse trajectory.")
+        expected_iterations = np.tile(np.arange(labels_per_trajectory), num_trajectories)
+        expected_trajectory_ids = np.repeat(np.arange(num_trajectories), labels_per_trajectory)
+        if not np.array_equal(self.iterations, expected_iterations):
+            raise ValueError("MPC score cache reverse iterations are incomplete or out of order.")
+        if not np.array_equal(self.trajectory_ids, expected_trajectory_ids):
+            raise ValueError("MPC score cache trajectory ids are incomplete or out of order.")
+        expected_times = np.asarray(
+            [
+                _time_from_iteration(
+                    iteration=iteration,
+                    num_iterations=labels_per_trajectory,
+                    num_train_timesteps=int(metadata["ddim_num_train_timesteps"]),
+                )
+                for iteration in range(labels_per_trajectory)
+            ],
+            dtype=np.float32,
+        )
+        if not np.allclose(self.times.reshape(num_trajectories, -1), expected_times[None, :]):
+            raise ValueError("MPC score cache diffusion times do not match reverse iterations.")
+        demo_grid = self.demo_names.reshape(num_trajectories, labels_per_trajectory)
+        step_grid = self.step_indices.reshape(num_trajectories, labels_per_trajectory)
+        if np.any(demo_grid != demo_grid[:, :1]) or np.any(step_grid != step_grid[:, :1]):
+            raise ValueError("MPC score cache changes observation inside a reverse trajectory.")
+        if not np.isfinite(self.diffusion_states).all() or not np.isfinite(self.target_scores).all():
+            raise ValueError("MPC score cache contains non-finite x_t or score values.")
+        if not np.isfinite(self.times).all() or np.any((self.times < 0.0) | (self.times > 1.0)):
+            raise ValueError("MPC score cache contains invalid normalized diffusion times.")
+
+        self.labels_per_trajectory = labels_per_trajectory
+        self.num_trajectories = num_trajectories
+        self.trajectory_demo_names = demo_grid[:, 0]
+        self.trajectory_step_indices = step_grid[:, 0]
+        observation_keys: dict[tuple[str, int], int] = {}
+        observation_indices = []
+        unique_demo_names = []
+        unique_step_indices = []
+        for demo_name, step_idx in zip(
+            self.trajectory_demo_names,
+            self.trajectory_step_indices,
+            strict=True,
+        ):
+            key = (str(demo_name), int(step_idx))
+            observation_idx = observation_keys.get(key)
+            if observation_idx is None:
+                observation_idx = len(unique_demo_names)
+                observation_keys[key] = observation_idx
+                unique_demo_names.append(key[0])
+                unique_step_indices.append(key[1])
+            observation_indices.append(observation_idx)
+        self.trajectory_observation_indices = np.asarray(observation_indices, dtype=np.int64)
+        self.unique_demo_names = np.asarray(unique_demo_names)
+        self.unique_step_indices = np.asarray(unique_step_indices, dtype=np.int64)
+
+        if observation_cache_path is None:
+            observation_cache_path = f"{cache_path}.observations"
+        self.observation_cache_path = pathlib.Path(observation_cache_path)
+        expected_metadata = self._observation_cache_metadata()
+        if not self._observation_cache_matches(expected_metadata):
+            if not build_observation_cache:
+                raise FileNotFoundError(
+                    f"Shared observation cache is missing or stale: {self.observation_cache_path}"
+                )
+            self._build_observation_cache(expected_metadata)
+        self._load_observation_cache()
 
     def __len__(self) -> int:
-        return int(self.x_t.shape[0])
+        return self.num_trajectories
 
-    def _file(self):
-        if self._h5 is None:
-            self._h5 = h5py.File(self.hdf5_path, "r")
-        return self._h5
+    @property
+    def num_labels(self) -> int:
+        return int(self.diffusion_states.shape[0])
+
+    def _observation_cache_metadata(self) -> dict[str, Any]:
+        hdf5_stat = pathlib.Path(self.hdf5_path).stat()
+        digest = hashlib.sha256()
+        for demo_name, step_idx in zip(
+            self.unique_demo_names,
+            self.unique_step_indices,
+            strict=True,
+        ):
+            digest.update(str(demo_name).encode("utf-8"))
+            digest.update(np.asarray(step_idx, dtype=np.int64).tobytes())
+        return {
+            "format_version": OBSERVATION_CACHE_FORMAT_VERSION,
+            "hdf5_size": int(hdf5_stat.st_size),
+            "observation_key_fingerprint": digest.hexdigest(),
+            "num_observations": int(len(self.unique_demo_names)),
+            "prompt": self.prompt,
+            "norm_stats_fingerprint": _norm_stats_fingerprint(self.data_config.norm_stats),
+            "use_quantile_norm": bool(self.data_config.use_quantile_norm),
+            "image_keys": list(OBSERVATION_IMAGE_KEYS),
+            "image_shape": [224, 224, 3],
+        }
+
+    def _observation_cache_matches(self, expected_metadata: dict[str, Any]) -> bool:
+        metadata_path = self.observation_cache_path / "metadata.json"
+        if not metadata_path.exists():
+            return False
+        try:
+            metadata = json.loads(metadata_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return False
+        if metadata != expected_metadata:
+            return False
+        required_files = [
+            "images.npy",
+            "image_masks.npy",
+            "states.npy",
+            "tokenized_prompt.npy",
+            "tokenized_prompt_mask.npy",
+        ]
+        return all((self.observation_cache_path / name).exists() for name in required_files)
+
+    def _build_observation_cache(self, metadata: dict[str, Any]) -> None:
+        cache_path = self.observation_cache_path
+        for stale_tmp_path in cache_path.parent.glob(f"{cache_path.name}.tmp-*"):
+            shutil.rmtree(stale_tmp_path)
+        tmp_path = cache_path.with_name(f"{cache_path.name}.tmp-{os.getpid()}")
+        tmp_path.mkdir(parents=True)
+
+        num_observations = len(self.unique_demo_names)
+        images = np.lib.format.open_memmap(
+            tmp_path / "images.npy",
+            mode="w+",
+            dtype=np.uint8,
+            shape=(num_observations, len(OBSERVATION_IMAGE_KEYS), 224, 224, 3),
+        )
+        image_masks = np.lib.format.open_memmap(
+            tmp_path / "image_masks.npy",
+            mode="w+",
+            dtype=np.bool_,
+            shape=(num_observations, len(OBSERVATION_IMAGE_KEYS)),
+        )
+        states = np.lib.format.open_memmap(
+            tmp_path / "states.npy",
+            mode="w+",
+            dtype=np.float32,
+            shape=(num_observations, self.config.model.action_dim),
+        )
+        tokenized_prompt = None
+        tokenized_prompt_mask = None
+
+        logging.info(
+            "Building shared observation cache with %s unique observations at %s",
+            num_observations,
+            cache_path,
+        )
+        with h5py.File(self.hdf5_path, "r") as h5_file:
+            iterator = zip(self.unique_demo_names, self.unique_step_indices, strict=True)
+            iterator = tqdm.tqdm(iterator, total=num_observations, desc="Observation cache")
+            for observation_idx, (demo_name, step_idx) in enumerate(iterator):
+                demo = h5_file["data"][str(demo_name)]
+                raw = _demo_sample(
+                    demo,
+                    int(step_idx),
+                    action_horizon=self.config.model.action_horizon,
+                    prompt=self.prompt,
+                )
+                inputs = self.input_transform(jax.tree.map(lambda x: x, raw))
+                for image_idx, image_key in enumerate(OBSERVATION_IMAGE_KEYS):
+                    image = np.asarray(inputs["image"][image_key])
+                    if image.shape != (224, 224, 3) or image.dtype != np.uint8:
+                        raise ValueError(
+                            f"Expected uint8 224x224 image for {image_key}, got "
+                            f"shape={image.shape} dtype={image.dtype}."
+                        )
+                    images[observation_idx, image_idx] = image
+                    image_masks[observation_idx, image_idx] = bool(
+                        inputs["image_mask"][image_key]
+                    )
+                states[observation_idx] = np.asarray(inputs["state"], dtype=np.float32)
+                if tokenized_prompt is None:
+                    tokenized_prompt = np.asarray(inputs["tokenized_prompt"], dtype=np.int64)
+                    tokenized_prompt_mask = np.asarray(
+                        inputs["tokenized_prompt_mask"], dtype=np.bool_
+                    )
+
+        images.flush()
+        image_masks.flush()
+        states.flush()
+        if tokenized_prompt is None or tokenized_prompt_mask is None:
+            raise ValueError("Cannot build an empty observation cache.")
+        np.save(tmp_path / "tokenized_prompt.npy", tokenized_prompt)
+        np.save(tmp_path / "tokenized_prompt_mask.npy", tokenized_prompt_mask)
+        (tmp_path / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True))
+        if cache_path.exists():
+            shutil.rmtree(cache_path)
+        tmp_path.rename(cache_path)
+        logging.info("Finished shared observation cache: %s", cache_path)
+
+    def _load_observation_cache(self) -> None:
+        cache_path = self.observation_cache_path
+        # Copy-on-write mmap keeps the underlying pages shared across DDP ranks and
+        # DataLoader workers while allowing zero-copy torch views without warnings.
+        self.cached_images = np.load(cache_path / "images.npy", mmap_mode="c")
+        self.cached_image_masks = np.load(cache_path / "image_masks.npy", mmap_mode="c")
+        self.cached_states = np.load(cache_path / "states.npy", mmap_mode="c")
+        self.cached_tokenized_prompt = np.load(
+            cache_path / "tokenized_prompt.npy", mmap_mode="c"
+        )
+        self.cached_tokenized_prompt_mask = np.load(
+            cache_path / "tokenized_prompt_mask.npy", mmap_mode="c"
+        )
 
     def __getitem__(self, idx: int):
-        demo = self._file()["data"][self.demo_names[idx]]
-        raw = _raw_hdf5_sample(
-            demo,
-            int(self.step_indices[idx]),
-            action_horizon=self.config.model.action_horizon,
-            prompt=self.prompt,
-        )
-        inputs = self.input_transform(jax.tree.map(lambda x: x, raw))
-        inputs = jax.tree.map(lambda x: torch.from_numpy(np.asarray(x)), inputs)
+        observation_idx = int(self.trajectory_observation_indices[idx])
+        inputs = {
+            "image": {
+                image_key: torch.from_numpy(self.cached_images[observation_idx, image_idx])
+                for image_idx, image_key in enumerate(OBSERVATION_IMAGE_KEYS)
+            },
+            "image_mask": {
+                image_key: torch.as_tensor(
+                    bool(self.cached_image_masks[observation_idx, image_idx]),
+                    dtype=torch.bool,
+                )
+                for image_idx, image_key in enumerate(OBSERVATION_IMAGE_KEYS)
+            },
+            "state": torch.from_numpy(self.cached_states[observation_idx]),
+            "tokenized_prompt": torch.from_numpy(self.cached_tokenized_prompt),
+            "tokenized_prompt_mask": torch.from_numpy(self.cached_tokenized_prompt_mask),
+        }
+        label_start = idx * self.labels_per_trajectory
+        label_end = label_start + self.labels_per_trajectory
         return (
             inputs,
-            torch.from_numpy(self.x_t[idx]),
-            torch.from_numpy(self.score[idx]),
-            torch.tensor(self.time[idx], dtype=torch.float32),
+            torch.from_numpy(self.diffusion_states[label_start:label_end]),
+            torch.from_numpy(self.target_scores[label_start:label_end]),
+            torch.from_numpy(self.times[label_start:label_end]),
         )
 
 
@@ -519,17 +831,23 @@ def _collate_cache_batch(batch):
     inputs, x_t, score, time_cond = zip(*batch, strict=True)
     inputs = torch.utils.data.default_collate(inputs)
     return (
-        _model.Observation.from_dict(inputs),
+        inputs,
         torch.stack(x_t, dim=0),
         torch.stack(score, dim=0),
         torch.stack(time_cond, dim=0),
     )
 
 
-def train_from_cache(args: argparse.Namespace) -> None:
+def train(args: argparse.Namespace) -> None:
     config = _config.get_config(args.config)
     if args.exp_name is not None:
         config = dataclasses.replace(config, exp_name=args.exp_name)
+    if args.train_steps is not None:
+        config = dataclasses.replace(config, num_train_steps=args.train_steps)
+    if args.batch_size is not None:
+        config = dataclasses.replace(config, batch_size=args.batch_size)
+    if args.checkpoint_base_dir is not None:
+        config = dataclasses.replace(config, checkpoint_base_dir=args.checkpoint_base_dir)
     config = dataclasses.replace(
         config,
         overwrite=bool(args.overwrite),
@@ -540,8 +858,10 @@ def train_from_cache(args: argparse.Namespace) -> None:
         raise ValueError(f"{args.config!r} must use ProxyScoreConfig.")
 
     use_ddp, local_rank, device = setup_ddp()
-    is_main = local_rank == 0
-    set_seed(config.seed, local_rank)
+    rank = torch.distributed.get_rank() if use_ddp else 0
+    world_size = torch.distributed.get_world_size() if use_ddp else 1
+    is_main = rank == 0
+    set_seed(config.seed, rank)
 
     resuming = False
     if config.resume:
@@ -550,9 +870,16 @@ def train_from_cache(args: argparse.Namespace) -> None:
                 f"Experiment checkpoint directory {config.checkpoint_dir} does not exist for resume."
             )
         resuming = True
-    elif config.overwrite and config.checkpoint_dir.exists():
+    elif config.overwrite and config.checkpoint_dir.exists() and is_main:
         shutil.rmtree(config.checkpoint_dir)
         logging.info("Overwriting checkpoint directory: %s", config.checkpoint_dir)
+    elif not config.overwrite and config.checkpoint_dir.exists():
+        raise FileExistsError(
+            f"Checkpoint directory {config.checkpoint_dir} already exists; use --resume or --overwrite."
+        )
+
+    if use_ddp:
+        torch.distributed.barrier()
 
     if is_main:
         config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -560,17 +887,96 @@ def train_from_cache(args: argparse.Namespace) -> None:
     elif config.wandb_enabled:
         wandb.init(mode="disabled")
 
-    dataset = MpcScoreCacheDataset(
-        hdf5_path=args.hdf5_path,
-        cache_path=args.cache_path,
-        config=config,
-        prompt=args.prompt,
+    cache_sync_group = None
+    if use_ddp:
+        # Cache preparation can take longer than NCCL's 10-minute watchdog.
+        # Keep the default NCCL group idle and synchronize this one-time CPU job
+        # through a long-timeout Gloo group instead.
+        cache_sync_group = torch.distributed.new_group(
+            backend="gloo",
+            timeout=datetime.timedelta(hours=2),
+        )
+
+    dataset = None
+    if is_main:
+        dataset = MPCScoreDataset(
+            hdf5_path=args.hdf5_path,
+            cache_path=args.cache_path,
+            config=config,
+            prompt=args.prompt,
+            observation_cache_path=args.observation_cache_path,
+            build_observation_cache=True,
+        )
+    if cache_sync_group is not None:
+        torch.distributed.barrier(group=cache_sync_group)
+        torch.distributed.destroy_process_group(cache_sync_group)
+    if dataset is None:
+        dataset = MPCScoreDataset(
+            hdf5_path=args.hdf5_path,
+            cache_path=args.cache_path,
+            config=config,
+            prompt=args.prompt,
+            observation_cache_path=args.observation_cache_path,
+            build_observation_cache=False,
+        )
+    if is_main:
+        logging.info(
+            "Loaded grouped reverse cache: trajectories=%s labels=%s labels_per_trajectory=%s "
+            "unique_observations=%s",
+            dataset.metadata["num_trajectories"],
+            dataset.num_labels,
+            dataset.metadata["labels_per_trajectory"],
+            len(dataset.unique_demo_names),
+        )
+    if config.batch_size % world_size != 0:
+        raise ValueError(
+            f"batch_size={config.batch_size} must be divisible by world_size={world_size}."
+        )
+    requested_local_label_batch = config.batch_size // world_size
+    labels_per_trajectory = dataset.labels_per_trajectory
+    local_observation_batch = max(
+        1,
+        (requested_local_label_batch + labels_per_trajectory // 2)
+        // labels_per_trajectory,
     )
+    effective_global_label_batch = (
+        local_observation_batch * labels_per_trajectory * world_size
+    )
+    if len(dataset) < local_observation_batch * world_size:
+        raise ValueError(
+            f"MPC score cache has {len(dataset)} trajectories, fewer than the "
+            f"global observation batch={local_observation_batch * world_size}."
+        )
+    if is_main:
+        logging.info(
+            "Grouped batch: requested_labels=%s effective_labels=%s observations=%s "
+            "labels_per_observation=%s observations_per_rank=%s",
+            config.batch_size,
+            effective_global_label_batch,
+            local_observation_batch * world_size,
+            labels_per_trajectory,
+            local_observation_batch,
+        )
+    sampler = (
+        torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True, drop_last=True)
+        if use_ddp
+        else None
+    )
+    # The mmap cache already contains training-ready tensors.  Forking loader
+    # workers after CUDA/NCCL initialization can leave one DDP rank waiting on
+    # its input queue while the other rank blocks in an all-reduce.  Loading
+    # these small mmap slices in the rank process is both cheaper and safer.
+    if args.num_workers != 0 and is_main:
+        logging.info(
+            "Shared mmap observation cache uses num_workers=0; ignoring requested num_workers=%s.",
+            args.num_workers,
+        )
     train_loader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
+        batch_size=local_observation_batch,
+        shuffle=sampler is None,
+        sampler=sampler,
+        num_workers=0,
         pin_memory=torch.cuda.is_available(),
         drop_last=True,
         collate_fn=_collate_cache_batch,
@@ -586,7 +992,7 @@ def train_from_cache(args: argparse.Namespace) -> None:
             find_unused_parameters=False,
         )
 
-    optim = torch.optim.AdamW(
+    optimizer = torch.optim.AdamW(
         get_model_parameters(model),
         lr=config.lr_schedule.peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
@@ -594,7 +1000,7 @@ def train_from_cache(args: argparse.Namespace) -> None:
         weight_decay=config.optimizer.weight_decay,
     )
 
-    global_step = load_checkpoint(model, optim, config.checkpoint_dir, device) if resuming else 0
+    global_step = load_checkpoint(model, optimizer, config.checkpoint_dir, device) if resuming else 0
 
     def lr_schedule(step: int):
         warmup_steps = config.lr_schedule.warmup_steps
@@ -614,23 +1020,33 @@ def train_from_cache(args: argparse.Namespace) -> None:
         if is_main
         else None
     )
-    infos = []
+    metrics = []
     start_time = time.time()
+    epoch = 0
+    if sampler is not None:
+        sampler.set_epoch(epoch)
     data_iter = iter(train_loader)
     while global_step < config.num_train_steps:
         try:
-            observation, x_t, score_target, time_cond = next(data_iter)
+            input_batch, x_t, score_target, time_cond = next(data_iter)
         except StopIteration:
+            epoch += 1
+            if sampler is not None:
+                sampler.set_epoch(epoch)
             data_iter = iter(train_loader)
-            observation, x_t, score_target, time_cond = next(data_iter)
+            input_batch, x_t, score_target, time_cond = next(data_iter)
 
-        observation = move_to_device(observation, device)
+        # Keep cached images as compact uint8 tensors through the worker/pinned-memory
+        # path. Conversion to float, channel permutation, and augmentations happen as
+        # one batched operation on the GPU.
+        input_batch = move_to_device(input_batch, device)
+        observation = _model.Observation.from_dict(input_batch)
         x_t = x_t.to(torch.float32).to(device)
         score_target = score_target.to(torch.float32).to(device)
         time_cond = time_cond.to(torch.float32).to(device)
 
-        for pg in optim.param_groups:
-            pg["lr"] = lr_schedule(global_step)
+        for group in optimizer.param_groups:
+            group["lr"] = lr_schedule(global_step)
 
         losses = model(
             observation,
@@ -641,30 +1057,30 @@ def train_from_cache(args: argparse.Namespace) -> None:
         losses = ensure_tensor_loss(losses, device)
         loss = losses.mean()
 
-        optim.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
             get_model_parameters(model),
             max_norm=config.optimizer.clip_gradient_norm,
         )
-        optim.step()
-        optim.zero_grad(set_to_none=True)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
 
-        infos.append(
+        metrics.append(
             {
                 "loss": float(loss.detach().cpu()),
-                "lr": float(optim.param_groups[0]["lr"]),
+                "lr": float(optimizer.param_groups[0]["lr"]),
                 "grad_norm": float(grad_norm.detach().cpu())
                 if isinstance(grad_norm, torch.Tensor)
                 else float(grad_norm),
             }
         )
         completed_step = global_step + 1
-        if is_main and completed_step % config.log_interval == 0 and infos:
+        if is_main and completed_step % config.log_interval == 0 and metrics:
             elapsed = time.time() - start_time
-            avg_loss = sum(info["loss"] for info in infos) / len(infos)
-            avg_lr = sum(info["lr"] for info in infos) / len(infos)
-            avg_grad_norm = sum(info["grad_norm"] for info in infos) / len(infos)
+            avg_loss = sum(item["loss"] for item in metrics) / len(metrics)
+            avg_lr = sum(item["lr"] for item in metrics) / len(metrics)
+            avg_grad_norm = sum(item["grad_norm"] for item in metrics) / len(metrics)
             logging.info(
                 "step=%s mpc_score_loss=%.4f lr=%.2e grad_norm=%.2f time=%.1fs",
                 completed_step,
@@ -683,17 +1099,17 @@ def train_from_cache(args: argparse.Namespace) -> None:
                     },
                     step=completed_step,
                 )
-            infos = []
+            metrics = []
             start_time = time.time()
 
         global_step = completed_step
-        save_checkpoint(model, optim, global_step, config, is_main, data_config)
+        save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
         if pbar is not None:
             pbar.update(1)
             pbar.set_postfix(
                 {
                     "mpc_score_loss": f"{loss.item():.4f}",
-                    "lr": f"{optim.param_groups[0]['lr']:.2e}",
+                    "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
                 }
             )
 
@@ -712,43 +1128,61 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    gen = subparsers.add_parser("generate-cache")
-    _add_config_arg(gen)
-    gen.add_argument("--hdf5_path", required=True)
-    gen.add_argument("--cache_path", required=True)
-    gen.add_argument("--base_config", default=DEFAULT_BASE_CONFIG)
-    gen.add_argument("--base_checkpoint_dir", default=DEFAULT_BASE_CHECKPOINT_DIR)
-    gen.add_argument("--prompt", default=DEFAULT_PROMPT)
-    gen.add_argument("--task", default="weight")
-    gen.add_argument("--device", default="cuda")
-    gen.add_argument("--seed", type=int, default=0)
-    gen.add_argument("--max_labels", type=int, default=None)
-    gen.add_argument("--stride", type=int, default=4)
-    gen.add_argument("--num_steps", type=int, default=10)
-    gen.add_argument("--subtask_mode", choices=("heuristic", "empty"), default="heuristic")
-    gen.add_argument("--mpc_num_samples", type=int, default=512)
-    gen.add_argument("--mpc_iterations", type=int, default=2)
-    gen.add_argument("--mpc_noise", type=float, default=0.35)
-    gen.add_argument("--mpc_temperature", type=float, default=0.15)
-    gen.add_argument("--mpc_beta_opt_iter", type=float, default=1.0)
-    gen.add_argument("--mpc_beta_horizon", type=float, default=1.0)
-    gen.add_argument("--mpc_cost", default="grasp_flow", choices=("priority", "ref_style", "explore", "grasp_flow"))
-    gen.add_argument("--mpc_interpolate", action="store_true")
-    gen.add_argument("--control_frequency", type=float, default=15.0)
-    gen.add_argument("--interpolate_frequency", type=float, default=5.0)
-    gen.set_defaults(func=generate_cache)
+    cache_parser = subparsers.add_parser("generate-cache")
+    _add_config_arg(cache_parser)
+    cache_parser.add_argument("--hdf5_path", required=True)
+    cache_parser.add_argument("--cache_path", required=True)
+    cache_parser.add_argument("--base_config", default=DEFAULT_BASE_CONFIG)
+    cache_parser.add_argument("--base_checkpoint_dir", default=DEFAULT_BASE_CHECKPOINT_DIR)
+    cache_parser.add_argument("--prompt", default=DEFAULT_PROMPT)
+    cache_parser.add_argument("--task", default="weight")
+    cache_parser.add_argument("--device", default="cuda")
+    cache_parser.add_argument("--seed", type=int, default=0)
+    cache_parser.add_argument(
+        "--max_trajectories",
+        type=int,
+        default=None,
+        help="Maximum number of observation-conditioned reverse trajectories.",
+    )
+    cache_parser.add_argument("--stride", type=int, default=4)
+    cache_parser.add_argument("--num_steps", type=int, default=10)
+    cache_parser.add_argument("--subtask_mode", choices=("heuristic", "empty"), default="heuristic")
+    cache_parser.add_argument("--mpc_num_samples", type=int, default=512)
+    cache_parser.add_argument("--mpc_iterations", type=int, default=8)
+    cache_parser.add_argument("--mpc_noise", type=float, default=0.8)
+    cache_parser.add_argument("--mpc_temperature", type=float, default=0.1)
+    cache_parser.add_argument("--mpc_beta_opt_iter", type=float, default=1.0)
+    cache_parser.add_argument("--mpc_beta_horizon", type=float, default=1.0)
+    cache_parser.add_argument("--mpc_joint_delta_clip", type=float, default=0.15)
+    cache_parser.add_argument(
+        "--mpc_cost",
+        default="grasp_flow",
+        choices=("priority", "ref_style", "explore", "grasp_flow"),
+    )
+    cache_parser.add_argument("--mpc_interpolate", action="store_true")
+    cache_parser.add_argument("--control_frequency", type=float, default=40.0)
+    cache_parser.add_argument("--interpolate_frequency", type=float, default=5.0)
+    cache_parser.set_defaults(func=generate_cache)
 
-    train = subparsers.add_parser("train")
-    _add_config_arg(train)
-    train.add_argument("--hdf5_path", required=True)
-    train.add_argument("--cache_path", required=True)
-    train.add_argument("--prompt", default=DEFAULT_PROMPT)
-    train.add_argument("--exp_name", default="reference")
-    train.add_argument("--overwrite", action="store_true")
-    train.add_argument("--resume", action="store_true")
-    train.add_argument("--no_wandb", action="store_true")
-    train.add_argument("--num_workers", type=int, default=2)
-    train.set_defaults(func=train_from_cache)
+    train_parser = subparsers.add_parser("train")
+    _add_config_arg(train_parser)
+    train_parser.add_argument("--hdf5_path", required=True)
+    train_parser.add_argument("--cache_path", required=True)
+    train_parser.add_argument(
+        "--observation_cache_path",
+        default=None,
+        help="Shared mmap observation cache directory (default: <cache_path>.observations).",
+    )
+    train_parser.add_argument("--prompt", default=DEFAULT_PROMPT)
+    train_parser.add_argument("--exp_name", default="ref")
+    train_parser.add_argument("--overwrite", action="store_true")
+    train_parser.add_argument("--resume", action="store_true")
+    train_parser.add_argument("--no_wandb", action="store_true")
+    train_parser.add_argument("--num_workers", type=int, default=2)
+    train_parser.add_argument("--train_steps", type=int, default=None)
+    train_parser.add_argument("--batch_size", type=int, default=None)
+    train_parser.add_argument("--checkpoint_base_dir", default=None)
+    train_parser.set_defaults(func=train)
     return parser
 
 

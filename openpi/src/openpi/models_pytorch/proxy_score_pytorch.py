@@ -257,7 +257,7 @@ class ProxyScorePytorch(nn.Module):
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
         return embs, pad_masks, att_masks, None
 
-    def _run_score_head(
+    def _run_diffusion_head(
         self,
         prefix_embs,
         prefix_pad_masks,
@@ -281,7 +281,7 @@ class ProxyScorePytorch(nn.Module):
         suffix_out = suffix_out.to(dtype=torch.float32)
         return self.action_out_proj(suffix_out)
 
-    def predict_score_from_prefix(
+    def _predict_model_output_from_prefix(
         self,
         state,
         prefix_embs,
@@ -294,13 +294,35 @@ class ProxyScorePytorch(nn.Module):
             x_t,
             time_cond,
         )
-        return self._run_score_head(
+        return self._run_diffusion_head(
             prefix_embs,
             prefix_pad_masks,
             suffix_embs,
             suffix_pad_masks,
             adarms_cond,
         )
+
+    def predict_score_from_prefix(
+        self,
+        state,
+        prefix_embs,
+        prefix_pad_masks,
+        x_t,
+        time_cond,
+    ) -> torch.Tensor:
+        output = self._predict_model_output_from_prefix(
+            state,
+            prefix_embs,
+            prefix_pad_masks,
+            x_t,
+            time_cond,
+        )
+        if self.config.prediction_type == "score":
+            return output
+
+        alpha = self._alpha_from_time(time_cond, x_t.device, x_t.dtype)
+        sqrt_beta = torch.sqrt(torch.clamp(1.0 - alpha, min=1e-6))
+        return -output / sqrt_beta[:, None, None]
 
     def forward(
         self,
@@ -318,14 +340,16 @@ class ProxyScorePytorch(nn.Module):
         if actions is None:
             raise ValueError("actions must be provided for score training.")
 
-        actions = actions[:, :, : self.config.action_dim]
+        actions = actions[..., : self.config.action_dim]
         images, img_masks, state = self._preprocess_observation(observation, train=True)
+        loss_weight = None
+        direct_score_target = score_target is not None
 
         if score_target is not None:
             if time is None:
                 raise ValueError("time must be provided when training from direct score targets.")
             x_t = actions
-            score_target = score_target[:, :, : self.config.action_dim].to(
+            target = score_target[..., : self.config.action_dim].to(
                 device=actions.device,
                 dtype=actions.dtype,
             )
@@ -351,17 +375,46 @@ class ProxyScorePytorch(nn.Module):
             sqrt_beta = torch.sqrt(beta)
 
             x_t = sqrt_alpha[:, None, None] * actions + sqrt_beta[:, None, None] * noise
-            score_target = -noise / sqrt_beta[:, None, None]
+            if self.config.prediction_type == "epsilon":
+                target = noise
+            else:
+                target = -noise / sqrt_beta[:, None, None]
+                loss_weight = beta[:, None, None]
 
         prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks)
-        score_pred = self.predict_score_from_prefix(
-            state,
-            prefix_embs,
-            prefix_pad_masks,
-            x_t,
-            time,
+        grouped_labels = x_t.ndim == 4
+        if grouped_labels:
+            if target.ndim != 4 or time.ndim != 2:
+                raise ValueError(
+                    "Grouped score targets require x_t/score shape [B, L, H, D] "
+                    "and time shape [B, L]."
+                )
+            batch_size, labels_per_observation = x_t.shape[:2]
+            if prefix_embs.shape[0] != batch_size:
+                raise ValueError("Observation batch does not match grouped score targets.")
+            # The expensive visual prefix is computed once per observation. Repeating
+            # the resulting embeddings preserves gradients from every score label
+            # without rerunning DINO for each reverse-diffusion state.
+            prefix_embs = prefix_embs.repeat_interleave(labels_per_observation, dim=0)
+            prefix_pad_masks = prefix_pad_masks.repeat_interleave(
+                labels_per_observation, dim=0
+            )
+            state = state.repeat_interleave(labels_per_observation, dim=0)
+            x_t = x_t.flatten(0, 1)
+            target = target.flatten(0, 1)
+            time = time.flatten(0, 1)
+        predict = (
+            self.predict_score_from_prefix
+            if direct_score_target or self.config.prediction_type == "score"
+            else self._predict_model_output_from_prefix
         )
-        return F.mse_loss(score_pred, score_target, reduction="none")
+        pred = predict(state, prefix_embs, prefix_pad_masks, x_t, time)
+        loss = F.mse_loss(pred, target, reduction="none")
+        if loss_weight is not None:
+            loss = loss * loss_weight
+        if grouped_labels:
+            loss = loss.unflatten(0, (batch_size, labels_per_observation))
+        return loss
 
     @torch.no_grad()
     def sample_actions(
@@ -392,7 +445,7 @@ class ProxyScorePytorch(nn.Module):
                 dtype=x_t.dtype,
             )
             expanded_time = time_cond.expand(bsize)
-            score = self.predict_score_from_prefix(
+            output = self._predict_model_output_from_prefix(
                 state,
                 prefix_embs,
                 prefix_pad_masks,
@@ -402,8 +455,13 @@ class ProxyScorePytorch(nn.Module):
             beta = torch.clamp(1.0 - alpha, min=1e-6)
             sqrt_alpha = torch.sqrt(torch.clamp(alpha, min=1e-6))
             sqrt_beta = torch.sqrt(beta)
-            x0_hat = (x_t + beta * score) / sqrt_alpha
-            eps_hat = -sqrt_beta * score
+            if self.config.prediction_type == "epsilon":
+                eps_hat = output
+                x0_hat = (x_t - sqrt_beta * eps_hat) / sqrt_alpha
+            else:
+                score = output
+                x0_hat = (x_t + beta * score) / sqrt_alpha
+                eps_hat = -sqrt_beta * score
             x_t = (
                 torch.sqrt(torch.clamp(alpha_prev, min=0.0)) * x0_hat
                 + torch.sqrt(torch.clamp(1.0 - alpha_prev, min=0.0)) * eps_hat

@@ -11,6 +11,7 @@ torch = pytest.importorskip("torch")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sim_free_mpc import SimFreeMPC, SimFreeMPCConfig  # noqa: E402
+from sim_free_mpc.ddim import ddim_iteration_alphas  # noqa: E402
 
 
 def test_bspline_basis_is_partition_of_unity():
@@ -139,7 +140,7 @@ def test_step_mbd_score_updates_only_active_dims(monkeypatch):
     assert diagnostics["update_mode"] == "mbd_score"
 
 
-def test_action_prox_mbd_score_samples_around_current_xt():
+def test_action_prox_mbd_score_uses_noisy_center_and_scaled_forward_noise_std():
     planner = object.__new__(SimFreeMPC)
     planner.config = SimFreeMPCConfig(action_dims=2, noise=0.25, flow_eps=1e-6)
     captured = {}
@@ -169,11 +170,87 @@ def test_action_prox_mbd_score_samples_around_current_xt():
     )
 
     assert torch.allclose(captured["initial_mean"], x_t[0, :, :2])
-    assert captured["noise_scale"] == pytest.approx(0.25)
+    assert captured["noise_scale"] == pytest.approx(
+        planner.config.noise * (1.0 - diagnostics["alpha_bar"]) ** 0.5
+    )
     assert next_x.shape == x_t.shape
     assert torch.allclose(next_x[:, :, 2:], x_t[:, :, 2:])
     assert diagnostics["update_mode"] == "mbd_score_action_prox"
     assert diagnostics["proposal_center"] == "current_noisy_action"
+
+    _, warm_diagnostics = planner.step_mbd_score_action_warm(
+        x_t,
+        {},
+        {},
+        iteration=1,
+        num_iterations=3,
+        score_scale=1.0,
+    )
+    assert warm_diagnostics["update_mode"] == "mbd_score_action_warm"
+    assert warm_diagnostics["proposal_noise_scale"] == pytest.approx(
+        planner.config.noise * (1.0 - warm_diagnostics["alpha_bar"]) ** 0.5
+    )
+
+
+def test_action_warm_start_shifts_previous_normalized_action():
+    planner = object.__new__(SimFreeMPC)
+    planner.reset_action_warm()
+
+    fallback = torch.zeros((1, 4, 2), dtype=torch.float32)
+    initial, started = planner.warm_start_noise(fallback, shift_steps=2)
+    assert not started
+    assert initial is fallback
+
+    previous = torch.tensor(
+        [[[0.0, 1.0], [2.0, 3.0], [4.0, 5.0], [6.0, 7.0]]],
+        dtype=torch.float32,
+    )
+    planner.set_warm_action(previous)
+    initial, started = planner.warm_start_noise(fallback, shift_steps=2)
+
+    assert started
+    assert torch.equal(
+        initial,
+        torch.tensor(
+            [[[4.0, 5.0], [6.0, 7.0], [6.0, 7.0], [6.0, 7.0]]],
+            dtype=torch.float32,
+        ),
+    )
+
+
+@pytest.mark.parametrize("use_quantile_norm", [False, True])
+def test_action_warm_start_rebases_deltas_to_current_state(use_quantile_norm):
+    planner = object.__new__(SimFreeMPC)
+    if use_quantile_norm:
+        stats = SimpleNamespace(q01=-torch.ones(8), q99=torch.ones(8))
+    else:
+        stats = SimpleNamespace(mean=torch.zeros(8), std=torch.ones(8))
+    planner.policy = SimpleNamespace(
+        _metadata={
+            "output_norm_stats": {"actions": stats, "state": stats},
+            "use_quantile_norm": use_quantile_norm,
+        }
+    )
+    planner.reset_action_warm()
+
+    previous = torch.zeros((1, 3, 8), dtype=torch.float32)
+    previous[..., :7] = torch.tensor([0.1, 0.2, 0.3]).view(1, 3, 1)
+    previous[..., 7] = 0.75
+    previous_state = torch.zeros((1, 8), dtype=torch.float32)
+    current_state = torch.zeros((1, 8), dtype=torch.float32)
+    current_state[..., :7] = 0.05
+    planner.set_warm_action(previous, state=previous_state)
+
+    initial, started = planner.warm_start_noise(
+        torch.zeros_like(previous),
+        shift_steps=1,
+        current_state=current_state,
+    )
+
+    assert started
+    expected_arm = torch.tensor([0.15, 0.25, 0.25]).view(1, 3, 1).expand(-1, -1, 7)
+    assert torch.allclose(initial[..., :7], expected_arm, atol=1e-6)
+    assert torch.allclose(initial[..., 7], torch.full((1, 3), 0.75), atol=1e-6)
 
 
 def test_step_from_score_mbd_matches_base_score_numerator_update():
@@ -195,3 +272,45 @@ def test_step_from_score_mbd_matches_base_score_numerator_update():
     assert next_x.shape == x_t.shape
     assert torch.allclose(next_x[:, :, 2:], x_t[:, :, 2:])
     assert torch.isfinite(next_x).all()
+
+
+def test_step_from_mbd_residual_is_exact_base_update_at_zero_scale():
+    planner = object.__new__(SimFreeMPC)
+    planner.config = SimFreeMPCConfig(action_dims=2, flow_eps=1e-6)
+    x_t = torch.tensor([[[0.2, -0.4, 1.5], [0.3, -0.5, 1.7]]], dtype=torch.float32)
+    numerator = torch.tensor(
+        [[[0.11, -0.23, 0.0], [0.31, -0.43, 0.0]]], dtype=torch.float32
+    )
+    residual = torch.randn_like(x_t)
+    iteration = 1
+    num_iterations = 3
+    base_scale = 1.3
+
+    next_x = planner.step_from_mbd_residual(
+        x_t,
+        numerator,
+        residual,
+        iteration=iteration,
+        num_iterations=num_iterations,
+        base_scale=base_scale,
+        residual_scale=0.0,
+        active_dims=2,
+    )
+
+    alpha_bar, alpha_bar_prev = ddim_iteration_alphas(
+        iteration=iteration,
+        num_iterations=num_iterations,
+        num_train_timesteps=planner.config.ddim_num_train_timesteps,
+    )
+    alpha = torch.as_tensor(alpha_bar, dtype=x_t.dtype)
+    alpha_prev = torch.as_tensor(alpha_bar_prev, dtype=x_t.dtype)
+    alpha_step = torch.clamp(
+        alpha / torch.clamp(alpha_prev, min=planner.config.flow_eps),
+        min=planner.config.flow_eps,
+    )
+    expected = x_t.clone()
+    expected[:, :, :2] = (
+        x_t[:, :, :2] + base_scale * numerator[:, :, :2]
+    ) / torch.sqrt(alpha_step)
+
+    assert torch.equal(next_x, expected)

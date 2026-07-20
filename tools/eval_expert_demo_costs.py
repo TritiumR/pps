@@ -96,6 +96,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plot_demo", default=None, help="Optional demo name or index to plot as cost-frame curves.")
     parser.add_argument("--plot_path", default=None, help="Optional output path for the cost-frame plot.")
     parser.add_argument(
+        "--plot_all_demos",
+        action="store_true",
+        help="Plot one cost-frame curve per scored demo.",
+    )
+    parser.add_argument(
+        "--plot_dir",
+        default=None,
+        help="Output directory for --plot_all_demos. Defaults to the plot path parent or data/weight/cost_plots.",
+    )
+    parser.add_argument(
         "--plot_merge_tail",
         action="store_true",
         help="Plot lift and place windows together as one place stage.",
@@ -104,6 +114,14 @@ def parse_args() -> argparse.Namespace:
         "--allow_missing_subtasks",
         action="store_true",
         help="Score the whole episode as pear grasp when subtask signals are missing.",
+    )
+    parser.add_argument(
+        "--infer_weight_subtasks",
+        action="store_true",
+        help=(
+            "For grasp_flow weight demos without annotation signals, infer grasp/place "
+            "subtask flags from gripper close/open transitions."
+        ),
     )
     return parser.parse_args()
 
@@ -219,6 +237,51 @@ def subtask_terms_at(
         for name, value in overrides.items():
             terms[name] = torch.as_tensor(value, device=device)
     return terms
+
+
+def gripper_signal(demo: h5py.Group, length: int) -> np.ndarray:
+    if "obs" in demo and "joint_actions" in demo["obs"]:
+        actions = np.asarray(demo["obs"]["joint_actions"], dtype=np.float32)
+        if actions.ndim == 2 and actions.shape[1] > 7:
+            return actions[:length, 7]
+    if "obs" in demo and "gripper_pos" in demo["obs"]:
+        gripper = np.asarray(demo["obs"]["gripper_pos"], dtype=np.float32)
+        return gripper[:length, 0] if gripper.ndim == 2 else gripper[:length].reshape(-1)
+    actions = read_actions(demo)
+    if actions.shape[1] <= 7:
+        raise KeyError(f"{demo.name} has no gripper signal for subtask inference.")
+    return actions[:length, 7]
+
+
+def infer_weight_subtask_transitions(demo: h5py.Group, length: int) -> dict[str, int]:
+    gripper = gripper_signal(demo, length)
+    closed = gripper >= 0.5
+    rising = np.flatnonzero((~closed[:-1]) & closed[1:]) + 1
+    falling = np.flatnonzero(closed[:-1] & (~closed[1:])) + 1
+    if rising.size < 2 or falling.size < 1:
+        raise ValueError(
+            f"{demo.name} needs at least two close transitions and one open transition "
+            "to infer pear/apple grasp_flow stages."
+        )
+    pear_grasp = int(rising[0])
+    pear_on_scale_candidates = falling[falling > pear_grasp]
+    if pear_on_scale_candidates.size == 0:
+        raise ValueError(f"{demo.name} has no open transition after pear close.")
+    pear_on_scale = int(pear_on_scale_candidates[0])
+    apple_grasp_candidates = rising[rising > pear_on_scale]
+    if apple_grasp_candidates.size == 0:
+        raise ValueError(f"{demo.name} has no apple close transition after pear release.")
+    return {
+        "grasp_pear": pear_grasp,
+        "pear_on_scale": pear_on_scale,
+        "grasp_apple": int(apple_grasp_candidates[0]),
+    }
+
+
+def inferred_subtask_overrides(transitions: dict[str, int] | None, index: int) -> dict[str, bool] | None:
+    if transitions is None:
+        return None
+    return {name: index >= frame for name, frame in transitions.items()}
 
 
 def context_at(
@@ -356,12 +419,16 @@ def compute_cost_trace(
     device: torch.device,
     grasp_flow_lift_height: float | None,
     grasp_flow_tail_cost: str = "native",
+    infer_weight_subtasks: bool = False,
 ) -> list[dict[str, Any]]:
     actions_np = read_actions(demo)
     eef_pos_np = read_required_obs(demo, "eef_pos")
     eef_quat_np = read_required_obs(demo, "eef_quat")
     length = min(actions_np.shape[0], eef_pos_np.shape[0], eef_quat_np.shape[0])
     signals = first_existing_group(demo, SUBTASK_SIGNAL_PATHS)
+    inferred_transitions = None
+    if signals is None and infer_weight_subtasks:
+        inferred_transitions = infer_weight_subtask_transitions(demo, length)
 
     if length < horizon:
         raise ValueError(f"{demo.name} has {length} samples, shorter than horizon={horizon}.")
@@ -378,7 +445,7 @@ def compute_cost_trace(
             length=length,
             signals=signals,
             device=device,
-            overrides=None,
+            overrides=inferred_subtask_overrides(inferred_transitions, window_start),
             grasp_flow_lift_height=grasp_flow_lift_height,
         )
 
@@ -555,7 +622,8 @@ def plot_cost_trace(
     merge_tail: bool = False,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    stage_order = ("grasp", "place") if merge_tail else ("grasp", "lift", "place")
+    has_lift = any(item["stage"] == "lift" for item in trace)
+    stage_order = ("grasp", "place") if merge_tail or not has_lift else ("grasp", "lift", "place")
     fig, axes = plt.subplots(len(stage_order), 1, figsize=(11, 5 if merge_tail else 7), sharex=True)
     if len(stage_order) == 1:
         axes = [axes]
@@ -582,7 +650,8 @@ def plot_cost_trace(
             )
         ax.set_ylabel(plot_stage)
         ax.grid(True, alpha=0.25)
-        ax.legend(loc="upper right")
+        if ax.lines:
+            ax.legend(loc="upper right")
 
     axes[-1].set_xlabel("frame")
     suffix = " (lift+place as place)" if merge_tail else ""
@@ -669,6 +738,7 @@ def main() -> int:
                     device=device,
                     grasp_flow_lift_height=args.grasp_flow_lift_height,
                     grasp_flow_tail_cost=args.grasp_flow_tail_cost,
+                    infer_weight_subtasks=args.infer_weight_subtasks,
                 )
                 traces_by_demo[demo_name] = trace
                 stage_rows = summarize_cost_trace(trace, horizon=args.horizon)
@@ -755,6 +825,18 @@ def main() -> int:
                 raise ValueError("--plot_path is required when --plot_demo is set.")
             output_path = Path(args.plot_path)
             plot_cost_trace(plot_demo, traces_by_demo[plot_demo], output_path, merge_tail=args.plot_merge_tail)
+            print(f"Wrote {output_path}")
+
+    if args.plot_all_demos:
+        if args.plot_dir is not None:
+            plot_dir = Path(args.plot_dir)
+        elif args.plot_path is not None:
+            plot_dir = Path(args.plot_path).parent
+        else:
+            plot_dir = Path("data/weight/cost_plots")
+        for demo_name, trace in traces_by_demo.items():
+            output_path = plot_dir / f"{demo_name}_grasp_flow_cost_by_stage.png"
+            plot_cost_trace(demo_name, trace, output_path, merge_tail=args.plot_merge_tail)
             print(f"Wrote {output_path}")
 
     return 0

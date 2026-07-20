@@ -71,6 +71,10 @@ class DINOExpertModel(nn.Module):
         self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
         # Remove embedding layer since we use input embeddings directly
         self.gemma_expert.model.embed_tokens = None  # type: ignore
+        # The proxy consumes decoder hidden states directly and never calls the
+        # language-modeling head. Keep it in the state dict for checkpoint
+        # compatibility, but exclude it from gradient reduction under DDP.
+        self.gemma_expert.lm_head.requires_grad_(False)
 
         self.to_bfloat16_for_selected_params(precision)
 

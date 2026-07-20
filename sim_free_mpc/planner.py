@@ -7,8 +7,9 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from .action_space import decode_model_action_chunks
+from .action_space import decode_model_action_chunks, rebase_model_action_chunk
 from .costs import PriorityStateCost
+from .costs_capsule_flow import CapsuleFlowStateCost
 from .costs_explore import ExploreStateCost
 from .costs_grasp_flow import GraspFlowStateCost
 from .costs_ref_style import RefStyleStateCost
@@ -56,18 +57,70 @@ class SimFreeMPC:
                 action_dims=config.action_dims,
             )
         )
+        self._warm_action: torch.Tensor | None = None
+        self._warm_state: torch.Tensor | None = None
         if config.cost_style == "ref_style":
             self.cost = RefStyleStateCost(config.task_name)
         elif config.cost_style == "explore":
             self.cost = ExploreStateCost(config.task_name)
         elif config.cost_style == "grasp_flow":
             self.cost = GraspFlowStateCost(config.task_name)
+        elif config.cost_style == "capsule_flow":
+            self.cost = CapsuleFlowStateCost(config.task_name)
         elif config.cost_style == "priority":
             self.cost = PriorityStateCost(config.task_name)
         else:
             raise ValueError(f"Unknown sim-free MPC cost_style: {config.cost_style!r}")
         if config.optimize_space not in ("action", "accel"):
             raise ValueError(f"Unknown sim-free MPC optimize_space: {config.optimize_space!r}")
+
+    def reset_action_warm(self) -> None:
+        self._warm_action = None
+        self._warm_state = None
+
+    def set_warm_action(
+        self,
+        action: torch.Tensor,
+        *,
+        state: torch.Tensor | None = None,
+    ) -> None:
+        if action.ndim != 3:
+            raise ValueError(f"Expected warm action [B,H,D], got {tuple(action.shape)}")
+        self._warm_action = action.detach().clone()
+        self._warm_state = None if state is None else torch.as_tensor(state).detach().clone()
+
+    def warm_start_noise(
+        self,
+        fallback_noise: torch.Tensor,
+        *,
+        shift_steps: int,
+        current_state: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, bool]:
+        """Shift and rebase the previous action as the next initial noise."""
+        warm_action = self._warm_action
+        if warm_action is None or warm_action.shape != fallback_noise.shape:
+            return fallback_noise, False
+
+        warm_action = warm_action.to(device=fallback_noise.device, dtype=fallback_noise.dtype)
+        horizon = warm_action.shape[1]
+        shift = min(max(int(shift_steps), 0), horizon)
+        if shift == 0:
+            shifted_action = warm_action.clone()
+        elif shift == horizon:
+            shifted_action = warm_action[:, -1:, :].expand_as(warm_action).clone()
+        else:
+            tail = warm_action[:, -1:, :].expand(-1, shift, -1)
+            shifted_action = torch.cat((warm_action[:, shift:, :], tail), dim=1)
+
+        warm_state = self._warm_state
+        if warm_state is not None and current_state is not None:
+            shifted_action = rebase_model_action_chunk(
+                self.policy,
+                shifted_action,
+                previous_state=warm_state,
+                current_state=current_state,
+            )
+        return shifted_action, True
 
     def _interpolation_knot_count(self, horizon: int) -> int:
         if not self.config.interpolate or horizon <= 1:
@@ -291,7 +344,7 @@ class SimFreeMPC:
                 root_quat.to(device=ee_quat.device, dtype=ee_quat.dtype),
                 ee_quat,
             )
-        if self.config.cost_style in ("ref_style", "explore", "grasp_flow"):
+        if self.config.cost_style in ("ref_style", "explore", "grasp_flow", "capsule_flow"):
             return self.cost(real_actions=real, tcp_pos=ee_pos, tcp_quat=ee_quat, context=context)
         return self.cost(real_actions=real, ee_pos=ee_pos, ee_quat=ee_quat, context=context)
 
@@ -311,6 +364,14 @@ class SimFreeMPC:
             values = values.to(device=result.weights.device, dtype=result.weights.dtype)
             diagnostics[f"term_{name}_best"] = float(values[best_idx].detach().cpu())
             diagnostics[f"term_{name}_weighted"] = float(torch.sum(values * result.weights).detach().cpu())
+        debug_values = getattr(cost, "last_debug", None)
+        if debug_values:
+            for name, values in debug_values.items():
+                if values.ndim != 1 or values.shape[0] != result.costs.shape[0]:
+                    continue
+                values = values.to(device=result.weights.device, dtype=result.weights.dtype)
+                diagnostics[f"debug_{name}_best"] = float(values[best_idx].detach().cpu())
+                diagnostics[f"debug_{name}_weighted"] = float(torch.sum(values * result.weights).detach().cpu())
         return diagnostics
 
     def _optimize_ddim_clean_chunk(
@@ -401,19 +462,14 @@ class SimFreeMPC:
         x_t: torch.Tensor,
         policy_inputs: dict[str, Any],
         context: dict[str, Any],
-        alpha_bar: float | None = None,
+        *,
+        alpha_bar: float,
     ):
-        """Optimize clean action candidates around the current noisy action.
-
-        Unlike `_optimize_ddim_clean_chunk`, this proposal rule does not center
-        samples at `x_t / sqrt(alpha_bar)`. It searches locally around the
-        current normalized action and then converts the selected clean estimate
-        into a DDIM/MBD score.
-        """
+        """Optimize action candidates directly around the current noisy action."""
         if x_t.shape[0] != 1:
-            raise ValueError("MBD action-prox sampler currently expects batch size 1.")
+            raise ValueError("MBD action-space sampler currently expects batch size 1.")
         if self.config.optimize_space != "action":
-            raise ValueError("mbd_score_action_prox only supports action optimize_space.")
+            raise ValueError("MBD action-prox/warm paths only support action optimize_space.")
 
         active_dims = min(self.config.action_dims, x_t.shape[-1])
         horizon = x_t.shape[1]
@@ -422,10 +478,9 @@ class SimFreeMPC:
             x_t.detach()[0, :, :active_dims],
             opt_horizon,
         )
-        proposal_std = float(self.config.noise)
-        if self.config.anneal_proposal and alpha_bar is not None:
-            # Match the proposal width to the noise level (MBD-ideal), like _optimize_ddim_clean_chunk.
-            proposal_std *= ddim_clean_sample_std_scale(float(alpha_bar))
+        proposal_std = float(self.config.noise) * math.sqrt(
+            max(1.0 - float(alpha_bar), 0.0)
+        )
 
         def cost_from_positions(samples: torch.Tensor) -> torch.Tensor:
             full_horizon_samples = self._interpolate_control_points(samples, horizon)
@@ -708,6 +763,28 @@ class SimFreeMPC:
         )
         return next_x, diagnostics
 
+    def step_mbd_score_action_warm(
+        self,
+        x_t: torch.Tensor,
+        policy_inputs: dict[str, Any],
+        context: dict[str, Any],
+        *,
+        iteration: int,
+        num_iterations: int,
+        score_scale: float = 1.0,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        next_x, diagnostics = self.step_mbd_score_action_prox(
+            x_t,
+            policy_inputs,
+            context,
+            iteration=iteration,
+            num_iterations=num_iterations,
+            score_scale=score_scale,
+        )
+        diagnostics = dict(diagnostics)
+        diagnostics["update_mode"] = "mbd_score_action_warm"
+        return next_x, diagnostics
+
     def estimate_mbd_score(
         self,
         x_t: torch.Tensor,
@@ -717,6 +794,24 @@ class SimFreeMPC:
         iteration: int,
         num_iterations: int,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
+        score, _, diagnostics = self.estimate_mbd_score_terms(
+            x_t,
+            policy_inputs,
+            context,
+            iteration=iteration,
+            num_iterations=num_iterations,
+        )
+        return score, diagnostics
+
+    def estimate_mbd_score_terms(
+        self,
+        x_t: torch.Tensor,
+        policy_inputs: dict[str, Any],
+        context: dict[str, Any],
+        *,
+        iteration: int,
+        num_iterations: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         alpha_bar, alpha_bar_prev = ddim_iteration_alphas(
             iteration=iteration,
             num_iterations=num_iterations,
@@ -734,6 +829,7 @@ class SimFreeMPC:
         sqrt_alpha = torch.sqrt(torch.clamp(alpha, min=self.config.flow_eps))
 
         score = torch.zeros_like(x_t)
+        numerator = torch.zeros_like(x_t)
         active_x = x_t.detach()[:, :, :active_dims]
         active_x0 = x0_hat[:, :, :active_dims]
 
@@ -748,8 +844,11 @@ class SimFreeMPC:
                 self._accel_code_to_trajectory(score_code.unsqueeze(0))[0],
                 horizon,
             ).unsqueeze(0)
+            numerator[:, :, :active_dims] = beta * score[:, :, :active_dims]
         else:
-            score[:, :, :active_dims] = (sqrt_alpha * active_x0 - active_x) / beta
+            active_numerator = sqrt_alpha * active_x0 - active_x
+            numerator[:, :, :active_dims] = active_numerator
+            score[:, :, :active_dims] = active_numerator / beta
 
         diagnostics = self._diagnostics(result=result, target=x0_hat, x_t=x_t, score=score)
         diagnostics.update(
@@ -763,7 +862,7 @@ class SimFreeMPC:
                 "clean_sample_std": float(clean_std),
             }
         )
-        return score, diagnostics
+        return score, numerator, diagnostics
 
     def estimate_mbd_score_action_prox(
         self,
@@ -774,6 +873,24 @@ class SimFreeMPC:
         iteration: int,
         num_iterations: int,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
+        score, _, diagnostics = self.estimate_mbd_score_action_prox_terms(
+            x_t,
+            policy_inputs,
+            context,
+            iteration=iteration,
+            num_iterations=num_iterations,
+        )
+        return score, diagnostics
+
+    def estimate_mbd_score_action_prox_terms(
+        self,
+        x_t: torch.Tensor,
+        policy_inputs: dict[str, Any],
+        context: dict[str, Any],
+        *,
+        iteration: int,
+        num_iterations: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         alpha_bar, alpha_bar_prev = ddim_iteration_alphas(
             iteration=iteration,
             num_iterations=num_iterations,
@@ -791,9 +908,12 @@ class SimFreeMPC:
         sqrt_alpha = torch.sqrt(torch.clamp(alpha, min=self.config.flow_eps))
 
         score = torch.zeros_like(x_t)
+        numerator = torch.zeros_like(x_t)
         active_x = x_t.detach()[:, :, :active_dims]
         active_x0 = x0_hat[:, :, :active_dims]
-        score[:, :, :active_dims] = (sqrt_alpha * active_x0 - active_x) / beta
+        active_numerator = sqrt_alpha * active_x0 - active_x
+        numerator[:, :, :active_dims] = active_numerator
+        score[:, :, :active_dims] = active_numerator / beta
 
         diagnostics = self._diagnostics(result=result, target=x0_hat, x_t=x_t, score=score)
         diagnostics.update(
@@ -809,7 +929,93 @@ class SimFreeMPC:
                 "clean_sample_std": float(proposal_std),
             }
         )
+        return score, numerator, diagnostics
+
+    def estimate_mbd_score_action_warm(
+        self,
+        x_t: torch.Tensor,
+        policy_inputs: dict[str, Any],
+        context: dict[str, Any],
+        *,
+        iteration: int,
+        num_iterations: int,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        score, diagnostics = self.estimate_mbd_score_action_prox(
+            x_t,
+            policy_inputs,
+            context,
+            iteration=iteration,
+            num_iterations=num_iterations,
+        )
+        diagnostics = dict(diagnostics)
+        diagnostics["update_mode"] = "estimate_mbd_score_action_warm"
         return score, diagnostics
+
+    def estimate_mbd_score_action_warm_terms(
+        self,
+        x_t: torch.Tensor,
+        policy_inputs: dict[str, Any],
+        context: dict[str, Any],
+        *,
+        iteration: int,
+        num_iterations: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        score, numerator, diagnostics = self.estimate_mbd_score_action_prox_terms(
+            x_t,
+            policy_inputs,
+            context,
+            iteration=iteration,
+            num_iterations=num_iterations,
+        )
+        diagnostics = dict(diagnostics)
+        diagnostics["update_mode"] = "estimate_mbd_score_action_warm"
+        return score, numerator, diagnostics
+
+    def step_from_mbd_residual(
+        self,
+        x_t: torch.Tensor,
+        base_numerator: torch.Tensor,
+        residual_score: torch.Tensor,
+        *,
+        iteration: int,
+        num_iterations: int,
+        base_scale: float = 1.0,
+        residual_scale: float = 1.0,
+        active_dims: int | None = None,
+    ) -> torch.Tensor:
+        """Apply score residual while preserving the direct MBD base update."""
+        alpha_bar, alpha_bar_prev = ddim_iteration_alphas(
+            iteration=iteration,
+            num_iterations=num_iterations,
+            num_train_timesteps=self.config.ddim_num_train_timesteps,
+        )
+        if base_numerator.shape != x_t.shape or residual_score.shape != x_t.shape:
+            raise ValueError(
+                "base_numerator and residual_score must match x_t: "
+                f"base={tuple(base_numerator.shape)}, residual={tuple(residual_score.shape)}, "
+                f"x_t={tuple(x_t.shape)}"
+            )
+        if active_dims is None:
+            active_dims = min(self.config.action_dims, x_t.shape[-1])
+        active_dims = min(int(active_dims), x_t.shape[-1])
+
+        alpha = torch.as_tensor(alpha_bar, device=x_t.device, dtype=x_t.dtype)
+        alpha_prev = torch.as_tensor(alpha_bar_prev, device=x_t.device, dtype=x_t.dtype)
+        beta = torch.clamp(1.0 - alpha, min=self.config.flow_eps)
+        alpha_step = torch.clamp(
+            alpha / torch.clamp(alpha_prev, min=self.config.flow_eps),
+            min=self.config.flow_eps,
+        )
+
+        active_x = x_t.detach()[:, :, :active_dims]
+        active_prev = (
+            active_x
+            + float(base_scale) * base_numerator[:, :, :active_dims]
+            + float(residual_scale) * beta * residual_score[:, :, :active_dims]
+        ) / torch.sqrt(alpha_step)
+        next_x = x_t.detach().clone()
+        next_x[:, :, :active_dims] = active_prev
+        return next_x
 
     def step_from_score(
         self,
