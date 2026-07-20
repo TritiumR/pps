@@ -10,6 +10,9 @@ after the Isaac app has booted (see vlm_base/main.py).
 """
 from __future__ import annotations
 
+import json
+import os
+
 import numpy as np
 import torch
 
@@ -25,23 +28,46 @@ class _Stats:
         self.mean, self.std, self.q01, self.q99 = mean, std, q01, q99
 
 
-# pi05_droid_jointpos quantile norm stats (7 joints + gripper); the decode fast-path reads only these,
-# so no checkpoint is needed.
+# Droid quantile norm stats (7 joints + gripper). The decode fast-path reads only these, so the runner
+# never has to load the policy model. build_policy prefers the checkpoint's norm_stats.json and falls back
+# to these constants, which match that file.
 _A_Q01 = np.array([-0.286921, -0.459455, -0.285718, -0.474518, -0.466063, -0.441598, -0.532181, 0.0], np.float32)
 _A_Q99 = np.array([0.285562, 0.527008, 0.283199, 0.470136, 0.453369, 0.500121, 0.532004, 0.9998], np.float32)
 _S_Q01 = np.array([-0.827973, -0.839831, -0.842548, -2.77302, -1.84262, 1.17166, -2.04726, 0.0], np.float32)
 _S_Q99 = np.array([0.899652, 1.38547, 0.692028, -0.454204, 1.7321, 3.4673, 2.1985, 0.991], np.float32)
 
+_NORM_STATS_JSON = os.path.join(   # read as plain JSON; the policy model itself is never loaded
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "openpi", "checkpoints", "pytorch", "pi05_droid_jointpos", "assets", "droid", "norm_stats.json")
+
+
+def _load_droid_norm_stats():
+    """Return (a_q01, a_q99, s_q01, s_q99) from the checkpoint's norm_stats.json, or None if absent."""
+    try:
+        with open(_NORM_STATS_JSON) as f:
+            ns = json.load(f)
+        ns = ns.get("norm_stats", ns)
+        a, s = ns["actions"], ns["state"]
+        return (np.asarray(a["q01"], np.float32), np.asarray(a["q99"], np.float32),
+                np.asarray(s["q01"], np.float32), np.asarray(s["q99"], np.float32))
+    except (OSError, KeyError, ValueError, TypeError):
+        return None
+
 
 def build_policy(real_stats: bool, action_std: float):
     """Mock policy carrying only the decode norm-stats (no checkpoint). Returns (policy, state_stats).
 
-    real_stats: use the pi05_droid_jointpos quantile norm (exact decode). Otherwise an
-    identity/action_std stand-in (arm delta = model * action_std + current joints).
+    real_stats: use the droid quantile norm for an exact decode, taken from norm_stats.json when present
+    and from the constants above otherwise. When false, an identity stand-in is used instead
+    (arm delta = model * action_std + current joints).
     """
     if real_stats:
-        actions_stats = _Stats(q01=_A_Q01, q99=_A_Q99)
-        state_stats = _Stats(q01=_S_Q01, q99=_S_Q99)
+        loaded = _load_droid_norm_stats()
+        a_q01, a_q99, s_q01, s_q99 = loaded if loaded is not None else (_A_Q01, _A_Q99, _S_Q01, _S_Q99)
+        print(f"[sim_free] droid norm-stats: {'loaded ' + _NORM_STATS_JSON if loaded is not None else 'hardcoded fallback'}",
+              flush=True)
+        actions_stats = _Stats(q01=a_q01, q99=a_q99)
+        state_stats = _Stats(q01=s_q01, q99=s_q99)
         use_qn = True
     else:
         amean = np.zeros(8, np.float32); amean[7] = 0.5
@@ -58,7 +84,7 @@ def build_policy(real_stats: bool, action_std: float):
 
 
 def build_mpc(policy, *, num_samples, iterations, noise, temperature, joint_delta_clip, interpolate,
-              task_name="auto", cost_style="priority", action_dims=8):
+              task_name="auto", cost_style="priority", action_dims=8, anneal_proposal=False):
     """Construct the SimFreeMPC and its config. Returns (mpc, cfg).
 
     task_name + cost_style select the engine's builtin cost (e.g. cost_style="grasp_flow" ->
@@ -68,7 +94,8 @@ def build_mpc(policy, *, num_samples, iterations, noise, temperature, joint_delt
     """
     cfg = SimFreeMPCConfig(task_name=task_name, cost_style=cost_style, num_samples=num_samples,
                            iterations=iterations, noise=noise, temperature=temperature,
-                           action_dims=action_dims, joint_delta_clip=joint_delta_clip, interpolate=interpolate)
+                           action_dims=action_dims, joint_delta_clip=joint_delta_clip, interpolate=interpolate,
+                           anneal_proposal=anneal_proposal)
     return SimFreeMPC(policy, cfg), cfg
 
 
@@ -121,7 +148,7 @@ def apply_horizon_basis(mpc, basis: str, knots: int):
         return torch.einsum("oi,...id->...od", mat, sequence)
 
     if basis in ("cubic", "bspline", "rbf"):
-        mpc._linear_resample = _basis_resample  # replace the linear resample with the smoother basis
+        mpc._linear_resample = _basis_resample
     if knots > 0:
         mpc._interpolation_knot_count = lambda horizon: max(2, min(knots, horizon))
 
@@ -143,19 +170,19 @@ def guard_cost(cost):
 
 
 def apply_arm_only_smoothing(mpc):
-    """Smooth the arm control points but keep the gripper channel (dim 7) sharp.
+    """Smooth the arm control points while keeping the gripper channel (dim 7) sharp.
 
-    The engine reduces the chunk to control points and B-spline-expands them; that smoothing keeps the
-    arm stable but flattens the gripper's close into a curve the sampler cannot push past ~0.35. Expanding
-    the gripper channel linearly instead lets it step closed at the grasp instant while the arm keeps the
-    smooth basis. Assumes the engine's interpolation is on (so there is a control-point reduction to expand).
+    The engine reduces a chunk to control points and B-spline-expands them. That smoothing keeps the arm
+    stable but rounds off the gripper's close, so the sampler cannot drive it fully shut. Expanding the
+    gripper channel linearly instead lets it step closed at the grasp instant while the arm keeps the
+    smooth basis. Requires the engine's interpolation to be on, so that control points exist to expand.
     """
     cls = type(mpc)
 
     def interp(sequence, output_horizon):
-        smoothed = cls._bspline_resample(sequence, output_horizon)   # arm: smooth (stable)
+        smoothed = cls._bspline_resample(sequence, output_horizon)   # arm: smooth, and so stable
         if sequence.shape[-1] > 7:
-            sharp = cls._linear_resample(sequence, output_horizon)   # gripper: linear (can snap closed)
+            sharp = cls._linear_resample(sequence, output_horizon)   # gripper: linear, and so able to snap shut
             smoothed = smoothed.clone()
             smoothed[..., 7] = sharp[..., 7]
         return smoothed
@@ -175,15 +202,76 @@ def policy_inputs(E, state_stats, real_stats: bool):
     return {"state": st}
 
 
-def plan_chunk(mpc, x_init, pin, ctx, *, mode, update, denoise_iters, score_scale, dt, it_start=0):
-    """Produce the model-space chunk x_0 to decode and execute (reverse update, or DIAL mean)."""
+def plan_chunk(mpc, x_init, pin, ctx, *, mode, update, denoise_iters, score_scale, dt, it_start=0,
+               record=None, steer=None):
+    """Produce the model-space chunk x_0 to decode and execute (reverse update, or DIAL mean).
+
+    ``record``: when a list is passed, append the on-policy base score at each denoise state -- the
+    ``(x_t, iteration, s_base)`` needed to distill the reference proxy for score-space PPS (Eq. 5, matching
+    v_base ALONG the denoising trajectory the base actually visits). Uses the public ``estimate_mbd_score``
+    (the same estimator eval combines), so nothing in the frozen engine changes; the extra optimize is fine
+    for a one-time offline label job.
+
+    ``steer``: a GeomSteer for score-space PPS. Each iteration estimates the base score, adds
+    ``gamma * (s_task - s_ref)``, and applies the reverse step from the combined score. step_from_score's
+    mbd_score update reproduces step_mbd_score(_action_prox) exactly, so at gamma=0 the base is unchanged.
+    """
     if mode == "mean":
-        target, _, _ = mpc._optimize_chunk(x_init, pin, ctx)  # single DIAL optimize, no reverse update
+        target, _, _ = mpc._optimize_chunk(x_init, pin, ctx)   # one DIAL optimize, no reverse update
         return target
+    if steer is not None and update not in ("mbd_score_action_prox", "mbd_score"):
+        raise ValueError(f"steering supports update mbd_score_action_prox or mbd_score, got {update!r}")
     x = x_init
     N = denoise_iters
     for it in range(it_start, N):
-        if update == "mbd_score":
+        if record is not None:
+            # Record the base score with the SAME estimator the eval denoise uses, at the state the base
+            # actually visits (on-policy), so the reference distills what it will be added to at eval.
+            est = (mpc.estimate_mbd_score_action_prox if update == "mbd_score_action_prox"
+                   else mpc.estimate_mbd_score)
+            s_base, _ = est(x, pin, ctx, iteration=it, num_iterations=N)
+            record.append({"it": int(it), "N": int(N),
+                           "x": x.detach().cpu().numpy().astype("float32"),
+                           "score": s_base.detach().cpu().numpy().astype("float32")})
+        if steer is not None and steer.only_task:
+            # Roll the task proxy out as the policy: denoise from s_task alone (no base), DDIM reverse
+            # matching the standalone sampler. Measures the task proxy's own task success rate.
+            ntt = mpc.config.ddim_num_train_timesteps
+            time_cond = (N - 1 - it) * (ntt // N) / max(ntt - 1, 1)
+            s = steer.task_score(x, time_cond)
+            x = mpc.step_from_score(x, s, iteration=it, num_iterations=N,
+                                    update_mode="ddim", score_scale=1.0, active_dims=x.shape[-1])
+            continue
+        if steer is not None and getattr(steer, "mode", "additive") == "weight":
+            # Weight-space PPS: fold the steer into the optimize's softmax so it survives the inner
+            # re-optimization that erases an additive score correction. Uses the normal base step; the hook
+            # (set on the sampler) steers the cost-weighted mean inside estimate/step_mbd_score(_action_prox).
+            ntt = mpc.config.ddim_num_train_timesteps
+            time_cond = (N - 1 - it) * (ntt // N) / max(ntt - 1, 1)
+            if time_cond >= steer.steer_step:
+                adims = min(mpc.config.action_dims, x.shape[-1])
+                mpc.sampler._weight_steer = steer.weight_hook(mpc, adims, x, time_cond)
+            step_fn = (mpc.step_mbd_score_action_prox if update == "mbd_score_action_prox"
+                       else mpc.step_mbd_score)
+            x, _ = step_fn(x, pin, ctx, iteration=it, num_iterations=N, score_scale=score_scale)
+            mpc.sampler._weight_steer = None
+            continue
+        if steer is not None:
+            est = (mpc.estimate_mbd_score_action_prox if update == "mbd_score_action_prox"
+                   else mpc.estimate_mbd_score)
+            s_base, diag = est(x, pin, ctx, iteration=it, num_iterations=N)
+            ntt = mpc.config.ddim_num_train_timesteps
+            time_cond = (N - 1 - it) * (ntt // N) / max(ntt - 1, 1)
+            # Steer only the coarse (high-noise) steps; leave the final convergence steps to the base, where
+            # the score is ~100x larger and a correction de-converges the action.
+            s = s_base + steer.correction(x, time_cond, s_base) if time_cond >= steer.steer_step else s_base
+            adims = int(diag.get("active_dims", s.shape[-1]))
+            x = mpc.step_from_score(x, s, iteration=it, num_iterations=N,
+                                    update_mode="mbd_score", score_scale=score_scale, active_dims=adims)
+            continue
+        if update == "mbd_score_action_prox":
+            x, _ = mpc.step_mbd_score_action_prox(x, pin, ctx, iteration=it, num_iterations=N, score_scale=score_scale)
+        elif update == "mbd_score":
             x, _ = mpc.step_mbd_score(x, pin, ctx, iteration=it, num_iterations=N, score_scale=score_scale)
         elif update == "score_space":
             x, _ = mpc.step_score_space(x, pin, ctx, step_scale=score_scale)

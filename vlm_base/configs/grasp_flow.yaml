@@ -1,21 +1,27 @@
-# Pipeline config for running the ReKep/GT pipeline with Yixuan's grasp_flow cost (--cost grasp_flow).
-# Reproduces the validated grasp_flow_clip10 recipe: exec_knot 2 (tight replan), denoise 11, joint clip
-# 0.10, the engine-native B-spline (basis linear / knots 0), her sampler noise/temperature. The cost is
-# StageGraspFlowCost (Yixuan's GraspFlowStateCost dispatched by the driver's stage); the `cost:` section
-# below is unused in this mode (kept so the file also works with --cost composite).
+# Pipeline config for the ReKep/GT pipeline. Works with either cost:
+#   --cost grasp_flow  uses StageGraspFlowCost (sim_free's grasp/lift/place geometry, dispatched by the
+#                      driver's stage) and ignores the `cost:` section below, which carries its own weights.
+#   --cost composite   uses CompositeCost, built from the `cost:` section below.
+# The engine settings (tight replan, 11 denoise steps, joint clip 0.10, native B-spline) are shared.
 
 run:
   seed: 1
-  max_chunks: 200         # exec_knot 2 executes 2 steps/chunk, so ~4x the chunks for the same reach budget
+  max_chunks: 200         # exec_knot 2 executes 2 steps per chunk, so ~4x the chunks for the same reach budget
   fps: 20
-  gripper_source: cost    # grasp_flow's close/lift/place_gripper terms drive the gripper (main.py sets this too)
+  gripper_source: cost    # the cost's gripper terms drive the gripper channel (main.py also sets this)
   gripper_in_loop: false
 
 grounding:
-  seat_dist: 0.02       # (unused with the cost-driven gripper) latch seat distance
+  seat_dist: 0.02       # latch seat distance (unused with the cost-driven gripper)
   commit_hold: 5        # closed frames before a grasp commits to the next stage
-  advance_persist: 1    # advance the instant grasp_pear fires (like her flag-based dispatch); the lift then
-                        # stabilizes the grasp -- debouncing (2) misses the one-chunk flicker and never commits
+  advance_persist: 1    # advance the instant the grasp flag fires; the lift then stabilizes the grasp.
+                        # Debouncing to 2 misses the one-chunk flicker and never commits.
+  regress_persist: 2    # chunks the carried object must read as un-held before the driver regresses to its
+                        # grasp stage (hysteresis). No-op for a coarsened grounding, which has no separate
+                        # grasp stage and whose cost re-grasps internally.
+  grasp_confirm: 10     # chunks a grasp may go without the object rising before it is judged an empty close.
+                        # The grasp flag is proximity plus finger travel with no force closure, so it also
+                        # fires on an empty hand near the object; object motion is the check that does not.
   clearance: 0.015      # rekep: placement clearance above the surface (m)
   release_tol: 0.05     # rekep: place-stage advance tolerance (m)
 
@@ -23,15 +29,18 @@ engine:
   real_stats: true
   interpolate: true     # engine-native coarse-knot B-spline
   horizon: 15
-  exec_knot: 2          # grasp_flow's tight replan (catches the incipient carry-slip)
+  exec_knot: 2          # tight replan, which catches an incipient carry-slip
   mode: denoise
+  # score_space runs the MPC arm and is the execution path. mbd_score_action_prox is the scoring method used
+  # to steer a base policy; run alone it samples near x_t and under-reaches with these parameters, so it
+  # needs re-tuning first. plan_chunk supports both.
   update: score_space
   init: noise
   warm_steps: 6
-  denoise_iters: 11     # grasp_flow value (was 10)
+  denoise_iters: 11
   score_scale: 1.0
-  joint_delta_clip: 0.10   # grasp_flow_clip10 value
-  basis: linear         # linear + knots 0 => no monkeypatch => the engine's native B-spline (her config path)
+  joint_delta_clip: 0.10
+  basis: linear         # linear with knots 0 selects the engine's native B-spline (no monkeypatch)
   knots: 0
 
 sampler:
@@ -40,17 +49,22 @@ sampler:
   noise: 0.5
   temperature: 0.7
 
-# Unused when --cost grasp_flow (StageGraspFlowCost carries Yixuan's own weights); kept for --cost composite.
+# Read only by --cost composite.
 cost:
   terms:
     reach: 25.0
     terminal_reach: 40.0
     rekep_subgoal: 25.0
     rekep_path: 200.0
-    smooth: 0.08
-    joint_delta: 0.005
+    # Regularizers. Every term is a per-element mean, so these weights are horizon and DOF invariant.
+    # joint_delta is the trust region (anchored to the current state) and is what makes a plan dwell. Only a
+    # dwelling plan can close the gripper: the gripper is a 2-knot ramp, so a plan still flying in fits a
+    # rising gate to a negative intercept and never shuts. consistency is anchored to the previous plan
+    # instead, giving temporal coherence, and is not a substitute for the trust region.
+    smooth: 7.8
+    joint_delta: 5.25
     orientation: 3.0
-    consistency: 30.0
+    consistency: 5.0      # summed rather than meaned, this swamps the sampler's ranking of the grasp signal
     straddle: 30.0
     collision: 20.0
     floor: 40.0
@@ -58,7 +72,7 @@ cost:
     yaw: 5.0
     center_region: 120.0
     aperture_region: 80.0
-    close_gripper: 2.0
+    close_gripper: 2.0    # do not raise: the gate doubles as a barrier, so scaling it repels the arm
     carry_hold: 40.0
   geometry:
     ee_r: 0.035
@@ -67,7 +81,20 @@ cost:
     open_half: 0.04
     tool_back: 0.06
     tcp_to_tip: 0.0
-    center_scale: 0.40
+    # Fraction of an object's radius within which the grasp point counts as centred. center_region clamps
+    # its error at this radius, so the cost is FLAT inside that ball: the arm converges to its edge and
+    # stops, and close_gripper reads the same radius, so the fingers may shut anywhere within it. It is
+    # therefore the grasp's accuracy, and has to sit inside the grasp's physical tolerance.
+    #
+    # It was 0.40, which on the pear (radius 52mm) is a 21mm ball. The arm duly closed 17mm off-centre, the
+    # fingers shoved the fruit instead of caging it, and the marginal grip shook loose on the lift -- the
+    # slip-and-regrasp cycling this task showed for months. Measured on the ground-truth arm, seeds 1-3:
+    #   0.40 -> closes 17mm out, 1/3 grasped, 61 regressions
+    #   0.20 -> closes  9mm out, 3/3 grasped,  2 regressions
+    #   0.12 -> closes  6mm out, 3/3 grasped,  1 regression
+    # 0.12 over 0.20 because the arm converges on the BELIEVED centre: perception locates a fruit to about
+    # 9mm, so a 6mm ball keeps the true error near 15mm where a 10mm ball would allow 19mm.
+    center_scale: 0.12
     aperture_margin: 0.006
     close_z_scale: 0.025
     release_xy: 0.06

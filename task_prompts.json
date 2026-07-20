@@ -11,7 +11,22 @@
     "grasp_obj": "pear",
     "place_obj": "scale",
     "task_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_weight_pi05_jointpos/task/24000",
-    "ref_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_weight_pi05_jointpos/reference/20000"
+    "ref_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_weight_pi05_jointpos/reference/20000",
+    "objects": {
+      "pear": "yellow pear",
+      "apple": "red apple",
+      "mango": "red green mango",
+      "cabbage": "green cabbage",
+      "board": "wooden cutting board",
+      "scale": "kitchen scale"
+    },
+    "fixtures": [
+      "scale"
+    ],
+    "grasp_objs": [
+      "pear",
+      "apple"
+    ]
   },
   "tea": {
     "task_id": "Isaac-Tea-Droid-Visuomotor-v0",

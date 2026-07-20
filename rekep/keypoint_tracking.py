@@ -1,49 +1,42 @@
-"""Track ReKep keypoints on IsaacLab rigid bodies using the sim's ground-truth poses.
+"""Track ReKep keypoints on the objects they sit on.
 
-Each keypoint is registered to the nearest rigid object within a threshold as a fixed offset
-in that body's frame (keypoints with no nearby object stay at their world position). Each step
-recomputes the world position from the body's current pose, so object keypoints follow it rigidly.
+Each keypoint is registered to the nearest object within a threshold, as a fixed offset in that object's
+frame; keypoints with no object nearby stay where they are. Reading a keypoint recomputes its world
+position from the object's current pose, so an object's keypoints follow it rigidly.
+
+Where those object poses come from is the ``world`` model's business, not this class's. The simulator's
+physics state and an estimate built from a camera and the joint encoders both satisfy the same
+``object_pose(name) -> (pos, R)`` contract, so tracking works the same either way.
 """
 
 import numpy as np
 
-from rekep.utils import quat_wxyz_to_matrix
-
 
 class KeypointTracker:
-    """Registers keypoints to rigid-object bodies and reads their live positions."""
+    """Registers keypoints to objects and reads their live positions from the world model."""
 
-    def __init__(self, env, keypoints, assoc_threshold=0.35, env_index=0):
-        self.env = env
-        self.env_index = env_index
-        self._rigid_objects = getattr(env.scene, "rigid_objects", {}) or {}
-        names = list(self._rigid_objects.keys())
+    def __init__(self, world, keypoints, assoc_threshold=0.35):
+        self.world = world
+        self.names = list(world.names)
 
         # per keypoint: (owner_name | None, offset). owner None -> offset is a world position;
-        # else offset is in the owner body's frame.
+        # else offset is in the owner object's frame.
         self.registrations = []
         self.owners = []
-        if names:
-            positions = np.stack([self._obj_pos(n) for n in names], axis=0)
-            quats = {n: self._obj_quat(n) for n in names}
+        poses = {n: self.world.object_pose(n) for n in self.names}
+        if self.names:
+            positions = np.stack([poses[n][0] for n in self.names], axis=0)
         for kp in np.asarray(keypoints, dtype=np.float64):
             owner = None
             offset = kp.copy()
-            if names:
+            if self.names:
                 dists = np.linalg.norm(positions - kp, axis=1)
                 j = int(np.argmin(dists))
                 if dists[j] <= assoc_threshold:
-                    owner = names[j]
-                    rot = quat_wxyz_to_matrix(quats[owner])
-                    offset = rot.T @ (kp - positions[j])  # offset in body frame
+                    owner = self.names[j]
+                    offset = poses[owner][1].T @ (kp - positions[j])   # offset in the object's frame
             self.registrations.append((owner, offset))
             self.owners.append(owner)
-
-    def _obj_pos(self, name):
-        return self._rigid_objects[name].data.root_pos_w[self.env_index].detach().cpu().numpy().astype(np.float64)
-
-    def _obj_quat(self, name):
-        return self._rigid_objects[name].data.root_quat_w[self.env_index].detach().cpu().numpy().astype(np.float64)
 
     def get_positions(self):
         """Current world positions of all keypoints, shape (N, 3)."""
@@ -52,8 +45,7 @@ class KeypointTracker:
             if owner is None:
                 out.append(offset)
             else:
-                pos = self._obj_pos(owner)
-                rot = quat_wxyz_to_matrix(self._obj_quat(owner))
+                pos, rot = self.world.object_pose(owner)
                 out.append(pos + rot @ offset)
         return np.stack(out, axis=0) if out else np.zeros((0, 3))
 

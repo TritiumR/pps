@@ -12,7 +12,11 @@ margin: 0.6   # padding added around the scene objects when deriving those bound
 
 keypoint_proposer:
   num_candidates_per_mask: 5    # candidate keypoints clustered per object mask
-  min_dist_bt_keypoints: 0.06   # merge keypoints closer than this (m)
+  min_dist_bt_keypoints: 0.03   # merge keypoints closer than this (m). Must stay well below the spacing
+                                # between distinct objects: at 0.06 the fruits (8-10cm across, sitting
+                                # adjacent) had their keypoints merged across object boundaries, so a
+                                # numbered keypoint no longer belonged to one object and the VLM's choice
+                                # landed on a neighbour (correct object selection 2/5 -> 4/5 at 0.03).
   max_mask_ratio: 0.5           # skip masks covering more than this fraction of the image
   dino_model: dinov2_vits14     # DINOv2 backbone (any dinov2_vit{s,b,l,g}14; patch size is 14)
   device: *device

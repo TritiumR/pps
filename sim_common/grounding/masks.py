@@ -1,7 +1,11 @@
-"""GT-mask perception helpers: map a keypoint / object name to its masked depth points.
+"""Map a keypoint or an object name to the depth points belonging to that object.
 
-Shared by the grounding sources and the fake-VLM stub -- turns IsaacLab's GT instance masks +
-back-projected depth into per-object world points, nearest-keypoint lookups, and centroids.
+Shared by the grounding sources and the fake-VLM stub -- turns a segmented frame plus back-projected depth
+into per-object world points, nearest-keypoint lookups, and centroids.
+
+Whichever segmenter produced the frame, the join is the same question: which pixels are this object? When a
+real segmenter ran it answers that directly, by name, and ``propose_keypoints`` hands its accessor down on
+the grounded frame. Otherwise the simulator's instance ids are joined to names through their prim paths.
 """
 import re
 
@@ -9,7 +13,10 @@ import numpy as np
 
 
 def _masked_points(grounded, env, name):
-    """World points belonging to `name`'s GT instance mask (real table_cam depth, GT-segmented)."""
+    """World points belonging to ``name`` in this frame, or None if it has none."""
+    points_of = grounded.get("points_of")
+    if points_of is not None:            # a real segmenter already knows its objects by name
+        return points_of(name)
     rel = re.sub(r"^/World/envs/env_[^/]*/", "", env.scene[name].cfg.prim_path)
     ids = [i for i, prim in grounded["id_to_prim"].items() if rel and rel in prim]
     sel = np.isin(grounded["masks"], ids) & np.isfinite(grounded["points"]).all(axis=-1)

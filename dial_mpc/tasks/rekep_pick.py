@@ -138,6 +138,7 @@ def run(args):
         from rekep import grounding
         from rekep.constraint_generation import ConstraintGenerator
         from rekep.keypoint_tracking import KeypointTracker
+        from sim_common.world import GTWorld
         from rekep.utils import get_callable_grasping_cost_fn, load_default_config
         from sim_common.constraints import TorchNumpyShim, load_torch_constraints, make_torch_constraint
 
@@ -171,7 +172,7 @@ def run(args):
         grasp_idx = grasp_keypoints[grasp_stage - 1]
         print(f"[rekep-pick] num_stages={num_stages} grasp_stage={grasp_stage} grasp_keypoint={grasp_idx}", flush=True)
 
-        tracker = KeypointTracker(E.env, keypoints)
+        tracker = KeypointTracker(GTWorld(E.env), keypoints)
         shim = TorchNumpyShim(device=DEV)
         get_grasp_fn = get_callable_grasping_cost_fn([])
         callables = load_torch_constraints(os.path.join(out_dir, f"stage{grasp_stage}_subgoal_constraints.txt"),

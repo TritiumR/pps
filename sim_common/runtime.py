@@ -5,8 +5,10 @@ Isaac Sim app. ``run_standalone`` does that dance -- ``bootstrap_syspath`` -> ``
 -> run -> force-exit -- so each entrypoint's ``__main__`` stays a few lines. The Isaac imports live inside the
 functions because ``sys.path`` is only set up by ``bootstrap_syspath``.
 """
+import argparse
 import os
 import sys
+import traceback
 
 
 def bootstrap_syspath():
@@ -33,7 +35,11 @@ def add_launcher_args(parser):
 
 
 def boot(args):
-    """Boot the Isaac Sim app and return the ``simulation_app`` (close it in a ``finally``)."""
+    """Boot the Isaac Sim app and return the ``simulation_app``.
+
+    Note: ``run_standalone`` never calls ``.close()`` on it -- Kit's teardown is slow and frequently
+    hangs (orphaning the process while it still holds the GPU), so drivers hard-exit instead.
+    """
     import pinocchio  # noqa: F401  -- import before Isaac Sim (load-order requirement)
     from isaaclab.app import AppLauncher
     return AppLauncher(args).app
@@ -45,25 +51,24 @@ def run_standalone(add_args, run, description=None):
     The boilerplate every entrypoint's ``__main__`` needs -- bootstrap sys.path, parse its args + the launcher
     args, boot, run, and force-exit to free the GPU on the shared machine -- kept here so scripts don't
     copy-paste it. Used by the base runner (``vlm_base/main.py``) and the diagnostics alike.
-    """
-    import argparse
 
+    Exit is a hard ``os._exit`` with NO ``app.close()``: by then ``run`` has written its outputs, and Isaac
+    Sim's Kit teardown is slow and frequently hangs -- leaving the process alive holding the GPU long after
+    the work is done. Skipping it exits immediately; the OS reclaims the GPU on process death.
+    """
     bootstrap_syspath()
     parser = argparse.ArgumentParser(description=description)
     add_args(parser)
     add_launcher_args(parser)
     args = parser.parse_args()
-    app = boot(args)
+    boot(args)   # boots Isaac Sim; the returned simulation_app is intentionally never closed (see docstring)
     ok = False
     try:
         run(args)
         ok = True
     except BaseException:
-        import traceback
         traceback.print_exc()
     finally:
-        try:
-            app.close()
-        except Exception:
-            pass
-        os._exit(0 if ok else 1)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0 if ok else 1)   # skip Kit teardown -> no post-DONE hang; GPU reclaimed on process death

@@ -56,6 +56,7 @@ def run(args):
 
     from rekep import grounding
     from rekep.keypoint_tracking import KeypointTracker
+    from sim_common.world import GTWorld
     from rekep.utils import get_callable_grasping_cost_fn, load_default_config
     from rekep.video import write_video_h264
     from sim_common.envs.droid import DroidEnv, ROBOTIQ_GRASP_OFFSET
@@ -159,7 +160,7 @@ def run(args):
     z_clear = (max(c[2] for c in obj_c.values()) + args.transit_margin) if obj_c else (z_floor + 0.2)
     print(f"[rekep-dial] obstacle objects={list(obj_c)}; z_clear={z_clear:.3f}", flush=True)
 
-    tracker = KeypointTracker(E.env, keypoints)
+    tracker = KeypointTracker(GTWorld(E.env), keypoints)
     shim = TorchNumpyShim(DEV)
     gen = torch.Generator(device=DEV).manual_seed(args.seed)
     exec_knot = min(args.exec_knot, args.horizon - 1)

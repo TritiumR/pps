@@ -63,9 +63,14 @@ class Grounding:
 
 
 class GroundingSource(Protocol):
-    """Turns an environment into a ``Grounding`` (implemented by ReKep/VoxPoser/MOKA/GT front-ends)."""
+    """Turns an environment into a ``Grounding`` (implemented by ReKep/VoxPoser/MOKA/GT front-ends).
 
-    def ground(self, env) -> Grounding: ...
+    ``world`` is where object state comes from -- the simulator, or an estimate built from a camera and the
+    joint encoders. A grounding never reads object state any other way, so the same front-end runs
+    privileged or not.
+    """
+
+    def ground(self, env, world) -> Grounding: ...
 
 
 def get_source(name: str, **kwargs) -> GroundingSource:
@@ -76,10 +81,12 @@ def get_source(name: str, **kwargs) -> GroundingSource:
     """
     if name == "gt":
         from sim_common.grounding.gt import GTGrounding
-        return GTGrounding(grasp_obj=kwargs.get("grasp_obj", "pear"), place_obj=kwargs.get("place_obj", "scale"))
+        return GTGrounding(grasp_obj=kwargs.get("grasp_obj", "pear"), place_obj=kwargs.get("place_obj", "scale"),
+                           grasp_objs=kwargs.get("grasp_objs"))
     if name in ("rekep_fake", "rekep_real"):
         from sim_common.grounding.rekep import RekepGrounding
         return RekepGrounding(vlm="real" if name == "rekep_real" else "fake",
                               task_key=kwargs.get("task_key", "weight"),
-                              place_obj=kwargs.get("place_obj", "scale"))
+                              place_obj=kwargs.get("place_obj", "scale"),
+                              perception=kwargs.get("perception"))
     raise ValueError(f"unknown grounding source: {name!r}")

@@ -32,23 +32,35 @@ class RekepGrounding:
     """Grounding from the ReKep front-end: tracked keypoints + per-stage relational constraints."""
 
     def __init__(self, vlm: str = "fake", task_key: str = "weight", place_obj: str = "scale",
-                 clearance: float = 0.015, release_tol: float = 0.05):
+                 clearance: float = 0.015, release_tol: float = 0.05, perception=None):
         self.vlm = vlm
         self.task_key = task_key
         self.place_obj = place_obj
         self.clearance = clearance
         self.release_tol = release_tol
+        self.perception = perception   # when set, masks and object points come from a segmenter, not the sim
 
-    def ground(self, env) -> Grounding:
+    def ground(self, env, world) -> Grounding:
         dev = env.device
         config = load_default_config()
-        grounded = rk_grounding.propose_keypoints(env.cam, env.env, config)
+        grounded = rk_grounding.propose_keypoints(env.cam, env.env, config, perception=self.perception)
         keypoints = grounded["keypoints"]
         if len(keypoints) == 0:
             raise SystemExit("[rekep-grounding] no keypoints proposed")
-        scene_objects = list(getattr(env.env.scene, "rigid_objects", {}) or {})
-        extents = usd_extents(env, scene_objects)
-        tracker = KeypointTracker(env.env, keypoints)
+        scene_objects = list(world.names)
+        if self.perception is not None:
+            # Object sizes from the segmented point cloud, not the USD model: the base then runs on image
+            # and instruction alone. An object perception could not size falls to a generic default rather
+            # than to a model lookup, so no per-object geometry is assumed.
+            extents = {n: e for n in scene_objects if (e := self.perception.object_extents(n)) is not None}
+            usd = usd_extents(env, scene_objects)   # logged only, to see how far the cloud size is from the model
+            for _n in scene_objects:
+                if _n in extents and _n in usd:
+                    print(f"[ext] {_n}: cloud(grip,keep,h)={tuple(round(x,3) for x in extents[_n])} "
+                          f"usd={tuple(round(x,3) for x in usd[_n])}", flush=True)
+        else:
+            extents = usd_extents(env, scene_objects)
+        tracker = KeypointTracker(world, keypoints)
         shim = TorchNumpyShim(dev)
 
         vlm_dir = os.path.join(_REPO, "results", "vlm_mpc", "vlm_base", f"vlm_query_{self.task_key}")
@@ -75,24 +87,28 @@ class RekepGrounding:
                 # percentile of z (~the silhouette edge) instead.
                 grasp_z = float(np.percentile(pts[:, 2], 15))
                 grasp_center = np.array([bbox_xy[0], bbox_xy[1], grasp_z], dtype=np.float64)
-                if name in ("pear", "apple"):   # z-estimate candidates vs GT root (pick the one nearest gt)
-                    z = pts[:, 2]; gz = float(env.object_pose(name)[0][2])
-                    print(f"[z-cand] {name}: gt={gz:.3f} mean={z.mean():.3f} p10={np.percentile(z,10):.3f} "
-                          f"p15={np.percentile(z,15):.3f} p25={np.percentile(z,25):.3f} min={z.min():.3f}", flush=True)
                 kp_of[name], centroid_off[name] = kp, grasp_center - keypoints[kp]
 
         def obj_pos(name):
-            kp = kp_of.get(name)
-            return tracker.get_positions()[kp] + centroid_off[name] if kp is not None else env.object_pose(name)[0]
+            """Live grasp centre: the object's tracked keypoint, offset to the centre the gripper wants.
 
-        for _n in ("pear", "apple"):   # grasp-center check: new estimate vs GT (diagnostic)
+            The keypoint carries the object's motion; the offset removes the surface bias it was proposed
+            with. No fallback to simulator state: an object perception never found has no position, and
+            saying so is better than quietly substituting the truth.
+            """
+            kp = kp_of.get(name)
+            if kp is None:
+                raise KeyError(f"[rekep] no grasp centre for {name!r}: it has no keypoint of its own.")
+            return tracker.get_positions()[kp] + centroid_off[name]
+
+        for _n in scene_objects:   # estimate vs ground truth, logged for scoring only (never read back)
             if _n in kp_of:
+                err = np.linalg.norm(obj_pos(_n) - env.object_pose(_n)[0]) * 1000
                 print(f"[rekep-dbg] {_n}: grasp_center={np.round(obj_pos(_n), 3)} "
-                      f"gt_pose={np.round(env.object_pose(_n)[0], 3)}", flush=True)
+                      f"gt={np.round(env.object_pose(_n)[0], 3)} err={err:.1f}mm", flush=True)
 
         objects = [SceneObject(name=n, pos=(lambda n=n: obj_pos(n)), extents=extents.get(n, _DEFAULT_EXTENT))
                    for n in scene_objects]
-        scale_kp = kp_of.get(self.place_obj)   # placement keypoint = the place-onto object's tracked keypoint
 
         def load_stage(idx, held):
             """Load stage idx's subgoal + path constraints as torch callables (held kps ride the gripper)."""
@@ -137,19 +153,30 @@ class RekepGrounding:
                 # Lift the just-grasped object before the carry (grasp_flow's grasp -> lift -> place). Reaches a
                 # fixed point above the grasp with the gripper held closed; done once the object physically rises.
                 held_after = tuple(j for j, o in enumerate(tracker.owners) if o == grasped_body)
-                lift_pos = keypoints[grasp_kp] + np.asarray([0.0, 0.0, _LIFT_HEIGHT], dtype=np.float64)
-                z0 = float(env.object_pose(name)[0][2])
+                # Lift straight up from the GRASP CENTER, not from the raw keypoint. The raw keypoint is a
+                # surface point (the near-side/top-shell bias that centroid_off exists to remove), so a lift
+                # target built on it is laterally offset from where the gripper actually holds the object --
+                # the arm then drags the object sideways as it lifts and the grasp slips. obj_pos is the
+                # corrected center, which is what the GT grounding lifts from too.
+                lift_pos = obj_pos(name) + np.asarray([0.0, 0.0, _LIFT_HEIGHT], dtype=np.float64)
+                z0 = float(obj_pos(name)[2])
                 stages.append(Stage(name=f"lift {name}", gripper="hold", grasp_obj=name, payload=name,
                                     held_idx=held_after, target=(lambda lp=lift_pos: lp),
-                                    done=(lambda n=name, z=z0: float(env.object_pose(n)[0][2]) > z + _LIFT_CONFIRM)))
+                                    done=(lambda n=name, z=z0: float(obj_pos(n)[2]) > z + _LIFT_CONFIRM)))
             elif release_kp >= 0:
                 name = name_for(release_kp)
                 manipulated.add(name)
-                place_ref = scale_kp if scale_kp is not None else release_kp   # place-onto kp, else the held kp
+                # Hover over the place object's corrected CENTER, not over one of its raw keypoints. A wide
+                # object like the scale owns several keypoints that are near-equidistant from its centroid,
+                # so `_nearest_kp` picks between them on a float-noise tie-break: the same scene resolved
+                # the scale to kp4 on one run and kp6 on the next, moving the place target and splitting
+                # otherwise identical rollouts. The centroid is tie-free, so the target is reproducible.
+                # (The VLM subgoal is already invariant to this: its offset is measured from whichever
+                # keypoint was chosen, so kp[scale] + off lands on the same scale-top point either way.)
                 stages.append(Stage(name=f"place {name}", gripper="place", grasp_obj=None, payload=name,
                                     place_target=self.place_obj, done_flag=f"{name}_on_{self.place_obj}",
                                     held_idx=held, done=satisfied(subgoal), constraint=subgoal, path_fns=path_fns,
-                                    target=(lambda rk=place_ref: tracker.get_positions()[rk] + np.asarray(_PLACE_HOVER))))
+                                    target=(lambda: obj_pos(self.place_obj) + np.asarray(_PLACE_HOVER))))
                 grasped_body = None
 
         kps_probe = torch.as_tensor(keypoints, device=dev, dtype=torch.float32)

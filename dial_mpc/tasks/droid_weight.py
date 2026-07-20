@@ -60,6 +60,7 @@ def run(args):
 
     from rekep import grounding
     from rekep.keypoint_tracking import KeypointTracker
+    from sim_common.world import GTWorld
     from rekep.utils import get_callable_grasping_cost_fn, load_default_config
     from rekep.video import write_video_h264
     from sim_common.envs.droid import DroidEnv, ROBOTIQ_GRASP_OFFSET
@@ -130,7 +131,7 @@ def run(args):
     print(f"[weight-rekep] metadata: num_stages={metadata['num_stages']} "
           f"grasp={metadata['grasp_keypoints']} release={metadata['release_keypoints']}", flush=True)
 
-    tracker = KeypointTracker(E.env, keypoints)
+    tracker = KeypointTracker(GTWorld(E.env), keypoints)
     shim = TorchNumpyShim(DEV)
     z_floor = float(np.min(keypoints[:, 2])) - 0.05
     gen = torch.Generator(device=DEV).manual_seed(args.seed)

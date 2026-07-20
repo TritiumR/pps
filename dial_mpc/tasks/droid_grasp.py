@@ -72,6 +72,7 @@ def run(args):
 
     from rekep import grounding
     from rekep.keypoint_tracking import KeypointTracker
+    from sim_common.world import GTWorld
     from rekep.utils import load_default_config
     from rekep.video import write_video_h264
     from sim_common.envs.droid import DroidEnv, ROBOTIQ_GRASP_OFFSET
@@ -123,7 +124,7 @@ def run(args):
         keypoints = grounded["keypoints"]
         if len(keypoints) == 0:
             raise SystemExit("[droid-grasp] no keypoints proposed")
-        tracker = KeypointTracker(E.env, keypoints)
+        tracker = KeypointTracker(GTWorld(E.env), keypoints)
         if target_mode == "centroid":
             rel = re.sub(r"^/World/envs/env_[^/]*/", "", E.env.scene[args.object].cfg.prim_path)
             ids = [i for i, prim in grounded["id_to_prim"].items() if rel and rel in prim]

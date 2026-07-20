@@ -43,6 +43,7 @@ def run(args):
 
     from rekep import grounding
     from rekep.keypoint_tracking import KeypointTracker
+    from sim_common.world import GTWorld
     from rekep.utils import load_default_config
     from rekep.video import write_video_h264
     from sim_common.envs.droid import DroidEnv, ROBOTIQ_GRASP_OFFSET
@@ -86,7 +87,7 @@ def run(args):
     print(f"[weight] propose_keypoints done ({len(keypoints)} kp)", flush=True)
     if len(keypoints) == 0:
         raise SystemExit("[weight] no keypoints proposed")
-    tracker = KeypointTracker(E.env, keypoints)
+    tracker = KeypointTracker(GTWorld(E.env), keypoints)
     print("[weight] tracker built", flush=True)
 
     # GT-mask centroids for the manipulated objects; scale placement targets from measured geometry.

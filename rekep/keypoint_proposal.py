@@ -24,13 +24,28 @@ class KeypointProposer:
             "facebookresearch/dinov2", self.config.get("dino_model", "dinov2_vits14")).eval().to(self.device)
         self.bounds_min = np.array(self.config["bounds_min"])
         self.bounds_max = np.array(self.config["bounds_max"])
-        self.mean_shift = MeanShift(bandwidth=self.config["min_dist_bt_keypoints"], bin_seeding=True, n_jobs=32)
+        # n_jobs=1, NOT 32: the parallel reduction makes the cluster count/ordering non-deterministic, so the
+        # same scene yielded a different keypoint list (and hence different keypoint INDICES, which the VLM
+        # constraints reference) on every run -- no ReKep rollout replayed. This clusters a few hundred
+        # points; the workers bought nothing.
+        self.mean_shift = MeanShift(bandwidth=self.config["min_dist_bt_keypoints"], bin_seeding=True, n_jobs=1)
         self.patch_size = 14  # dinov2
         np.random.seed(self.config["seed"])
         torch.manual_seed(self.config["seed"])
         torch.cuda.manual_seed(self.config["seed"])
 
     def get_keypoints(self, rgb, points, masks):
+        # Re-seed HERE, not only in __init__. `_cluster_features` calls torch.pca_lowrank, which is a
+        # RANDOMIZED algorithm, and by the time this runs the global RNG has been advanced by everything
+        # else in the process (the env reset, the MPC sampler, DINOv2's own forward). Seeding once at
+        # construction therefore does not make the proposal reproducible: the same scene proposed
+        # different keypoints on different runs, so no ReKep rollout replayed and no success rate on the
+        # perception path was measurable. Seeding at the call site pins the proposal to (image, config).
+        np.random.seed(self.config["seed"])
+        torch.manual_seed(self.config["seed"])
+        torch.cuda.manual_seed_all(self.config["seed"])
+        torch.backends.cudnn.deterministic = True   # DINOv2's forward otherwise perturbs the PCA input
+        torch.backends.cudnn.benchmark = False      # autotuning picks different kernels run-to-run
         transformed_rgb, rgb, points, masks, shape_info = self._preprocess(rgb, points, masks)
         features_flat = self._get_features(transformed_rgb, shape_info)
         # cluster each mask's features into candidate keypoints
@@ -107,8 +122,8 @@ class KeypointProposer:
         return projected
 
     @torch.inference_mode()
-    @torch.amp.autocast("cuda")
-    def _get_features(self, transformed_rgb, shape_info):
+    def _get_features(   # NO autocast: fp16 is not bitwise-reproducible
+self, transformed_rgb, shape_info):
         img_h = shape_info["img_h"]
         img_w = shape_info["img_w"]
         patch_h = shape_info["patch_h"]

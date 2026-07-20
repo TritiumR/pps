@@ -35,6 +35,9 @@ class DIALSampler:
 
     def __init__(self, config: DIALSamplerConfig):
         self.config = config
+        # Opt-in weight-space PPS hook: (logits[N], samples[N,H,D], scale_view) -> logits[N].
+        # None (default) => byte-identical to the original sampler. Set by the steer layer per chunk.
+        self._weight_steer = None
 
     def optimize(
         self,
@@ -153,7 +156,10 @@ class DIALSampler:
                     "cost_fn must return [num_samples], got "
                     f"{tuple(costs.shape)} for {self.config.num_samples} samples"
                 )
-            weights = torch.softmax(-costs / max(self.config.temperature, 1e-6), dim=0)
+            logits = -costs / max(self.config.temperature, 1e-6)
+            if self._weight_steer is not None:  # opt-in weight-space PPS (default off)
+                logits = self._weight_steer(logits, samples, scale_view)
+            weights = torch.softmax(logits, dim=0)
             mean = torch.sum(weights[:, None, None] * samples, dim=0)
 
             last_costs = costs

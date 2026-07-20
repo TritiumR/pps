@@ -67,6 +67,19 @@ class DroidEnv(IsaacLabEnv):
         """Ground-truth Robotiq TCP from the env's ee_frame sensor (FK reference)."""
         return self.ee_frame.data.target_pos_w[0, 0].detach().cpu().numpy()
 
+    def gripper_q(self):
+        """Finger-joint angle [rad]: 0 = open, larger = more closed. Proprioception, not scene state.
+
+        The gripper is commanded binary (see apply_arm) but driven by a soft PD (stiffness 5), so the
+        angle it actually settles at reports whether the close was blocked: a free close reaches the
+        commanded angle, a close onto an object stalls short of it. That gap is the grasp signal.
+        """
+        return float(self.robot.data.joint_pos[0, self.grip_id])
+
+    def gripper_qd(self):
+        """Finger-joint angular velocity [rad/s]; near zero means the close has settled."""
+        return float(self.robot.data.joint_vel[0, self.grip_id])
+
     def apply_arm(self, q_arm, grip_open):
         a = torch.zeros((1, self.act_dim), dtype=torch.float32, device=self.device)
         a[0, :7] = q_arm.to(self.device)          # absolute joint targets (scale=1)

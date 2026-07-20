@@ -262,7 +262,7 @@ def main():
     parser.set_defaults(enable_cameras=True, headless=True)
     args = parser.parse_args()
 
-    app = AppLauncher(args).app
+    AppLauncher(args).app   # boots Isaac Sim; the app is intentionally never closed (see below)
     ok = False
     try:
         run(args, repo)
@@ -271,11 +271,11 @@ def main():
         import traceback
         traceback.print_exc()
     finally:
-        try:
-            app.close()
-        except Exception:  # noqa: BLE001
-            pass
-        os._exit(0 if ok else 1)  # force-exit to free the GPU on the shared machine
+        # No app.close(): Isaac Sim's Kit teardown is slow and often hangs, orphaning the process while it
+        # still holds the GPU. run() already wrote the video, so hard-exit; the OS reclaims the GPU on death.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0 if ok else 1)
 
 
 if __name__ == "__main__":

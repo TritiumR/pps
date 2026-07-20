@@ -35,6 +35,7 @@ class SimFreeMPCConfig:
     interpolate_frequency: float = 5.0
     cost_style: str = "priority"
     optimize_space: str = "action"
+    anneal_proposal: bool = False   # action_prox: scale proposal std by sqrt((1-a)/a) per step (opt-in)
 
 
 class SimFreeMPC:
@@ -400,6 +401,7 @@ class SimFreeMPC:
         x_t: torch.Tensor,
         policy_inputs: dict[str, Any],
         context: dict[str, Any],
+        alpha_bar: float | None = None,
     ):
         """Optimize clean action candidates around the current noisy action.
 
@@ -421,6 +423,9 @@ class SimFreeMPC:
             opt_horizon,
         )
         proposal_std = float(self.config.noise)
+        if self.config.anneal_proposal and alpha_bar is not None:
+            # Match the proposal width to the noise level (MBD-ideal), like _optimize_ddim_clean_chunk.
+            proposal_std *= ddim_clean_sample_std_scale(float(alpha_bar))
 
         def cost_from_positions(samples: torch.Tensor) -> torch.Tensor:
             full_horizon_samples = self._interpolate_control_points(samples, horizon)
@@ -660,6 +665,7 @@ class SimFreeMPC:
             x_t,
             policy_inputs,
             context,
+            alpha_bar=alpha_bar,
         )
 
         alpha = torch.as_tensor(alpha_bar, device=x_t.device, dtype=x_t.dtype)
@@ -777,6 +783,7 @@ class SimFreeMPC:
             x_t,
             policy_inputs,
             context,
+            alpha_bar=alpha_bar,
         )
 
         alpha = torch.as_tensor(alpha_bar, device=x_t.device, dtype=x_t.dtype)
