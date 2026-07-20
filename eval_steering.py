@@ -2,6 +2,7 @@ import argparse
 import atexit
 import json
 import os
+import random
 import subprocess
 import sys
 import time
@@ -514,6 +515,34 @@ _SOUND_AUDIO_MIN_DISTANCE = 1e-3
 _LAST_INFERENCE_RUNTIME = {}
 _WEIGHT_SCALE_CENTER_OFFSET_DEBUG = (-0.0470425, 0.0, 0.0272255)
 _WEIGHT_SCALE_TOP_OFFSET_Z_DEBUG = 0.0523800
+
+
+def _seed_runtime(seed: int) -> None:
+    """Seed policy, MPC, and environment-facing random number generators."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def _enable_deterministic_runtime(seed: int) -> None:
+    """Enable strict deterministic PyTorch/CUDA execution before app startup."""
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    _seed_runtime(seed)
+
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.use_deterministic_algorithms(True)
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("highest")
+    if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
 
 
 def _score_update_mode_for_mpc_update(update_mode: str) -> str:
@@ -1780,6 +1809,7 @@ def _infer_actions_eager(
             combined_proxy_score = combined_score[..., :proxy_dims]
             score_state = x_t[..., :proxy_dims].detach()
             base_proxy_norm = torch.linalg.vector_norm(base_proxy_score.detach())
+            task_proxy_norm = torch.linalg.vector_norm(task_proxy_score.detach())
             residual_proxy_norm = torch.linalg.vector_norm(residual_proxy_score.detach())
             applied_residual_norm = abs(float(args.steer_scale)) * residual_proxy_norm
 
@@ -1825,6 +1855,9 @@ def _infer_actions_eager(
                         torch.linalg.vector_norm(base_proxy_score.detach()).cpu()
                     ),
                     "score_task_norm": float(torch.linalg.vector_norm(task_full_score.detach()).cpu()),
+                    "score_task_base_ratio": float(
+                        (task_proxy_norm / base_proxy_norm.clamp_min(1e-8)).cpu()
+                    ),
                     "score_residual_norm": float(torch.linalg.vector_norm(residual_score.detach()).cpu()),
                     "score_residual_proxy_norm": float(residual_proxy_norm.cpu()),
                     "score_applied_residual_norm": float(applied_residual_norm.cpu()),
@@ -1872,6 +1905,9 @@ def _infer_actions_eager(
                     score_components["ref"] = ref_full_score
                 for component_name, component_score in score_components.items():
                     gripper_score = component_score[..., 7].detach()
+                    geom_stats[f"score_{component_name}_gripper_first"] = float(
+                        gripper_score.reshape(-1)[0].cpu()
+                    )
                     geom_stats[f"score_{component_name}_gripper_mean"] = float(
                         gripper_score.mean().cpu()
                     )
@@ -1881,11 +1917,22 @@ def _infer_actions_eager(
             record_mpc_stats(geom_stats)
             if args.mpc_debug_stdout:
                 print(
-                    f"vlm_mpc_{geom_stats['update_mode']} "
+                    f"score_step={mpc_denoise_iteration} "
+                    f"t={geom_stats['proxy_score_time']:.4f} "
+                    f"base={geom_stats['score_base_proxy_norm']:.4f} "
+                    f"task={geom_stats['score_task_norm']:.4f} "
+                    f"task/base={geom_stats['score_task_base_ratio']:.4f} "
+                    f"lambda_residual/base={geom_stats['score_applied_residual_ratio']:.4f} "
+                    f"base_grip0={geom_stats.get('score_base_gripper_first', float('nan')):.4f} "
+                    f"task_grip0={geom_stats.get('score_task_gripper_first', float('nan')):.4f} "
+                    f"base_grip_mean={geom_stats.get('score_base_gripper_mean', float('nan')):.4f} "
+                    f"task_grip_mean={geom_stats.get('score_task_gripper_mean', float('nan')):.4f} "
+                    f"base_grip_norm={geom_stats.get('score_base_gripper_norm', float('nan')):.4f} "
+                    f"task_grip_norm={geom_stats.get('score_task_gripper_norm', float('nan')):.4f} "
+                    f"update={geom_stats['update_mode']} "
                     f"cost_min={geom_stats['cost_min']:.4f} "
                     f"cost_mean={geom_stats['cost_mean']:.4f} "
                     f"cost_weighted={geom_stats['cost_weighted']:.4f} "
-                    f"base_score_norm={geom_stats['score_norm']:.4f} "
                     f"combined_score_norm={geom_stats['score_combined_norm']:.4f}"
                     f"{_format_mpc_term_debug(geom_stats)}",
                     flush=True,
@@ -2396,6 +2443,7 @@ def _mpc_debug_stats(stats: dict[str, Any] | None) -> dict[str, Any]:
         "score_base_norm",
         "score_base_proxy_norm",
         "score_task_norm",
+        "score_task_base_ratio",
         "score_ref_norm",
         "score_residual_norm",
         "score_residual_proxy_norm",
@@ -2408,14 +2456,19 @@ def _mpc_debug_stats(stats: dict[str, Any] | None) -> dict[str, Any]:
         "score_ref_base_relative_error",
         "score_task_ref_cosine",
         "proxy_score_time",
+        "score_base_gripper_first",
         "score_base_gripper_mean",
         "score_base_gripper_norm",
+        "score_task_gripper_first",
         "score_task_gripper_mean",
         "score_task_gripper_norm",
+        "score_ref_gripper_first",
         "score_ref_gripper_mean",
         "score_ref_gripper_norm",
+        "score_residual_gripper_first",
         "score_residual_gripper_mean",
         "score_residual_gripper_norm",
+        "score_combined_gripper_first",
         "score_combined_gripper_mean",
         "score_combined_gripper_norm",
         "gripper_mean",
@@ -2993,6 +3046,8 @@ def _video_config_slug(args) -> str:
         f"t{float(args.mpc_temperature):g}",
         f"clip{float(args.mpc_joint_delta_clip):g}",
     ]
+    if args.determine:
+        parts.append("det")
     return _slugify("_".join(parts))
 
 
@@ -3035,7 +3090,7 @@ def _video_config_lines(args, *, seed: int) -> list[str]:
             f"sampler={args.sampler} grad={args.grad_calc} "
             f"samples={args.mpc_num_samples} iters={args.mpc_iterations} "
             f"noise={args.mpc_noise:g} temp={args.mpc_temperature:g} "
-            f"joint_clip={args.mpc_joint_delta_clip:g}"
+            f"joint_clip={args.mpc_joint_delta_clip:g} determine={int(args.determine)}"
         ),
     ]
 
@@ -3311,6 +3366,16 @@ def parse_args():
     parser.add_argument("--seed_start", type=int, default=1)
     parser.add_argument("--seed_end", type=int, default=51)
     parser.add_argument(
+        "--determine",
+        "--deterministic-eval",
+        dest="determine",
+        action="store_true",
+        help=(
+            "Enable strict reproducibility settings for PyTorch/CUDA, RTX rendering, "
+            "environment seeding, and PhysX enhanced determinism."
+        ),
+    )
+    parser.add_argument(
         "--load_init_from_dataset",
         type=str,
         default=None,
@@ -3457,7 +3522,14 @@ def parse_args():
     )
     parser.add_argument(
         "--mpc_cost",
-        choices=("priority", "ref_style", "explore", "grasp_flow", "capsule_flow"),
+        choices=(
+            "priority",
+            "ref_style",
+            "explore",
+            "grasp_flow",
+            "grasp_flow_fake",
+            "capsule_flow",
+        ),
         default="priority",
         help="Cost function used by sim-free MPC.",
     )
@@ -3648,6 +3720,13 @@ if args.worker_id < 0 and args.workers == 1 and not any(
 ):
     args.device = f"cuda:{configured_gpu_ids[0]}"
 _apply_task_prompt_defaults(args, parser)
+if args.determine:
+    _enable_deterministic_runtime(args.seed_start)
+    deterministic_render_arg = "--/isaaclab/render/deterministic=true"
+    kit_args = (args.kit_args or "").split()
+    if deterministic_render_arg not in kit_args:
+        kit_args.append(deterministic_render_arg)
+    args.kit_args = " ".join(kit_args)
 standalone_role = _standalone_policy_role(args)
 if standalone_role is not None:
     incompatible_flags = [
@@ -3744,7 +3823,6 @@ _report_initialization_stage(args, "importing Isaac extensions and task registry
 import asyncio
 import gymnasium as gym
 import inspect
-import random
 
 import omni
 
@@ -3778,6 +3856,15 @@ env_cfg = parse_env_cfg(env_name, device=args.device, num_envs=1)
 _report_initialization_stage(args, "environment config ready", environment=env_name)
 
 env_cfg.env_name = env_name
+if args.determine:
+    env_cfg.seed = args.seed_start
+    env_cfg.sim.physx.enable_enhanced_determinism = True
+    print(
+        "Deterministic eval enabled: "
+        f"startup_seed={env_cfg.seed}, "
+        "physx_enhanced_determinism=True, strict_torch=True, deterministic_rtx=requested",
+        flush=True,
+    )
 
 # Extract success checking function
 success_term = None
@@ -3999,7 +4086,10 @@ print(
 )
 
 _report_initialization_stage(args, "resetting environment for warmup")
-env_obs_dict, _ = env.reset()
+env_obs_dict, _ = env.reset(seed=args.seed_start if args.determine else None)
+if args.determine:
+    # Decouple policy/MPC randomness from random draws consumed by env.reset().
+    _seed_runtime(args.seed_start)
 _report_initialization_stage(args, "building warmup observation")
 obs = get_pi_observation(env_obs_dict["policy"])
 obs["prompt"] = args.prompt
@@ -4132,6 +4222,7 @@ if args.mpc_debug:
         mpc_optimize_space=args.mpc_optimize_space,
         seed_start=args.seed_start,
         seed_end=args.seed_end,
+        determine=args.determine,
         steps_per_inference=steps_per_inference,
         task_num_steps=args.task_num_steps,
     )
@@ -4148,16 +4239,22 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
     episode_inference_time_s = 0.0
     episode_inference_calls = 0
 
-    # Set seed for generation
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+    # Set seed for generation. Preserve the original path unless strict
+    # determinism was explicitly requested.
+    if args.determine:
+        _seed_runtime(seed)
+    else:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
 
     if mpc_planner is not None and args.mpc_update == "mbd_score_action_warm":
         mpc_planner.reset_action_warm()
 
     # Reset before starting
     if dataset_file is not None:
+        if args.determine:
+            env.seed(seed)
         initial_state = _load_hdf5_state(
             dataset_file["data"][
                 dataset_demo_names[rollout_idx + args.worker_rollout_offset]
@@ -4166,7 +4263,10 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
         )
         env_obs_dict, _ = env.reset_to(initial_state, env_ids=None, is_relative=True)
     else:
-        env_obs_dict, _ = env.reset()
+        env_obs_dict, _ = env.reset(seed=seed if args.determine else None)
+    if args.determine:
+        # Make the policy/MPC random stream independent of reset implementation details.
+        _seed_runtime(seed)
 
     if args.initial_action_after_reset:
         # Optional hold step for environments that need an action-buffer flush. Keep

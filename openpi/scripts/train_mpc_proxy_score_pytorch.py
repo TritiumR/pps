@@ -1160,7 +1160,7 @@ def build_parser() -> argparse.ArgumentParser:
     cache_parser.add_argument(
         "--mpc_cost",
         default="grasp_flow",
-        choices=("priority", "ref_style", "explore", "grasp_flow"),
+        choices=("priority", "ref_style", "explore", "grasp_flow", "grasp_flow_fake"),
     )
     cache_parser.add_argument("--mpc_interpolate", action="store_true")
     cache_parser.add_argument(
