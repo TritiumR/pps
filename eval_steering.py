@@ -10,7 +10,7 @@ from typing import Any
 from tqdm import tqdm
 
 
-_DEFAULT_WORKERS = 2
+_DEFAULT_WORKERS = 1
 _DEFAULT_GPUS = "0"
 _WORKER_PROGRESS_HANDLE = None
 _WORKER_PROGRESS_HANDLE_PATH = None
@@ -3277,7 +3277,7 @@ def parse_args():
         type=int,
         default=_DEFAULT_WORKERS,
         help=(
-            "Number of independent evaluation worker processes. Defaults to 2. "
+            "Number of independent evaluation worker processes. Defaults to 1. "
             "Seeds are divided into contiguous, balanced ranges."
         ),
     )

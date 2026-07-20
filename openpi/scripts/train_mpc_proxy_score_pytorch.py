@@ -476,7 +476,7 @@ def generate_cache(args: argparse.Namespace) -> None:
         "mpc": {
             "num_samples": int(args.mpc_num_samples),
             "iterations": int(args.mpc_iterations),
-            "proposal_center": "current_noisy_action",
+            "proposal_center": "noisy_action_div_sqrt_alpha",
             "noise_schedule": ACTION_PROX_NOISE_SCHEDULE,
             "noise": float(args.mpc_noise),
             "temperature": float(args.mpc_temperature),
@@ -544,8 +544,11 @@ class MPCScoreDataset(torch.utils.data.Dataset):
         if metadata.get("trajectory_update") != "mbd_score":
             raise ValueError("MPC score cache does not use the online MBD reverse update.")
         mpc_metadata = metadata.get("mpc", {})
-        if mpc_metadata.get("proposal_center") != "current_noisy_action":
-            raise ValueError("MPC score cache does not use z_t as the action-prox proposal center.")
+        if mpc_metadata.get("proposal_center") != "noisy_action_div_sqrt_alpha":
+            raise ValueError(
+                "MPC score cache does not use z_t / sqrt(alpha_bar) as the "
+                "action-prox proposal center."
+            )
         if mpc_metadata.get("noise_schedule") != ACTION_PROX_NOISE_SCHEDULE:
             raise ValueError(
                 "MPC score cache does not use mpc_noise * sqrt(1 - alpha_bar) proposals."

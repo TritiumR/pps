@@ -243,7 +243,7 @@ def test_step_mbd_score_updates_only_active_dims(monkeypatch):
     assert diagnostics["update_mode"] == "mbd_score"
 
 
-def test_action_prox_mbd_score_uses_noisy_center_and_scaled_forward_noise_std():
+def test_action_prox_mbd_score_uses_scaled_noisy_center_and_forward_noise_std():
     planner = object.__new__(SimFreeMPC)
     planner.config = SimFreeMPCConfig(action_dims=2, noise=0.25, flow_eps=1e-6)
     captured = {}
@@ -272,14 +272,22 @@ def test_action_prox_mbd_score_uses_noisy_center_and_scaled_forward_noise_std():
         score_scale=1.0,
     )
 
-    assert torch.allclose(captured["initial_mean"], x_t[0, :, :2])
+    alpha_bar, _ = ddim_iteration_alphas(
+        iteration=1,
+        num_iterations=3,
+        num_train_timesteps=planner.config.ddim_num_train_timesteps,
+    )
+    assert torch.allclose(
+        captured["initial_mean"],
+        x_t[0, :, :2] / alpha_bar**0.5,
+    )
     assert captured["noise_scale"] == pytest.approx(
         planner.config.noise * (1.0 - diagnostics["alpha_bar"]) ** 0.5
     )
     assert next_x.shape == x_t.shape
     assert torch.allclose(next_x[:, :, 2:], x_t[:, :, 2:])
     assert diagnostics["update_mode"] == "mbd_score_action_prox"
-    assert diagnostics["proposal_center"] == "current_noisy_action"
+    assert diagnostics["proposal_center"] == "noisy_action_div_sqrt_alpha"
 
     _, warm_diagnostics = planner.step_mbd_score_action_warm(
         x_t,
