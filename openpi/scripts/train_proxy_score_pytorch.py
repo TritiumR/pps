@@ -475,7 +475,11 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
         ckpt_dir / "model.safetensors",
         device=str(device),
     )
-    optimizer.load_state_dict(torch.load(ckpt_dir / "optimizer.pt", map_location=device))
+    # Optimizer checkpoints are written by this training script and may contain
+    # NumPy scalars, which PyTorch 2.6's weights-only loader rejects.
+    optimizer.load_state_dict(
+        torch.load(ckpt_dir / "optimizer.pt", map_location=device, weights_only=False)
+    )
     logging.info("Resumed checkpoint %s", ckpt_dir)
     return latest_step
 

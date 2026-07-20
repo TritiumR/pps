@@ -1257,28 +1257,34 @@ def _infer_actions_eager(
                 )
 
             if args.mpc_update == "mbd_score_action_prox":
-                base_score, geom_stats = mpc_planner.estimate_mbd_score_action_prox(
-                    x_t,
-                    base_inputs,
-                    mpc_context,
-                    iteration=mpc_denoise_iteration,
-                    num_iterations=mpc_denoise_iterations,
+                base_score, base_numerator, geom_stats = (
+                    mpc_planner.estimate_mbd_score_action_prox_terms(
+                        x_t,
+                        base_inputs,
+                        mpc_context,
+                        iteration=mpc_denoise_iteration,
+                        num_iterations=mpc_denoise_iterations,
+                    )
                 )
             elif args.mpc_update == "mbd_score_action_warm":
-                base_score, geom_stats = mpc_planner.estimate_mbd_score_action_warm(
-                    x_t,
-                    base_inputs,
-                    mpc_context,
-                    iteration=mpc_denoise_iteration,
-                    num_iterations=mpc_denoise_iterations,
+                base_score, base_numerator, geom_stats = (
+                    mpc_planner.estimate_mbd_score_action_warm_terms(
+                        x_t,
+                        base_inputs,
+                        mpc_context,
+                        iteration=mpc_denoise_iteration,
+                        num_iterations=mpc_denoise_iterations,
+                    )
                 )
             else:
-                base_score, geom_stats = mpc_planner.estimate_mbd_score(
-                    x_t,
-                    base_inputs,
-                    mpc_context,
-                    iteration=mpc_denoise_iteration,
-                    num_iterations=mpc_denoise_iterations,
+                base_score, base_numerator, geom_stats = (
+                    mpc_planner.estimate_mbd_score_terms(
+                        x_t,
+                        base_inputs,
+                        mpc_context,
+                        iteration=mpc_denoise_iteration,
+                        num_iterations=mpc_denoise_iterations,
+                    )
                 )
             score_time = _proxy_score_time_cond(
                 args,
@@ -1333,17 +1339,37 @@ def _infer_actions_eager(
             )
             proxy_dims = task_score.shape[-1]
             base_proxy_score = base_score[..., :proxy_dims]
+            task_proxy_score = task_full_score[..., :proxy_dims]
+            residual_proxy_score = residual_score[..., :proxy_dims]
+            combined_proxy_score = combined_score[..., :proxy_dims]
+            score_state = x_t[..., :proxy_dims].detach()
+            base_proxy_norm = torch.linalg.vector_norm(base_proxy_score.detach())
+            residual_proxy_norm = torch.linalg.vector_norm(residual_proxy_score.detach())
+            applied_residual_norm = abs(float(args.steer_scale)) * residual_proxy_norm
 
             active_dims = int(geom_stats.get("active_dims", task_score.shape[-1]))
-            x_t = mpc_planner.step_from_score(
-                x_t,
-                combined_score,
-                iteration=mpc_denoise_iteration,
-                num_iterations=mpc_denoise_iterations,
-                update_mode=_score_update_mode_for_mpc_update(args.mpc_update),
-                score_scale=1.0,
-                active_dims=active_dims,
-            )
+            score_update_mode = _score_update_mode_for_mpc_update(args.mpc_update)
+            if score_update_mode == "mbd_score":
+                x_t = mpc_planner.step_from_mbd_residual(
+                    x_t,
+                    base_numerator,
+                    residual_score,
+                    iteration=mpc_denoise_iteration,
+                    num_iterations=mpc_denoise_iterations,
+                    base_scale=args.gamma_base,
+                    residual_scale=args.steer_scale,
+                    active_dims=active_dims,
+                )
+            else:
+                x_t = mpc_planner.step_from_score(
+                    x_t,
+                    combined_score,
+                    iteration=mpc_denoise_iteration,
+                    num_iterations=mpc_denoise_iterations,
+                    update_mode=score_update_mode,
+                    score_scale=1.0,
+                    active_dims=active_dims,
+                )
 
             runtime_stats["score_shape"] = tuple(combined_score.shape)
             runtime_stats["proxy_task_shape"] = tuple(task_score.shape)
@@ -1364,10 +1390,30 @@ def _infer_actions_eager(
                     ),
                     "score_task_norm": float(torch.linalg.vector_norm(task_full_score.detach()).cpu()),
                     "score_residual_norm": float(torch.linalg.vector_norm(residual_score.detach()).cpu()),
+                    "score_residual_proxy_norm": float(residual_proxy_norm.cpu()),
+                    "score_applied_residual_norm": float(applied_residual_norm.cpu()),
+                    "score_applied_residual_ratio": float(
+                        (applied_residual_norm / base_proxy_norm.clamp_min(1e-8)).cpu()
+                    ),
                     "score_combined_norm": float(torch.linalg.vector_norm(combined_score.detach()).cpu()),
+                    "score_base_task_cosine": _score_cosine(
+                        base_proxy_score, task_proxy_score
+                    ),
+                    "score_base_combined_cosine": _score_cosine(
+                        base_proxy_score, combined_proxy_score
+                    ),
                     "proxy_score_time": float(score_time[0].detach().cpu()),
                 }
             )
+            if args.mpc_debug:
+                geom_stats.update(
+                    {
+                        "score_state_values": score_state,
+                        "score_base_values": base_proxy_score.detach(),
+                        "score_task_values": task_proxy_score.detach(),
+                        "score_combined_values": combined_proxy_score.detach(),
+                    }
+                )
             if ref_full_score is not None:
                 geom_stats["score_ref_norm"] = float(
                     torch.linalg.vector_norm(ref_full_score.detach()).cpu()
@@ -1912,7 +1958,12 @@ def _mpc_debug_stats(stats: dict[str, Any] | None) -> dict[str, Any]:
         "score_task_norm",
         "score_ref_norm",
         "score_residual_norm",
+        "score_residual_proxy_norm",
+        "score_applied_residual_norm",
+        "score_applied_residual_ratio",
         "score_combined_norm",
+        "score_base_task_cosine",
+        "score_base_combined_cosine",
         "score_ref_base_cosine",
         "score_ref_base_relative_error",
         "score_task_ref_cosine",
@@ -1932,6 +1983,10 @@ def _mpc_debug_stats(stats: dict[str, Any] | None) -> dict[str, Any]:
         "proposal_noise_scale",
         "action_warm_started",
         "action_warm_shift_steps",
+        "score_state_values",
+        "score_base_values",
+        "score_task_values",
+        "score_combined_values",
     )
     payload = {key: _jsonable_debug_value(stats[key]) for key in keys if key in stats}
     best_terms = {}
@@ -3710,6 +3765,13 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                 force_replan = True
             current_phase = next_phase
             current_subtasks = next_subtasks
+            policy_step_obs = env_obs_dict["policy"]
+            step_trace = {
+                "action": np.asarray(action_step),
+                "joint_pos": _to_numpy_unbatched(policy_step_obs["joint_pos"]),
+            }
+            if "eef_pos" in policy_step_obs:
+                step_trace["eef_pos"] = _to_numpy_unbatched(policy_step_obs["eef_pos"])
             _write_mpc_debug_log(
                 mpc_debug_log_file,
                 "step",
@@ -3718,6 +3780,7 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                 phase=current_phase,
                 subtasks=current_subtasks,
                 action_gripper=_debug_action_gripper(action_step),
+                **step_trace,
             )
 
             obs = get_pi_observation(env_obs_dict["policy"])

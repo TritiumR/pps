@@ -10,7 +10,7 @@
     "prompt": "put pear and apple on the scale",
     "task_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_weight_pi05_jointpos/task/24000",
     "ref_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_weight_pi05_jointpos/reference/20000",
-    "score_task_checkpoint_dir": "openpi/checkpoints/score_task_weight/task_expert/30000",
+    "score_task_checkpoint_dir": "openpi/checkpoints/score_task_weight/task_eps/30000",
     "score_ref_checkpoint_dir": "openpi/checkpoints/score_ref_weight/ref/30000"
   },
   "tea": {

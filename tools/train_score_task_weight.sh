@@ -6,7 +6,7 @@ ROOT="${ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 DATA_FILE="${DATA_FILE:-${ROOT}/data/weight/generated_dataset.hdf5}"
 DATASET_DIR="${HF_LEROBOT_HOME:-${HOME}/.cache/huggingface/lerobot}/local/isaaclab_weight_score"
 TASK_CACHE_DIR="${TASK_CACHE_DIR:-${ROOT}/data/weight/score_task_weight.observations}"
-EXP_NAME="${EXP_NAME:-task_expert}"
+EXP_NAME="${EXP_NAME:-task_eps}"
 GPU_NUM="${1:-${GPU_NUM:-1}}"
 BATCH_SIZE="${2:-${BATCH_SIZE:-32}}"
 if [[ -n "${3:-}" ]]; then
@@ -86,7 +86,7 @@ PYTHONUNBUFFERED=1 conda run --no-capture-output -n pps \
 export SCORE_TASK_CACHE_PATH="${TASK_CACHE_DIR}"
 
 echo "[score_task] global batch=${BATCH_SIZE}, per-GPU batch=$((BATCH_SIZE / GPU_NUM)), GPUs=${GPU_NUM}, workers/rank=0"
-echo "[score_task] expert DSM training; no reference checkpoint"
+echo "[score_task] expert epsilon training; no reference checkpoint"
 PYTHONUNBUFFERED=1 conda run --no-capture-output -n pps \
     "${train_launcher[@]}" scripts/train_proxy_score_pytorch.py \
     score_task_weight \

@@ -793,6 +793,24 @@ class SimFreeMPC:
         iteration: int,
         num_iterations: int,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
+        score, _, diagnostics = self.estimate_mbd_score_terms(
+            x_t,
+            policy_inputs,
+            context,
+            iteration=iteration,
+            num_iterations=num_iterations,
+        )
+        return score, diagnostics
+
+    def estimate_mbd_score_terms(
+        self,
+        x_t: torch.Tensor,
+        policy_inputs: dict[str, Any],
+        context: dict[str, Any],
+        *,
+        iteration: int,
+        num_iterations: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         alpha_bar, alpha_bar_prev = ddim_iteration_alphas(
             iteration=iteration,
             num_iterations=num_iterations,
@@ -810,6 +828,7 @@ class SimFreeMPC:
         sqrt_alpha = torch.sqrt(torch.clamp(alpha, min=self.config.flow_eps))
 
         score = torch.zeros_like(x_t)
+        numerator = torch.zeros_like(x_t)
         active_x = x_t.detach()[:, :, :active_dims]
         active_x0 = x0_hat[:, :, :active_dims]
 
@@ -824,8 +843,11 @@ class SimFreeMPC:
                 self._accel_code_to_trajectory(score_code.unsqueeze(0))[0],
                 horizon,
             ).unsqueeze(0)
+            numerator[:, :, :active_dims] = beta * score[:, :, :active_dims]
         else:
-            score[:, :, :active_dims] = (sqrt_alpha * active_x0 - active_x) / beta
+            active_numerator = sqrt_alpha * active_x0 - active_x
+            numerator[:, :, :active_dims] = active_numerator
+            score[:, :, :active_dims] = active_numerator / beta
 
         diagnostics = self._diagnostics(result=result, target=x0_hat, x_t=x_t, score=score)
         diagnostics.update(
@@ -839,7 +861,7 @@ class SimFreeMPC:
                 "clean_sample_std": float(clean_std),
             }
         )
-        return score, diagnostics
+        return score, numerator, diagnostics
 
     def estimate_mbd_score_action_prox(
         self,
@@ -850,6 +872,24 @@ class SimFreeMPC:
         iteration: int,
         num_iterations: int,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
+        score, _, diagnostics = self.estimate_mbd_score_action_prox_terms(
+            x_t,
+            policy_inputs,
+            context,
+            iteration=iteration,
+            num_iterations=num_iterations,
+        )
+        return score, diagnostics
+
+    def estimate_mbd_score_action_prox_terms(
+        self,
+        x_t: torch.Tensor,
+        policy_inputs: dict[str, Any],
+        context: dict[str, Any],
+        *,
+        iteration: int,
+        num_iterations: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         alpha_bar, alpha_bar_prev = ddim_iteration_alphas(
             iteration=iteration,
             num_iterations=num_iterations,
@@ -867,9 +907,12 @@ class SimFreeMPC:
         sqrt_alpha = torch.sqrt(torch.clamp(alpha, min=self.config.flow_eps))
 
         score = torch.zeros_like(x_t)
+        numerator = torch.zeros_like(x_t)
         active_x = x_t.detach()[:, :, :active_dims]
         active_x0 = x0_hat[:, :, :active_dims]
-        score[:, :, :active_dims] = (sqrt_alpha * active_x0 - active_x) / beta
+        active_numerator = sqrt_alpha * active_x0 - active_x
+        numerator[:, :, :active_dims] = active_numerator
+        score[:, :, :active_dims] = active_numerator / beta
 
         diagnostics = self._diagnostics(result=result, target=x0_hat, x_t=x_t, score=score)
         diagnostics.update(
@@ -885,7 +928,7 @@ class SimFreeMPC:
                 "clean_sample_std": float(proposal_std),
             }
         )
-        return score, diagnostics
+        return score, numerator, diagnostics
 
     def estimate_mbd_score_action_warm(
         self,
@@ -906,6 +949,72 @@ class SimFreeMPC:
         diagnostics = dict(diagnostics)
         diagnostics["update_mode"] = "estimate_mbd_score_action_warm"
         return score, diagnostics
+
+    def estimate_mbd_score_action_warm_terms(
+        self,
+        x_t: torch.Tensor,
+        policy_inputs: dict[str, Any],
+        context: dict[str, Any],
+        *,
+        iteration: int,
+        num_iterations: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        score, numerator, diagnostics = self.estimate_mbd_score_action_prox_terms(
+            x_t,
+            policy_inputs,
+            context,
+            iteration=iteration,
+            num_iterations=num_iterations,
+        )
+        diagnostics = dict(diagnostics)
+        diagnostics["update_mode"] = "estimate_mbd_score_action_warm"
+        return score, numerator, diagnostics
+
+    def step_from_mbd_residual(
+        self,
+        x_t: torch.Tensor,
+        base_numerator: torch.Tensor,
+        residual_score: torch.Tensor,
+        *,
+        iteration: int,
+        num_iterations: int,
+        base_scale: float = 1.0,
+        residual_scale: float = 1.0,
+        active_dims: int | None = None,
+    ) -> torch.Tensor:
+        """Apply score residual while preserving the direct MBD base update."""
+        alpha_bar, alpha_bar_prev = ddim_iteration_alphas(
+            iteration=iteration,
+            num_iterations=num_iterations,
+            num_train_timesteps=self.config.ddim_num_train_timesteps,
+        )
+        if base_numerator.shape != x_t.shape or residual_score.shape != x_t.shape:
+            raise ValueError(
+                "base_numerator and residual_score must match x_t: "
+                f"base={tuple(base_numerator.shape)}, residual={tuple(residual_score.shape)}, "
+                f"x_t={tuple(x_t.shape)}"
+            )
+        if active_dims is None:
+            active_dims = min(self.config.action_dims, x_t.shape[-1])
+        active_dims = min(int(active_dims), x_t.shape[-1])
+
+        alpha = torch.as_tensor(alpha_bar, device=x_t.device, dtype=x_t.dtype)
+        alpha_prev = torch.as_tensor(alpha_bar_prev, device=x_t.device, dtype=x_t.dtype)
+        beta = torch.clamp(1.0 - alpha, min=self.config.flow_eps)
+        alpha_step = torch.clamp(
+            alpha / torch.clamp(alpha_prev, min=self.config.flow_eps),
+            min=self.config.flow_eps,
+        )
+
+        active_x = x_t.detach()[:, :, :active_dims]
+        active_prev = (
+            active_x
+            + float(base_scale) * base_numerator[:, :, :active_dims]
+            + float(residual_scale) * beta * residual_score[:, :, :active_dims]
+        ) / torch.sqrt(alpha_step)
+        next_x = x_t.detach().clone()
+        next_x[:, :, :active_dims] = active_prev
+        return next_x
 
     def step_from_score(
         self,

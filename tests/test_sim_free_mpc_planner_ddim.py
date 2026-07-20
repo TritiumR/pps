@@ -11,6 +11,7 @@ torch = pytest.importorskip("torch")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sim_free_mpc import SimFreeMPC, SimFreeMPCConfig  # noqa: E402
+from sim_free_mpc.ddim import ddim_iteration_alphas  # noqa: E402
 
 
 def test_bspline_basis_is_partition_of_unity():
@@ -271,3 +272,45 @@ def test_step_from_score_mbd_matches_base_score_numerator_update():
     assert next_x.shape == x_t.shape
     assert torch.allclose(next_x[:, :, 2:], x_t[:, :, 2:])
     assert torch.isfinite(next_x).all()
+
+
+def test_step_from_mbd_residual_is_exact_base_update_at_zero_scale():
+    planner = object.__new__(SimFreeMPC)
+    planner.config = SimFreeMPCConfig(action_dims=2, flow_eps=1e-6)
+    x_t = torch.tensor([[[0.2, -0.4, 1.5], [0.3, -0.5, 1.7]]], dtype=torch.float32)
+    numerator = torch.tensor(
+        [[[0.11, -0.23, 0.0], [0.31, -0.43, 0.0]]], dtype=torch.float32
+    )
+    residual = torch.randn_like(x_t)
+    iteration = 1
+    num_iterations = 3
+    base_scale = 1.3
+
+    next_x = planner.step_from_mbd_residual(
+        x_t,
+        numerator,
+        residual,
+        iteration=iteration,
+        num_iterations=num_iterations,
+        base_scale=base_scale,
+        residual_scale=0.0,
+        active_dims=2,
+    )
+
+    alpha_bar, alpha_bar_prev = ddim_iteration_alphas(
+        iteration=iteration,
+        num_iterations=num_iterations,
+        num_train_timesteps=planner.config.ddim_num_train_timesteps,
+    )
+    alpha = torch.as_tensor(alpha_bar, dtype=x_t.dtype)
+    alpha_prev = torch.as_tensor(alpha_bar_prev, dtype=x_t.dtype)
+    alpha_step = torch.clamp(
+        alpha / torch.clamp(alpha_prev, min=planner.config.flow_eps),
+        min=planner.config.flow_eps,
+    )
+    expected = x_t.clone()
+    expected[:, :, :2] = (
+        x_t[:, :, :2] + base_scale * numerator[:, :, :2]
+    ) / torch.sqrt(alpha_step)
+
+    assert torch.equal(next_x, expected)
