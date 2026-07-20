@@ -3,6 +3,11 @@ logs
 wandb
 outputs
 data
+/checkpoints/score_task_weight/task_eps/30000/30000/
+!IsaacLab/source/isaaclab/isaaclab/controllers/config/data/
+!IsaacLab/source/isaaclab/isaaclab/controllers/config/data/**
+!IsaacLab/source/isaaclab/isaaclab/devices/openxr/retargeters/humanoid/fourier/data/
+!IsaacLab/source/isaaclab/isaaclab/devices/openxr/retargeters/humanoid/fourier/data/**
 data_local
 slurm
 .secrets/

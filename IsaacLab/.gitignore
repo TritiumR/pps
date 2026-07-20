@@ -76,6 +76,8 @@ tests/
 # Assets
 asset/
 assets/
+!source/isaaclab/isaaclab/assets/
+!source/isaaclab/isaaclab/assets/**
 
 # Droid
 /droid/

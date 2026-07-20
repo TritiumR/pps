@@ -1,7 +1,450 @@
-import sys
+import argparse
+import atexit
+import json
 import os
-from typing import Any
 import subprocess
+import sys
+import time
+from typing import Any
+
+from tqdm import tqdm
+
+
+_DEFAULT_WORKERS = 2
+_DEFAULT_GPUS = "0"
+_WORKER_PROGRESS_HANDLE = None
+_WORKER_PROGRESS_HANDLE_PATH = None
+_INIT_PROCESS_START = time.perf_counter()
+_INIT_LAST_STAGE_TIME = _INIT_PROCESS_START
+_INIT_LAST_STAGE = "process start"
+
+
+def _parse_gpu_ids(value: str) -> list[int]:
+    tokens = value.replace(",", " ").split()
+    if not tokens:
+        raise ValueError(
+            "--gpus must contain at least one GPU index, for example --gpus 0,1."
+        )
+    gpu_ids = []
+    for token in tokens:
+        if token.startswith("cuda:"):
+            token = token[5:]
+        try:
+            gpu_id = int(token)
+        except ValueError as exc:
+            raise ValueError(f"Invalid GPU index {token!r} in --gpus {value!r}.") from exc
+        if gpu_id < 0:
+            raise ValueError(f"GPU indices must be non-negative, got {gpu_id}.")
+        gpu_ids.append(gpu_id)
+    return gpu_ids
+
+
+def _multi_worker_preparse(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--task")
+    parser.add_argument("--exp_name", default="eval")
+    parser.add_argument("--seed_start", type=int, default=1)
+    parser.add_argument("--seed_end", type=int, default=51)
+    parser.add_argument("--task_num_steps", type=int, default=225)
+    parser.add_argument("--workers", type=int, default=_DEFAULT_WORKERS)
+    parser.add_argument("--gpus", default=_DEFAULT_GPUS)
+    parser.add_argument("--worker-id", type=int, default=-1)
+    parser.add_argument("--worker-progress-path", default=None)
+    return parser.parse_known_args(argv)[0]
+
+
+def _remove_value_options(argv: list[str], option_names: set[str]) -> list[str]:
+    result = []
+    skip_value = False
+    for arg in argv:
+        if skip_value:
+            skip_value = False
+            continue
+        if arg in option_names:
+            skip_value = True
+            continue
+        if any(arg.startswith(f"{name}=") for name in option_names):
+            continue
+        result.append(arg)
+    return result
+
+
+def _split_seed_ranges(
+    seed_start: int, seed_end: int, workers: int
+) -> list[tuple[int, int]]:
+    num_seeds = seed_end - seed_start
+    if num_seeds <= 0:
+        raise ValueError("--seed_end must be greater than --seed_start.")
+    workers = min(workers, num_seeds)
+    base, remainder = divmod(num_seeds, workers)
+    ranges = []
+    start = seed_start
+    for worker_id in range(workers):
+        count = base + (1 if worker_id < remainder else 0)
+        ranges.append((start, start + count))
+        start += count
+    return ranges
+
+
+def _emit_worker_progress(args: argparse.Namespace, event: str, **payload: Any) -> None:
+    global _WORKER_PROGRESS_HANDLE, _WORKER_PROGRESS_HANDLE_PATH
+
+    progress_path = getattr(args, "worker_progress_path", None)
+    if progress_path is None:
+        return
+    if _WORKER_PROGRESS_HANDLE_PATH != progress_path:
+        if _WORKER_PROGRESS_HANDLE is not None:
+            _WORKER_PROGRESS_HANDLE.close()
+        _WORKER_PROGRESS_HANDLE = open(
+            progress_path, "a", encoding="utf-8", buffering=1
+        )
+        _WORKER_PROGRESS_HANDLE_PATH = progress_path
+    record = {
+        "event": event,
+        "time": time.time(),
+        "worker_id": args.worker_id,
+        **payload,
+    }
+    _WORKER_PROGRESS_HANDLE.write(json.dumps(record, sort_keys=True) + "\n")
+    if event == "run_end":
+        _WORKER_PROGRESS_HANDLE.close()
+        _WORKER_PROGRESS_HANDLE = None
+        _WORKER_PROGRESS_HANDLE_PATH = None
+
+
+def _report_initialization_stage(
+    args: argparse.Namespace, stage: str, **details: Any
+) -> None:
+    """Report initialization progress to stdout or the multi-worker progress UI."""
+    global _INIT_LAST_STAGE, _INIT_LAST_STAGE_TIME
+
+    now = time.perf_counter()
+    total_seconds = now - _INIT_PROCESS_START
+    previous_seconds = now - _INIT_LAST_STAGE_TIME
+    payload = {
+        "stage": stage,
+        "elapsed_s": round(total_seconds, 3),
+        "previous_stage": _INIT_LAST_STAGE,
+        "previous_stage_s": round(previous_seconds, 3),
+        **details,
+    }
+    _emit_worker_progress(args, "init_stage", **payload)
+
+    detail_text = " ".join(f"{key}={value}" for key, value in details.items())
+    message = (
+        f"[INIT +{total_seconds:7.2f}s] {stage} "
+        f"(previous: {_INIT_LAST_STAGE}, {previous_seconds:.2f}s)"
+    )
+    if detail_text:
+        message += f" | {detail_text}"
+    # Worker stdout is retained in its log file, while the parent renders this
+    # same event on the worker's progress bar.
+    print(message, flush=True)
+
+    _INIT_LAST_STAGE = stage
+    _INIT_LAST_STAGE_TIME = now
+
+
+def _wait_for_worker_start(args: argparse.Namespace) -> None:
+    _emit_worker_progress(args, "ready", device=args.device)
+    barrier_path = args.worker_start_barrier
+    if barrier_path is None:
+        return
+    while not os.path.exists(barrier_path):
+        if args.worker_parent_pid > 0:
+            try:
+                os.kill(args.worker_parent_pid, 0)
+            except ProcessLookupError as exc:
+                raise RuntimeError("Multi-worker parent exited before releasing workers.") from exc
+        time.sleep(0.1)
+
+
+def _read_worker_progress(worker: dict[str, Any]) -> None:
+    progress_path = worker["progress_path"]
+    if not os.path.exists(progress_path):
+        return
+    with open(progress_path, encoding="utf-8") as handle:
+        handle.seek(worker["progress_offset"])
+        for line in handle:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            event_name = event.get("event")
+            if event_name == "init_stage":
+                stage = event.get("stage", "initializing")
+                elapsed = event.get("elapsed_s", 0.0)
+                worker["bar"].set_description_str(
+                    f"worker {worker['id'] + 1} gpu {worker['gpu']} init: {stage}"
+                )
+                worker["bar"].set_postfix_str(f"init {elapsed:.1f}s", refresh=True)
+            elif event_name == "ready":
+                worker["ready"] = True
+                worker["bar"].set_description_str(
+                    f"worker {worker['id'] + 1} gpu {worker['gpu']} ready"
+                )
+            elif event_name == "rollout_start":
+                worker["bar"].set_description_str(
+                    f"worker {worker['id'] + 1} gpu {worker['gpu']} seed {event['seed']}"
+                )
+            elif event_name == "step":
+                completed = event["rollout_index"] * event["task_num_steps"] + event["step"]
+                worker["bar"].n = min(completed, worker["bar"].total)
+                worker["bar"].refresh()
+            elif event_name == "rollout_end":
+                completed = (event["rollout_index"] + 1) * event["task_num_steps"]
+                worker["bar"].n = min(completed, worker["bar"].total)
+                worker["bar"].set_postfix_str(
+                    "success" if event.get("success") else "failed", refresh=True
+                )
+            elif event_name == "run_end":
+                worker["results_path"] = event.get("results_path")
+                worker["output_path"] = event.get("output_path")
+                worker["bar"].n = worker["bar"].total
+                worker["bar"].refresh()
+        worker["progress_offset"] = handle.tell()
+
+
+def _run_multi_worker_launcher(pre_args: argparse.Namespace, argv: list[str]) -> int:
+    if pre_args.task is None:
+        print("error: --task is required", file=sys.stderr)
+        return 2
+    if pre_args.workers <= 0:
+        print("error: --workers must be positive", file=sys.stderr)
+        return 2
+    try:
+        gpu_ids = _parse_gpu_ids(pre_args.gpus)
+        seed_ranges = _split_seed_ranges(
+            pre_args.seed_start, pre_args.seed_end, pre_args.workers
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if len(seed_ranges) < pre_args.workers:
+        print(
+            f"Using {len(seed_ranges)} workers because only {len(seed_ranges)} seeds were requested.",
+            file=sys.stderr,
+        )
+
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    run_id = time.strftime("%Y%m%d-%H%M%S") + f"-pid{os.getpid()}"
+    launcher_dir = os.path.join(
+        repo_dir,
+        "results",
+        pre_args.task,
+        pre_args.exp_name,
+        "_workers",
+        run_id,
+    )
+    os.makedirs(launcher_dir, exist_ok=False)
+    barrier_path = os.path.join(launcher_dir, "start.barrier")
+    stripped_argv = _remove_value_options(
+        argv,
+        {
+            "--workers",
+            "--gpus",
+            "--worker-id",
+            "--worker-progress-path",
+            "--worker-start-barrier",
+            "--worker-rollout-offset",
+            "--worker-parent-pid",
+            "--seed_start",
+            "--seed_end",
+            "--exp_name",
+            "--device",
+        },
+    )
+
+    workers = []
+    rollout_offset = 0
+    for worker_id, (worker_seed_start, worker_seed_end) in enumerate(seed_ranges):
+        gpu_id = gpu_ids[worker_id % len(gpu_ids)]
+        progress_path = os.path.join(launcher_dir, f"worker_{worker_id:02d}.jsonl")
+        log_path = os.path.join(launcher_dir, f"worker_{worker_id:02d}.log")
+        open(progress_path, "w", encoding="utf-8").close()
+        worker_exp_name = os.path.join(
+            pre_args.exp_name, f"worker_{worker_id:02d}_gpu_{gpu_id}"
+        )
+        command = [
+            sys.executable,
+            os.path.abspath(__file__),
+            *stripped_argv,
+            "--workers",
+            "1",
+            "--gpus",
+            str(gpu_id),
+            "--worker-id",
+            str(worker_id),
+            "--worker-progress-path",
+            progress_path,
+            "--worker-start-barrier",
+            barrier_path,
+            "--worker-rollout-offset",
+            str(rollout_offset),
+            "--worker-parent-pid",
+            str(os.getpid()),
+            "--seed_start",
+            str(worker_seed_start),
+            "--seed_end",
+            str(worker_seed_end),
+            "--exp_name",
+            worker_exp_name,
+            "--device",
+            f"cuda:{gpu_id}",
+        ]
+        bar = tqdm(
+            total=(worker_seed_end - worker_seed_start) * pre_args.task_num_steps,
+            desc=f"worker {worker_id + 1} gpu {gpu_id} initializing",
+            position=worker_id,
+            leave=True,
+            dynamic_ncols=True,
+        )
+        workers.append(
+            {
+                "id": worker_id,
+                "gpu": gpu_id,
+                "seed_start": worker_seed_start,
+                "seed_end": worker_seed_end,
+                "rollout_offset": rollout_offset,
+                "progress_path": progress_path,
+                "progress_offset": 0,
+                "log_path": log_path,
+                "log_handle": None,
+                "command": command,
+                "process": None,
+                "ready": False,
+                "results_path": None,
+                "output_path": None,
+                "bar": bar,
+            }
+        )
+        rollout_offset += worker_seed_end - worker_seed_start
+
+    def terminate_workers() -> None:
+        for worker in workers:
+            process = worker["process"]
+            if process is not None and process.poll() is None:
+                process.terminate()
+
+    atexit.register(terminate_workers)
+    failed_to_initialize = False
+    for wave_start in range(0, len(workers), len(gpu_ids)):
+        wave = workers[wave_start : wave_start + len(gpu_ids)]
+        for worker in wave:
+            worker["log_handle"] = open(worker["log_path"], "w", encoding="utf-8")
+            env = os.environ.copy()
+            env["PYTHONUNBUFFERED"] = "1"
+            worker["process"] = subprocess.Popen(
+                worker["command"],
+                cwd=repo_dir,
+                env=env,
+                stdout=worker["log_handle"],
+                stderr=subprocess.STDOUT,
+            )
+        while not all(worker["ready"] for worker in wave):
+            for worker in workers:
+                _read_worker_progress(worker)
+            for worker in wave:
+                return_code = worker["process"].poll()
+                if return_code is not None and not worker["ready"]:
+                    failed_to_initialize = True
+            if failed_to_initialize:
+                break
+            time.sleep(0.1)
+        if failed_to_initialize:
+            break
+
+    if failed_to_initialize:
+        terminate_workers()
+    else:
+        with open(barrier_path, "w", encoding="utf-8") as handle:
+            handle.write("start\n")
+
+    while any(
+        worker["process"] is not None and worker["process"].poll() is None
+        for worker in workers
+    ):
+        for worker in workers:
+            _read_worker_progress(worker)
+        time.sleep(0.1)
+    for worker in workers:
+        _read_worker_progress(worker)
+
+    failed_workers = []
+    manifest_workers = []
+    for worker in workers:
+        process = worker["process"]
+        return_code = process.wait() if process is not None else 1
+        if return_code != 0:
+            failed_workers.append(worker)
+            worker["bar"].set_description_str(
+                f"worker {worker['id'] + 1} gpu {worker['gpu']} ERROR"
+            )
+        else:
+            worker["bar"].n = worker["bar"].total
+            worker["bar"].refresh()
+            worker["bar"].set_description_str(
+                f"worker {worker['id'] + 1} gpu {worker['gpu']} complete"
+            )
+        worker["bar"].close()
+        if worker["log_handle"] is not None:
+            worker["log_handle"].close()
+        manifest_workers.append(
+            {
+                "worker_id": worker["id"],
+                "gpu": worker["gpu"],
+                "seed_start": worker["seed_start"],
+                "seed_end": worker["seed_end"],
+                "return_code": return_code,
+                "log_path": worker["log_path"],
+                "results_path": worker["results_path"],
+                "output_path": worker["output_path"],
+            }
+        )
+
+    manifest_path = os.path.join(launcher_dir, "manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "run_id": run_id,
+                "workers": len(workers),
+                "gpus": gpu_ids,
+                "seed_start": pre_args.seed_start,
+                "seed_end": pre_args.seed_end,
+                "worker_runs": manifest_workers,
+            },
+            handle,
+            indent=2,
+        )
+
+    atexit.unregister(terminate_workers)
+    if failed_workers:
+        print(
+            f"{len(failed_workers)} worker(s) failed. Logs: {launcher_dir}",
+            file=sys.stderr,
+        )
+        for worker in failed_workers:
+            print(f"  worker {worker['id']}: {worker['log_path']}", file=sys.stderr)
+        return 1
+    print(f"All workers completed. Manifest: {manifest_path}")
+    return 0
+
+
+_MULTI_WORKER_PRE_ARGS = _multi_worker_preparse(sys.argv[1:])
+if (
+    _MULTI_WORKER_PRE_ARGS.worker_id < 0
+    and _MULTI_WORKER_PRE_ARGS.workers > 1
+    and "--help" not in sys.argv
+    and "-h" not in sys.argv
+):
+    raise SystemExit(_run_multi_worker_launcher(_MULTI_WORKER_PRE_ARGS, sys.argv[1:]))
+
+_report_initialization_stage(
+    _MULTI_WORKER_PRE_ARGS,
+    "loading Python/model dependencies",
+    task=_MULTI_WORKER_PRE_ARGS.task,
+)
 
 _REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 _OPENPI_SRC_DIR = os.path.join(_REPO_DIR, "openpi", "src")
@@ -26,25 +469,18 @@ from openpi.training import config as _config
 from openpi.policies import policy_config
 from openpi.shared import download
 
-import time
-
 # from openpi.policies import libero_policy
 
-import os
-import time
 import cv2
 import h5py
-import json
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 # import dill
 # import hydra
-import argparse
 import copy
 import re
-from tqdm import tqdm
 
 # from botocore.exceptions import NoCredentialsError
 
@@ -1599,7 +2035,11 @@ def _infer_actions_eager(
     actions = base_policy.output_to_actions(base_inputs, x_t)
     if use_vlm_mpc_base:
         current_joint_pos = raw_obs.get("observation/joint_position")
-        max_joint_delta = args.mpc_joint_delta_clip if args.mpc_joint_delta_clip > 0.0 else None
+        max_joint_delta = (
+            None
+            if args.sampler == "truncated"
+            else args.mpc_joint_delta_clip if args.mpc_joint_delta_clip > 0.0 else None
+        )
         action_tensor = torch.as_tensor(actions, device=device, dtype=torch.float32)
         actions = (
             clamp_real_action_chunk(
@@ -2542,6 +2982,8 @@ def _slugify(text: str) -> str:
 
 def _video_config_slug(args) -> str:
     parts = [
+        f"sampler-{getattr(args, 'sampler', 'base')}",
+        f"grad-{getattr(args, 'grad_calc', 'mbd')}",
         _base_source_name(args),
         f"update-{args.mpc_update}" if _uses_vlm_mpc_base(args) else "update-flow",
         f"cost-{getattr(args, 'mpc_cost', 'na')}",
@@ -2590,6 +3032,7 @@ def _video_config_lines(args, *, seed: int) -> list[str]:
             f"rollout_steps={args.task_num_steps} spi={args.steps_per_inference}"
         ),
         (
+            f"sampler={args.sampler} grad={args.grad_calc} "
             f"samples={args.mpc_num_samples} iters={args.mpc_iterations} "
             f"noise={args.mpc_noise:g} temp={args.mpc_temperature:g} "
             f"joint_clip={args.mpc_joint_delta_clip:g}"
@@ -2830,6 +3273,39 @@ def parse_args():
     )
     parser.add_argument("--exp_name", type=str, default="eval")
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=_DEFAULT_WORKERS,
+        help=(
+            "Number of independent evaluation worker processes. Defaults to 2. "
+            "Seeds are divided into contiguous, balanced ranges."
+        ),
+    )
+    parser.add_argument(
+        "--gpus",
+        type=str,
+        default=_DEFAULT_GPUS,
+        help=(
+            "Comma-separated logical GPU indices assigned round-robin to workers, "
+            "for example --gpus 0,1. Defaults to GPU 0."
+        ),
+    )
+    parser.add_argument(
+        "--worker-id", "--worker_id", type=int, default=-1, help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--worker-progress-path", type=str, default=None, help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--worker-start-barrier", type=str, default=None, help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--worker-rollout-offset", type=int, default=0, help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--worker-parent-pid", type=int, default=-1, help=argparse.SUPPRESS
+    )
+    parser.add_argument(
         "--output", type=str, default=None, help="Path to the output directory."
     )
     parser.add_argument("--seed_start", type=int, default=1)
@@ -2946,6 +3422,15 @@ def parse_args():
     parser.add_argument("--mpc_noise", type=float, default=0.35)
     parser.add_argument("--mpc_temperature", type=float, default=0.15)
     parser.add_argument(
+        "--grad_calc",
+        choices=("mbd", "backprop"),
+        default="mbd",
+        help=(
+            "Cost-score estimator. 'mbd' uses weighted sample displacement; "
+            "'backprop' uses the softmax-weighted cost gradient through action decoding and FK."
+        ),
+    )
+    parser.add_argument(
         "--mpc_update",
         choices=(
             "ddim",
@@ -2958,6 +3443,16 @@ def parse_args():
         help=(
             "Reverse update used by MBD base/full/task score modes. Defaults to "
             "mbd_score_action_prox to match the current Weight ref distillation teacher."
+        ),
+    )
+    parser.add_argument(
+        "--sampler",
+        choices=("base", "truncated"),
+        default="base",
+        help=(
+            "MPC proposal sampler. 'base' uses unconstrained Gaussians and the "
+            "final joint-delta clamp; 'truncated' autoregressively samples only "
+            "valid decoded joint targets and disables that final delta clamp."
         ),
     )
     parser.add_argument(
@@ -2985,9 +3480,15 @@ def parse_args():
         "--interpolate",
         action="store_true",
         help=(
-            "Optimize sim-free MPC at a lower knot rate and linearly "
+            "Optimize sim-free MPC at a lower knot rate and "
             "interpolate back to the action horizon."
         ),
+    )
+    parser.add_argument(
+        "--interpolation_method",
+        choices=("bspline", "linear"),
+        default="bspline",
+        help="Interpolation used to expand low-frequency control points.",
     )
     parser.add_argument(
         "--interpolate_low_frequency",
@@ -3136,6 +3637,16 @@ AppLauncher.add_app_launcher_args(parser)
 parser.set_defaults(enable_cameras=True, headless=True)
 
 args = parser.parse_args()
+if args.workers <= 0:
+    parser.error("--workers must be positive.")
+try:
+    configured_gpu_ids = _parse_gpu_ids(args.gpus)
+except ValueError as exc:
+    parser.error(str(exc))
+if args.worker_id < 0 and args.workers == 1 and not any(
+    value == "--device" or value.startswith("--device=") for value in sys.argv[1:]
+):
+    args.device = f"cuda:{configured_gpu_ids[0]}"
 _apply_task_prompt_defaults(args, parser)
 standalone_role = _standalone_policy_role(args)
 if standalone_role is not None:
@@ -3175,6 +3686,24 @@ if score_steering_mode in ("full", "task"):
         )
 if score_steering_mode == "base" and (args.only_steer or args.compare_difference):
     parser.error("--vlm_base is base-only and cannot be combined with --only_steer or --compare_difference.")
+if args.sampler == "truncated":
+    if not _uses_vlm_mpc_base(args):
+        parser.error("--sampler truncated requires a VLM/MPC base mode.")
+    if args.mpc_optimize_space != "action":
+        parser.error("--sampler truncated requires --mpc_optimize_space action.")
+    if args.mpc_joint_delta_clip <= 0.0:
+        parser.error(
+            "--sampler truncated requires a positive --mpc_joint_delta_clip."
+        )
+if args.grad_calc == "backprop":
+    if not _uses_vlm_mpc_base(args):
+        parser.error("--grad_calc backprop requires a VLM/MPC base mode.")
+    if args.mpc_update not in ("ddim", "mbd_score"):
+        parser.error(
+            "--grad_calc backprop currently supports --mpc_update ddim or mbd_score."
+        )
+    if args.mpc_optimize_space != "action":
+        parser.error("--grad_calc backprop requires --mpc_optimize_space action.")
 if args.mpc_cost == "capsule_flow" and "capsule" not in args.task.lower():
     parser.error(
         "--mpc_cost capsule_flow requires a capsule task, for example "
@@ -3191,6 +3720,14 @@ if _uses_accel_action_mpc(args):
 if args.steps_per_inference <= 0:
     raise ValueError("--steps_per_inference must be positive.")
 
+_report_initialization_stage(
+    args,
+    "arguments parsed",
+    task=args.task,
+    device=args.device,
+    worker=args.worker_id if args.worker_id >= 0 else "standalone",
+)
+
 # output path
 output_path = os.path.join("results", f"{args.task}/{args.exp_name}")
 
@@ -3198,9 +3735,12 @@ if not os.path.exists(output_path):
     os.makedirs(output_path)
 
 # Make the robot env
+_report_initialization_stage(args, "starting Isaac Sim")
 app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
+_report_initialization_stage(args, "Isaac Sim ready")
 
+_report_initialization_stage(args, "importing Isaac extensions and task registry")
 import asyncio
 import gymnasium as gym
 import inspect
@@ -3219,6 +3759,7 @@ from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 # from isaaclab_mimic.datagen.utils import get_env_name_from_dataset, setup_output_paths
 
 import isaaclab_tasks  # noqa: F401
+_report_initialization_stage(args, "Isaac extensions and task registry ready")
 
 
 # Setup output paths and get env name
@@ -3232,8 +3773,9 @@ env_name = task_name
 print(f"Environment name: {env_name}", flush=True)
 
 # Configure environment
-print("Parsing env cfg...", flush=True)
+_report_initialization_stage(args, "parsing environment config", environment=env_name)
 env_cfg = parse_env_cfg(env_name, device=args.device, num_envs=1)
+_report_initialization_stage(args, "environment config ready", environment=env_name)
 
 env_cfg.env_name = env_name
 
@@ -3252,9 +3794,9 @@ else:
 # env_cfg.observations.policy.concatenate_terms = False
 
 # Create environment
-print("Creating eval env...", flush=True)
+_report_initialization_stage(args, "creating simulation environment")
 env = gym.make(env_name, cfg=env_cfg).unwrapped
-print("Eval env created.", flush=True)
+_report_initialization_stage(args, "simulation environment ready")
 
 # Derive each training-config name from its checkpoint dir so the model names do
 # not need to be passed on the command line. Checkpoints follow the layout
@@ -3284,31 +3826,43 @@ def _config_name_from_checkpoint_dir(checkpoint_dir):
 base_checkpoint_dir = args.base_checkpoint_dir
 task_checkpoint_dir = args.task_checkpoint_dir
 ref_checkpoint_dir = args.ref_checkpoint_dir
-print("Resolving checkpoint configs...", flush=True)
+_report_initialization_stage(args, "resolving checkpoint configs")
 base_policy = None
 task_policy = None
 ref_policy = None
 required_policy_roles = _required_policy_roles(args)
 if "base" in required_policy_roles:
-    base_config = _config.get_config(_config_name_from_checkpoint_dir(base_checkpoint_dir))
-    print("Loading base policy checkpoint...", flush=True)
-    base_policy = policy_config.create_trained_policy(base_config, base_checkpoint_dir)
+    base_config_name = _config_name_from_checkpoint_dir(base_checkpoint_dir)
+    base_config = _config.get_config(base_config_name)
+    _report_initialization_stage(args, "loading base policy", config=base_config_name)
+    base_policy = policy_config.create_trained_policy(
+        base_config,
+        base_checkpoint_dir,
+        pytorch_device=args.device,
+    )
+    _report_initialization_stage(args, "base policy ready", config=base_config_name)
 if "task" in required_policy_roles:
-    task_config = _config.get_config(_config_name_from_checkpoint_dir(task_checkpoint_dir))
-    print("Loading task policy checkpoint...", flush=True)
+    task_config_name = _config_name_from_checkpoint_dir(task_checkpoint_dir)
+    task_config = _config.get_config(task_config_name)
+    _report_initialization_stage(args, "loading task policy", config=task_config_name)
     task_policy = policy_config.create_trained_policy(
         task_config,
         task_checkpoint_dir,
         sample_kwargs={"num_steps": args.num_steps} if standalone_role == "task" else None,
+        pytorch_device=args.device,
     )
+    _report_initialization_stage(args, "task policy ready", config=task_config_name)
 if "ref" in required_policy_roles:
-    ref_config = _config.get_config(_config_name_from_checkpoint_dir(ref_checkpoint_dir))
-    print("Loading ref policy checkpoint...", flush=True)
+    ref_config_name = _config_name_from_checkpoint_dir(ref_checkpoint_dir)
+    ref_config = _config.get_config(ref_config_name)
+    _report_initialization_stage(args, "loading ref policy", config=ref_config_name)
     ref_policy = policy_config.create_trained_policy(
         ref_config,
         ref_checkpoint_dir,
         sample_kwargs={"num_steps": args.num_steps} if standalone_role == "ref" else None,
+        pytorch_device=args.device,
     )
+    _report_initialization_stage(args, "ref policy ready", config=ref_config_name)
 
 base_source = _base_source_name(args)
 print(f"Base source: {base_source}", flush=True)
@@ -3364,18 +3918,23 @@ if _uses_vlm_mpc_base(args):
                 ddim_num_train_timesteps=args.mpc_ddim_train_timesteps,
                 interpolate=args.interpolate,
                 control_frequency=args.interpolate_high_frequency,
+                sampler=args.sampler,
                 interpolate_frequency=args.interpolate_low_frequency,
+                interpolation_method=args.interpolation_method,
                 cost_style=args.mpc_cost,
                 optimize_space=args.mpc_optimize_space,
+                grad_calc=args.grad_calc,
             ),
         )
     print(
         "Sim-free MPC planner enabled: "
         f"base_source={base_source}, task={inferred_task}, samples={args.mpc_num_samples}, "
         f"iterations={args.mpc_iterations}, update={args.mpc_update}, cost={args.mpc_cost}, "
-        f"optimize_space={args.mpc_optimize_space}, "
+        f"optimize_space={args.mpc_optimize_space}, sampler={args.sampler}, "
+        f"grad_calc={args.grad_calc}, "
         f"ddim_train_timesteps={args.mpc_ddim_train_timesteps}, gamma_base={args.gamma_base}, "
         f"joint_delta_clip={args.mpc_joint_delta_clip}, interpolate={args.interpolate}, "
+        f"interpolation_method={args.interpolation_method}, "
         f"interpolate_low_frequency={args.interpolate_low_frequency}, "
         f"interpolate_high_frequency={args.interpolate_high_frequency}",
         flush=True,
@@ -3387,10 +3946,11 @@ if args.load_init_from_dataset is not None:
     dataset_file = h5py.File(args.load_init_from_dataset, "r")
     dataset_demo_names = sorted(dataset_file["data"].keys(), key=_episode_sort_key)
     num_rollouts = args.seed_end - args.seed_start
-    if num_rollouts > len(dataset_demo_names):
+    required_episodes = args.worker_rollout_offset + num_rollouts
+    if required_episodes > len(dataset_demo_names):
         raise ValueError(
             f"Dataset {args.load_init_from_dataset} only has {len(dataset_demo_names)} episodes, "
-            f"but {num_rollouts} rollouts were requested."
+            f"but episodes through index {required_episodes - 1} were requested."
         )
 
 if standalone_role is None:
@@ -3438,12 +3998,12 @@ print(
     flush=True,
 )
 
-print("Resetting env for warmup...", flush=True)
+_report_initialization_stage(args, "resetting environment for warmup")
 env_obs_dict, _ = env.reset()
-print("Building warmup observation...", flush=True)
+_report_initialization_stage(args, "building warmup observation")
 obs = get_pi_observation(env_obs_dict["policy"])
 obs["prompt"] = args.prompt
-print("Running warmup policy inference...", flush=True)
+_report_initialization_stage(args, "compiling/warming policy inference")
 with torch.no_grad():
     warmup_actions, _ = infer_actions_with_mpc(
         base_policy,
@@ -3458,7 +4018,8 @@ with torch.no_grad():
             else build_mpc_context(env, env_obs_dict, args)
         ),
     )
-print("Warmup policy inference finished.", flush=True)
+_report_initialization_stage(args, "initialization complete")
+_wait_for_worker_start(args)
 
 if args.dry_run:
     print("Dry-run inference check passed", flush=True)
@@ -3564,6 +4125,8 @@ if args.mpc_debug:
         run_id=video_run_id,
         task=args.task,
         prompt=args.prompt,
+        sampler=args.sampler,
+        grad_calc=args.grad_calc,
         mpc_cost=args.mpc_cost,
         mpc_update=args.mpc_update,
         mpc_optimize_space=args.mpc_optimize_space,
@@ -3596,7 +4159,9 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
     # Reset before starting
     if dataset_file is not None:
         initial_state = _load_hdf5_state(
-            dataset_file["data"][dataset_demo_names[rollout_idx]]["initial_state"],
+            dataset_file["data"][
+                dataset_demo_names[rollout_idx + args.worker_rollout_offset]
+            ]["initial_state"],
             env.device,
         )
         env_obs_dict, _ = env.reset_to(initial_state, env_ids=None, is_relative=True)
@@ -3627,6 +4192,13 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
         step=0,
         phase=current_phase,
         subtasks=current_subtasks,
+    )
+    _emit_worker_progress(
+        args,
+        "rollout_start",
+        seed=seed,
+        rollout_index=rollout_idx,
+        task_num_steps=args.task_num_steps,
     )
 
     pear_guard_state = (
@@ -3659,7 +4231,11 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
     force_replan = False
     action_start_step = -steps_per_inference
     actions = None
-    for step_idx in tqdm(range(args.task_num_steps), desc="Policy Control Loop"):
+    for step_idx in tqdm(
+        range(args.task_num_steps),
+        desc="Policy Control Loop",
+        disable=args.worker_progress_path is not None,
+    ):
         try:
             if (
                 actions is None
@@ -3826,6 +4402,14 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                 )
 
             step_idx += 1
+            _emit_worker_progress(
+                args,
+                "step",
+                seed=seed,
+                rollout_index=rollout_idx,
+                step=step_idx,
+                task_num_steps=args.task_num_steps,
+            )
 
             if terminated or truncated or task_success:
                 if args.task_debug:
@@ -3914,6 +4498,15 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
         subtasks=current_subtasks,
         success=success,
         video_path=video_path,
+    )
+    _emit_worker_progress(
+        args,
+        "rollout_end",
+        seed=seed,
+        rollout_index=rollout_idx,
+        steps=step_idx,
+        task_num_steps=args.task_num_steps,
+        success=bool(success),
     )
     if episode_inference_calls:
         avg_infer_ms = 1000.0 * episode_inference_time_s / episode_inference_calls
@@ -4033,6 +4626,12 @@ _write_mpc_debug_log(
 )
 if mpc_debug_log_file is not None:
     mpc_debug_log_file.close()
+_emit_worker_progress(
+    args,
+    "run_end",
+    results_path=os.path.abspath(experiment_results_path),
+    output_path=os.path.abspath(experiment_output_path),
+)
 
 # Close the simulation app after environment is closed
 simulation_app.close()

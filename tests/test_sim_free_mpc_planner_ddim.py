@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 
@@ -57,6 +57,51 @@ def test_interpolate_control_points_uses_bspline_when_enabled():
     assert torch.allclose(resampled[:, -1], control_points[:, -1], atol=1e-6)
 
 
+def test_interpolate_control_points_uses_linear_when_selected():
+    planner = object.__new__(SimFreeMPC)
+    planner.config = SimFreeMPCConfig(
+        interpolate=True,
+        control_frequency=2.0,
+        interpolate_frequency=1.0,
+        interpolation_method="linear",
+    )
+    control_points = torch.tensor([[[0.0], [1.0]]], dtype=torch.float32)
+
+    resampled = planner._interpolate_control_points(control_points, 5)
+    expected = torch.tensor([[[0.0], [0.5], [1.0], [1.0], [1.0]]])
+
+    assert resampled.shape == (1, 5, 1)
+    assert torch.equal(resampled, expected)
+    assert torch.allclose(resampled[:, 0], control_points[:, 0], atol=1e-6)
+    assert torch.allclose(resampled[:, -1], control_points[:, -1], atol=1e-6)
+
+
+def test_linear_control_point_extraction_uses_frequency_spacing():
+    planner = object.__new__(SimFreeMPC)
+    planner.config = SimFreeMPCConfig(
+        interpolate=True,
+        control_frequency=50.0,
+        interpolate_frequency=2.5,
+        interpolation_method="linear",
+    )
+    trajectory = torch.arange(40, dtype=torch.float32)[:, None]
+
+    control_points = planner._control_point_resample(trajectory, 2)
+
+    assert torch.equal(control_points[:, 0], torch.tensor([0.0, 20.0]))
+
+
+def test_unknown_interpolation_method_is_rejected():
+    planner = object.__new__(SimFreeMPC)
+    planner.config = SimFreeMPCConfig(
+        interpolate=True,
+        interpolation_method="unknown",
+    )
+
+    with pytest.raises(ValueError, match="interpolation_method"):
+        planner._interpolate_control_points(torch.zeros(1, 2, 1), 4)
+
+
 def test_accel_parameterization_reconstructs_trajectory():
     sequence = torch.tensor(
         [
@@ -105,6 +150,64 @@ def test_step_ddim_updates_only_active_dims(monkeypatch):
     assert torch.allclose(next_x[:, :, 2:], x_t[:, :, 2:])
     assert torch.isfinite(next_x).all()
     assert diagnostics["update_mode"] == "ddim"
+
+
+def test_backprop_clean_score_matches_weighted_pathwise_gradient_under_no_grad():
+    planner = object.__new__(SimFreeMPC)
+    planner.config = SimFreeMPCConfig(
+        action_dims=2,
+        temperature=0.5,
+        flow_eps=1e-6,
+        grad_calc="backprop",
+    )
+
+    def quadratic_cost(
+        _self,
+        samples,
+        _x_template,
+        _active_dims,
+        _policy_inputs,
+        _context,
+    ):
+        return samples.square().sum(dim=(1, 2))
+
+    planner._cost_active_samples = MethodType(quadratic_cost, planner)
+    samples = torch.tensor(
+        [
+            [[1.0, -2.0], [0.5, 0.25]],
+            [[-0.5, 1.0], [2.0, -1.0]],
+        ],
+        dtype=torch.float32,
+    )
+    weights = torch.tensor([0.25, 0.75], dtype=torch.float32)
+    result = SimpleNamespace(samples=samples, weights=weights)
+    x_t = torch.zeros((1, 2, 3), dtype=torch.float32)
+    alpha_bar = 0.25
+
+    with torch.no_grad():
+        score = planner._backprop_clean_score(
+            result,
+            x_t,
+            2,
+            {},
+            {},
+            alpha_bar=alpha_bar,
+        )
+
+    weighted_cost_gradient = torch.sum(
+        weights[:, None, None] * 2.0 * samples,
+        dim=0,
+        keepdim=True,
+    )
+    expected = -weighted_cost_gradient / (
+        planner.config.temperature * alpha_bar**0.5
+    )
+    assert torch.allclose(score[:, :, :2], expected)
+    assert torch.equal(score[:, :, 2:], torch.zeros_like(score[:, :, 2:]))
+
+
+def test_mbd_is_default_gradient_calculation_method():
+    assert SimFreeMPCConfig().grad_calc == "mbd"
 
 
 def test_step_mbd_score_updates_only_active_dims(monkeypatch):

@@ -1160,6 +1160,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("priority", "ref_style", "explore", "grasp_flow"),
     )
     cache_parser.add_argument("--mpc_interpolate", action="store_true")
+    cache_parser.add_argument(
+        "--mpc_interpolation_method",
+        choices=("bspline", "linear"),
+        default="bspline",
+    )
     cache_parser.add_argument("--control_frequency", type=float, default=40.0)
     cache_parser.add_argument("--interpolate_frequency", type=float, default=5.0)
     cache_parser.set_defaults(func=generate_cache)

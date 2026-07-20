@@ -43,7 +43,7 @@ class GraspFlowCostWeights:
     tip_z: float = 80.0
     center_region: float = 120.0
     aperture_region: float = 80.0
-    close_gripper: float = 2.0
+    close_gripper: float = 20.0
     gripper_smooth: float = 0.5
     soft_grasp: float = 0.0
     lift_reach: float = 12.0

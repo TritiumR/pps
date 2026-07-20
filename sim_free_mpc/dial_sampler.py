@@ -35,6 +35,7 @@ class DIALSampler:
 
     def __init__(self, config: DIALSamplerConfig):
         self.config = config
+        self.proposal_fn = None
 
     def optimize(
         self,
@@ -54,12 +55,6 @@ class DIALSampler:
         last_noise_scale = None
 
         for opt_iter in range(self.config.iterations):
-            noise = torch.randn(
-                (self.config.num_samples, *mean.shape),
-                device=mean.device,
-                dtype=mean.dtype,
-                generator=generator,
-            )
             horizon_idx = torch.arange(horizon, device=mean.device, dtype=mean.dtype)
             noise_level = self.config.noise * torch.exp(
                 -torch.as_tensor(opt_iter, device=mean.device, dtype=mean.dtype)
@@ -67,7 +62,28 @@ class DIALSampler:
                 - (horizon - 1 - horizon_idx)
                 / (self.config.beta_horizon * max(horizon, 1))
             )
-            samples = mean.unsqueeze(0) + noise * noise_level[None, :, None]
+            if self.proposal_fn is None:
+                noise = torch.randn(
+                    (self.config.num_samples, *mean.shape),
+                    device=mean.device,
+                    dtype=mean.dtype,
+                    generator=generator,
+                )
+                samples = mean.unsqueeze(0) + noise * noise_level[None, :, None]
+            else:
+                samples = self.proposal_fn(
+                    mean,
+                    noise_level,
+                    int(self.config.num_samples),
+                    generator,
+                )
+                if samples.shape != (self.config.num_samples, *mean.shape):
+                    raise ValueError(
+                        "proposal_fn returned "
+                        f"{tuple(samples.shape)}, expected "
+                        f"{(self.config.num_samples, *mean.shape)}"
+                    )
+                samples = samples.to(device=mean.device, dtype=mean.dtype)
             costs = cost_fn(samples)
             if costs.ndim != 1 or costs.shape[0] != self.config.num_samples:
                 raise ValueError(
@@ -139,14 +155,29 @@ class DIALSampler:
         last_samples = None
 
         for _ in range(self.config.iterations):
-            noise = torch.randn(
-                (self.config.num_samples, *mean.shape),
-                device=mean.device,
-                dtype=mean.dtype,
-                generator=generator,
-            )
-            samples = mean.unsqueeze(0) + noise * scale_view
-            samples[0] = mean
+            if self.proposal_fn is None:
+                noise = torch.randn(
+                    (self.config.num_samples, *mean.shape),
+                    device=mean.device,
+                    dtype=mean.dtype,
+                    generator=generator,
+                )
+                samples = mean.unsqueeze(0) + noise * scale_view
+                samples[0] = mean
+            else:
+                samples = self.proposal_fn(
+                    mean,
+                    scale,
+                    int(self.config.num_samples),
+                    generator,
+                )
+                if samples.shape != (self.config.num_samples, *mean.shape):
+                    raise ValueError(
+                        "proposal_fn returned "
+                        f"{tuple(samples.shape)}, expected "
+                        f"{(self.config.num_samples, *mean.shape)}"
+                    )
+                samples = samples.to(device=mean.device, dtype=mean.dtype)
             costs = cost_fn(samples)
             if costs.ndim != 1 or costs.shape[0] != self.config.num_samples:
                 raise ValueError(

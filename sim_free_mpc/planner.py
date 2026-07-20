@@ -16,6 +16,7 @@ from .costs_ref_style import RefStyleStateCost
 from .ddim import ddim_clean_sample_std_scale, ddim_iteration_alphas
 from .dial_sampler import DIALSampler, DIALSamplerConfig
 from .fk import PandaFK, quat_mul_wxyz, transform_points_wxyz
+from .truncated_sampler import sample_truncated_model_action_chunks
 
 
 @dataclass(frozen=True)
@@ -34,8 +35,11 @@ class SimFreeMPCConfig:
     interpolate: bool = False
     control_frequency: float = 40.0
     interpolate_frequency: float = 5.0
+    interpolation_method: str = "bspline"
     cost_style: str = "priority"
     optimize_space: str = "action"
+    sampler: str = "base"
+    grad_calc: str = "mbd"
 
 
 class SimFreeMPC:
@@ -72,6 +76,26 @@ class SimFreeMPC:
             raise ValueError(f"Unknown sim-free MPC cost_style: {config.cost_style!r}")
         if config.optimize_space not in ("action", "accel"):
             raise ValueError(f"Unknown sim-free MPC optimize_space: {config.optimize_space!r}")
+        if config.sampler not in ("base", "truncated"):
+            raise ValueError(f"Unknown MPC sampler: {config.sampler!r}")
+        if config.grad_calc not in ("mbd", "backprop"):
+            raise ValueError(f"Unknown MPC gradient calculation method: {config.grad_calc!r}")
+        if config.grad_calc == "backprop" and config.optimize_space != "action":
+            raise ValueError("Backprop cost gradients only support action optimize_space.")
+        if config.sampler == "truncated":
+            if config.optimize_space != "action":
+                raise ValueError(
+                    "The truncated sampler only supports action optimize_space."
+                )
+            if config.joint_delta_clip <= 0.0:
+                raise ValueError(
+                    "The truncated sampler requires a positive joint_delta_clip."
+                )
+        if config.interpolation_method not in ("bspline", "linear"):
+            raise ValueError(
+                "Unknown sim-free MPC interpolation_method: "
+                f"{config.interpolation_method!r}"
+            )
 
     def reset_action_warm(self) -> None:
         self._warm_action = None
@@ -122,11 +146,40 @@ class SimFreeMPC:
         return shifted_action, True
 
     def _interpolation_knot_count(self, horizon: int) -> int:
-        if not self.config.interpolate or horizon <= 1:
+        if self.config.sampler == "truncated" or not self.config.interpolate or horizon <= 1:
             return horizon
         ratio = self.config.interpolate_frequency / max(self.config.control_frequency, self.config.flow_eps)
         knots = int(math.ceil(horizon * ratio))
         return max(2, min(horizon, knots))
+
+    def _configure_sampler_proposal(
+        self,
+        policy_inputs: dict[str, Any],
+        context: dict[str, Any],
+    ) -> None:
+        if self.config.sampler == "base":
+            self.sampler.proposal_fn = None
+            return
+
+        current_joint_pos = context.get("joint_pos")
+        if current_joint_pos is None:
+            raise ValueError(
+                "The truncated sampler requires context['joint_pos']."
+            )
+
+        def proposal_fn(mean, noise_scale, num_samples, generator):
+            return sample_truncated_model_action_chunks(
+                self.policy,
+                policy_inputs,
+                mean,
+                noise_scale,
+                num_samples,
+                current_joint_pos=current_joint_pos,
+                max_joint_delta=self.config.joint_delta_clip,
+                generator=generator,
+            )
+
+        self.sampler.proposal_fn = proposal_fn
 
     @staticmethod
     def _linear_resample(sequence: torch.Tensor, output_horizon: int) -> torch.Tensor:
@@ -229,13 +282,60 @@ class SimFreeMPC:
             return resampled[0]
         return resampled
 
+    def _linear_control_point_resample(
+        self,
+        sequence: torch.Tensor,
+        output_horizon: int,
+    ) -> torch.Tensor:
+        if sequence.shape[-2] == output_horizon:
+            return sequence
+        if sequence.shape[-2] == 1:
+            return sequence.expand(*sequence.shape[:-2], output_horizon, sequence.shape[-1])
+
+        knot_steps = max(
+            1,
+            int(round(self.config.control_frequency / self.config.interpolate_frequency)),
+        )
+        knot_position = torch.arange(
+            output_horizon,
+            device=sequence.device,
+            dtype=sequence.dtype,
+        ) / float(knot_steps)
+        lower = torch.floor(knot_position).to(torch.long)
+        lower = lower.clamp(0, sequence.shape[-2] - 1)
+        upper = (lower + 1).clamp(0, sequence.shape[-2] - 1)
+        alpha = knot_position - lower.to(sequence.dtype)
+        return (
+            (1.0 - alpha)[..., None] * sequence[..., lower, :]
+            + alpha[..., None] * sequence[..., upper, :]
+        )
+
     def _control_point_resample(self, sequence: torch.Tensor, output_horizon: int) -> torch.Tensor:
+        if (
+            self.config.interpolate
+            and self.config.interpolation_method == "linear"
+            and sequence.shape[-2] != output_horizon
+        ):
+            knot_steps = max(
+                1,
+                int(round(self.config.control_frequency / self.config.interpolate_frequency)),
+            )
+            indices = torch.arange(output_horizon, device=sequence.device) * knot_steps
+            indices = indices.clamp(max=sequence.shape[-2] - 1)
+            return sequence[..., indices, :]
         return self._linear_resample(sequence, output_horizon)
 
     def _interpolate_control_points(self, sequence: torch.Tensor, output_horizon: int) -> torch.Tensor:
         if not self.config.interpolate:
             return self._linear_resample(sequence, output_horizon)
-        return self._bspline_resample(sequence, output_horizon)
+        if self.config.interpolation_method == "linear":
+            return self._linear_control_point_resample(sequence, output_horizon)
+        if self.config.interpolation_method == "bspline":
+            return self._bspline_resample(sequence, output_horizon)
+        raise ValueError(
+            "Unknown sim-free MPC interpolation_method: "
+            f"{self.config.interpolation_method!r}"
+        )
 
     @staticmethod
     def _trajectory_to_accel_code(sequence: torch.Tensor) -> torch.Tensor:
@@ -285,6 +385,7 @@ class SimFreeMPC:
         horizon = x_t.shape[1]
         opt_horizon = self._interpolation_knot_count(horizon)
         mean0 = self._control_point_resample(x_t[0, :, :active_dims].detach(), opt_horizon)
+        self._configure_sampler_proposal(policy_inputs, context)
 
         def cost_from_positions(samples: torch.Tensor) -> torch.Tensor:
             full_horizon_samples = self._interpolate_control_points(samples, horizon)
@@ -347,6 +448,61 @@ class SimFreeMPC:
             return self.cost(real_actions=real, tcp_pos=ee_pos, tcp_quat=ee_quat, context=context)
         return self.cost(real_actions=real, ee_pos=ee_pos, ee_quat=ee_quat, context=context)
 
+    def _backprop_clean_score(
+        self,
+        result,
+        x_t: torch.Tensor,
+        active_dims: int,
+        policy_inputs: dict[str, Any],
+        context: dict[str, Any],
+        *,
+        alpha_bar: float,
+    ) -> torch.Tensor:
+        """Estimate the annealed score from weighted clean-sample cost gradients."""
+        if self.config.optimize_space != "action":
+            raise ValueError("Backprop cost gradients only support action optimize_space.")
+        if self.config.temperature <= 0.0:
+            raise ValueError("Backprop cost gradients require a positive temperature.")
+
+        horizon = x_t.shape[1]
+        with torch.enable_grad():
+            clean_samples = self._interpolate_control_points(
+                result.samples.detach(),
+                horizon,
+            )
+            clean_samples = clean_samples.detach().requires_grad_(True)
+            costs = self._cost_active_samples(
+                clean_samples,
+                x_t,
+                active_dims,
+                policy_inputs,
+                context,
+            )
+            weights = result.weights.detach().to(device=costs.device, dtype=costs.dtype)
+            weighted_cost = torch.sum(weights * costs)
+            (sample_cost_grads,) = torch.autograd.grad(
+                weighted_cost,
+                clean_samples,
+                create_graph=False,
+                retain_graph=False,
+            )
+
+        mean_clean_cost_grad = sample_cost_grads.sum(dim=0, keepdim=True)
+        sqrt_alpha = torch.as_tensor(
+            alpha_bar,
+            device=x_t.device,
+            dtype=x_t.dtype,
+        ).sqrt()
+        score = torch.zeros_like(x_t)
+        score[:, :, :active_dims] = (
+            -mean_clean_cost_grad
+            / (
+                float(self.config.temperature)
+                * torch.clamp(sqrt_alpha, min=self.config.flow_eps)
+            )
+        ).detach()
+        return score
+
     def _last_cost_term_diagnostics(self, result) -> dict[str, Any]:
         cost = getattr(self, "cost", None)
         terms = getattr(cost, "last_terms", None)
@@ -389,6 +545,7 @@ class SimFreeMPC:
         opt_horizon = self._interpolation_knot_count(horizon)
         sqrt_alpha = torch.as_tensor(alpha_bar, device=x_t.device, dtype=x_t.dtype).sqrt()
         active_x_opt = self._control_point_resample(x_t.detach()[0, :, :active_dims], opt_horizon)
+        self._configure_sampler_proposal(policy_inputs, context)
         clean_std = self.config.noise * ddim_clean_sample_std_scale(alpha_bar)
 
         def cost_from_positions(samples: torch.Tensor) -> torch.Tensor:
@@ -433,6 +590,8 @@ class SimFreeMPC:
             "interpolate": bool(self.config.interpolate),
             "cost_style": self.config.cost_style,
             "optimize_space": self.config.optimize_space,
+            "sampler": self.config.sampler,
+            "grad_calc": self.config.grad_calc,
         }
         if self.config.interpolate:
             diagnostics.update(
@@ -441,7 +600,11 @@ class SimFreeMPC:
                     "interpolate_knot_count": int(self._interpolation_knot_count(x_t.shape[1])),
                     "interpolate_frequency": float(self.config.interpolate_frequency),
                     "control_frequency": float(self.config.control_frequency),
-                    "interpolate_method": "clamped_cubic_bspline",
+                    "interpolate_method": (
+                        "clamped_cubic_bspline"
+                        if self.config.interpolation_method == "bspline"
+                        else "linear"
+                    ),
                 }
             )
         if score is not None:
@@ -477,6 +640,7 @@ class SimFreeMPC:
             x_t.detach()[0, :, :active_dims],
             opt_horizon,
         )
+        self._configure_sampler_proposal(policy_inputs, context)
         proposal_std = float(self.config.noise) * math.sqrt(
             max(1.0 - float(alpha_bar), 0.0)
         )
@@ -580,7 +744,23 @@ class SimFreeMPC:
         score = torch.zeros_like(x_t)
         active_x = x_t.detach()[:, :, :active_dims]
         active_x0 = x0_hat[:, :, :active_dims]
-        if self.config.optimize_space == "accel":
+        if self.config.grad_calc == "backprop":
+            score = self._backprop_clean_score(
+                result,
+                x_t,
+                active_dims,
+                policy_inputs,
+                context,
+                alpha_bar=alpha_bar,
+            )
+            active_score = score[:, :, :active_dims]
+            score_x0 = (active_x + beta * active_score) / sqrt_alpha
+            pred_epsilon = -sqrt_beta * active_score
+            active_prev = (
+                torch.sqrt(torch.clamp(alpha_prev, min=0.0)) * score_x0
+                + torch.sqrt(torch.clamp(1.0 - alpha_prev, min=0.0)) * pred_epsilon
+            )
+        elif self.config.optimize_space == "accel":
             horizon = x_t.shape[1]
             opt_horizon = self._interpolation_knot_count(horizon)
             active_x_opt = self._control_point_resample(active_x[0], opt_horizon)
@@ -658,7 +838,20 @@ class SimFreeMPC:
         active_x0 = x0_hat[:, :, :active_dims]
 
         alpha_step = torch.clamp(alpha / torch.clamp(alpha_prev, min=self.config.flow_eps), min=self.config.flow_eps)
-        if self.config.optimize_space == "accel":
+        if self.config.grad_calc == "backprop":
+            score = self._backprop_clean_score(
+                result,
+                x_t,
+                active_dims,
+                policy_inputs,
+                context,
+                alpha_bar=alpha_bar,
+            )
+            score_numerator = beta * score[:, :, :active_dims]
+            active_prev = (
+                active_x + float(score_scale) * score_numerator
+            ) / torch.sqrt(alpha_step)
+        elif self.config.optimize_space == "accel":
             horizon = x_t.shape[1]
             opt_horizon = self._interpolation_knot_count(horizon)
             active_x_opt = self._control_point_resample(active_x[0], opt_horizon)
@@ -832,7 +1025,17 @@ class SimFreeMPC:
         active_x = x_t.detach()[:, :, :active_dims]
         active_x0 = x0_hat[:, :, :active_dims]
 
-        if self.config.optimize_space == "accel":
+        if self.config.grad_calc == "backprop":
+            score = self._backprop_clean_score(
+                result,
+                x_t,
+                active_dims,
+                policy_inputs,
+                context,
+                alpha_bar=alpha_bar,
+            )
+            numerator[:, :, :active_dims] = beta * score[:, :, :active_dims]
+        elif self.config.optimize_space == "accel":
             horizon = x_t.shape[1]
             opt_horizon = self._interpolation_knot_count(horizon)
             active_x_opt = self._control_point_resample(active_x[0], opt_horizon)
