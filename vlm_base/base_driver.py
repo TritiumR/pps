@@ -215,6 +215,7 @@ def run_base(env, grounding, world, *, mpc, policy, state_stats, cfg, args, out_
     obj_gt0 = {o.name: env.object_pose(o.name)[0].copy() for o in grounding.objects}
     obj_names = [o.name for o in grounding.objects]
     stage_idx, hold, x_carry, released, advance_streak, lost_streak = 0, 0, None, False, 0, 0
+    ever_held = False   # payload was actually grasped at some point THIS stage; gates a genuine release
     stage_chunk = 0
     grasp_baselines = {}
     held_offset = _capture_held(env, grounding, grounding.stages[0].held_idx)
@@ -272,7 +273,12 @@ def run_base(env, grounding, world, *, mpc, policy, state_stats, cfg, args, out_
                 grip_open = _gripper_open(env, stage, stage.target(), args.seat_dist)
             if stage.gripper == "close" and not grip_open:
                 hold += 1
-            if stage.gripper == "place" and grip_open:
+            # `released` marks a deliberate let-go: it advances a place stage and latches the gripper open.
+            # Gate it on `ever_held` -- a coarsened "transport" stage is gripper="place" from its first chunk,
+            # before it has grasped anything, so an open gripper at the start would otherwise read as an
+            # instant release and skip the object without grasping. A fine place stage is entered already
+            # holding the payload (ever_held set by its first carry chunk), so this is a no-op there.
+            if stage.gripper == "place" and grip_open and ever_held:
                 released = True
             # A placement is one-way: once released over the target, stay open, even as the geometric `done`
             # flickers while a round object settles on the surface.
@@ -290,6 +296,7 @@ def run_base(env, grounding, world, *, mpc, policy, state_stats, cfg, args, out_
             frames.append(_frame(env, grounding, stage, chunk, t, d_now, grip_open))
 
         flags = world.flags()
+        ever_held = ever_held or (stage.payload is not None and _held(flags, stage.payload))
         # This chunk's replanning verdict. Recovery belongs here, not in the cost: regressing to the grasp
         # stage clears `payload`, which re-enables the cost's grasp terms (they gate on it). `lost_streak`
         # gives a noisy grasp signal some hysteresis.
@@ -315,6 +322,7 @@ def run_base(env, grounding, world, *, mpc, policy, state_stats, cfg, args, out_
             # The object was dropped, so where it is is no longer known: look again before grasping again.
             world.refresh(env)
             stage_idx, hold, released, advance_streak, lost_streak = regress_to, 0, False, 0, 0
+            ever_held = False
             stage_chunk = 0
             _grasp_baseline(world, grounding, stage_idx, grasp_baselines)
             held_offset = _capture_held(env, grounding, grounding.stages[stage_idx].held_idx)
@@ -327,6 +335,7 @@ def run_base(env, grounding, world, *, mpc, policy, state_stats, cfg, args, out_
             advance_streak = advance_streak + 1 if signal else 0
             if advance_streak >= getattr(args, "advance_persist", 2) and stage_idx + 1 < len(grounding.stages):
                 stage_idx, hold, released, advance_streak = stage_idx + 1, 0, False, 0
+                ever_held = False
                 stage_chunk = 0
                 _grasp_baseline(world, grounding, stage_idx, grasp_baselines)
                 held_offset = _capture_held(env, grounding, grounding.stages[stage_idx].held_idx)

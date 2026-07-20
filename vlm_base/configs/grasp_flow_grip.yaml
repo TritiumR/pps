@@ -1,0 +1,84 @@
+# grasp_flow variant: firmer gripper commitment (a probe, not the faithful baseline).
+# Identical to grasp_flow.yaml except for the `grasp_flow:` weight-override block at the bottom, which
+# raises lift_gripper/place_gripper 40->60 to damp the end-of-place gripper flicker (drop + re-grasp near
+# release) seen in the GT weight pilot. Everything else reproduces the validated grasp_flow_clip10 recipe.
+
+run:
+  seed: 1
+  max_chunks: 200         # exec_knot 2 executes 2 steps/chunk, so ~4x the chunks for the same reach budget
+  fps: 20
+  gripper_source: cost    # grasp_flow's close/lift/place_gripper terms drive the gripper (main.py sets this too)
+  gripper_in_loop: false
+
+grounding:
+  seat_dist: 0.02       # (unused with the cost-driven gripper) latch seat distance
+  commit_hold: 5        # closed frames before a grasp commits to the next stage
+  advance_persist: 1    # advance the instant grasp_pear fires (like her flag-based dispatch); the lift then
+                        # stabilizes the grasp -- debouncing (2) misses the one-chunk flicker and never commits
+  clearance: 0.015      # rekep: placement clearance above the surface (m)
+  release_tol: 0.05     # rekep: place-stage advance tolerance (m)
+
+engine:
+  real_stats: true
+  interpolate: true     # engine-native coarse-knot B-spline
+  horizon: 15
+  exec_knot: 2          # grasp_flow's tight replan (catches the incipient carry-slip)
+  mode: denoise
+  # score_space is her execution path for running the MPC arm (what we do here). mbd_score_action_prox is
+  # her *scoring* method for steering pi0 and needs re-tuning if executed alone (samples near x_t -> under-
+  # reaches with these params). plan_chunk supports both; keep score_space unless re-tuning action_prox.
+  update: score_space
+  init: noise
+  warm_steps: 6
+  denoise_iters: 11     # grasp_flow value (was 10)
+  score_scale: 1.0
+  joint_delta_clip: 0.10   # grasp_flow_clip10 value
+  basis: linear         # linear + knots 0 => no monkeypatch => the engine's native B-spline (her config path)
+  knots: 0
+
+sampler:
+  num_samples: 512
+  iterations: 8
+  noise: 0.5
+  temperature: 0.7
+
+# Yixuan's GraspFlowCostWeights knobs (read only with --cost grasp_flow). Any key omitted falls back to her
+# dataclass default; only the two gripper-commitment weights are raised here. This is the sole difference
+# from the faithful grasp_flow.yaml baseline -- a probe for whether the end-of-place flicker is the
+# single-object placement bottleneck.
+grasp_flow:
+  lift_gripper: 60.0    # hold-closed weight during carry (her default 40)
+  place_gripper: 60.0   # open weight at placement       (her default 40)
+
+# Unused when --cost grasp_flow (StageGraspFlowCost carries Yixuan's own weights); kept for --cost composite.
+cost:
+  terms:
+    reach: 25.0
+    terminal_reach: 40.0
+    rekep_subgoal: 25.0
+    rekep_path: 200.0
+    smooth: 0.08
+    joint_delta: 0.005
+    orientation: 3.0
+    consistency: 30.0
+    straddle: 30.0
+    collision: 20.0
+    floor: 40.0
+    tip_z: 80.0
+    yaw: 5.0
+    center_region: 120.0
+    aperture_region: 80.0
+    close_gripper: 2.0
+    carry_hold: 40.0
+  geometry:
+    ee_r: 0.035
+    coll_clear: 0.02
+    finger_r: 0.012
+    open_half: 0.04
+    tool_back: 0.06
+    tcp_to_tip: 0.0
+    center_scale: 0.40
+    aperture_margin: 0.006
+    close_z_scale: 0.025
+    release_xy: 0.06
+    release_z: 0.035

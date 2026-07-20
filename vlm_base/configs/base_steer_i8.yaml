@@ -1,0 +1,92 @@
+# STEERABLE-BASE variant for PPS: iters=1 + anneal -> field-like/distributional (steer compounds).
+# Own task success is expected ~0; the point is steerability, not competence. See base.yaml for the base.
+# Pipeline config for the VLM-DP base runner (vlm_base/main.py).
+# All tunable parameters live here; the runner reads them. Scene + front-end + per-run knobs are CLI:
+# --task weight|pot|tea|capsule, --ground gt|rekep_fake|rekep_real, --exp_name/--seed/--joint_delta_clip.
+# Copy this file for a variant (e.g. base_ddim.yaml) rather than editing in place.
+
+run:
+  seed: 1
+  max_chunks: 50
+  fps: 20
+  gripper_in_loop: false  # grasp closes on seating (proximity latch), not the lenient cost gate (see base_driver)
+
+grounding:                 # agnostic tuning only; scene objects (grasp/place) live in task_prompts.json
+  seat_dist: 0.02       # grasp gripper closes only once the TCP is this tight on the object (m)
+  commit_hold: 5        # closed frames before a grasp commits to the next stage
+  advance_persist: 2    # consecutive chunks the done-signal must hold before advancing (debounces flicker)
+  clearance: 0.015      # rekep: placement clearance above the surface (m)
+  release_tol: 0.05     # rekep: place-stage advance tolerance (m)
+
+engine:
+  real_stats: true      # exact pi05_droid_jointpos quantile decode
+  interpolate: true     # coarse-knot horizon interpolation
+  horizon: 15
+  exec_knot: 8          # chunk steps executed before re-planning
+  mode: denoise         # denoise | mean
+  update: score_space   # score_space | ddim | mbd_score | flow
+  init: noise           # warm | noise (tuned: fresh noise each chunk)
+  warm_steps: 3         # warm init: run only the last N reverse steps (SDEdit); 3 (was 6) = less dwell/hesitance on carry
+  denoise_iters: 10
+  score_scale: 1.0      # tuned grasp_flow value (was 0.3)
+  joint_delta_clip: 0.15   # post-decode per-step joint-motion cap; tuned grasp_flow value (was 0.05)
+  carry_joint_delta_clip: 0.07  # tighter per-step cap while a payload is carried (smoother carry, less slip)
+  basis: bspline        # linear | cubic | bspline | rbf
+  knots: 4
+
+sampler:
+  num_samples: 1024
+  iterations: 8
+  noise: 0.5            # tuned grasp_flow value (was 0.35)
+  temperature: 0.7      # DIAL softmax temperature; tuned grasp_flow value (was 0.15)
+  anneal_proposal: true  # STEERABLE base: annealed proposal width + iters=1 -> field-like single-shot IS
+                         # mean (x_t-dependent, distributional) so an additive score steer can compound
+
+cost:                   # config-driven composite: {term: weight} + gripper/collision geometry (m)
+  terms:                # each term is a function in cost_terms.py; add, drop, or reweight here
+    reach: 25.0         # J_task: mean squared TCP->target (non-constraint stage)
+    terminal_reach: 40.0
+    rekep_subgoal: 25.0 # J_task: ReKep relational subgoal (constraint stage)
+    rekep_path: 200.0   # ReKep running path constraints
+    smooth: 0.08        # consecutive-joint smoothness
+    joint_delta: 0.005  # trust region (stay near current joints)
+    orientation: 3.0    # downward tool axis
+    consistency: 30.0   # stay near the warm-started previous plan
+    straddle: 30.0      # fingertips bracket the grasp point
+    collision: 20.0     # keepout from non-target objects
+    floor: 40.0         # stay above the table plane
+    # grasp geometry ported from the sim_free grasp-flow cost (self-gate to grasp stages)
+    tip_z: 80.0           # fingertip at grasp height
+    yaw: 5.0              # closing axis aligned to a world x/y axis
+    center_region: 120.0  # object within a region of the gripper center
+    aperture_region: 80.0 # object within the gripper opening
+    close_gripper: 2.0    # gated in-loop gripper close
+    carry_hold: 40.0      # hold the gripper closed through the carry, release at the place target
+    place_descent: 50.0   # lower the carried object onto the surface and seat it (fly-then-descend); the sole
+                          # arm attractor on the place stage, where reach/terminal_reach gate off (_placing).
+                          # An earlier port of grasp_flow's place set measured WORSE (0 on scale, scale shoved
+                          # to 107cm) ONLY because reach/terminal_reach were left ON during place and fought the
+                          # descent (two competing attractors, + collision excludes the place obj so the arm
+                          # rammed it). Gating them off lets the descent work. Task-agnostic (payload/place
+                          # extents only); replaces the old reach-to-a-10cm-hover + xy-only release that dropped
+                          # the object from height. For the grasp_flow cost path instead, run --cost grasp_flow.
+  geometry:
+    ee_r: 0.035         # gripper collision radius
+    coll_clear: 0.02    # keepout margin beyond the object extent
+    finger_r: 0.012     # fingertip radius
+    open_half: 0.04     # gripper half-span
+    tool_back: 0.06     # collision point set back up the tool axis from the TCP
+    tcp_to_tip: 0.0     # TCP -> fingertip offset along the tool axis
+    center_scale: 0.12  # gripper center-region radius = center_scale * object radius. 0.40 (was) leaves a
+                        # center_scale*radius ~= 14mm flat basin in center_region AND in the close gate, so
+                        # the gripper closes up to 14mm off-centre and a round fruit rolls out of the fingers.
+                        # 0.12 (~4mm) makes the arm converge on the object centre before closing. Matches the
+                        # grasp_flow value; validated GT weight two-object: pear grasp-hold 1/3 -> 3/3.
+    aperture_margin: 0.006  # extra clearance for the aperture check
+    close_z_scale: 0.025    # height tolerance for the in-loop close gate
+    release_xy: 0.06        # carry_hold: release when the carried object is within this xy of the place target
+    release_z: 0.035        # carry_hold: release when the carried object is within this z of the place target
+    place_descend_radius: 0.18  # place_descent: begin descending within this xy of the seat (ramp outer radius)
+    place_seat_radius: 0.10     # place_descent: fully lowered onto the seat within this xy (ramp inner radius;
+                                # ~ the place tolerance, so it seats anywhere on the surface, not only centre)
+    place_carry_clear: 0.10     # place_descent: carry the object this high above the seat before descending

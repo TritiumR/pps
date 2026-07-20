@@ -1,0 +1,65 @@
+# Yixuan's reproduction recipe for the vlm_base MBD base (her Slack settings, 2026-07-20), translated into
+# our vlm_base/main.py harness so we can run it under the validated GT pipeline (--ground gt --state gt).
+#
+# THE INSIGHT this config encodes: competence and steerability are NOT in tension. Her base runs
+#   iterations=1     -> a SINGLE denoise pass, so there is no inner re-optimization to erase an additive
+#                       steer (our Finding 2 only fires at iterations>1); the steer survives.
+#   num_samples=4096 -> 8x our pool
+#   temperature=0.1  -> a near-argmin softmax; with 4096 candidates one pass already selects a near-optimal
+#                       chunk. So competence comes from samples x sharp-selection, NOT from mode-seeking iters.
+# We had (wrongly) attributed competence to iterations=8; our iters=1 looked weak only because we starved it
+# (512 samples, soft temperature 0.7).
+#
+# Run (base, no steer):
+#   python -m vlm_base.main --task weight --ground gt --state gt --config vlm_base/configs/base_yixuan.yaml \
+#     --cost grasp_flow --update mbd_score_action_prox --exec_knot 4 --seed N --exp_name yx_base_sN
+# Her flag -> our knob:
+#   --mpc_num_samples 4096   -> sampler.num_samples
+#   --mpc_iterations 1       -> sampler.iterations
+#   --mpc_noise 0.8          -> sampler.noise
+#   --mpc_temperature 0.1    -> sampler.temperature
+#   --num_steps 10           -> engine.denoise_iters
+#   --mpc_joint_delta_clip 0.15 -> engine.joint_delta_clip
+#   --gamma_base 1           -> engine.score_scale 1.0 (eval_steering passes gamma_base as score_scale)
+#   --steps_per_inference 4  -> engine.exec_knot (also CLI --exec_knot 4)
+#   --task_num_steps 800     -> run.max_chunks 200 (200 chunks x exec_knot 4 = 800 executed steps)
+#   --mpc_cost grasp_flow    -> CLI --cost grasp_flow (StageGraspFlowCost; ignores the cost: section)
+#   --mpc_update mbd_score_action_prox -> CLI --update (action optimize_space, the planner default)
+#   --interpolate            -> engine.interpolate (basis linear + knots 0 = engine-native B-spline)
+
+run:
+  seed: 1
+  max_chunks: 200         # x exec_knot 4 = 800 executed steps (her --task_num_steps 800)
+  fps: 20
+  gripper_source: cost    # grasp_flow cost drives the gripper channel
+  gripper_in_loop: false
+
+grounding:                # identical to grasp_flow.yaml (grasp/lift/place advance + regress logic)
+  seat_dist: 0.02
+  commit_hold: 5
+  advance_persist: 1
+  regress_persist: 2
+  grasp_confirm: 10
+  clearance: 0.015
+  release_tol: 0.05
+
+engine:
+  real_stats: true
+  interpolate: true       # her --interpolate
+  horizon: 15
+  exec_knot: 4            # her --steps_per_inference 4 (CLI --exec_knot 4 also sets it)
+  mode: denoise
+  update: mbd_score_action_prox   # her --mpc_update (CLI --update also sets it)
+  init: noise
+  warm_steps: 6
+  denoise_iters: 10       # her --num_steps 10
+  score_scale: 1.0        # her --gamma_base 1 -> step_mbd_score_action_prox(score_scale=1.0)
+  joint_delta_clip: 0.15  # her --mpc_joint_delta_clip 0.15
+  basis: linear           # native B-spline (knots 0), matching grasp_flow.yaml
+  knots: 0
+
+sampler:
+  num_samples: 4096       # her --mpc_num_samples 4096 (8x ours; competence lever #1)
+  iterations: 1           # her --mpc_iterations 1 (single pass; steer survives, no Finding-2 erasure)
+  noise: 0.8              # her --mpc_noise 0.8
+  temperature: 0.1        # her --mpc_temperature 0.1 (near-argmin selection; competence lever #2)
