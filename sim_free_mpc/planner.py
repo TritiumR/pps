@@ -12,7 +12,9 @@ from .costs import PriorityStateCost
 from .costs_capsule_flow import CapsuleFlowStateCost
 from .costs_explore import ExploreStateCost
 from .costs_grasp_flow import GraspFlowStateCost
+from .costs_grasp_flow_ex import GraspFlowStateCost as ExtendedGraspFlowStateCost
 from .costs_grasp_flow_fake import GraspFlowStateCost as FakeGraspFlowStateCost
+from .costs_grasp_flow_loose import GraspFlowStateCost as LooseGraspFlowStateCost
 from .costs_ref_style import RefStyleStateCost
 from .ddim import ddim_clean_sample_std_scale, ddim_iteration_alphas
 from .dial_sampler import DIALSampler, DIALSamplerConfig
@@ -69,8 +71,12 @@ class SimFreeMPC:
             self.cost = ExploreStateCost(config.task_name)
         elif config.cost_style == "grasp_flow":
             self.cost = GraspFlowStateCost(config.task_name)
+        elif config.cost_style == "grasp_flow_ex":
+            self.cost = ExtendedGraspFlowStateCost(config.task_name)
         elif config.cost_style == "grasp_flow_fake":
             self.cost = FakeGraspFlowStateCost(config.task_name)
+        elif config.cost_style == "grasp_flow_loose":
+            self.cost = LooseGraspFlowStateCost(config.task_name)
         elif config.cost_style == "capsule_flow":
             self.cost = CapsuleFlowStateCost(config.task_name)
         elif config.cost_style == "priority":
@@ -511,7 +517,9 @@ class SimFreeMPC:
             "ref_style",
             "explore",
             "grasp_flow",
+            "grasp_flow_ex",
             "grasp_flow_fake",
+            "grasp_flow_loose",
             "capsule_flow",
         ):
             return self.cost(real_actions=real, tcp_pos=ee_pos, tcp_quat=ee_quat, context=context)

@@ -8,7 +8,9 @@ import torch
 from .costs import PriorityStateCost
 from .costs_explore import ExploreStateCost
 from .costs_grasp_flow import GraspFlowStateCost
+from .costs_grasp_flow_ex import GraspFlowStateCost as ExtendedGraspFlowStateCost
 from .costs_grasp_flow_fake import GraspFlowStateCost as FakeGraspFlowStateCost
+from .costs_grasp_flow_loose import GraspFlowStateCost as LooseGraspFlowStateCost
 from .costs_ref_style import RefStyleStateCost
 from .ddim import ddim_clean_sample_std_scale, ddim_iteration_alphas
 from .dial_sampler import DIALSampler, DIALSamplerConfig
@@ -59,8 +61,12 @@ class AccelActionMPC:
             self.cost = ExploreStateCost(config.task_name)
         elif config.cost_style == "grasp_flow":
             self.cost = GraspFlowStateCost(config.task_name)
+        elif config.cost_style == "grasp_flow_ex":
+            self.cost = ExtendedGraspFlowStateCost(config.task_name)
         elif config.cost_style == "grasp_flow_fake":
             self.cost = FakeGraspFlowStateCost(config.task_name)
+        elif config.cost_style == "grasp_flow_loose":
+            self.cost = LooseGraspFlowStateCost(config.task_name)
         elif config.cost_style == "priority":
             self.cost = PriorityStateCost(config.task_name)
         else:
@@ -200,7 +206,14 @@ class AccelActionMPC:
             )
         real_actions = torch.cat([q_traj, gripper[..., :1]], dim=-1)
         ee_pos, ee_quat = self._world_fk(q_traj, context)
-        if self.config.cost_style in ("ref_style", "explore", "grasp_flow", "grasp_flow_fake"):
+        if self.config.cost_style in (
+            "ref_style",
+            "explore",
+            "grasp_flow",
+            "grasp_flow_ex",
+            "grasp_flow_fake",
+            "grasp_flow_loose",
+        ):
             return self.cost(real_actions=real_actions, tcp_pos=ee_pos, tcp_quat=ee_quat, context=context)
         return self.cost(real_actions=real_actions, ee_pos=ee_pos, ee_quat=ee_quat, context=context)
 
