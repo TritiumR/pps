@@ -63,7 +63,7 @@ from pot_scene_fix import seat_pot_lid
 
 from rekep import grounding, isaaclab_helpers
 from rekep.keypoint_tracking import KeypointTracker
-from sim_common.world import GTWorld
+from vlm_dp.world import GTWorld
 from rekep.rekep_viz import camera_overlay_frame
 from rekep.utils import get_config, load_default_config
 from rekep.video import write_video_h264

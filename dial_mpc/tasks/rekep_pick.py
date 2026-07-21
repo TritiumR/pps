@@ -138,7 +138,7 @@ def run(args):
         from rekep import grounding
         from rekep.constraint_generation import ConstraintGenerator
         from rekep.keypoint_tracking import KeypointTracker
-        from sim_common.world import GTWorld
+        from vlm_dp.world import GTWorld
         from rekep.utils import get_callable_grasping_cost_fn, load_default_config
         from sim_common.constraints import TorchNumpyShim, load_torch_constraints, make_torch_constraint
 

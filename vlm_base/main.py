@@ -103,7 +103,7 @@ def run(args):
     # Vision backends must load before the policy stack (GroundingDINO -> timm -> torch._dynamo clash).
     perception = None
     if args.state == "real":
-        from sim_common.perception import Perception
+        from vlm_dp.perception import Perception
         if "objects" not in meta:
             raise SystemExit(
                 f"[vlm_base] --state real needs the scene's object names, which task '{args.task}' "
@@ -111,7 +111,7 @@ def run(args):
         perception = Perception(meta["objects"], fixtures=meta.get("fixtures", ()), segment=args.segment)
         perception.warmup()
         if args.track == "visual":
-            from sim_common.visual_tracker import load_cotracker
+            from vlm_dp.visual_tracker import load_cotracker
             load_cotracker()
             print("[vlm_base] CoTracker loaded for --track visual", flush=True)
     if args.track != "fk" and args.state != "real":
@@ -121,11 +121,11 @@ def run(args):
 
     from vlm_base import base_driver
     from vlm_base import sim_free_core as core
-    from vlm_base.base_cost import CompositeCost
+    from vlm_dp.cost.base_cost import CompositeCost
     from sim_common.envs.droid import DroidEnv, ROBOTIQ_GRASP_OFFSET
-    from sim_common.grasp_sensor import ApertureGraspSensor
-    from sim_common.grounding import get_source
-    from sim_common.world import GTWorld, SensedWorld
+    from vlm_dp.grasp_sensor import ApertureGraspSensor
+    from vlm_dp.grounding import get_source
+    from vlm_dp.world import GTWorld, SensedWorld
 
     path = args.config if os.path.isabs(args.config) else os.path.join(repo, args.config)
     with open(path, encoding="utf-8") as f:
@@ -200,7 +200,7 @@ def run(args):
         if missing:
             raise SystemExit(f"[vlm_base] perception did not find {missing}; refusing to run half-blind")
         if args.track == "visual":
-            from sim_common.visual_tracker import VisualTracker
+            from vlm_dp.visual_tracker import VisualTracker
             init_pos = {n: world.object_pose(n)[0] for n in world.names}
             world.visual = VisualTracker(E.cam, world.names, init_pos)
             print(f"[vlm_base] CoTracker tracking {world.names}", flush=True)

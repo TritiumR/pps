@@ -58,6 +58,41 @@ class DroidEnv(IsaacLabEnv):
         self.fk = WorldFK(FrankaFK(device=device), base_pos, base_quat, device=device)
         self.a_local = np.asarray(APPROACH_LOCAL, dtype=np.float64)
 
+    @classmethod
+    def attach(cls, raw_env, device="cuda:0"):
+        """Bind the DroidEnv accessors over an ALREADY-CREATED raw IsaacLab env (no gym.make/reset).
+
+        For harnesses (``eval_steering``) that own env creation and stepping: runs only the pure
+        binding work of ``__init__`` and skips creation (``parse_env_cfg``/``gym.make``), the camera
+        depth+seg augmentation (must happen pre-``gym.make``; the bound ``table_cam`` is RGB-only),
+        and every sim mutation (``reset``/settle). The wrapper never steps: ``apply_arm`` stays
+        unused; the harness drives ``raw_env.step`` itself.
+
+        Precondition: ``raw_env`` has been reset, so ``body_pos_w[0, l0]`` (the FK anchor) is
+        populated. Re-attach after each env reset so the anchor matches the fresh episode.
+        """
+        self = cls.__new__(cls)   # skip __init__: no second env, no physics stepping
+        self.device = device
+        self.env = raw_env
+        self.robot = raw_env.scene["robot"]
+        self.ee_frame = raw_env.scene["ee_frame"]
+        try:
+            self.cam = raw_env.scene["table_cam"]   # RGB-only here (no pre-make augmentation)
+        except KeyError:
+            self.cam = None
+        self.act_dim = int(raw_env.action_space.shape[1])
+        self._compute_arm_ids()
+        jn = list(self.robot.data.joint_names)
+        bn = list(self.robot.data.body_names)
+        self.grip_id = jn.index("finger_joint")
+        self.l0 = bn.index("panda_link0")
+        self._read_limits_dt(getattr(raw_env, "cfg", None))
+        base_pos = self.robot.data.body_pos_w[0, self.l0].detach().cpu().numpy()
+        base_quat = self.robot.data.body_quat_w[0, self.l0].detach().cpu().numpy()
+        self.fk = WorldFK(FrankaFK(device=device), base_pos, base_quat, device=device)
+        self.a_local = np.asarray(APPROACH_LOCAL, dtype=np.float64)
+        return self
+
     def _neutral(self):
         a = torch.zeros((1, self.act_dim), dtype=torch.float32, device=self.device)
         a[0, :7] = self.robot.data.joint_pos[0, self.arm_ids].detach()  # hold current arm, gripper open

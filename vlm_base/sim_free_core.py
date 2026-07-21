@@ -153,20 +153,7 @@ def apply_horizon_basis(mpc, basis: str, knots: int):
         mpc._interpolation_knot_count = lambda horizon: max(2, min(knots, horizon))
 
 
-def guard_cost(cost):
-    """Wrap a cost so NaN/inf map to a large finite value before the sampler's softmax."""
-
-    class _Guarded:
-        def __init__(self, c):
-            self._c = c
-
-        def __call__(self, **kw):
-            return torch.nan_to_num(self._c(**kw), nan=1e12, posinf=1e12, neginf=1e12)
-
-        def target(self, *a, **k):
-            return self._c.target(*a, **k)
-
-    return _Guarded(cost)
+from vlm_dp.cost import guard_cost  # moved in the Phase-2 migration (vlm_base -> vlm_dp)
 
 
 def apply_arm_only_smoothing(mpc):

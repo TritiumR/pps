@@ -1,6 +1,7 @@
 import sys
 import os
 from typing import Any
+import shutil
 import subprocess
 
 _REPO_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -2434,6 +2435,43 @@ def _visualize_log_mel_spectrogram(
     return image
 
 
+def _ffmpeg_exe():
+    """ffmpeg binary: PATH if present, else the imageio-ffmpeg bundled build (if installed)."""
+    exe = shutil.which("ffmpeg")
+    if exe is not None:
+        return exe
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def _transcode_h264(video_path, label="video"):
+    """Re-encode an OpenCV 'mp4v' file to H.264/yuv420p in place so browsers/VSCode can play it.
+
+    cv2.VideoWriter's mp4v (MPEG-4 Part 2) does not decode in Chromium-based players. On any
+    failure (no ffmpeg, transcode error) the original mp4v file is kept.
+    """
+    exe = _ffmpeg_exe()
+    if exe is None:
+        print(f"[WARN] no ffmpeg available; {label} left as mp4v (not browser-playable)", flush=True)
+        return
+    tmp = video_path + ".h264.mp4"
+    cmd = [exe, "-y", "-loglevel", "error", "-i", video_path,
+           "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", tmp]
+    try:
+        subprocess.run(cmd, check=True)
+        os.replace(tmp, video_path)
+    except Exception as exc:
+        print(f"[WARN] H.264 transcode failed for {label}: {exc}", flush=True)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
 def _mux_audio_into_video(tmp_video_path, final_video_path, audio_path, label):
     if audio_path is None or not os.path.exists(audio_path):
         os.replace(tmp_video_path, final_video_path)
@@ -2967,6 +3005,17 @@ def parse_args():
         help="Cost function used by sim-free MPC.",
     )
     parser.add_argument(
+        "--vlm_cost",
+        choices=("none", "gt", "rekep_fake", "rekep_real"),
+        default="none",
+        help=(
+            "Attach the ReKep CompositeCost (via vlm_dp.VlmDpBridge) to the sim-free MPC planner, "
+            "with the named grounding source providing stages/targets. Requires a score-steering "
+            "mode (--vlm_base/--task_steer/--full_steer) and --mpc_cost priority. Default 'none' "
+            "leaves the planner untouched."
+        ),
+    )
+    parser.add_argument(
         "--mpc_optimize_space",
         choices=("action", "accel"),
         default="action",
@@ -3235,6 +3284,13 @@ print(f"Environment name: {env_name}", flush=True)
 print("Parsing env cfg...", flush=True)
 env_cfg = parse_env_cfg(env_name, device=args.device, num_envs=1)
 
+if args.vlm_cost in ("rekep_fake", "rekep_real"):
+    # The ReKep keypoint proposal reads depth + instance segmentation from table_cam; the
+    # annotators must be added to the cfg before gym.make. RGB-only otherwise (byte-identical).
+    from rekep import isaaclab_helpers as _rekep_helpers
+
+    _rekep_helpers.augment_table_cam_with_depth_and_seg(env_cfg)
+
 env_cfg.env_name = env_name
 
 # Extract success checking function
@@ -3381,6 +3437,35 @@ if _uses_vlm_mpc_base(args):
         flush=True,
     )
 
+vlm_bridge = None
+if args.vlm_cost != "none":
+    import yaml
+
+    from vlm_dp.bridge import VlmDpBridge
+
+    if mpc_planner is None:
+        raise SystemExit(
+            "--vlm_cost needs a score-steering mode (--vlm_base/--task_steer/--full_steer): "
+            "the sim-free MPC planner is only built under those modes."
+        )
+    _vlm_entry = _task_prompt_entry(args.task) or {}
+    _vlm_roles = {k: _vlm_entry[k] for k in ("grasp_obj", "place_obj", "grasp_objs") if k in _vlm_entry}
+    with open(os.path.join(_REPO_DIR, "vlm_dp", "configs", "base.yaml")) as _f:
+        _vlm_cost_cfg = yaml.safe_load(_f)
+    vlm_bridge = VlmDpBridge(
+        args.vlm_cost,
+        _vlm_roles,
+        _vlm_cost_cfg,
+        task_key=_task_name_for_mpc(args.task),
+        device=args.device,
+    )
+    vlm_bridge.attach_cost(mpc_planner)
+    print(
+        f"[vlm_dp] CompositeCost attached: ground={args.vlm_cost}, roles={_vlm_roles}, "
+        f"terms={list(_vlm_cost_cfg['cost']['terms'])}",
+        flush=True,
+    )
+
 dataset_file = None
 dataset_demo_names = None
 if args.load_init_from_dataset is not None:
@@ -3440,6 +3525,8 @@ print(
 
 print("Resetting env for warmup...", flush=True)
 env_obs_dict, _ = env.reset()
+if args.vlm_cost != "none":
+    vlm_bridge.reset(env)
 print("Building warmup observation...", flush=True)
 obs = get_pi_observation(env_obs_dict["policy"])
 obs["prompt"] = args.prompt
@@ -3455,7 +3542,11 @@ with torch.no_grad():
         mpc_context=(
             None
             if standalone_role is not None
-            else build_mpc_context(env, env_obs_dict, args)
+            else (
+                vlm_bridge.context(env, env_obs_dict)
+                if args.vlm_cost != "none"
+                else build_mpc_context(env, env_obs_dict, args)
+            )
         ),
     )
 print("Warmup policy inference finished.", flush=True)
@@ -3616,6 +3707,9 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
             )
         )
 
+    if args.vlm_cost != "none":
+        vlm_bridge.reset(env)
+
     current_subtasks = _debug_subtasks(env_obs_dict)
     current_phase = _debug_phase_from_subtasks(args.task, current_subtasks)
     print(f"phase seed={seed} step=0 {current_phase} subtasks={current_subtasks}", flush=True)
@@ -3670,10 +3764,16 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                 # run inference
                 with torch.no_grad():
                     infer_start = time.perf_counter()
+                    if args.vlm_cost != "none":
+                        vlm_bridge.advance(_debug_subtasks(env_obs_dict))
                     mpc_context = (
                         None
                         if standalone_role is not None
-                        else build_mpc_context(env, env_obs_dict, args)
+                        else (
+                            vlm_bridge.context(env, env_obs_dict)
+                            if args.vlm_cost != "none"
+                            else build_mpc_context(env, env_obs_dict, args)
+                        )
                     )
                     warm_shift_steps = (
                         0 if actions is None else max(step_idx - action_start_step, 0)
@@ -3688,6 +3788,8 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                         mpc_context=mpc_context,
                         warm_shift_steps=warm_shift_steps,
                     )
+                    if args.vlm_cost != "none":
+                        vlm_bridge.observe_plan(actions, steps_per_inference)
                     infer_elapsed = time.perf_counter() - infer_start
                     if args.mpc_debug:
                         _write_mpc_debug_log(
@@ -3879,6 +3981,7 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
     for frame in excute_frames:
         out.write(frame)
     out.release()
+    _transcode_h264(video_write_path, "rollout video")
     if audio_path is not None:
         _mux_audio_into_video(video_write_path, video_path, audio_path, "rollout")
 
@@ -3902,6 +4005,7 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
         for frame in thermal_overlay_frames:
             thermal_out.write(frame)
         thermal_out.release()
+        _transcode_h264(thermal_video_path, "thermal video")
 
     print("video saved")
     _write_mpc_debug_log(

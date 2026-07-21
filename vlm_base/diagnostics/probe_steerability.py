@@ -60,7 +60,7 @@ def add_args(ap):
 def run(args):
     # Repo-local + Isaac imports: need the bootstrapped sys.path + a booted app (see runtime.run_standalone).
     from vlm_base import sim_free_core as core
-    from vlm_base.base_cost import CompositeCost
+    from vlm_dp.cost.base_cost import CompositeCost
     from sim_common.geometry import DEFAULT_EXTENT, usd_extents
     from sim_common.envs.droid import DroidEnv
 

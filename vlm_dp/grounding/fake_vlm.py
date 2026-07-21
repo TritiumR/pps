@@ -1,29 +1,16 @@
-"""Fake ReKep VLM stubs, per task -- validate the pipeline without calling GPT-4o.
-
-Each registered task writes the *exact* artifacts ``rekep.constraint_generation.ConstraintGenerator``
-produces -- a ``metadata.json`` (num_stages, grasp/release keypoints) + per-stage
-``stage{i}_{subgoal,path}_constraints.txt`` (numpy functions of ``end_effector, keypoints``) -- so a
-driver loads them identically to the real VLM. Add a task by writing a
-``_<task>(out_dir, keypoints, grounded, env, clearance)`` and registering it in ``_FAKE_VLMS``.
-
-What the VLM would supply, stubbed: which keypoint is which object (resolved from GT instance masks),
-and any placement offsets (derived from the object/target point clouds).
+"""Fake ReKep VLM stubs, per task: write the exact artifacts ``ConstraintGenerator`` produces
+(metadata.json + per-stage constraint files) without calling GPT-4o. Register in ``_FAKE_VLMS``.
 """
 import json
 import os
 
 import numpy as np
 
-from sim_common.grounding.masks import _masked_points, _nearest_kp
+from vlm_dp.grounding.masks import _masked_points, _nearest_kp
 
 
 def _weight_roles(keypoints, grounded, env, clearance):
-    """Weight task roles: map pear/apple/scale to nearest keypoints + the placement offset onto the scale.
-
-    Derived from GT-masked perception -- the keypoint selection (object -> nearest keypoint) and the
-    placement offset (scale top + object half-height + clearance). Returns ``(roles, off)`` with
-    ``off[name]`` a 3-vector added to the scale keypoint.
-    """
+    """Weight task: pear/apple/scale -> nearest keypoints + the placement offset onto the scale."""
     roles, half_h, scale_top = {}, {}, None
     for name in ("pear", "apple", "scale"):
         pts = _masked_points(grounded, env, name)
@@ -79,10 +66,7 @@ _FAKE_VLMS = {"weight": _weight}
 
 
 def generate(task_key, out_dir, keypoints, grounded, env, clearance=0.015):
-    """Write ``task_key``'s fake ReKep VLM output (metadata + constraint files). Returns (metadata, roles).
-
-    Dispatches to the stub registered in ``_FAKE_VLMS``; register a new task's ``_<task>`` to extend.
-    """
+    """Write ``task_key``'s fake VLM output (metadata + constraint files) -> (metadata, roles)."""
     if task_key not in _FAKE_VLMS:
         raise SystemExit(f"[fake-vlm] no fake VLM for task {task_key!r}; register one in _FAKE_VLMS "
                          f"(have: {sorted(_FAKE_VLMS)})")

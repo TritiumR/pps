@@ -1,12 +1,6 @@
-"""Composable cost terms for the VLM-DP base.
-
-Each term is a function term(I: CostInputs) -> Tensor[K] (unweighted, lower = better) registered in
-TERMS by name. A cost is a config-chosen {name: weight} combination summed by
-base_cost.CompositeCost. Add a term = write a function + @register("name") + list it in the config.
-
-Shapes: ee_pos / ee_quat are [K,H,3] / [K,H,4] (K candidates, H horizon); real_actions
-is [K,H,8] (7 joints + gripper); every term returns [K]. Terms self-gate: one that does not
-apply to the current stage (for example reach when a relational constraint is set) returns zeros.
+"""Composable cost terms: term(I: CostInputs) -> Tensor[K], registered in TERMS by name and
+summed config-weighted by CompositeCost. Shapes: ee_pos [K,H,3], real_actions [K,H,8];
+terms self-gate (return zeros) when they do not apply to the current stage.
 """
 from __future__ import annotations
 
@@ -30,9 +24,7 @@ def register(name: str):
 
 @dataclasses.dataclass
 class CostInputs:
-    """Everything a term may read: candidate actions/pose, the stage context, per-object extents
-    (grip, keepout, half_height), and the gripper/collision geometry (see base_cost.DEFAULT_GEOM).
-    """
+    """Everything a term may read: candidate actions/pose, stage context, extents, gripper geometry."""
     real_actions: torch.Tensor
     ee_pos: torch.Tensor
     ee_quat: torch.Tensor | None
@@ -72,12 +64,9 @@ def _gripper_points(I):
 
 
 def _grasp_frame(I):
-    """Grasp-stage geometry (tip, closing, approach, lateral, center, obj_radius), or None off a grasp stage.
+    """Grasp-stage geometry (tip, closing, approach, lateral, center, obj_radius), or None.
 
-    Gated like straddle: needs an orientation, a grasp object in the scene, and no carried payload.
-    obj_radius is the object's WIDE horizontal half-extent (its footprint), not the narrow one: the narrow
-    extent understates the object for center_region and the close_gripper gate, so the gate never reaches
-    the close threshold and the gripper is never commanded shut.
+    obj_radius is the WIDE horizontal half-extent; the narrow one understates the close gate.
     """
     if I.ee_quat is None:
         return None
@@ -111,9 +100,7 @@ def _rekep_keypoints(I):
     return kp
 
 
-# J_task: reach a target point, or satisfy a ReKep relational constraint. The two are mutually exclusive.
-# reach/terminal_reach also gate off on the place stage, where place_descent is the sole arm attractor:
-# left on, they pin the TCP to the hover target and fight the descent (two competing attractors).
+# Task terms: reach a point or satisfy a constraint; both gate off on the place stage (place_descent leads).
 
 
 def _placing(ctx):
@@ -164,24 +151,23 @@ def rekep_path(I):
 
 @register("smooth")
 def smooth(I):
-    """Mean squared consecutive joint change (motion smoothness).
-
-    Reduced to a per-element mean, like every term here, so a weight means the same thing regardless of
-    horizon or DOF count. Summing over horizon x joints inflates a term by ~100x against the mean-reduced
-    task terms and swamps the sampler's ranking.
-    """
+    """Mean squared consecutive joint change (per-element mean keeps weights shape-independent)."""
     joints = I.real_actions[..., :7]
     return ((joints[:, 1:] - joints[:, :-1]) ** 2).mean(dim=(-1, -2))
 
 
+@register("gripper_smooth")
+def gripper_smooth(I):
+    """Mean squared consecutive change of the gripper channel (``smooth`` covers arm joints only)."""
+    if I.real_actions.shape[-1] <= 7 or I.real_actions.shape[1] < 2:
+        return _zeros(I)
+    gripper = I.real_actions[..., 7]
+    return (gripper[:, 1:] - gripper[:, :-1]).pow(2).mean(dim=1)
+
+
 @register("joint_delta")
 def joint_delta(I):
-    """Mean squared deviation from the current joints: the trust region that makes a plan dwell.
-
-    This is what lets the gripper close at all. The sampler represents the gripper as a 2-knot ramp, so a
-    plan that is still flying in fits a rising gate profile to a negative intercept and can never shut.
-    Only a dwelling plan can.
-    """
+    """Trust region toward the current joints; a dwelling plan is what lets the gripper gate close."""
     joints = I.real_actions[..., :7]
     current = I.context.get("joint_pos")
     if current is None:
@@ -203,12 +189,7 @@ def orientation(I):
 
 @register("consistency")
 def consistency(I):
-    """Mean squared deviation from the warm-started previous plan (damps step-to-step wander).
-
-    Reduced to a mean like the rest. Summed, this term's spread across the sampler's candidates dwarfs the
-    grasp signal and collapses the softmax's effective sample size to about one: the weighted mean becomes
-    a single arbitrary candidate, leaving the gripper channel (which no arm term constrains) as noise.
-    """
+    """Mean squared deviation from the previous plan (mean-reduced; summed it collapses the softmax)."""
     ref = I.context.get("plan_ref")
     joints = I.real_actions[..., :7]
     if ref is None or ref.shape[0] != joints.shape[1]:
@@ -276,13 +257,10 @@ def aperture_region(I):
 
 @register("close_gripper")
 def close_gripper(I):
-    """Shut the gripper when the measured TCP is at the grasp pose.
+    """Shut the gripper when the MEASURED TCP is at the grasp pose.
 
-    The gate is evaluated at the robot's actual TCP (``context["eef_pos"]``), never at a candidate's own
-    tip. Gating on the candidate lets ``(g - gate(candidate))**2`` be minimised by retreating as well as by
-    closing, turning the term into a repulsive barrier that pins the gripper open. On the measured TCP the
-    gate is a per-chunk constant -- a pure pull on the gripper channel that the sampler's 2-knot ramp
-    represents exactly. Do not raise this weight; scaling the term scales the barrier.
+    Gate on ``context['eef_pos']``, never the candidate (that turns the term into a repulsive
+    barrier). Do not raise this weight.
     """
     f = _grasp_frame(I)
     if f is None or I.real_actions.shape[-1] <= 7:
@@ -306,13 +284,7 @@ def close_gripper(I):
 
 @register("carry_hold")
 def carry_hold(I):
-    """Hold the gripper closed while a payload is carried, releasing at the place target.
-
-    Faithful port of the grasp-flow lift_gripper / place_gripper terms: an object in hand pins the
-    gripper channel to fully closed (1), and it opens only once the carried object reaches the place
-    target (within release_xy / release_z). Active only on carry/place stages (a payload is set), so
-    it is the carry-phase complement of close_gripper (which gates off when a payload is set).
-    """
+    """Hold the gripper closed while carrying; release once the payload reaches the place target."""
     ctx = I.context
     payload, objects = ctx.get("payload"), ctx.get("objects", {})
     if payload is None or payload not in objects or I.real_actions.shape[-1] <= 7:
@@ -338,14 +310,8 @@ def carry_hold(I):
 
 @register("place_descent")
 def place_descent(I):
-    """Lower the carried object onto the place surface, the place-phase analogue of the grasp descent.
-
-    Flies the carried object at a carry height until it is over the place target (xy within
-    place_descend_radius), then descends to the seat (payload bottom resting on the surface). Active only
-    on a place stage (payload AND place_target set); pairs with reach/terminal_reach gating off there, so it
-    is the sole arm attractor. Ported from grasp_flow's _place_terms; task-agnostic (reads only the
-    payload/place extents from context). The old place was reach-to-a-10cm-hover with an xy-only release,
-    which dropped the object from height; this brings it down and seats it.
+    """Fly the payload at carry height, then ramp it down onto the place seat. Sole arm attractor
+    on the place stage (reach terms gate off there).
     """
     ctx = I.context
     payload, objects = ctx.get("payload"), ctx.get("objects", {})
@@ -364,10 +330,7 @@ def place_descent(I):
     inner = getattr(I.geom, "place_seat_radius", 0.10)         # fully lowered onto the seat within this xy
     carry_clear = getattr(I.geom, "place_carry_clear", 0.10)
     xy = torch.linalg.vector_norm(carried[..., :2] - dest[:2].view(1, 1, 2), dim=-1)
-    # Progressive descent (a smooth ramp, NOT a hard gate): carry height when far, ramping down to the seat as
-    # the object closes in. A hard gate let the arm stall just outside the threshold and never lower; the ramp
-    # lowers it continuously, and inner ~ the place tolerance means it seats anywhere on the surface, not only
-    # dead-centre (the arm plateaus a few cm off-centre).
+    # Smooth ramp, not a hard gate: a gate stalls just outside the threshold and never lowers.
     frac = ((xy - inner) / max(outer - inner, 1e-3)).clamp(0.0, 1.0)
     z_target = dest[2] + frac * carry_clear
     z_err = carried[..., 2] - z_target
@@ -376,11 +339,8 @@ def place_descent(I):
 
 @register("collision")
 def collision(I):
-    """Soft keepout of the gripper points from every non-manipulated object, as an upright cylinder.
-
-    A sphere of radius max(half_x, half_y) over-approximates a flat support into a ball that swallows
-    whatever rests on it, blocking any top-down grasp; a cylinder needs both horizontal AND vertical
-    overlap, so a wide thin surface no longer blocks an approach from above. The plane itself is `floor`.
+    """Soft keepout from non-manipulated objects as upright cylinders (a sphere over-approximates
+    flat supports and blocks top-down grasps).
     """
     if I.ee_quat is None:
         return _zeros(I)

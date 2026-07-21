@@ -60,14 +60,14 @@ def run(args):
 
     from rekep import grounding
     from rekep.keypoint_tracking import KeypointTracker
-    from sim_common.world import GTWorld
+    from vlm_dp.world import GTWorld
     from rekep.utils import get_callable_grasping_cost_fn, load_default_config
     from rekep.video import write_video_h264
     from sim_common.envs.droid import DroidEnv, ROBOTIQ_GRASP_OFFSET
     from dial_mpc.sampler import make_accel_sampler
     from dial_mpc.costs import make_grasp_cost, make_rekep_cost
     from sim_common.constraints import TorchNumpyShim, load_torch_constraints, make_torch_constraint
-    from sim_common.grounding import fake_vlm, masks
+    from vlm_dp.grounding import fake_vlm, masks
     from sim_common import overlay
     from dial_mpc import control
 

@@ -1,9 +1,5 @@
-"""Config-driven composite cost for the VLM-DP base.
-
-CompositeCost(terms, geom, extents) sums weight * cost_terms.TERMS[name](inputs) for each
-{name: weight} in terms (the config's cost.terms); geom is the gripper/collision geometry
-(cost.geometry). It exposes the __call__(*, real_actions, ee_pos, ee_quat, context) signature the
-sim_free_mpc planner expects. Change the cost mix purely in config; implement new terms in cost_terms.
+"""CompositeCost sums weight * TERMS[name](inputs) per the config's cost.terms; cost.geometry
+supplies gripper/collision geometry. Exposes the call signature the sim_free_mpc planner expects.
 """
 from __future__ import annotations
 
@@ -11,7 +7,7 @@ import types
 
 import torch
 
-from vlm_base.cost_terms import TERMS, CostInputs
+from vlm_dp.cost.terms import TERMS, CostInputs
 
 # Fallbacks for callers that build the cost without a config (e.g. diagnostics); the runner uses the YAML.
 DEFAULT_TERMS = {

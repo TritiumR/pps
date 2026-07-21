@@ -58,7 +58,7 @@ def run(args):
     # Repo-local + Isaac imports: need the bootstrapped sys.path + a booted app (see runtime.run_standalone).
     from vlm_base import sim_free_core as core
     from vlm_base import metrics
-    from vlm_base.cost_terms import TERMS, CostInputs
+    from vlm_dp.cost.terms import TERMS, CostInputs
     from sim_common.envs.droid import DroidEnv
     from sim_common import overlay
     from rekep.video import write_video_h264

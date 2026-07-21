@@ -85,7 +85,7 @@ from pot_scene_fix import seat_pot_lid
 from rekep import grounding, isaaclab_helpers
 from rekep.constraint_generation import ConstraintGenerator
 from rekep.keypoint_tracking import KeypointTracker
-from sim_common.world import GTWorld
+from vlm_dp.world import GTWorld
 from rekep.rekep_viz import camera_overlay_frame
 from rekep.solvers import SubgoalSolver
 from rekep.utils import get_callable_grasping_cost_fn, get_config, load_default_config, load_functions_from_txt

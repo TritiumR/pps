@@ -17,7 +17,7 @@ from typing import Any
 
 import torch
 
-from sim_common.grounding import Grounding, Stage
+from vlm_dp.grounding import Grounding, Stage
 from sim_free_mpc.costs_explore import _target_from_object
 from sim_free_mpc.costs_grasp_flow import GraspFlowCostWeights, GraspFlowStateCost
 

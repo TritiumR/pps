@@ -1,29 +1,8 @@
-"""What the controller believes about object state, and the only place it may read it from.
+"""Object-state seam: the only place the controller reads object poses and grasp flags.
 
-Exactly two dynamic quantities drive the controller: where each object is, and whether one is in the
-gripper. Everything else it uses -- object sizes, workspace bounds, camera calibration -- is static, known
-once, and legitimately available to a real robot. So those two, and only those two, sit behind this seam.
-
-Putting them here makes the privileged and the sensed arms differ in one place instead of a dozen:
-
-    GTWorld       reads the simulator: object poses from the physics state, grasp flags from its contact
-                  detector. The upper bound, and the control the sensed arm is measured against.
-    SensedWorld   reads sensors only: object poses from segmentation, then propagated by forward
-                  kinematics for as long as the gripper reports contact; grasp from the finger joint.
-
-``SensedWorld`` rests on one claim, and that claim is what licenses forward kinematics to stand in for a
-visual tracker:
-
-    An object moves only when something touches it, and the gripper is the only thing that does. So while
-    contact holds, the object rides the hand rigidly and the joint encoders give its motion exactly -- and
-    that is also the phase where vision is worst, because the hand is in front of the object. While contact
-    does not hold, the object is where perception last saw it. When contact is lost, that belief is stale
-    and perception has to look again.
-
-The contact sensor is what licenses the propagation, and it is a genuinely independent measurement: the
-finger joint reports what is *between the fingers*, which no amount of arm kinematics can tell you. Without
-that gate the two signals would collapse into one -- an object whose position is derived from the arm
-always "rises" when the arm rises, so an empty gripper would report a perfect lift, forever.
+``GTWorld`` reads the simulator (privileged upper bound). ``SensedWorld`` reads sensors only:
+perception fixes poses, FK carries the held object while the finger joint reports contact,
+lost contact marks the belief stale.
 """
 from __future__ import annotations
 
@@ -36,11 +15,7 @@ _PLACE_Z = 0.10     # m: vertical tolerance, so an object still in the air does 
 
 
 class GTWorld:
-    """Object state read straight from the simulator: the privileged upper bound.
-
-    Faithful to what the controller did before this seam existed, so this arm is unchanged by the refactor
-    and remains the reference the sensed arm is scored against. Takes the raw IsaacLab env.
-    """
+    """Object state straight from the simulator: the privileged upper bound (raw IsaacLab env)."""
 
     def __init__(self, env):
         self.env = env
@@ -68,12 +43,7 @@ class GTWorld:
 
 
 class SensedWorld:
-    """Object state from perception and proprioception only: the real stack.
-
-    Perception fixes each object's pose whenever the scene is looked at. From then on that pose is held --
-    a still object stays put -- except while the gripper reports contact, when the object is carried rigidly
-    with the hand. Losing contact invalidates the belief and marks the object for a fresh look.
-    """
+    """Object state from perception and proprioception only."""
 
     def __init__(self, perception, sensor, place_obj=None, tcp_offset=(0.0, 0.0, 0.0),
                  track="fk", reperceive_every=8, tracker=None):
@@ -81,15 +51,8 @@ class SensedWorld:
         self.sensor = sensor                  # ApertureGraspSensor: is something between the fingers?
         self.place_obj = place_obj
         self.tcp_offset = tcp_offset
-        # How an object's position is kept between the looks that fix it. All three ride the same seam --
-        # a periodic correction on top of the kinematic dead-reckoning below -- so downstream is identical.
-        #   fk         : dead-reckoning only. The held object rides the hand; nothing corrects it until
-        #                contact is lost (today's behaviour, and the default).
-        #   reperceive : + a full re-segmentation every ``reperceive_every`` steps snaps every object,
-        #                held included, back onto what the camera sees. Genuinely vision-based, but the
-        #                grasp is exactly when the hand occludes the object, so it is the weaker option.
-        #   visual     : + a point tracker (``tracker``) corrects every object each step it reports one,
-        #                which is occlusion-aware in a way re-segmentation is not.
+        # Between-look tracking: "fk" dead-reckoning only (default); "reperceive" re-segments every
+        # reperceive_every steps; "visual" corrects per step from a point tracker (occlusion-aware).
         self.track = track
         self.reperceive_every = reperceive_every
         self.visual = tracker                 # a VisualTracker (CoTracker) for track="visual", else None
@@ -109,20 +72,15 @@ class SensedWorld:
             if name == self._held:            # the hand is in front of it; kinematics knows better
                 continue
             self._pos[name] = np.asarray(pos, dtype=np.float64)
-            # Back to the frame the keypoint offsets were measured in. A single view does not recover
-            # orientation, and for an object that was just dropped the rotation it happened to be carried
-            # at is not an estimate of anything -- it is a leftover.
+            # A single view does not recover orientation; a dropped object's carried rotation is a leftover.
             self._rot[name] = np.eye(3)
             self._stale.discard(name)
         self.names = list(self._pos)
 
     def observe(self, env, commanded_close, candidates=None):
-        """One control step: update contact, and carry the held object with the hand.
+        """One control step: update contact and carry the held object with the hand.
 
-        ``candidates`` are the objects the controller is currently trying to grasp or carry. The fingers
-        report that *something* is between them, not what, so naming it needs both what was reached for and
-        where the hand is. Without that, the nearest estimate wins -- and the board the fruit is sitting on
-        has a centroid close enough to steal the answer.
+        ``candidates``: objects currently reached for; needed to name what the fingers hold.
         """
         self.sensor.observe(env, commanded_close)
         near = ({n: p for n, p in self._pos.items() if n in candidates} if candidates
@@ -161,13 +119,7 @@ class SensedWorld:
             self._vision_correct(env, self.visual.step(env))
 
     def _vision_correct(self, env, seen):
-        """Snap object beliefs to a visual estimate, and re-anchor the held object's ride there.
-
-        Vision sees what kinematics cannot: the object leaving the hand. Correcting onto it is what turns a
-        slip -- invisible to FK, which rides the object with the arm no matter what -- into an observable jump
-        away from the gripper. The held object is re-anchored at the corrected pose so its dead-reckoning
-        continues from where vision last saw it, rather than snapping back on the next step.
-        """
+        """Snap beliefs to a visual estimate and re-anchor the held object's ride there."""
         if not seen:
             return
         moved = []                            # where vision disagrees with the current belief: the correction

@@ -1,12 +1,4 @@
-"""Map a keypoint or an object name to the depth points belonging to that object.
-
-Shared by the grounding sources and the fake-VLM stub -- turns a segmented frame plus back-projected depth
-into per-object world points, nearest-keypoint lookups, and centroids.
-
-Whichever segmenter produced the frame, the join is the same question: which pixels are this object? When a
-real segmenter ran it answers that directly, by name, and ``propose_keypoints`` hands its accessor down on
-the grounded frame. Otherwise the simulator's instance ids are joined to names through their prim paths.
-"""
+"""Join keypoints/object names to their depth points, whichever segmenter produced the frame."""
 import re
 
 import numpy as np
@@ -28,13 +20,7 @@ def _nearest_kp(keypoints, point):
 
 
 def object_for_keypoint(grounded, env, point, names):
-    """Which of ``names`` a keypoint sits on, by GT-mask grounding (pass the scene's rigid-object names).
-
-    The real VLM picks keypoint *indices*; this maps a chosen keypoint's world position back to the
-    object whose masked depth points it is nearest to. Lets the grasp target that object's local
-    centroid (the perception grasp center) in live mode, where the fake VLM's role table is gone.
-    Returns the object name, or None if no candidate has masked points.
-    """
+    """Name the object whose masked depth points are nearest this keypoint (or None)."""
     point = np.asarray(point)
     best, best_d = None, np.inf
     for name in names:

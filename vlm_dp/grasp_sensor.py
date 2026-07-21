@@ -1,25 +1,6 @@
-"""Grasp detection from the gripper's own finger joint: proprioception, not scene state.
-
-A close that meets an object stalls short of the free-close angle; an empty close reaches it. That gap is
-the grasp signal, and it is the same signal a real parallel gripper reports from its encoder.
-
-This replaces a simulator grasp flag computed from the object's true pose plus "the fingers moved at all",
-which therefore certified an empty close near the object as a grasp. A stall cannot do that, so the
-scaffolding that existed to catch those false positives -- carry the object N chunks, then check whether it
-rose -- is not needed and is removed with it.
-
-Calibrated on this gripper (agent_tests/_probe_gripper.py):
-
-    close on air     0.785 rad   (exactly the commanded angle; settles within ~3 steps)
-    close on pear    0.258 rad
-    close on apple   0.166 rad
-
-so held and empty are separated by more than half a radian, and neither fruit creeps out of the fingers.
-
-Settling is judged on the finger ANGLE, never on the reported joint velocity. While the gripper holds an
-object the drive keeps pushing against it through the underactuated linkage, so ``joint_vel`` reads a
-steady -0.5 to -0.9 rad/s even though the angle is constant to within a milliradian. A velocity gate would
-never fire on a held object.
+"""Grasp detection from the finger joint: a close that meets an object stalls short of the
+free-close angle (calibrated: air 0.785 rad, pear 0.258, apple 0.166). Settling is judged on
+the angle, never joint_vel (a held object reads a steady nonzero velocity).
 """
 from __future__ import annotations
 
@@ -29,11 +10,8 @@ import numpy as np
 
 
 class ApertureGraspSensor:
-    """Is something between the fingers, and if so which object?
-
-    ``observe`` is called once per executed control step with the gripper command that was just applied;
-    ``holding`` and ``held_object`` report the current verdict.
-    """
+    """Is something between the fingers, and if so which object? ``observe`` once per control
+    step; ``holding``/``held_object`` report the verdict."""
 
     def __init__(self, q_free=0.7854, stall_margin=0.15, q_touch=0.05, settle_steps=3,
                  settle_eps=0.01, close_steps=3, proximity=0.10):
@@ -62,11 +40,9 @@ class ApertureGraspSensor:
         return self.q_touch < window[-1] < self.q_free - self.stall_margin
 
     def held_object(self, positions: dict, tcp) -> str | None:
-        """Which object is in the hand: the nearest estimated centroid, when the fingers report a hold.
+        """Nearest estimated centroid to the TCP when the fingers report a hold (else None).
 
-        The stall says *something* is held, not *what*. Proximity to the TCP names it, and it is also what
-        stops a close blocked by the table edge or by the arm's own link from reading as a grasp.
-        ``positions`` are estimates; nothing here reads ground truth.
+        Proximity names the object and rejects closes blocked by the table or the arm itself.
         """
         if not self.holding() or not positions:
             return None

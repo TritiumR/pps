@@ -1,22 +1,7 @@
 """Text-prompted object perception: one camera frame -> per-object masks and world positions.
 
-Replaces the simulator's instance segmentation, which handed the controller pixel-exact masks already
-keyed by object. Here the objects have to be found and named from the image, using GroundingDINO to
-localise each name and SAM to cut its mask, then the scene's own depth to lift it into the world.
-
-Two things this does differently from the usual GroundedSAM call, each because the naive version was
-measured failing on this scene:
-
-**Labels compete for objects, instead of each taking its own best box.** Prompting one name at a time and
-taking that name's top-scoring box lets a distractor win a label outright: on the weight scene, "apple"
-landed on the *mango* and the real apple went undetected. Prompting every object in the scene and solving
-a one-to-one assignment makes the mango's own label claim it, which frees "apple" for the apple.
-
-**Masks are eroded before they are back-projected.** The grasp centre is the mid-point of the mask's
-horizontal extent, which is a min/max over the masked points -- so a single pixel of silhouette bleed,
-where the mask edge overhangs the object and the depth behind it belongs to the table, lands a point
-centimetres away and drags the centre with it. A ground-truth instance mask is pixel-exact and has no such
-rim; a predicted one has one no matter how well it scores on IoU.
+GroundingDINO localises each named object, SAM cuts its mask, the scene depth lifts it to world.
+Labels are assigned one-to-one (Hungarian) and masks are eroded before back-projection.
 """
 from __future__ import annotations
 
@@ -42,12 +27,8 @@ _MIN_PIXELS = 80      # below this a mask cannot be clustered into keypoints (ma
 
 
 def _backends():
-    """Import the vision backends through moka.vision.segmentation, and only through it.
-
-    That module imports segment_anything before groundingdino and patches a transformers incompatibility
-    on the way in. Importing groundingdino directly skips both and dies inside timm, which drags in
-    torch._dynamo and hits a typing_extensions clash. The import order is load-bearing, so it lives in one
-    place and everything goes through it.
+    """Import vision backends through moka.vision.segmentation only; its import order and
+    transformers patch are load-bearing.
     """
     import moka.vision.segmentation as seg   # noqa: F401  -- imported for its order + compat shim
     return seg
@@ -98,25 +79,19 @@ def _mask_iou(a, b):
 class Perception:
     """Finds the named objects in the camera frame and reports where they are.
 
-    ``prompts`` maps each scene object to the text a detector is asked to find ("scale" -> "kitchen
-    scale"). The names are semantic content of the image, the sort of thing a VLM reads off it; they carry
-    no pose, size, or identity information from the simulator.
+    ``prompts`` maps scene object -> detector text ("scale" -> "kitchen scale").
     """
 
     def __init__(self, prompts: dict, fixtures=(), erode: int = 2, device: str = "cuda",
                  segment: str = "groundedsam"):
         self.fixtures = tuple(fixtures)   # objects whose geometry is workcell calibration, not perception
-        # A fixture is not looked for at all. Leaving its name in the vocabulary would let it take part in
-        # the assignment and win a box that belongs to a real object -- the "kitchen scale" label happily
-        # claims the pear once the scale itself is out of frame.
+        # Fixtures are excluded from the vocabulary so their labels cannot claim a real object's box.
         self.prompts = {n: t for n, t in prompts.items() if n not in self.fixtures}
         self.names = list(self.prompts)
         self.erode = erode
         self.device = device
-        # Which segmenter names the objects. groundedsam (default): GroundingDINO on a per-object text vocab
-        # (the ``prompts`` values, e.g. "yellow pear") + SAM. sam_vlm: class-agnostic SAM regions named by a
-        # VLM from the plain object names alone -- the ReKep-faithful "semantics live in the VLM", with no
-        # hand-written colour table. Only the keys of ``prompts`` (the names) are used under sam_vlm.
+        # Segmenter: "groundedsam" = GroundingDINO text vocab + SAM (default); "sam_vlm" = class-agnostic
+        # SAM regions named by a VLM from plain names.
         self.segment = segment
         self.masks: dict = {}      # name -> (H,W) bool, from the last look
         self.rgb = None
@@ -127,28 +102,12 @@ class Perception:
         self._fixture_points: dict = {}
 
     def warmup(self):
-        """Load the detector and the segmenter now, before anything else initialises torch.
-
-        Import order matters here and it is not optional: GroundingDINO pulls in timm, which pulls in
-        torch._dynamo, and doing that after the policy stack has already set torch up trips a
-        typing_extensions clash inside timm that kills the process. Loading them first is also what the
-        probes do, which is why they run and a lazy import does not.
-        """
+        """Load detector + segmenter before anything else initialises torch (import-order clash)."""
         _dino()
         _sam(self.device)
 
     def calibrate(self, env):
-        """Measure the fixtures once. They are furniture: bolted down, and they never move.
-
-        The scale is the reason this exists. Its rigid body is only the weighing platform, but a segmenter
-        prompted for it returns the whole appliance -- housing, display and base -- and on this camera it
-        also runs off the edge of the frame. So the top of its mask is the top of the display, and an
-        object placed there would be placed on the display. Estimating it per-frame would inject a large
-        error into something that does not move, which is what calibration is for.
-
-        Perceiving the objects you manipulate and calibrating the furniture you do not is what a real cell
-        does. It is recorded here rather than assumed, so it can be read off the run.
-        """
+        """Measure the fixtures once; they never move and per-frame masks of them are unreliable."""
         if self.segment == "sam_vlm":   # the box that trims class-agnostic SAM masks to the workcell
             self._bounds = workspace_bounds_from_scene(env.env, margin=0.6)   # raw IsaacLab env (has .scene)
         if not self.fixtures:
@@ -170,12 +129,7 @@ class Perception:
         return self.observe_frame(rgb, points)
 
     def observe_frame(self, rgb, points) -> dict:
-        """Segment one already-captured frame: ``{name: world position}`` for every object found.
-
-        Objects that were not confidently detected are simply absent. The caller keeps its previous belief
-        for those rather than trusting a low-confidence mask, which on an occluded object is worse than no
-        mask at all: the visible sliver's centroid can be centimetres from the object.
-        """
+        """Segment one captured frame: ``{name: world position}`` for confidently detected objects."""
         self.rgb, self.points = rgb, points
         self.masks = dict(self._segment(rgb), **self._fixture_masks)   # fixtures are known, not detected
         out = {}
@@ -186,12 +140,7 @@ class Perception:
         return out
 
     def position(self, name) -> np.ndarray | None:
-        """Grasp centre of ``name``: the middle of its horizontal extent, at the height of its silhouette.
-
-        A single view sees an object's top surface down to its silhouette edge, which is its widest visible
-        cross-section and about where a gripper should close. The mean of the visible points sits high on
-        the top shell instead, so a low percentile of z is used for the height.
-        """
+        """Grasp centre of ``name``: middle of the horizontal extent, at a low-percentile z."""
         pts = self.object_points(name)
         if pts is None:
             return None
@@ -199,14 +148,7 @@ class Perception:
         return np.array([xy[0], xy[1], float(np.percentile(pts[:, 2], 15))], dtype=np.float64)
 
     def object_extents(self, name) -> tuple | None:
-        """``(grip, keepout, half_height)`` estimated from the object's own point cloud, no object model.
-
-        The controller needs a grasp radius (narrow horizontal half-extent), a collision radius (the wide
-        one), and a half-height. All three come from the segmented silhouette so the base runs on image and
-        instruction alone, the way a general policy would. A top-down-ish view sees the full horizontal
-        silhouette, so the two horizontal half-extents are reliable; it sees only the top of the object, so
-        the visible z-span reads about the object's half-height for a rounded object and is used as such.
-        """
+        """``(grip, keepout, half_height)`` estimated from the segmented point cloud (no object model)."""
         pts = self.object_points(name)
         if pts is None:
             return None
@@ -216,10 +158,7 @@ class Perception:
         return (min(x_half, y_half), max(x_half, y_half), z_span)
 
     def object_points(self, name) -> np.ndarray | None:
-        """The object's world points: its eroded mask back-projected through the depth image.
-
-        A fixture's points come from calibration instead, and never change (see ``calibrate``).
-        """
+        """The object's world points: eroded mask back-projected through depth (fixtures: calibrated)."""
         if name in self._fixture_points:
             return self._fixture_points[name]
         mask = self.masks.get(name)
@@ -231,13 +170,7 @@ class Perception:
         return pts if pts.shape[0] >= 20 else None
 
     def label_image(self):
-        """``(labels (H,W) int32, id_to_prim)`` in the shape the keypoint proposer already consumes.
-
-        The proposer only needs a set of binary object masks -- it re-derives them as ``labels == uid`` and
-        never looks at which object a uid is. The prim-path map is kept because the rest of the front-end
-        joins names to pixels through it; here it is synthesised from the detections, so it carries the
-        names we asked for rather than the simulator's scene graph.
-        """
+        """``(labels (H,W) int32, id_to_prim)`` in the shape the keypoint proposer consumes."""
         labels = np.zeros(self.points.shape[:2], dtype=np.int32)
         id_to_prim = {}
         for i, (name, mask) in enumerate(self.masks.items(), start=1):
@@ -258,13 +191,7 @@ class Perception:
         return self._segment_groundedsam(rgb)
 
     def _segment_sam_vlm(self, rgb) -> dict:
-        """SAM regions named by a VLM (no colour vocabulary): the ReKep-faithful segmentation.
-
-        Class-agnostic SAM masks in place of GroundingDINO's per-name boxes, and the VLM reads the numbered
-        regions and says which is which -- the semantics live in the VLM, as in ReKep, not in a hand-written
-        colour table. The VLM is asked once (the first look); later frames re-identify by nearest position,
-        since objects do not teleport between looks, so re-perception during a rollout adds no VLM calls.
-        """
+        """Class-agnostic SAM regions named once by a VLM; later frames re-identify by position."""
         masks = self._sam_masks(rgb)
         centroids = [self._world_centroid(m) for m in masks]
         keep = [(m, c) for m, c in zip(masks, centroids) if c is not None]
@@ -424,12 +351,7 @@ class Perception:
         return dets
 
     def _assign(self, dets) -> dict:
-        """One box per label, one label per box (Hungarian over the detection scores).
-
-        This is the fix for the distractor stealing a label. Independently arg-maxing lets "apple" and
-        "mango" both point at the mango; forcing a one-to-one assignment makes them compete, and the mango
-        wins its own label by a wide margin, so "apple" falls to the apple.
-        """
+        """One box per label, one label per box (Hungarian over detection scores)."""
         cands = []                                     # the union of every label's boxes, deduplicated
         for name in self.names:
             for box, _ in dets.get(name, []):

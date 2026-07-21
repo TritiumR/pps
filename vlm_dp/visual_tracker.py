@@ -1,8 +1,4 @@
-"""Visual point tracking with CoTracker: object positions from the image stream, not the arm.
-
-One pixel per object (its grasp centre) is tracked across frames and lifted to a world coordinate through
-the camera depth, so a mid-carry slip that FK dead-reckoning cannot see is caught.
-"""
+"""CoTracker point tracking: one pixel per object, lifted to world through the camera depth."""
 from __future__ import annotations
 
 import functools
@@ -17,20 +13,13 @@ from rekep.rekep_viz import world_to_pixel
 
 @functools.lru_cache(maxsize=1)
 def load_cotracker(device: str = "cuda"):
-    """Load the CoTracker3 online predictor once, cached so warmup can preload it before the policy stack.
-
-    Load early, with the other vision backends, to avoid the torch import-order clash the segmenter hits.
-    """
+    """Load the CoTracker3 online predictor once (early, with the other vision backends)."""
     model = torch.hub.load("facebookresearch/co-tracker", "cotracker3_online", trust_repo=True)
     return model.to(device).eval()
 
 
 class VisualTracker:
-    """Tracks one pixel per object with CoTracker and reports each object's corrected world position.
-
-    Built after the first look at the scene so object positions exist to seed the queries. ``step`` returns
-    ``{name: world_pos}`` for objects vision placed this step, empty between windows or while occluded.
-    """
+    """Tracks one pixel per object; ``step`` -> ``{name: world_pos}`` for objects placed this step."""
 
     _TRACK_HW = (384, 680)
 
