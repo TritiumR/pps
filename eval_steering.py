@@ -3517,7 +3517,9 @@ def parse_args():
         help=(
             "MPC proposal sampler. 'base' uses unconstrained Gaussians and the "
             "final joint-delta clamp; 'truncated' autoregressively samples only "
-            "valid decoded joint targets and disables that final delta clamp."
+            "valid decoded joint targets, automatically enables low-frequency "
+            "interpolation (10 Hz -> 40 Hz by default), and disables that final "
+            "delta clamp."
         ),
     )
     parser.add_argument(
@@ -3565,7 +3567,7 @@ def parse_args():
     parser.add_argument(
         "--interpolate_low_frequency",
         type=float,
-        default=5.0,
+        default=10.0,
         help="Low-frequency knot rate used by --interpolate.",
     )
     parser.add_argument(
@@ -3774,6 +3776,15 @@ if args.sampler == "truncated":
         parser.error(
             "--sampler truncated requires a positive --mpc_joint_delta_clip."
         )
+    # Truncated proposals are optimized as low-frequency control points and
+    # interpolated back to the policy action horizon. The CLI defaults define
+    # the standard 10 Hz -> 40 Hz path and remain user-overridable.
+    args.interpolate = True
+if args.interpolate and (
+    args.interpolate_low_frequency <= 0.0
+    or args.interpolate_high_frequency <= 0.0
+):
+    parser.error("Interpolation frequencies must both be positive.")
 if args.grad_calc == "backprop":
     if not _uses_vlm_mpc_base(args):
         parser.error("--grad_calc backprop requires a VLM/MPC base mode.")

@@ -99,6 +99,11 @@ class SimFreeMPC:
                 "Unknown sim-free MPC interpolation_method: "
                 f"{config.interpolation_method!r}"
             )
+        if config.interpolate and (
+            config.control_frequency <= 0.0
+            or config.interpolate_frequency <= 0.0
+        ):
+            raise ValueError("Interpolation frequencies must both be positive.")
 
     def reset_action_warm(self) -> None:
         self._warm_action = None
@@ -149,16 +154,61 @@ class SimFreeMPC:
         return shifted_action, True
 
     def _interpolation_knot_count(self, horizon: int) -> int:
-        if self.config.sampler == "truncated" or not self.config.interpolate or horizon <= 1:
+        if not self.config.interpolate or horizon <= 1:
             return horizon
         ratio = self.config.interpolate_frequency / max(self.config.control_frequency, self.config.flow_eps)
         knots = int(math.ceil(horizon * ratio))
         return max(2, min(horizon, knots))
 
+    def _truncated_max_joint_deltas(
+        self,
+        proposal_horizon: int,
+        output_horizon: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Return knot bounds that preserve the 40 Hz per-step delta limit."""
+        base_delta = float(self.config.joint_delta_clip)
+        deltas = torch.full(
+            (proposal_horizon,),
+            base_delta,
+            device=device,
+            dtype=dtype,
+        )
+        if (
+            not self.config.interpolate
+            or proposal_horizon <= 1
+            or proposal_horizon == output_horizon
+        ):
+            return deltas
+
+        # Express interpolation as y = mapping @ control_points. Rewriting each
+        # control point as p_0 plus cumulative knot deltas gives an exact
+        # component-wise gain from bounded knot deltas to adjacent output steps.
+        # This handles both linear interpolation and the larger endpoint slope of
+        # a clamped cubic B-spline without relying on a frequency-ratio heuristic.
+        control_basis = torch.eye(proposal_horizon, device=device, dtype=dtype)
+        mapping = self._interpolate_control_points(control_basis, output_horizon)
+        cumulative_delta_coeffs = mapping[:, 1:].flip(1).cumsum(1).flip(1)
+        step_gain = (
+            cumulative_delta_coeffs[1:] - cumulative_delta_coeffs[:-1]
+        ).abs().sum(dim=1).max()
+        if not torch.isfinite(step_gain) or step_gain <= 0.0:
+            raise ValueError("Interpolation produced an invalid truncated-sampler step gain.")
+
+        # The first control point is the first executed action and must remain
+        # within one high-frequency step of the current joint state. Later knot
+        # deltas may be wider while the interpolated 40 Hz trajectory stays safe.
+        deltas[1:] = base_delta / step_gain
+        return deltas
+
     def _configure_sampler_proposal(
         self,
         policy_inputs: dict[str, Any],
         context: dict[str, Any],
+        *,
+        output_horizon: int,
     ) -> None:
         if self.config.sampler == "base":
             self.sampler.proposal_fn = None
@@ -171,6 +221,12 @@ class SimFreeMPC:
             )
 
         def proposal_fn(mean, noise_scale, num_samples, generator):
+            max_joint_delta = self._truncated_max_joint_deltas(
+                mean.shape[0],
+                output_horizon,
+                device=mean.device,
+                dtype=mean.dtype,
+            )
             return sample_truncated_model_action_chunks(
                 self.policy,
                 policy_inputs,
@@ -178,7 +234,7 @@ class SimFreeMPC:
                 noise_scale,
                 num_samples,
                 current_joint_pos=current_joint_pos,
-                max_joint_delta=self.config.joint_delta_clip,
+                max_joint_delta=max_joint_delta,
                 generator=generator,
             )
 
@@ -388,7 +444,11 @@ class SimFreeMPC:
         horizon = x_t.shape[1]
         opt_horizon = self._interpolation_knot_count(horizon)
         mean0 = self._control_point_resample(x_t[0, :, :active_dims].detach(), opt_horizon)
-        self._configure_sampler_proposal(policy_inputs, context)
+        self._configure_sampler_proposal(
+            policy_inputs,
+            context,
+            output_horizon=horizon,
+        )
 
         def cost_from_positions(samples: torch.Tensor) -> torch.Tensor:
             full_horizon_samples = self._interpolate_control_points(samples, horizon)
@@ -554,7 +614,11 @@ class SimFreeMPC:
         opt_horizon = self._interpolation_knot_count(horizon)
         sqrt_alpha = torch.as_tensor(alpha_bar, device=x_t.device, dtype=x_t.dtype).sqrt()
         active_x_opt = self._control_point_resample(x_t.detach()[0, :, :active_dims], opt_horizon)
-        self._configure_sampler_proposal(policy_inputs, context)
+        self._configure_sampler_proposal(
+            policy_inputs,
+            context,
+            output_horizon=horizon,
+        )
         clean_std = self.config.noise * ddim_clean_sample_std_scale(alpha_bar)
 
         def cost_from_positions(samples: torch.Tensor) -> torch.Tensor:
@@ -654,7 +718,11 @@ class SimFreeMPC:
             x_t.detach()[0, :, :active_dims],
             opt_horizon,
         ) / torch.clamp(sqrt_alpha, min=self.config.flow_eps)
-        self._configure_sampler_proposal(policy_inputs, context)
+        self._configure_sampler_proposal(
+            policy_inputs,
+            context,
+            output_horizon=horizon,
+        )
         proposal_std = float(self.config.noise) * math.sqrt(
             max(1.0 - float(alpha_bar), 0.0)
         )

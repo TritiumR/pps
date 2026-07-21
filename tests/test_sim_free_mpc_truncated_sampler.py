@@ -146,7 +146,7 @@ def test_legacy_optimizer_uses_custom_proposal():
     assert captured["scale"].shape == (3,)
 
 
-def test_truncated_sampler_uses_full_horizon_when_interpolation_is_enabled():
+def test_truncated_sampler_uses_low_frequency_knots_when_interpolation_is_enabled():
     planner = object.__new__(SimFreeMPC)
     planner.config = SimFreeMPCConfig(
         sampler="truncated",
@@ -155,4 +155,53 @@ def test_truncated_sampler_uses_full_horizon_when_interpolation_is_enabled():
         interpolate_frequency=5.0,
     )
 
-    assert planner._interpolation_knot_count(12) == 12
+    assert planner._interpolation_knot_count(12) == 4
+
+
+@pytest.mark.parametrize("interpolation_method", ["linear", "bspline"])
+def test_truncated_interpolation_preserves_high_frequency_joint_delta(
+    interpolation_method,
+):
+    policy, policy_inputs = _policy_and_inputs(use_quantile_norm=False)
+    planner = object.__new__(SimFreeMPC)
+    planner.config = SimFreeMPCConfig(
+        sampler="truncated",
+        interpolate=True,
+        control_frequency=40.0,
+        interpolate_frequency=5.0,
+        interpolation_method=interpolation_method,
+        joint_delta_clip=0.15,
+    )
+    output_horizon = 40
+    proposal_horizon = planner._interpolation_knot_count(output_horizon)
+    mean = torch.zeros(proposal_horizon, 8)
+    mean[:, 7] = 0.5
+    max_joint_delta = planner._truncated_max_joint_deltas(
+        proposal_horizon,
+        output_horizon,
+        device=mean.device,
+        dtype=mean.dtype,
+    )
+
+    samples = sample_truncated_model_action_chunks(
+        policy,
+        policy_inputs,
+        mean,
+        noise_scale=1.0,
+        num_samples=256,
+        current_joint_pos=torch.zeros(7),
+        max_joint_delta=max_joint_delta,
+        generator=torch.Generator().manual_seed(17),
+    )
+    interpolated = planner._interpolate_control_points(samples, output_horizon)
+    decoded = decode_model_action_chunks(
+        policy,
+        policy_inputs,
+        interpolated,
+        apply_clamp=False,
+    ).real_actions
+
+    assert proposal_horizon == 5
+    assert max_joint_delta[0] == pytest.approx(0.15)
+    assert torch.all(max_joint_delta[1:] > max_joint_delta[0])
+    _assert_valid(decoded, torch.zeros(7), 0.15)

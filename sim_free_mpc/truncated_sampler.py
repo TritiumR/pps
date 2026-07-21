@@ -84,7 +84,7 @@ def sample_truncated_model_action_chunks(
     num_samples: int,
     *,
     current_joint_pos: torch.Tensor | np.ndarray,
-    max_joint_delta: float,
+    max_joint_delta: torch.Tensor | float,
     joint_limit_margin: float = 0.0,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
@@ -93,7 +93,19 @@ def sample_truncated_model_action_chunks(
         raise ValueError(f"Expected proposal mean [H,D], got {tuple(mean.shape)}")
     if num_samples <= 0:
         raise ValueError("num_samples must be positive")
-    if max_joint_delta <= 0.0:
+    max_joint_delta = torch.as_tensor(
+        max_joint_delta,
+        device=mean.device,
+        dtype=mean.dtype,
+    )
+    if max_joint_delta.ndim == 0:
+        max_joint_delta = max_joint_delta.expand(mean.shape[0])
+    elif max_joint_delta.ndim != 1 or max_joint_delta.shape[0] != mean.shape[0]:
+        raise ValueError(
+            "max_joint_delta must be scalar or [H], got "
+            f"{tuple(max_joint_delta.shape)} for horizon {mean.shape[0]}."
+        )
+    if torch.any(max_joint_delta <= 0.0):
         raise ValueError(
             "Truncated action sampling requires a positive max_joint_delta."
         )
@@ -176,11 +188,12 @@ def sample_truncated_model_action_chunks(
     decoded_scale = affine_scale[:joint_dims]
 
     for step in range(horizon):
+        step_delta = max_joint_delta[step]
         real_lower = torch.maximum(
-            joint_lower, previous - float(max_joint_delta)
+            joint_lower, previous - step_delta
         )
         real_upper = torch.minimum(
-            joint_upper, previous + float(max_joint_delta)
+            joint_upper, previous + step_delta
         )
         model_a = (real_lower - decoded_offset) / decoded_scale
         model_b = (real_upper - decoded_offset) / decoded_scale
