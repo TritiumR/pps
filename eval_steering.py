@@ -3482,9 +3482,9 @@ def parse_args():
         default=1.0,
         help="Scale multiplying the MBD base score before score composition.",
     )
-    parser.add_argument("--mpc_num_samples", type=int, default=512)
-    parser.add_argument("--mpc_iterations", type=int, default=8)
-    parser.add_argument("--mpc_noise", type=float, default=0.35)
+    parser.add_argument("--mpc_num_samples", type=int, default=4096)
+    parser.add_argument("--mpc_iterations", type=int, default=1)
+    parser.add_argument("--mpc_noise", type=float, default=1.0)
     parser.add_argument("--mpc_temperature", type=float, default=0.15)
     parser.add_argument(
         "--grad_calc",

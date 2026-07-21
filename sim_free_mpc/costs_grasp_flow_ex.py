@@ -24,10 +24,6 @@ from .costs_explore import (
 
 _GRASP_FLOW_TCP_TO_TIP_Z = 0.0
 _GRASP_FLOW_CENTER_REGION_RADIUS_SCALE = 0.40
-_GRASP_FLOW_CENTER_REGION_RADIUS_MIN = 0.02
-_GRASP_FLOW_CLOSE_STABLE_STEPS = 3
-_GRASP_FLOW_CLOSE_COMMAND_START = 0.60
-_GRASP_FLOW_CLOSE_COMMAND_FULL = 0.85
 _GRASP_FLOW_PLACE_RELEASE_CLEARANCE_Z = 0.01
 _GRASP_FLOW_PLACE_CARRY_CLEARANCE_Z = 0.20
 _GRASP_FLOW_LIFT_HEIGHT = 0.20
@@ -49,7 +45,7 @@ _GRASP_FLOW_RELEASE_COMMAND_FULL = 0.90
 class GraspFlowCostWeights:
     # Pre-grasp geometry intentionally follows ExploreStateCost.
     reach: float = 8.0
-    terminal: float = 80.0
+    terminal: float = 40.0
     orient: float = 8.0
     floor: float = 50.0
     smooth: float = 0.08
@@ -57,10 +53,9 @@ class GraspFlowCostWeights:
     yaw: float = 5.0
     straddle: float = 30.0
     tip_z: float = 80.0
-    center_region: float = 240.0
+    center_region: float = 120.0
     aperture_region: float = 80.0
-    close_gripper: float = 2.0
-    close_gripper_first: float = 2.0
+    close_gripper: float = 20.0
     gripper_smooth: float = 0.5
     soft_grasp: float = 0.0
     lift_reach: float = 12.0
@@ -275,14 +270,10 @@ class GraspFlowStateCost:
                 + approach_coord.pow(2)
                 + 1e-12
             )
-            default_center_radius = max(
-                _GRASP_FLOW_CENTER_REGION_RADIUS_SCALE * object_radius,
-                _GRASP_FLOW_CENTER_REGION_RADIUS_MIN,
-            )
             center_radius = float(
                 context.get(
                     "gripper_center_region_radius",
-                    default_center_radius,
+                    _GRASP_FLOW_CENTER_REGION_RADIUS_SCALE * object_radius,
                 )
             )
             center_region = torch.clamp(center_err - center_radius, min=0.0).pow(2)
@@ -318,46 +309,6 @@ class GraspFlowStateCost:
                 terms["close_gripper"] = weights.close_gripper * torch.mean(
                     (gripper - close_gate).pow(2),
                     dim=1,
-                )
-                stable_steps = max(
-                    1,
-                    min(
-                        int(context.get("gripper_close_stable_steps", _GRASP_FLOW_CLOSE_STABLE_STEPS)),
-                        close_gate.shape[1],
-                    ),
-                )
-                stable_close_gate = torch.amin(close_gate[:, :stable_steps], dim=1)
-                close_command_start = float(
-                    context.get("gripper_close_command_start", _GRASP_FLOW_CLOSE_COMMAND_START)
-                )
-                close_command_full = float(
-                    context.get("gripper_close_command_full", _GRASP_FLOW_CLOSE_COMMAND_FULL)
-                )
-                first_close_command = self._smooth_ramp(
-                    stable_close_gate,
-                    start=close_command_start,
-                    full=close_command_full,
-                )
-                terms["close_gripper_first"] = weights.close_gripper_first * (
-                    gripper[:, 0] - first_close_command
-                ).pow(2)
-                batch = real_actions.shape[0]
-                center_radius_debug = torch.full((batch,), center_radius, device=device, dtype=dtype)
-                self.last_debug.update(
-                    {
-                        "grasp_center_radius": center_radius_debug,
-                        "grasp_center_err_first": center_err[:, 0],
-                        "grasp_center_err_mean": torch.mean(center_err, dim=1),
-                        "grasp_center_err_final": center_err[:, -1],
-                        "grasp_close_gate_first": close_gate[:, 0],
-                        "grasp_close_gate_mean": torch.mean(close_gate, dim=1),
-                        "grasp_close_gate_final": close_gate[:, -1],
-                        "grasp_stable_close_gate": stable_close_gate,
-                        "grasp_first_close_command": first_close_command,
-                        "grasp_candidate_gripper_first": gripper[:, 0],
-                        "grasp_candidate_gripper_mean": torch.mean(gripper, dim=1),
-                        "grasp_candidate_gripper_final": gripper[:, -1],
-                    }
                 )
 
                 if weights.soft_grasp != 0.0:
