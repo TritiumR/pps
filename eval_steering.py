@@ -292,7 +292,7 @@ def _run_multi_worker_launcher(pre_args: argparse.Namespace, argv: list[str]) ->
             "--exp_name",
             worker_exp_name,
             "--device",
-            f"cuda:{gpu_id}",
+            "cuda:0",
         ]
         bar = tqdm(
             total=(worker_seed_end - worker_seed_start) * pre_args.task_num_steps,
@@ -336,6 +336,10 @@ def _run_multi_worker_launcher(pre_args: argparse.Namespace, argv: list[str]) ->
             worker["log_handle"] = open(worker["log_path"], "w", encoding="utf-8")
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"
+            # Isolate each Isaac Sim worker to one physical GPU. Without this,
+            # every process enumerates all GPUs and concurrently runs the
+            # expensive IOMMU/P2P validation during startup.
+            env["CUDA_VISIBLE_DEVICES"] = str(worker["gpu"])
             worker["process"] = subprocess.Popen(
                 worker["command"],
                 cwd=repo_dir,
@@ -2445,7 +2449,11 @@ def _mpc_debug_stats(stats: dict[str, Any] | None) -> dict[str, Any]:
         "optimize_space",
         "cost_min",
         "cost_mean",
+        "cost_std",
         "cost_weighted",
+        "weight_max",
+        "weight_ess",
+        "weight_entropy",
         "target_delta_norm",
         "accel_norm",
         "score_norm",

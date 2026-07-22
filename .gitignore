@@ -5,6 +5,7 @@ outputs
 data
 /IsaacLab/
 /checkpoints/
+.codex/
 data_local
 slurm
 .secrets/

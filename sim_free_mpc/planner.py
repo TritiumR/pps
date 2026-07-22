@@ -670,10 +670,17 @@ class SimFreeMPC:
         x_t: torch.Tensor,
         score: torch.Tensor | None = None,
     ) -> dict[str, Any]:
+        weights = result.weights.detach()
+        weight_ess = torch.reciprocal(torch.clamp(torch.sum(weights.square()), min=1e-12))
+        weight_entropy = -torch.sum(weights * torch.log(torch.clamp(weights, min=1e-12)))
         diagnostics = {
             "cost_min": float(result.costs.min().detach().cpu()),
             "cost_mean": float(result.costs.mean().detach().cpu()),
+            "cost_std": float(result.costs.std(unbiased=False).detach().cpu()),
             "cost_weighted": float(torch.sum(result.costs * result.weights).detach().cpu()),
+            "weight_max": float(weights.max().cpu()),
+            "weight_ess": float(weight_ess.cpu()),
+            "weight_entropy": float(weight_entropy.cpu()),
             "target_delta_norm": float(torch.linalg.vector_norm((target - x_t).detach()).cpu()),
             "interpolate": bool(self.config.interpolate),
             "cost_style": self.config.cost_style,
