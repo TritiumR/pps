@@ -8,6 +8,20 @@ import torch
 ScoreSteeringMode = Literal["full", "task"]
 
 
+def steer_scale_for_stage(
+    cost_stage: str | None,
+    *,
+    default: float,
+    grasp: float | None = None,
+    lift: float | None = None,
+    place: float | None = None,
+) -> float:
+    """Return the optional stage-specific score-steering scale."""
+    stage_type = (cost_stage or "").split("_", 1)[0]
+    override = {"grasp": grasp, "lift": lift, "place": place}.get(stage_type)
+    return float(default if override is None else override)
+
+
 def combine_scores(
     base_score: torch.Tensor,
     task_score: torch.Tensor,

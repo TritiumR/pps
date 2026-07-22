@@ -75,7 +75,15 @@ class GraspFlowStateCost:
         self.last_terms: dict[str, torch.Tensor] = {}
         self.last_stage = "init"
         self._lift_start_z: dict[str, float] = {}
+        self._lift_start_frozen: set[str] = set()
         self._lift_done: dict[str, bool] = {}
+
+    def reset(self) -> None:
+        """Reset episode-local lift bookkeeping."""
+        self._lift_start_z.clear()
+        self._lift_start_frozen.clear()
+        self._lift_done.clear()
+        self.last_stage = "init"
 
     def _store(self, terms: dict[str, torch.Tensor]) -> torch.Tensor:
         self.last_terms = {key: value.detach() for key, value in terms.items()}
@@ -336,6 +344,18 @@ class GraspFlowStateCost:
             self._lift_start_z[object_name] = float(object_pos[2].detach().cpu())
         return self._lift_start_z[object_name]
 
+    def _update_lift_start(self, object_name: str, context: dict[str, Any], device, dtype) -> None:
+        """Track the object height before grasp, then freeze it for the episode."""
+        object_pos = _target_from_object(context, object_name, device, dtype)
+        if object_pos is None:
+            return
+        if _flag(context, f"grasp_{object_name}"):
+            if object_name not in self._lift_start_z:
+                self._lift_start_z[object_name] = float(object_pos[2].detach().cpu())
+            self._lift_start_frozen.add(object_name)
+        elif object_name not in self._lift_start_frozen:
+            self._lift_start_z[object_name] = float(object_pos[2].detach().cpu())
+
     def _lift_target_z_value(self, object_name: str, context: dict[str, Any], object_pos: torch.Tensor) -> float:
         lift_height = float(context.get("grasp_flow_lift_height", _GRASP_FLOW_LIFT_HEIGHT))
         return self._lift_start_z_value(object_name, context, object_pos) + lift_height
@@ -353,14 +373,12 @@ class GraspFlowStateCost:
             return False
         return True
 
-    def _reset_lift_state(self, active_object: str | None) -> None:
+    def _reset_lift_progress(self, active_object: str | None) -> None:
         if active_object is None:
-            self._lift_start_z.clear()
             self._lift_done.clear()
             return
-        for object_name in list(self._lift_start_z):
+        for object_name in list(self._lift_done):
             if object_name != active_object:
-                self._lift_start_z.pop(object_name, None)
                 self._lift_done.pop(object_name, None)
 
     def _lift_terms(
@@ -485,16 +503,18 @@ class GraspFlowStateCost:
             return None
         if _flag(context, "grasp_apple"):
             return "apple"
-        if _flag(context, "grasp_pear") and not _flag(context, "pear_on_scale"):
+        if _flag(context, "grasp_pear"):
             return "pear"
         return None
 
     def _grasp_object_name(self, context: dict[str, Any]) -> str | None:
         if "weight" not in self.task_name:
             return None
+        if _flag(context, "grasp_pear"):
+            return None
         if _flag(context, "pear_on_scale"):
             return None if _flag(context, "grasp_apple") else "apple"
-        return None if _flag(context, "grasp_pear") else "pear"
+        return "pear"
 
     def compute_terms(
         self,
@@ -506,10 +526,13 @@ class GraspFlowStateCost:
     ) -> dict[str, torch.Tensor]:
         device = real_actions.device
         dtype = real_actions.dtype
+        if "weight" in self.task_name:
+            self._update_lift_start("pear", context, device, dtype)
+            self._update_lift_start("apple", context, device, dtype)
         pick_object = self._grasp_object_name(context)
         place_object = self._place_object_name(context)
         if place_object is not None:
-            self._reset_lift_state(place_object)
+            self._reset_lift_progress(place_object)
             if self._needs_lift(place_object, context, device, dtype):
                 self.last_stage = f"lift_{place_object}"
                 terms, target_pos = self._lift_terms(
@@ -527,7 +550,7 @@ class GraspFlowStateCost:
                     context=context,
                 )
         elif pick_object is not None:
-            self._reset_lift_state(None)
+            self._reset_lift_progress(None)
             self.last_stage = f"grasp_{pick_object}"
             terms, target_pos = self._grasp_terms(
                 object_name=pick_object,
@@ -543,7 +566,7 @@ class GraspFlowStateCost:
             else:
                 target_pos = target_pos[:3]
             terms = {}
-            self._reset_lift_state(None)
+            self._reset_lift_progress(None)
             self.last_stage = "idle"
 
         terms.update(

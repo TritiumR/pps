@@ -499,7 +499,7 @@ from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
 from sim_free_mpc import AccelActionMPC, AccelMPCConfig, SimFreeMPC, SimFreeMPCConfig
 from sim_free_mpc.action_space import clamp_real_action_chunk
 from sim_free_mpc.ddim import ddim_iteration_alphas
-from sim_free_mpc.score_steering import combine_scores
+from sim_free_mpc.score_steering import combine_scores, steer_scale_for_stage
 
 
 DEFAULT_BASE_CHECKPOINT_DIR = "openpi/checkpoints/pytorch/pi05_droid_jointpos"
@@ -1788,11 +1788,18 @@ def _infer_actions_eager(
                 ref_full_score = torch.zeros_like(x_t)
                 ref_full_score[:, :, : ref_score.shape[-1]] = ref_score
 
+            step_steer_scale = steer_scale_for_stage(
+                geom_stats.get("cost_stage"),
+                default=args.steer_scale,
+                grasp=args.grasp_steer_scale,
+                lift=args.lift_steer_scale,
+                place=args.place_steer_scale,
+            )
             combined_score = combine_scores(
                 base_score,
                 task_full_score,
                 mode=score_steering_mode,
-                steer_scale=args.steer_scale,
+                steer_scale=step_steer_scale,
                 ref_score=ref_full_score,
                 base_scale=args.gamma_base,
             )
@@ -1811,7 +1818,7 @@ def _infer_actions_eager(
             base_proxy_norm = torch.linalg.vector_norm(base_proxy_score.detach())
             task_proxy_norm = torch.linalg.vector_norm(task_proxy_score.detach())
             residual_proxy_norm = torch.linalg.vector_norm(residual_proxy_score.detach())
-            applied_residual_norm = abs(float(args.steer_scale)) * residual_proxy_norm
+            applied_residual_norm = abs(step_steer_scale) * residual_proxy_norm
 
             active_dims = int(geom_stats.get("active_dims", task_score.shape[-1]))
             score_update_mode = _score_update_mode_for_mpc_update(args.mpc_update)
@@ -1823,7 +1830,7 @@ def _infer_actions_eager(
                     iteration=mpc_denoise_iteration,
                     num_iterations=mpc_denoise_iterations,
                     base_scale=args.gamma_base,
-                    residual_scale=args.steer_scale,
+                    residual_scale=step_steer_scale,
                     active_dims=active_dims,
                 )
             else:
@@ -1864,6 +1871,7 @@ def _infer_actions_eager(
                     "score_applied_residual_ratio": float(
                         (applied_residual_norm / base_proxy_norm.clamp_min(1e-8)).cpu()
                     ),
+                    "score_steer_scale": step_steer_scale,
                     "score_combined_norm": float(torch.linalg.vector_norm(combined_score.detach()).cpu()),
                     "score_base_task_cosine": _score_cosine(
                         base_proxy_score, task_proxy_score
@@ -1922,6 +1930,7 @@ def _infer_actions_eager(
                     f"base={geom_stats['score_base_proxy_norm']:.4f} "
                     f"task={geom_stats['score_task_norm']:.4f} "
                     f"task/base={geom_stats['score_task_base_ratio']:.4f} "
+                    f"lambda={geom_stats['score_steer_scale']:.4f} "
                     f"lambda_residual/base={geom_stats['score_applied_residual_ratio']:.4f} "
                     f"base_grip0={geom_stats.get('score_base_gripper_first', float('nan')):.4f} "
                     f"task_grip0={geom_stats.get('score_task_gripper_first', float('nan')):.4f} "
@@ -2412,10 +2421,10 @@ def _debug_phase_from_subtasks(task_name: str, subtasks: dict[str, bool]) -> str
     if "weight" in task:
         if subtasks.get("grasp_apple", False):
             return "place_apple"
-        if subtasks.get("pear_on_scale", False):
-            return "grasp_apple"
         if subtasks.get("grasp_pear", False):
             return "place_pear"
+        if subtasks.get("pear_on_scale", False):
+            return "grasp_apple"
         return "grasp_pear"
     if "capsule" in task:
         if subtasks.get("grasp_pod", False):
@@ -2449,6 +2458,7 @@ def _mpc_debug_stats(stats: dict[str, Any] | None) -> dict[str, Any]:
         "score_residual_proxy_norm",
         "score_applied_residual_norm",
         "score_applied_residual_ratio",
+        "score_steer_scale",
         "score_combined_norm",
         "score_base_task_cosine",
         "score_base_combined_cosine",
@@ -3048,6 +3058,14 @@ def _video_config_slug(args) -> str:
     ]
     if args.determine:
         parts.append("det")
+    for prefix, name in (
+        ("sg", "grasp_steer_scale"),
+        ("sl", "lift_steer_scale"),
+        ("sp", "place_steer_scale"),
+    ):
+        value = getattr(args, name, None)
+        if value is not None:
+            parts.append(f"{prefix}{float(value):g}")
     return _slugify("_".join(parts))
 
 
@@ -3427,6 +3445,24 @@ def parse_args():
         type=float,
         default=0.4,
         help="Lambda multiplying the task residual in full/task score steering.",
+    )
+    parser.add_argument(
+        "--grasp_steer_scale",
+        type=float,
+        default=None,
+        help="Optional steering scale for MPC grasp stages; defaults to --steer_scale.",
+    )
+    parser.add_argument(
+        "--lift_steer_scale",
+        type=float,
+        default=None,
+        help="Optional steering scale for MPC lift stages; defaults to --steer_scale.",
+    )
+    parser.add_argument(
+        "--place_steer_scale",
+        type=float,
+        default=None,
+        help="Optional steering scale for MPC place stages; defaults to --steer_scale.",
     )
     parser.add_argument("--num_steps", type=int, default=10)
     parser.add_argument(
@@ -4261,8 +4297,8 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
         np.random.seed(seed)
         torch.manual_seed(seed)
 
-    if mpc_planner is not None and args.mpc_update == "mbd_score_action_warm":
-        mpc_planner.reset_action_warm()
+    if mpc_planner is not None:
+        mpc_planner.reset_episode()
 
     # Reset before starting
     if dataset_file is not None:

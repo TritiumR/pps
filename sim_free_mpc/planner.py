@@ -115,6 +115,13 @@ class SimFreeMPC:
         self._warm_action = None
         self._warm_state = None
 
+    def reset_episode(self) -> None:
+        """Reset planner state that must not leak across environment episodes."""
+        self.reset_action_warm()
+        reset_cost = getattr(self.cost, "reset", None)
+        if callable(reset_cost):
+            reset_cost()
+
     def set_warm_action(
         self,
         action: torch.Tensor,

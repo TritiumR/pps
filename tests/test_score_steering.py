@@ -7,7 +7,27 @@ torch = pytest.importorskip("torch")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sim_free_mpc.score_steering import combine_scores  # noqa: E402
+from sim_free_mpc.score_steering import combine_scores, steer_scale_for_stage  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    ("stage", "expected"),
+    [
+        ("grasp_pear", 0.15),
+        ("lift_pear", 0.0),
+        ("place_pear", 0.05),
+        ("idle", 0.4),
+        (None, 0.4),
+    ],
+)
+def test_stage_steer_scale_uses_matching_override(stage, expected):
+    assert steer_scale_for_stage(
+        stage,
+        default=0.4,
+        grasp=0.15,
+        lift=0.0,
+        place=0.05,
+    ) == pytest.approx(expected)
 
 
 def test_full_score_steering_uses_task_minus_ref():
