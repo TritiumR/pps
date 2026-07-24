@@ -19,6 +19,10 @@ _wandb
 IsaacLab/assets
 similarity
 gap_similarity
+# MOKA perception checkpoints (SAM + GroundingDINO, ~3GB — fetch separately)
+moka/ckpts
+# dial_mpc archived scratch drivers (kept local, not shared)
+dial_mpc/archive
 # dinov3
 openpi/small_droid_dataset
 openpi/checkpoints
@@ -158,3 +162,11 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+agent_tests/
+Proxy Policy Steering.pdf
+scene_synthesizer/
+diary/
+
+# personal design notes + papers (kept local, not shared)
+VLMDP_DESIGN.md
+*.pdf
