@@ -1,0 +1,54 @@
+# Phase-0 de-risk probe (VLM-driven base plan): does the MBD sampler realize a held-keypoint
+# relational sub-goal? Reuses the working template grasp+lift stages; the PLACE stage is driven
+# PURELY by the VLM sub-goal (rekep_subgoal/rekep_path) instead of the geometric place_* terms.
+# rekep_subgoal auto-gates off the grasp/lift stages (fires only where a constraint is set, i.e.
+# the template's place stage), so grasp+lift are unchanged. Additive: parity13_rekep is untouched.
+# NOTE: carry_hold still releases geometrically (near-surface), so at a 10cm hover it will NOT open
+# -- this probe validates the CARRY toward the VLM target, not the drop; the sub-goal-keyed release
+# is the next step. Derived from parity13_rekep_flagfree.
+
+cost:
+  terms:
+    reach: 8.0              # grasp phase only (gates off under a constraint or a held payload)
+    terminal_reach: 40.0
+    rekep_subgoal: 25.0     # VLM sub-goal: sole place-stage arm attractor (base.yaml parity)
+    rekep_path: 200.0       # VLM per-step path constraints on the place stage
+    smooth: 5.04
+    joint_delta: 3.5
+    orientation: 8.0
+    straddle: 30.0
+    clear: 0.1
+    floor: 40.0
+    tip_z: 80.0
+    yaw: 5.0
+    grasp_axis: 15.0
+    center_region: 120.0
+    aperture_region: 80.0
+    close_gripper: 2.0
+    carry_hold: 40.0        # holds during carry; geometric release (won't fire at hover -- see header)
+    release_gripper: 40.0
+    gripper_smooth: 0.5
+    lift_reach: 12.0        # lift stage kept geometric (isolates the place sub-goal question)
+    lift_xy: 80.0
+    lift_z: 120.0
+    lift_terminal: 80.0
+    # place_* omitted on purpose: the VLM sub-goal is the only place-stage arm attractor here.
+  geometry:
+    ee_r: 0.035
+    coll_clear: 0.02
+    finger_r: 0.012
+    open_half: 0.04
+    tool_back: 0.06
+    tcp_to_tip: 0.0
+    center_scale: 0.40
+    close_z_scale: 0.025
+    close_xy_floor: 0.008
+    aperture_margin: 0.006
+    release_xy: 0.06
+    release_z: 0.02
+    place_descend_radius: 0.08
+    place_release_clearance: 0.012
+    clear_max_radius: 0.10
+
+advance:
+  flag_fallback: false

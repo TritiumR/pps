@@ -1,0 +1,60 @@
+# VLM-driven base (opt-in): the ReKep VLM sub-goal owns WHERE to place (which object -> which
+# destination). Everything else is task-agnostic EXECUTION -- continuous cost behaviors, no stages, no
+# VLM-prompt edits. Transport a grasped object the safe way: LIFT+TRANSIT (carry_altitude keeps the
+# payload above a clearance while far -> it rises and clears the table/other fruit), route around
+# obstacles (carry_clear), then DESCEND + SET DOWN onto the referenced destination surface
+# (place_setdown), and release only when it is supported (carry_hold, geometric release -- NOT mid-air at
+# the sub-goal). Grasp centres on the object BODY (mid-height). subgoal_mean balances the sub-goal so
+# execution terms can shape the path. Steerable cost, no primitives. Pair with --vlm_cost rekep_real_vlm
+# (or _fake_vlm). Assumes non-deterministic VLM output (stages emitted from whatever it returns).
+
+cost:
+  terms:
+    reach: 8.0              # grasp EXECUTION: reach the object BODY centre (gates off under a constraint/payload)
+    terminal_reach: 40.0
+    rekep_subgoal: 30.0     # VLM sub-goal (MEANED): owns WHERE to place -- drives the payload to the destination
+    rekep_path: 200.0       # VLM per-step path constraints (e.g. keep grasping keypoint N)
+    smooth: 5.04
+    joint_delta: 3.5
+    orientation: 8.0
+    straddle: 30.0
+    clear: 0.1
+    floor: 40.0
+    tip_z: 80.0
+    yaw: 5.0
+    grasp_axis: 15.0
+    center_region: 120.0
+    aperture_region: 80.0
+    close_gripper: 2.0
+    carry_hold: 40.0        # hold while carrying; support-gated release (release_on_subgoal OFF -> geometric)
+    carry_clear: 150.0      # carried payload avoids obstacles (routes around, emergent)
+    carry_altitude: 40.0    # LIFT + TRANSIT: MILD -- a strong vertical pull shears the marginal grasp; the
+                            #   sub-goal's own +10cm target already provides most of the lift, this just biases up
+    place_setdown: 100.0    # DESCEND + SET DOWN onto the destination surface when near (gentle, not a yank)
+    release_gripper: 40.0
+    gripper_smooth: 0.5
+  geometry:
+    ee_r: 0.035
+    coll_clear: 0.02
+    finger_r: 0.012
+    open_half: 0.04
+    tool_back: 0.06
+    tcp_to_tip: 0.0
+    center_scale: 0.40
+    close_z_scale: 0.025
+    close_xy_floor: 0.008
+    aperture_margin: 0.006
+    subgoal_mean: true          # average the sub-goal so it does not dwarf the execution terms
+    release_on_subgoal: false   # support-gated release: open when SET DOWN (near the surface), not mid-air
+    release_xy: 0.06            # m: horizontal tolerance for the set-down release
+    release_z: 0.02             # m: release when the payload is within this of the destination surface
+    place_release_clearance: 0.012   # m: set-down height above the surface (gentle, near-contact)
+    place_descend_radius: 0.10  # far/near boundary: outside -> lift+transit, inside -> descend+set-down
+    carry_altitude_clear: 0.12  # m above the support plane the payload transits at
+    clear_max_radius: 0.10      # objects wider than this are fixtures (board/scale), not obstacles
+    carry_clear_margin: 0.05    # extra clearance the carried payload keeps from obstacles
+
+# Sub-goal-satisfied advance + support-gated release. No env flag touches the loop.
+advance:
+  mode: subgoal
+  flag_fallback: false

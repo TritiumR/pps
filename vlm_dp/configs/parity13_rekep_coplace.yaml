@@ -1,0 +1,58 @@
+# parity13_rekep_flagfree + co-placement: the already-placed object stays a SOFT carry obstacle so the
+# SECOND object (round apple, placed beside the pear on the small scale) seats in the FREE space beside it
+# instead of beelining onto it and knocking it off. Emergent free-seat (place sub-goal pulls to the scale,
+# carry_clear pushes off the placed object) -- no hand-picked seat offset, generalizes to any co-placement.
+# Only additions vs parity13_rekep_flagfree: the carry_clear term + its 3 geometry keys. Everything else
+# (grasp shape, lift/place terms, tolerances) is identical, so the pear placement is unchanged.
+
+cost:
+  terms:
+    reach: 8.0
+    terminal_reach: 40.0
+    smooth: 5.04
+    joint_delta: 3.5
+    orientation: 8.0
+    straddle: 30.0
+    clear: 0.1
+    floor: 40.0
+    tip_z: 80.0
+    yaw: 5.0
+    grasp_axis: 15.0
+    center_region: 120.0
+    aperture_region: 80.0
+    close_gripper: 2.0
+    carry_hold: 40.0
+    release_gripper: 40.0
+    gripper_smooth: 0.5
+    lift_reach: 12.0
+    lift_xy: 80.0
+    lift_z: 120.0
+    lift_terminal: 80.0
+    place_reach: 12.0
+    place_xy: 120.0
+    place_z: 80.0
+    place_carry_height: 80.0
+    place_terminal: 60.0
+    carry_clear: 80.0       # co-placement: route the carried apple around the already-placed pear (soft)
+  geometry:
+    ee_r: 0.035
+    coll_clear: 0.02
+    finger_r: 0.012
+    open_half: 0.04
+    tool_back: 0.06
+    tcp_to_tip: 0.0
+    center_scale: 0.40
+    close_z_scale: 0.025
+    close_xy_floor: 0.008
+    aperture_margin: 0.006
+    release_xy: 0.06
+    release_z: 0.02
+    place_descend_radius: 0.08
+    place_release_clearance: 0.012
+    clear_max_radius: 0.10
+    carry_clear_include_placed: true   # placed object #1 stays a soft obstacle for payload #2 (the fix)
+    carry_clear_margin: 0.015          # small: seat the apple ADJACENT to the pear, not pushed off the scale
+
+# Ablation: no env flag ever touches the control loop (place advance = geometric done() only).
+advance:
+  flag_fallback: false
