@@ -16,6 +16,28 @@ def quat_wxyz_to_R(q_wxyz):
     return _Rot.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()
 
 
+def center_from_points(pts, support_top=None):
+    """Object centre from a depth cloud: the middle of the visible extent on every axis.
+
+    One rule for xy and z; no object-model frame assumption, so it holds for lying objects.
+    ``support_top``: the surface the object RESTS ON. A settled convex object's centre is midway
+    between its visible top and that surface; without it the visible silhouette bottom stands in,
+    which reads ~1-2cm high on resting fruit (the bulge occludes the true bottom) and the pinch
+    lands above the equator and ejects the object.
+    """
+    top = np.percentile(pts[:, 2], 95)
+    if support_top is not None:
+        # Resting convex object: its top cap sits directly above its centre, and the cap is the
+        # least view-biased part of the cloud (the full silhouette's extent centre shifts ~1cm
+        # toward the camera and the off-centre pinch loses the carry).
+        band = pts[pts[:, 2] >= np.percentile(pts[:, 2], 85)]
+        xy = (band[:, :2].min(axis=0) + band[:, :2].max(axis=0)) / 2.0
+        return np.array([xy[0], xy[1], float((top + support_top) / 2.0)], dtype=np.float64)
+    xy = (pts[:, :2].min(axis=0) + pts[:, :2].max(axis=0)) / 2.0
+    return np.array([xy[0], xy[1], float((top + np.percentile(pts[:, 2], 5)) / 2.0)],
+                    dtype=np.float64)
+
+
 def usd_extents(E, scene_objects):
     """Per-object ``(grip, keepout, half_height)`` from the sim's USD bounding boxes, keyed by name.
 
