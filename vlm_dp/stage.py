@@ -3,11 +3,11 @@ from __future__ import annotations
 
 import numpy as np
 
-from sim_common.envs.droid import ROBOTIQ_GRASP_OFFSET
+from vlm_dp.sim_helpers import ROBOTIQ_GRASP_OFFSET
 
 
 def _capture_held(env, grounding, held_idx):
-    """Gripper-local offsets of held keypoints at stage entry (for rigid riding in the constraint cost)."""
+    """Gripper-local offsets of held keypoints at stage entry, so they ride the gripper rigidly."""
     if not held_idx or grounding.keypoints is None:
         return None
     kps = np.asarray(grounding.keypoints(), dtype=np.float64)

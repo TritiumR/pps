@@ -163,3 +163,7 @@ agent_tests/
 Proxy Policy Steering.pdf
 scene_synthesizer/
 diary/
+
+# personal design notes + papers (kept local, not shared)
+VLMDP_DESIGN.md
+*.pdf

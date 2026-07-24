@@ -19,6 +19,21 @@ def _nearest_kp(keypoints, point):
     return int(np.argmin(np.linalg.norm(keypoints - point, axis=1)))
 
 
+def narrow_axis(pts, min_aspect=1.3):
+    """Unit horizontal direction of an object's NARROW axis (PCA of the xy cloud), or None if the
+    object is roughly round (long/short spread < ``min_aspect``, so no axis is worth grasping across).
+    Grasp across the narrow axis = the gripper closes along this direction (the object fits)."""
+    if pts is None or len(pts) < 8:
+        return None
+    xy = pts[:, :2] - pts[:, :2].mean(axis=0)
+    evals, evecs = np.linalg.eigh(xy.T @ xy)          # ascending eigenvalues
+    if evals[0] <= 1e-9 or (evals[1] / evals[0]) ** 0.5 < min_aspect:
+        return None                                    # ~round: narrow axis ill-defined, don't constrain
+    n = evecs[:, 0]                                    # smallest-spread direction = the narrow axis
+    n = n / (np.linalg.norm(n) + 1e-9)
+    return (float(n[0]), float(n[1]), 0.0)
+
+
 def object_for_keypoint(grounded, env, point, names):
     """Name the object whose masked depth points are nearest this keypoint (or None)."""
     point = np.asarray(point)

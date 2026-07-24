@@ -1,8 +1,8 @@
-"""CPU tests pinning ``build_context``'s world-frame convention (no simulator needed).
+"""CPU tests pinning build_context's world-frame convention (no simulator needed).
 
-Planner-replay tests score the real reach term through a replica of the planner's FK + root
-transform; builder tests run ``build_context`` on a mock env with non-zero ``env_origins``.
-Run: ``python -m vlm_dp.tests.test_context``.
+Planner-replay tests score the real reach term through a replica of the planner's FK and root
+transform. Builder tests run build_context on a mock env with non-zero env_origins.
+Run: python -m vlm_dp.tests.test_context.
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ Q = torch.tensor([[[0.0, -0.3, 0.0, -2.0, 0.0, 1.9, 0.79]]])          # [1,1,7] 
 ROOT_POS = torch.tensor([0.35, -0.20, 0.10])                          # panda_link0 WORLD pos (nontrivial)
 ROOT_QUAT = torch.tensor([np.cos(np.pi / 12), 0.0, 0.0, np.sin(np.pi / 12)])  # yaw 30deg, wxyz
 ENV_ORIGIN = torch.tensor([2.5, -1.0, 0.0])                           # NON-ZERO -> exposes the frame bug
-REACH = CompositeCost(terms={"reach": 1.0})                           # reach uses ee_pos & ctx['target'] only
+REACH = CompositeCost(terms={"reach": 1.0})                           # reach uses ee_pos and the target only
 DUMMY_ACT = torch.zeros(1, 1, 8)
 
 EE_BASE = PandaFK().forward(Q).ee_pos                                 # panda_link0 base frame [1,1,3]
@@ -100,8 +100,10 @@ class _Env:
 
 
 class _Obj:
-    def __init__(self, name, pos, extents):
+    def __init__(self, name, pos, extents, axis=None, grasp_extent=None, grasp_region=None):
         self.name, self._pos, self.extents = name, pos, extents
+        # Optional grasp geometry. build_context forwards all three, so the stub must carry them.
+        self.axis, self.grasp_extent, self.grasp_region = axis, grasp_extent, grasp_region
 
     def pos(self):
         return self._pos

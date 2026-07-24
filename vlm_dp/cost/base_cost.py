@@ -1,5 +1,7 @@
-"""CompositeCost sums weight * TERMS[name](inputs) per the config's cost.terms; cost.geometry
-supplies gripper/collision geometry. Exposes the call signature the sim_free_mpc planner expects.
+"""CompositeCost sums weight * TERMS[name](inputs) over a config's cost.terms.
+
+cost.geometry supplies gripper and collision geometry. Exposes the call signature the sim_free_mpc
+planner expects.
 """
 from __future__ import annotations
 
@@ -9,7 +11,7 @@ import torch
 
 from vlm_dp.cost.terms import TERMS, CostInputs
 
-# Fallbacks for callers that build the cost without a config (e.g. diagnostics); the runner uses the YAML.
+# Fallbacks for callers that build the cost without a config, such as diagnostics. The runner uses YAML.
 DEFAULT_TERMS = {
     "reach": 25.0,
     "terminal_reach": 40.0,
@@ -22,7 +24,7 @@ DEFAULT_TERMS = {
     "straddle": 30.0,
     "collision": 20.0,
     "floor": 40.0,
-    # Grasp geometry (from grasp_flow); these self-gate to grasp stages.
+    # Grasp geometry, self-gating to grasp stages.
     "tip_z": 80.0,
     "yaw": 5.0,
     "center_region": 120.0,
@@ -50,7 +52,7 @@ DEFAULT_GEOM = {
 
 
 class CompositeCost:
-    """Weighted sum of config-selected cost terms; the interface sim_free_mpc's planner calls."""
+    """Weighted sum of config-selected cost terms, the interface sim_free_mpc's planner calls."""
 
     def __init__(self, terms=None, geom=None, extents=None):
         weights = DEFAULT_TERMS if terms is None else terms
@@ -66,6 +68,14 @@ class CompositeCost:
         extents = {n: o["extents"] for n, o in objects.items() if "extents" in o} or self.extents
         inputs = CostInputs(real_actions, ee_pos, ee_quat, context, extents, self.geom)
         cost = ee_pos.new_zeros(ee_pos.shape[0])
+        terms = {}
         for fn, w in self.term_fns:
-            cost = cost + w * fn(inputs)
+            v = w * fn(inputs)
+            terms[fn.__name__] = v.detach()
+            cost = cost + v
+        # Planner diagnostics contract, read as planner._last_cost_term_diagnostics.
+        self.last_terms = terms
+        self.last_stage = ("place" if context.get("place_target") else
+                           "carry" if context.get("payload") else
+                           f"grasp {context.get('grasp_obj')}")
         return cost

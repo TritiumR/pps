@@ -10,9 +10,9 @@ cost:
     terminal_reach: 40.0
     rekep_subgoal: 25.0
     rekep_path: 200.0
-    smooth: 0.08
-    joint_delta: 0.005
-    orientation: 3.0
+    smooth: 7.8            # = grasp_flow's 0.08 x (H-1)x7 (hers SUMS over joints x horizon; ours means)
+    joint_delta: 5.25      # = grasp_flow's local 0.05 x Hx7 (same sum-vs-mean unit conversion)
+    orientation: 8.0        # grasp_flow's orient weight
     consistency: 30.0
     straddle: 30.0
     collision: 20.0
@@ -23,7 +23,8 @@ cost:
     aperture_region: 80.0
     close_gripper: 2.0
     carry_hold: 40.0        # pins the gripper closed while carrying (matches grasp-flow lift/place weights)
-    place_descent: 50.0
+    place_descent: 130.0    # grasp_flow's place_reach 12 + place_xy 120 aggregate
+    place_terminal: 60.0    # grasp_flow's place_terminal (end-of-chunk seat pull)
     gripper_smooth: 0.5     # keeps the executed gripper channel steady (this harness has no driver latch)
   geometry:
     ee_r: 0.035
@@ -32,7 +33,7 @@ cost:
     open_half: 0.04
     tool_back: 0.06
     tcp_to_tip: 0.0
-    center_scale: 0.12
+    center_scale: 0.40      # grasp_flow's value; 0.12 was tuned for the vlm_base driver latch
     close_z_scale: 0.025
     aperture_margin: 0.006
     release_xy: 0.06

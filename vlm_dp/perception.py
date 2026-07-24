@@ -19,36 +19,47 @@ from PIL import Image
 from scipy.optimize import linear_sum_assignment
 
 from rekep.isaaclab_helpers import camera_to_rekep_inputs, workspace_bounds_from_scene
+from vlm_dp.sim_helpers import center_from_points
 
+_SIG_TOL = 60.0       # uint8-RGB distance. Same object under lighting drift stays well inside, a
+                      # pear-vs-apple swap is far outside. Re-ID after track loss needs appearance
+                      # evidence, not just a label assignment.
 _BOX_THRESH = 0.15    # keep every plausible box and let the assignment choose, rather than pre-filtering
 _TEXT_THRESH = 0.22
 _IOU_MERGE = 0.80     # boxes overlapping this much are the same physical object
 _MIN_PIXELS = 80      # below this a mask cannot be clustered into keypoints (matches the proposer's floor)
+# Support ring: the surface an object rests on, sampled just outside its own footprint since it occludes
+# what is directly beneath it. Multiples of the object's own radius, so it scales with object size.
+_RING_INNER = 1.2     # start clear of the object's own silhouette and mask bleed
+_RING_OUTER = 3.0     # stay local, a distant surface is a different one
+_RING_PAD = 0.02      # m, keeps the ring usable for a very small object
+_MIN_RING_PTS = 50    # below this the ring is not a surface measurement
+_MASK_ESCAPE_TOL = 8.0    # px of average bleed past the prompt box, beyond which the mask left its object
+_OBSTACLE_MIN_H = 0.01    # m above the support before leftover cloud counts as an obstacle, not the surface
 
 
 def _backends():
-    """Import vision backends through moka.vision.segmentation only; its import order and
-    transformers patch are load-bearing.
-    """
-    import moka.vision.segmentation as seg   # noqa: F401  -- imported for its order + compat shim
-    return seg
+    """Apply the load-bearing GroundingDINO and transformers compat shim and return the vision-backend
+    helper (checkpoint dir and image transform). Self-contained, no moka import."""
+    from vlm_dp import vision_backends   # deferred: applies the transformers shim on import
+    return vision_backends
 
 
 @functools.lru_cache(maxsize=1)
 def _dino():
     """GroundingDINO, built once. The stock helper rebuilds a 700MB checkpoint on every call."""
-    seg = _backends()
+    vb = _backends()
     from groundingdino.util.inference import load_model
-    return load_model(os.path.join(seg._MOKA_DIR, "config", "grounding_dino.py"),
-                      os.path.join(seg._MOKA_DIR, "ckpts", "groundingdino_swint_ogc.pth"))
+    return load_model(os.path.join(vb.ckpt_dir(), "config", "grounding_dino.py"),
+                      os.path.join(vb.ckpt_dir(), "ckpts", "groundingdino_swint_ogc.pth"))
 
 
 @functools.lru_cache(maxsize=1)
 def _sam(device="cuda"):
     """SAM, built once. The stock helper reloads a 2.5GB checkpoint on every call."""
-    seg = _backends()
+    vb = _backends()
     from segment_anything import build_sam, SamPredictor
-    ckpt = os.path.join(seg._MOKA_DIR, "ckpts", "sam_vit_h_4b8939.pth")
+    ckpt = os.path.join(vb.ckpt_dir(), "ckpts", "sam_vit_h_4b8939.pth")
     return SamPredictor(build_sam(checkpoint=ckpt).to(device))
 
 
@@ -76,24 +87,122 @@ def _mask_iou(a, b):
     return int(np.logical_and(a, b).sum()) / union if union else 0.0
 
 
+def _r(t):
+    """Round a 3-tuple of metres for logging."""
+    return tuple(round(float(x), 3) for x in t)
+
+
+def _mask_escape(mask, box) -> float:
+    """How far a SAM mask spills outside its prompting box, as an average bleed width in pixels.
+
+    Normalised by the box perimeter, not its area: boundary error is a boundary effect, so it scales
+    with perimeter. An area fraction would be scale-dependent and would punish small objects for the
+    same few pixels of bleed a large one gets away with (measured: a 3px bleed reads as 20% of a 50px
+    box but 2% of a 500px one). In these units the threshold is a property of the segmenter, how many
+    pixels SAM's boundary wanders, and carries over to any scene or object size.
+
+    SAM's contract is to segment the object its box indicates, so a correct mask lies inside its box and
+    bleeds a few pixels at the boundary, never spilling across the scene. This is a self-consistency
+    check between two stages the pipeline already runs, with no ground truth and no size threshold.
+
+    It exists because a bad mask is unrecoverable downstream: object extents, position and keypoint
+    clustering all read the same points, so one bled mask corrupts all three at once. Measured on tea, a
+    bad teapot mask gave 154k points and a 729mm half-extent against 48mm true, and neither percentile
+    trimming nor connected-component selection could repair it (the bad cluster is the mask). Rejecting
+    the frame is honest, repairing it is not possible.
+    """
+    total = int(mask.sum())
+    if total == 0:
+        return float("inf")
+    x0, y0, x1, y1 = (int(round(float(v))) for v in box)
+    h, w = mask.shape[-2:]
+    x0, y0 = max(x0, 0), max(y0, 0)
+    x1, y1 = min(max(x1, 0), w), min(max(y1, 0), h)
+    if x1 <= x0 or y1 <= y0:
+        return float("inf")
+    outside = total - int(mask[y0:y1, x0:x1].sum())
+    perimeter = 2.0 * ((x1 - x0) + (y1 - y0))
+    return outside / max(perimeter, 1.0)
+
+
+def _cluster_blobs(pts, voxel=0.02, limit=12, min_pts=_MIN_RING_PTS):
+    """Split a point cloud into spatially separate blobs -> ``[(centre, extents), ...]``, largest first.
+
+    Same occupancy labelling as ``_dominant_cluster``, but keeping every component instead of the
+    biggest: unexplained scene geometry is several obstacles, not one. Extents use the same
+    ``(narrow, wide, half-height)`` convention as ``object_extents``, so a blob is interchangeable with
+    a named object everywhere downstream.
+    """
+    from scipy import ndimage
+
+    lo = pts.min(axis=0)
+    idx = np.floor((pts - lo) / voxel).astype(np.int64)
+    grid = np.zeros(tuple(idx.max(axis=0) + 1), dtype=bool)
+    grid[idx[:, 0], idx[:, 1], idx[:, 2]] = True
+    labels, n = ndimage.label(grid, structure=np.ones((3, 3, 3), dtype=bool))
+    if n == 0:
+        return []
+    per_point = labels[idx[:, 0], idx[:, 1], idx[:, 2]]
+    out = []
+    for label in range(1, n + 1):
+        blob = pts[per_point == label]
+        if blob.shape[0] < min_pts:
+            continue
+        half = (blob.max(axis=0) - blob.min(axis=0)) / 2.0
+        centre = (blob.max(axis=0) + blob.min(axis=0)) / 2.0
+        out.append((centre, (float(min(half[0], half[1])), float(max(half[0], half[1])), float(half[2])),
+                    blob.shape[0]))
+    out.sort(key=lambda b: -b[2])
+    return [(c, e) for c, e, _ in out[:limit]]
+
+
+def _dominant_cluster(pts, voxel=0.01, max_cells=4_000_000):
+    """Largest connected component of a point cloud. Returns (mask, share of points, its extent).
+
+    Voxel connected components, not distance clustering: a back-projected mask is already a raster, so
+    occupancy labelling is the natural operation and it needs no neighbour count or density knob, only a
+    voxel size set by the depth image's resolution rather than tuned per object.
+    """
+    from scipy import ndimage
+
+    lo = pts.min(axis=0)
+    span = pts.max(axis=0) - lo
+    while np.prod(np.floor(span / voxel) + 3) > max_cells:   # coarsen rather than allocate a huge grid
+        voxel *= 2.0
+    idx = np.floor((pts - lo) / voxel).astype(np.int64)
+    grid = np.zeros(tuple(idx.max(axis=0) + 1), dtype=bool)
+    grid[idx[:, 0], idx[:, 1], idx[:, 2]] = True
+    labels, n = ndimage.label(grid, structure=np.ones((3, 3, 3), dtype=bool))   # 26-connectivity
+    if n <= 1:
+        return np.ones(pts.shape[0], dtype=bool), 1.0, tuple(span / 2.0)
+    per_point = labels[idx[:, 0], idx[:, 1], idx[:, 2]]
+    biggest = np.bincount(per_point[per_point > 0]).argmax()
+    keep = per_point == biggest
+    main = pts[keep]
+    return keep, float(keep.mean()), tuple((main.max(axis=0) - main.min(axis=0)) / 2.0)
+
+
 class Perception:
     """Finds the named objects in the camera frame and reports where they are.
 
-    ``prompts`` maps scene object -> detector text ("scale" -> "kitchen scale").
+    prompts maps scene object to detector text, for example scale to kitchen scale.
     """
 
     def __init__(self, prompts: dict, fixtures=(), erode: int = 2, device: str = "cuda",
-                 segment: str = "groundedsam"):
+                 segment: str = "groundedsam", support: str | None = None, support_names=()):
         self.fixtures = tuple(fixtures)   # objects whose geometry is workcell calibration, not perception
+        self.support = support            # surface the support_names objects rest on
+        self.support_names = frozenset(support_names)
         # Fixtures are excluded from the vocabulary so their labels cannot claim a real object's box.
         self.prompts = {n: t for n, t in prompts.items() if n not in self.fixtures}
         self.names = list(self.prompts)
         self.erode = erode
         self.device = device
-        # Segmenter: "groundedsam" = GroundingDINO text vocab + SAM (default); "sam_vlm" = class-agnostic
+        # Segmenter: groundedsam is GroundingDINO text vocab plus SAM (default). sam_vlm is class-agnostic
         # SAM regions named by a VLM from plain names.
         self.segment = segment
         self.masks: dict = {}      # name -> (H,W) bool, from the last look
+        self._sig: dict = {}       # name -> mean-RGB signature from the first (settled) look
         self.rgb = None
         self.points = None
         self._bounds = None                 # sam_vlm workspace box, measured once (calibration)
@@ -107,7 +216,7 @@ class Perception:
         _sam(self.device)
 
     def calibrate(self, env):
-        """Measure the fixtures once; they never move and per-frame masks of them are unreliable."""
+        """Measure the fixtures once. They never move and per-frame masks of them are unreliable."""
         if self.segment == "sam_vlm":   # the box that trims class-agnostic SAM masks to the workcell
             self._bounds = workspace_bounds_from_scene(env.env, margin=0.6)   # raw IsaacLab env (has .scene)
         if not self.fixtures:
@@ -124,14 +233,15 @@ class Perception:
         print(f"[perception] calibrated fixtures (not perceived): {list(self._fixture_points)}", flush=True)
 
     def observe(self, env) -> dict:
-        """Look through the camera: return ``{name: world position}`` for every object found."""
-        rgb, points, _, _ = camera_to_rekep_inputs(env.cam, 0)   # rgb + depth only; the seg channel is unused
+        """Look through the camera. Returns {name: world position} for every object found."""
+        rgb, points, _, _ = camera_to_rekep_inputs(env.cam, 0)   # rgb and depth only, seg channel unused
         return self.observe_frame(rgb, points)
 
     def observe_frame(self, rgb, points) -> dict:
-        """Segment one captured frame: ``{name: world position}`` for confidently detected objects."""
+        """Segment one captured frame. Returns {name: world position} for confidently detected objects."""
         self.rgb, self.points = rgb, points
         self.masks = dict(self._segment(rgb), **self._fixture_masks)   # fixtures are known, not detected
+        self._verify_identities()
         out = {}
         for name in self.masks:
             pos = self.position(name)
@@ -139,23 +249,136 @@ class Perception:
                 out[name] = pos
         return out
 
+    def _verify_identities(self):
+        """Re-identification needs appearance evidence. A label whose mask no longer looks like the
+        object it was first seen as (a Hungarian pear-apple swap after a drop) is dropped from this frame
+        rather than accepted, so the belief stays stale until a matching look.
+        """
+        for name in list(self.masks):
+            if name in self._fixture_masks:
+                continue
+            mask = self._erode(self.masks[name])
+            if int(mask.sum()) < _MIN_PIXELS:
+                continue
+            sig = self.rgb[mask].reshape(-1, 3).mean(axis=0)
+            ref = self._sig.get(name)
+            if ref is None:
+                self._sig[name] = sig
+            elif float(np.linalg.norm(sig - ref)) > _SIG_TOL:
+                print(f"[perception] '{name}' mask fails appearance check "
+                      f"(d={float(np.linalg.norm(sig - ref)):.0f}); rejected this frame", flush=True)
+                del self.masks[name]
+
     def position(self, name) -> np.ndarray | None:
-        """Grasp centre of ``name``: middle of the horizontal extent, at a low-percentile z."""
+        """Grasp centre of name: the middle of the visible extent on every axis. Objects on the declared
+        support use its surface as the bottom, giving the resting-geometry centre."""
         pts = self.object_points(name)
         if pts is None:
             return None
-        xy = (pts[:, :2].min(axis=0) + pts[:, :2].max(axis=0)) / 2.0
-        return np.array([xy[0], xy[1], float(np.percentile(pts[:, 2], 15))], dtype=np.float64)
+        support_top = None
+        if name in self.support_names:
+            if self.support:                              # declared entity wins where a task names one
+                spts = self.object_points(self.support)
+                if spts is not None:
+                    support_top = float(np.percentile(spts[:, 2], 95))
+            else:                                         # else measure the surface it stands on
+                support_top = self.support_height(name)
+        return center_from_points(pts, support_top)
+
+    def support_height(self, name) -> float | None:
+        """Height of the surface name rests on, measured from the scene cloud around its footprint.
+
+        A named support entity is a hand-authored role, and only one task ever declared one, so every
+        other task lost the resting-geometry grasp centre and took the visible-extent midpoint, which
+        measures about 1 to 2 cm too high (an object's top is better seen than its occluded bottom) and
+        puts the grasp above the object.
+
+        Derived instead: an object occludes what is directly beneath it, but the same surface just
+        outside its footprint is in plain view, so a ring around the object measures what it stands on.
+        Works for a board, tray, counter or bare table without naming any of them, and needs no scene
+        entity to exist for the surface. The median rejects a neighbouring object clipping the ring, and
+        points at or above the object's own top are excluded so a taller neighbour cannot pull it up.
+        """
+        pts = self.object_points(name)
+        if pts is None or self.points is None:
+            return None
+        centre = (pts[:, :2].min(axis=0) + pts[:, :2].max(axis=0)) / 2.0
+        r_obj = float(np.max(pts[:, :2].max(axis=0) - pts[:, :2].min(axis=0))) / 2.0
+        scene = self.points[np.isfinite(self.points).all(axis=-1)].reshape(-1, 3)
+        d = np.linalg.norm(scene[:, :2] - centre, axis=1)
+        ring = scene[(d > r_obj * _RING_INNER) & (d < r_obj * _RING_OUTER + _RING_PAD)]
+        ring = ring[ring[:, 2] < float(np.percentile(pts[:, 2], 5))]   # below the object's own base
+        if ring.shape[0] < _MIN_RING_PTS:
+            return None
+        return float(np.median(ring[:, 2]))
+
+    def unexplained_obstacles(self, support_z=None, limit=12, max_half=0.10) -> list:
+        """Scene geometry that belongs to no named object. Returns unnamed [(centre, extents), ...].
+
+        The counterpart to deriving the vocabulary from the instruction. Once only referents are named,
+        the distractors stop being scene objects, and an unnamed distractor the arm cannot see is worse
+        than a named one it might grasp. But an obstacle never needs identity, only extent: the cost must
+        route around a thing, not know what it is.
+
+        So the leftover cloud (everything outside every named mask, above the support plane) is clustered
+        into blobs and returned with the same (centre, extents) shape a named object has. The existing
+        keepout terms then treat them as obstacles with no change: they exclude by name (grasp_obj,
+        payload, place_target, placed), and an anonymous blob matches none of those, so it can never be
+        mistaken for a target. Identity for referents, geometry for everything else.
+        """
+        if self.points is None:
+            return []
+        finite = np.isfinite(self.points).all(axis=-1)
+        claimed = np.zeros(finite.shape, dtype=bool)
+        for mask in self.masks.values():
+            claimed |= self._dilate(mask)          # dilate: a mask's own boundary is not an obstacle
+        pts = self.points[finite & ~claimed].reshape(-1, 3)
+        if support_z is not None:
+            pts = pts[pts[:, 2] > support_z + _OBSTACLE_MIN_H]   # the support plane is not an obstacle
+        if pts.shape[0] < _MIN_RING_PTS:
+            return []
+        # Only object-scale blobs. Anything wider is structure (a counter edge, a wall, the robot's own
+        # column): a keepout cylinder around it would wall off the workspace, which is why clear caps its
+        # radius too. Structure is already handled by the table plane (floor and z_table).
+        return [(c, e) for c, e in _cluster_blobs(pts, limit=limit * 3) if e[1] <= max_half][:limit]
+
+    def _dilate(self, mask):
+        """Grow a mask by the erosion radius, so its own boundary is not read as unexplained."""
+        k = np.ones((2 * self.erode + 1, 2 * self.erode + 1), np.uint8)
+        return cv2.dilate(mask.astype(np.uint8), k, iterations=1).astype(bool)
 
     def object_extents(self, name) -> tuple | None:
-        """``(grip, keepout, half_height)`` estimated from the segmented point cloud (no object model)."""
+        """(grip, keepout, half_height) estimated from the segmented point cloud, no object model."""
         pts = self.object_points(name)
         if pts is None:
             return None
         x_half = float(pts[:, 0].max() - pts[:, 0].min()) / 2.0
         y_half = float(pts[:, 1].max() - pts[:, 1].min()) / 2.0
-        z_span = float(pts[:, 2].max() - pts[:, 2].min())
-        return (min(x_half, y_half), max(x_half, y_half), z_span)
+        # Slot [2] is a half-height, consumed as z_bottom, keepout cylinder and place z. usd_extents
+        # returns half too.
+        z_half = float(pts[:, 2].max() - pts[:, 2].min()) / 2.0
+        return (min(x_half, y_half), max(x_half, y_half), z_half)
+
+    def extent_diagnostics(self, name) -> str | None:
+        """Why an extent is what it is: point count, trimmed spans, and cluster structure.
+
+        Answers the one question that decides how to fix a bad extent: is the mask correct with a few
+        stray back-projected pixels (percentile trimming repairs it), or has the mask swallowed a large
+        region (trimming cannot repair it and the measurement must be rejected instead)? Read frac (share
+        of points in the dominant cluster) and main (that cluster's own extent).
+        """
+        pts = self.object_points(name)
+        if pts is None:
+            return None
+        raw = tuple((pts[:, i].max() - pts[:, i].min()) / 2.0 for i in range(3))
+        trims = {}
+        for lo, hi in ((1, 99), (5, 95), (10, 90)):
+            band = np.percentile(pts, [lo, hi], axis=0)
+            trims[f"{lo}-{hi}"] = tuple((band[1, i] - band[0, i]) / 2.0 for i in range(3))
+        keep, frac, main = _dominant_cluster(pts)
+        return (f"n={pts.shape[0]} raw={_r(raw)} "
+                + " ".join(f"p{k}={_r(v)}" for k, v in trims.items())
+                + f" | clusters: frac={frac:.2f} n_main={int(keep.sum())} main={_r(main)}")
 
     def object_points(self, name) -> np.ndarray | None:
         """The object's world points: eroded mask back-projected through depth (fixtures: calibrated)."""
@@ -191,7 +414,7 @@ class Perception:
         return self._segment_groundedsam(rgb)
 
     def _segment_sam_vlm(self, rgb) -> dict:
-        """Class-agnostic SAM regions named once by a VLM; later frames re-identify by position."""
+        """Class-agnostic SAM regions named once by a VLM. Later frames re-identify by position."""
         masks = self._sam_masks(rgb)
         centroids = [self._world_centroid(m) for m in masks]
         keep = [(m, c) for m, c in zip(masks, centroids) if c is not None]
@@ -220,7 +443,7 @@ class Perception:
                 m = m & within
             if int(m.sum()) < _MIN_PIXELS:
                 continue
-            if any(_mask_iou(m, o) > 0.7 for o in out):   # SAM auto returns nested masks; keep the larger
+            if any(_mask_iou(m, o) > 0.7 for o in out):   # SAM auto returns nested masks, keep the larger
                 continue
             out.append(m)
             if len(out) >= 20:
@@ -233,15 +456,18 @@ class Perception:
         return self.points[sel].mean(axis=0) if int(sel.sum()) >= 20 else None
 
     def _vlm_identify(self, rgb, masks, centroids) -> dict:
-        """Ask GPT-4o which numbered region is which named object; cache each name's centroid."""
+        """Ask GPT-4o which numbered region is which named object, caching each name's centroid."""
         names = list(self.prompts)
+        # Build the format example from THIS task's own names: a fixed example (pear/apple) primes the
+        # VLM with objects that do not exist in another task's scene.
+        example = ", ".join(f'"{n}": {i}' for i, n in enumerate(names[:2])) or '"<name>": 0'
         prompt = (
             f"The image shows a scene; candidate regions are outlined in red and numbered 0 to {len(masks) - 1}. "
             "Some regions are the table, the background, or a part of an object -- ignore those. "
             f"For each object in this list, give the number of the region that IS that object: {names}. "
             "If an object is not visible, use -1. "
             'Reply with only a JSON object mapping each name to its integer region number, '
-            'e.g. {"pear": 3, "apple": 7}.')
+            f'e.g. {{{example}}}.')
         overlay = self._mask_overlay(rgb, masks)
         try:                                           # keep the exact image the VLM saw, for inspection
             dbg = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -308,7 +534,7 @@ class Perception:
     def _segment_groundedsam(self, rgb) -> dict:
         """RGB -> ``{name: binary mask}``, with the labels competing for objects one-to-one."""
         # Deferred, not hoistable: the vision-backend import order is load-bearing (see _backends).
-        from moka.vision.segmentation import load_pil_image
+        from vlm_dp.vision_backends import load_pil_image
 
         _, image_torch = load_pil_image(Image.fromarray(rgb).convert("RGB"))
         H, W = rgb.shape[:2]
@@ -328,8 +554,14 @@ class Perception:
         out = {}
         for i, name in enumerate(order):
             m = masks[i, 0].cpu().numpy()
-            if int(m.sum()) >= _MIN_PIXELS:
-                out[name] = m
+            if int(m.sum()) < _MIN_PIXELS:
+                continue
+            escaped = _mask_escape(m, boxes[name])
+            if escaped > _MASK_ESCAPE_TOL:               # see _mask_escape: a mask that left its own box
+                print(f"[perception] '{name}' mask escaped its detection box "
+                      f"({escaped:.0f}px average bleed); rejected this frame", flush=True)
+                continue
+            out[name] = m
         return out
 
     def _detect(self, image_torch, W, H) -> dict:

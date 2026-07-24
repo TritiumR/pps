@@ -15,4 +15,7 @@ def guard_cost(cost):
         def target(self, *a, **k):
             return self._c.target(*a, **k)
 
+        def __getattr__(self, name):
+            return getattr(self._c, name)
+
     return _Guarded(cost)

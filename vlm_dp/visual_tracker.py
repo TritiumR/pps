@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import functools
+import os
 
 import cv2
 import numpy as np
@@ -13,13 +14,21 @@ from rekep.rekep_viz import world_to_pixel
 
 @functools.lru_cache(maxsize=1)
 def load_cotracker(device: str = "cuda"):
-    """Load the CoTracker3 online predictor once (early, with the other vision backends)."""
-    model = torch.hub.load("facebookresearch/co-tracker", "cotracker3_online", trust_repo=True)
+    """Load the CoTracker3 online predictor once (early, with the other vision backends).
+
+    From the local torch.hub cache when present, so a per-seed build never hits github (its ref check
+    crashed the run when github was flaky). Falls back to a one-time download if absent.
+    """
+    hub_local = os.path.join(torch.hub.get_dir(), "facebookresearch_co-tracker_main")
+    if os.path.isdir(hub_local):
+        model = torch.hub.load(hub_local, "cotracker3_online", source="local")
+    else:
+        model = torch.hub.load("facebookresearch/co-tracker", "cotracker3_online", trust_repo=True)
     return model.to(device).eval()
 
 
 class VisualTracker:
-    """Tracks one pixel per object; ``step`` -> ``{name: world_pos}`` for objects placed this step."""
+    """Tracks one pixel per object. step returns {name: world_pos} for objects seen this step."""
 
     _TRACK_HW = (384, 680)
 
@@ -40,7 +49,7 @@ class VisualTracker:
         uv, _ = world_to_pixel(pts, cam.data.pos_w[0].detach().cpu().numpy(),
                                cam.data.quat_w_ros[0].detach().cpu().numpy(),
                                cam.data.intrinsic_matrices[0].detach().cpu().numpy())
-        # CoTracker query rows are (t, x, y); t stays 0, the first frame.
+        # CoTracker query rows are (t, x, y), with t held at 0 (the first frame).
         q = np.zeros((len(self.names), 3), dtype=np.float32)
         q[:, 1], q[:, 2] = uv[:, 0] * self.sx, uv[:, 1] * self.sy
         self._queries = torch.as_tensor(q, device=device)[None]
@@ -92,7 +101,7 @@ class VisualTracker:
         self._inited, self._ind = True, 0
 
     def _lift(self, uv, vis, points) -> dict:
-        """Track-res pixels + visibilities -> ``{name: world_pos}`` via the full-res world-point image."""
+        """Map track-res pixels and visibilities to {name: world_pos} via the full-res world-point image."""
         uv = uv.detach().cpu().numpy()
         vis = vis.detach().cpu().numpy()
         out = {}
