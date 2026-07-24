@@ -736,10 +736,16 @@ class SimFreeMPC:
             device=x_t.device,
             dtype=x_t.dtype,
         ).sqrt()
-        proposal_center = self._control_point_resample(
+        resampled = self._control_point_resample(
             x_t.detach()[0, :, :active_dims],
             opt_horizon,
-        ) / torch.clamp(sqrt_alpha, min=self.config.flow_eps)
+        )
+        # Priority cost (vlm_dp CompositeCost) scores raw-action candidates and needs the unscaled
+        # center. Scaled (z_t / sqrt(alpha_bar)) stays default for the grasp_flow / proxy path.
+        if self.config.cost_style == "priority":
+            proposal_center = resampled
+        else:
+            proposal_center = resampled / torch.clamp(sqrt_alpha, min=self.config.flow_eps)
         self._configure_sampler_proposal(
             policy_inputs,
             context,
