@@ -1,0 +1,35 @@
+# ReKep front-end config for the IsaacLab port: keypoint proposal, VLM constraint
+# generation, and the subgoal-pose solver.
+
+device: &device cuda
+seed: &seed 0
+
+# World-frame workspace box for filtering keypoint candidates. Fallback values;
+# normally overridden per scene at runtime from the object poses.
+bounds_min: &bounds_min [-2.0, -2.0, 0.0]
+bounds_max: &bounds_max [12.0, 2.0, 2.0]
+margin: 0.6   # padding added around the scene objects when deriving those bounds
+
+keypoint_proposer:
+  num_candidates_per_mask: 5    # candidate keypoints clustered per object mask
+  min_dist_bt_keypoints: 0.03   # merge keypoints closer than this (m). Must stay well below the spacing
+                                # between distinct objects: at 0.06 the fruits (8-10cm across, sitting
+                                # adjacent) had their keypoints merged across object boundaries, so a
+                                # numbered keypoint no longer belonged to one object and the VLM's choice
+                                # landed on a neighbour (correct object selection 2/5 -> 4/5 at 0.03).
+  max_mask_ratio: 0.5           # skip masks covering more than this fraction of the image
+  dino_model: dinov2_vits14     # DINOv2 backbone (any dinov2_vit{s,b,l,g}14; patch size is 14)
+  device: *device
+  bounds_min: *bounds_min
+  bounds_max: *bounds_max
+  seed: *seed
+
+constraint_generator:   # VLM that writes the relational constraints
+  model: gpt-4o
+  temperature: 0.0
+  max_tokens: 2048
+
+subgoal_solver:   # optimizes the next end-effector subgoal pose
+  sampling_maxfun: 2000   # global-search evaluation budget
+  minimizer_options:
+    maxiter: 200          # local refinement iterations
