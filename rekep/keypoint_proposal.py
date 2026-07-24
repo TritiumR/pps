@@ -6,6 +6,8 @@ Ported from upstream ReKep; PPS tweaks are a config-selectable DINOv2 backbone a
 epsilon guards for the degenerate tiny masks IsaacLab instance-seg can produce.
 """
 
+import os
+
 import cv2
 import numpy as np
 import torch
@@ -20,8 +22,14 @@ class KeypointProposer:
     def __init__(self, config):
         self.config = config
         self.device = torch.device(self.config["device"])
-        self.dinov2 = torch.hub.load(
-            "facebookresearch/dinov2", self.config.get("dino_model", "dinov2_vits14")).eval().to(self.device)
+        # Load DINOv2 from the local torch.hub cache when present, so grounding never hits github (its
+        # ref check runs on every seed and a flaky response there crashed mid-run). Download once if absent.
+        dino_model = self.config.get("dino_model", "dinov2_vits14")
+        hub_local = os.path.join(torch.hub.get_dir(), "facebookresearch_dinov2_main")
+        if os.path.isdir(hub_local):
+            self.dinov2 = torch.hub.load(hub_local, dino_model, source="local").eval().to(self.device)
+        else:
+            self.dinov2 = torch.hub.load("facebookresearch/dinov2", dino_model).eval().to(self.device)
         self.bounds_min = np.array(self.config["bounds_min"])
         self.bounds_max = np.array(self.config["bounds_max"])
         # n_jobs=1, NOT 32: the parallel reduction makes the cluster count/ordering non-deterministic, so the

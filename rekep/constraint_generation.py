@@ -27,7 +27,10 @@ class ConstraintGenerator:
     def __init__(self, config):
         self.config = config
         self.client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-        with open(os.path.join(_PROMPT_DIR, "prompt_template.txt"), "r", encoding="utf-8") as f:
+        # Prompt file is selectable (env var) so alternates stay tracked as separate files, and the
+        # default is unchanged. The chosen prompt is also saved per-run as prompt.txt.
+        prompt_name = os.environ.get("REKEP_PROMPT_TEMPLATE", "prompt_template.txt")
+        with open(os.path.join(_PROMPT_DIR, prompt_name), "r", encoding="utf-8") as f:
             self.prompt_template = f.read()
         self.task_dir = None
 
