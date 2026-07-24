@@ -2521,6 +2521,55 @@ def _overlay_thermal_on_rgb(rgb_image, thermal_image, alpha=0.45):
     return cv2.addWeighted(rgb_image, 1.0 - alpha, thermal_image, alpha, 0.0)
 
 
+def _draw_vlm_overlay(image: np.ndarray, env, camera_name: str, vlm: dict) -> np.ndarray:
+    """Draw the VLM bridge's live state: numbered keypoints, the stage's target/seat geometry,
+    and the payload->seat line (the active place constraint)."""
+    try:
+        camera = env.scene[camera_name]
+    except Exception:
+        return image
+    out = image.copy()
+    height, width = out.shape[:2]
+
+    def px(p):
+        pts = torch.as_tensor(np.asarray(p, dtype=np.float32).reshape(-1, 3))
+        pix = _project_world_points_to_camera(pts, camera)
+        good = []
+        for u, v in pix:
+            if np.isfinite((u, v)).all() and 0 <= u < width and 0 <= v < height:
+                good.append((int(round(u)), int(round(v))))
+            else:
+                good.append(None)
+        return good
+
+    kps = vlm.get("keypoints")
+    if kps is not None and len(kps):
+        for i, at in enumerate(px(kps)):
+            if at is None:
+                continue
+            cv2.circle(out, at, 3, (0, 255, 255), -1, lineType=cv2.LINE_AA)
+            cv2.putText(out, str(i), (at[0] + 3, at[1] - 3),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1, cv2.LINE_AA)
+    payload = vlm.get("payload")
+    seat = vlm.get("seat")
+    if payload is not None and seat is not None:
+        a, b = px(np.stack([payload, seat]))
+        if a is not None and b is not None:
+            cv2.line(out, a, b, (255, 0, 255), 1, cv2.LINE_AA)
+    for key, color, marker in (("target", (0, 255, 0), cv2.MARKER_CROSS),
+                               ("seat", (255, 0, 255), cv2.MARKER_TILTED_CROSS),
+                               ("payload", (0, 165, 255), cv2.MARKER_DIAMOND)):
+        p = vlm.get(key)
+        if p is None:
+            continue
+        at = px(p)[0]
+        if at is not None:
+            cv2.drawMarker(out, at, color, marker, 10, 1, cv2.LINE_AA)
+    cv2.putText(out, f"{vlm.get('stage', '')}  {'HOLDING' if vlm.get('holding') else 'open'}",
+                (6, height - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+    return out
+
+
 def _build_rollout_frame(obs, use_thermal_overlay=False, debug_overlay=None):
     table_image = _to_uint8_image(obs["observation/exterior_image_1_left"])
     wrist_image = _to_uint8_image(obs["observation/wrist_image_left"])
@@ -2538,6 +2587,12 @@ def _build_rollout_frame(obs, use_thermal_overlay=False, debug_overlay=None):
         axes = debug_overlay.get("axes", {})
         table_image = _draw_projected_debug_axes(table_image, env, "table_cam", axes)
         wrist_image = _draw_projected_debug_axes(wrist_image, env, "wrist_cam", axes)
+        vlm = debug_overlay.get("vlm")
+        if vlm is not None:
+            try:
+                table_image = _draw_vlm_overlay(table_image, env, "table_cam", vlm)
+            except Exception as exc:
+                print(f"[vlm_dp] overlay draw failed: {exc}", flush=True)
 
     frame = np.concatenate((table_image, wrist_image), axis=1)
     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -3006,7 +3061,7 @@ def parse_args():
     )
     parser.add_argument(
         "--vlm_cost",
-        choices=("none", "gt", "rekep_fake", "rekep_real"),
+        choices=("none", "gt", "rekep_fake", "rekep_real", "rekep_fake_vlm", "rekep_real_vlm"),
         default="none",
         help=(
             "Attach the ReKep CompositeCost (via vlm_dp.VlmDpBridge) to the sim-free MPC planner, "
@@ -3014,6 +3069,50 @@ def parse_args():
             "mode (--vlm_base/--task_steer/--full_steer) and --mpc_cost priority. Default 'none' "
             "leaves the planner untouched."
         ),
+    )
+    parser.add_argument(
+        "--vlm_cost_config",
+        type=str,
+        default=os.path.join("vlm_dp", "configs", "base.yaml"),
+        help="Cost config YAML for --vlm_cost (term weights + gripper geometry).",
+    )
+    parser.add_argument(
+        "--vlm_state",
+        choices=("gt", "real"),
+        default="gt",
+        help=(
+            "Object-state source for --vlm_cost: 'gt' reads poses from the sim; 'real' builds a "
+            "SensedWorld (GroundedSAM perception + FK-while-held from the aperture sensor)."
+        ),
+    )
+    parser.add_argument(
+        "--vlm_track",
+        choices=("fk", "reperceive", "visual"),
+        default="fk",
+        help=(
+            "Between-look tracking for --vlm_state real: 'fk' dead-reckons the held object only; "
+            "'reperceive' re-segments periodically; 'visual' corrects per step from CoTracker."
+        ),
+    )
+    parser.add_argument(
+        "--vlm_segment",
+        choices=("groundedsam", "sam_vlm"),
+        default="groundedsam",
+        help="Segmenter for --vlm_state real: text-grounded boxes, or SAM regions named by a VLM.",
+    )
+    parser.add_argument(
+        "--vlm_vocab",
+        default=None,
+        help="Comma-separated object names to restrict the perception vocabulary to (detector text kept "
+             "from the task_prompts.json objects entry). Unnamed objects become anonymous obstacle blobs "
+             "instead of tracked entities. Default None keeps the full declared vocabulary.",
+    )
+    parser.add_argument(
+        "--vlm_derive_vocab",
+        action="store_true",
+        help="Derive the object vocabulary and roles from the instruction (GPT-4o), ignoring any declared "
+             "objects entry. Only referents are named; distractors and fixtures become anonymous obstacle "
+             "blobs and the support surface is measured geometrically. The generalizable, zero-config path.",
     )
     parser.add_argument(
         "--mpc_optimize_space",
@@ -3224,6 +3323,11 @@ if score_steering_mode in ("full", "task"):
         )
 if score_steering_mode == "base" and (args.only_steer or args.compare_difference):
     parser.error("--vlm_base is base-only and cannot be combined with --only_steer or --compare_difference.")
+if args.vlm_state == "real" and args.vlm_cost == "none":
+    parser.error("--vlm_state real only affects the --vlm_cost bridge; set --vlm_cost as well.")
+if args.vlm_track != "fk" and args.vlm_state != "real":
+    parser.error(f"--vlm_track {args.vlm_track} corrects a sensed world and needs --vlm_state real; "
+                 "--vlm_state gt reads object poses from the simulator and ignores tracking.")
 if args.mpc_cost == "capsule_flow" and "capsule" not in args.task.lower():
     parser.error(
         "--mpc_cost capsule_flow requires a capsule task, for example "
@@ -3284,9 +3388,10 @@ print(f"Environment name: {env_name}", flush=True)
 print("Parsing env cfg...", flush=True)
 env_cfg = parse_env_cfg(env_name, device=args.device, num_envs=1)
 
-if args.vlm_cost in ("rekep_fake", "rekep_real"):
-    # The ReKep keypoint proposal reads depth + instance segmentation from table_cam; the
-    # annotators must be added to the cfg before gym.make. RGB-only otherwise (byte-identical).
+if args.vlm_cost.startswith("rekep") or args.vlm_state == "real":
+    # The ReKep keypoint proposal and the SensedWorld perception read depth (+ instance seg for
+    # fixture calibration) from table_cam; the annotators must be added to the cfg before
+    # gym.make. RGB-only otherwise (byte-identical). startswith("rekep") covers the _vlm variants too.
     from rekep import isaaclab_helpers as _rekep_helpers
 
     _rekep_helpers.augment_table_cam_with_depth_and_seg(env_cfg)
@@ -3449,8 +3554,41 @@ if args.vlm_cost != "none":
             "the sim-free MPC planner is only built under those modes."
         )
     _vlm_entry = _task_prompt_entry(args.task) or {}
-    _vlm_roles = {k: _vlm_entry[k] for k in ("grasp_obj", "place_obj", "grasp_objs") if k in _vlm_entry}
-    with open(os.path.join(_REPO_DIR, "vlm_dp", "configs", "base.yaml")) as _f:
+    _vlm_roles = {k: _vlm_entry[k]
+                  for k in ("grasp_obj", "place_obj", "grasp_objs", "support") if k in _vlm_entry}
+    _vlm_vocab = _vlm_entry.get("objects")
+    if args.vlm_derive_vocab:
+        # Force the generalizable path: ignore any declared objects and roles, derive both from the
+        # instruction. Support is not named here, so it falls to the geometric derivation (A.2).
+        _vlm_vocab = None
+        _vlm_roles.pop("support", None)
+        _vlm_entry = {**_vlm_entry, "objects": None}
+    if args.vlm_vocab and _vlm_vocab is not None:
+        # Restrict to the named subset, keeping each name's detector text. Dropped objects are not
+        # detected or tracked; they enter the cost as anonymous obstacle blobs instead. Isolates the
+        # effect of naming distractors (they can capture a keypoint's identity when tracked).
+        _keep = [n.strip() for n in args.vlm_vocab.split(",") if n.strip()]
+        _missing = [n for n in _keep if n not in _vlm_vocab]
+        if _missing:
+            raise SystemExit(f"--vlm_vocab names {_missing} not in the task's objects {list(_vlm_vocab)}")
+        _vlm_vocab = {n: _vlm_vocab[n] for n in _keep}
+        print(f"[vocabulary] restricted to {list(_vlm_vocab)} (dropped "
+              f"{[n for n in _vlm_entry['objects'] if n not in _vlm_vocab]})", flush=True)
+    if _vlm_vocab is None and args.vlm_cost != "none":
+        # No hand-authored vocabulary -> read it off the instruction, so a new task needs no config.
+        # A declared entry still wins, so existing tasks are untouched until each is A/B'd across.
+        from vlm_dp.grounding.vocabulary import derive as _derive_vocab
+
+        _derived = _derive_vocab(_vlm_entry.get("prompt") or args.prompt or "")
+        _vlm_vocab = _derived["objects"]
+        for _k in ("grasp_objs", "place_obj"):
+            if _k not in _vlm_roles and _derived.get(_k):
+                _vlm_roles[_k] = _derived[_k]
+        if "grasp_obj" not in _vlm_roles and _derived["grasp_objs"]:
+            _vlm_roles["grasp_obj"] = _derived["grasp_objs"][0]
+        print(f"[vocabulary] derived from the instruction: objects={_vlm_vocab} "
+              f"grasp_objs={_derived['grasp_objs']} place_obj={_derived['place_obj']}", flush=True)
+    with open(os.path.join(_REPO_DIR, args.vlm_cost_config)) as _f:
         _vlm_cost_cfg = yaml.safe_load(_f)
     vlm_bridge = VlmDpBridge(
         args.vlm_cost,
@@ -3458,11 +3596,16 @@ if args.vlm_cost != "none":
         _vlm_cost_cfg,
         task_key=_task_name_for_mpc(args.task),
         device=args.device,
+        state=args.vlm_state,
+        track=args.vlm_track,
+        segment=args.vlm_segment,
+        vocab=_vlm_vocab,
+        fixtures=_vlm_entry.get("fixtures", ()),
     )
     vlm_bridge.attach_cost(mpc_planner)
     print(
-        f"[vlm_dp] CompositeCost attached: ground={args.vlm_cost}, roles={_vlm_roles}, "
-        f"terms={list(_vlm_cost_cfg['cost']['terms'])}",
+        f"[vlm_dp] CompositeCost attached: ground={args.vlm_cost}, state={args.vlm_state}, "
+        f"roles={_vlm_roles}, terms={list(_vlm_cost_cfg['cost']['terms'])}",
         flush=True,
     )
 
@@ -3764,20 +3907,21 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                 # run inference
                 with torch.no_grad():
                     infer_start = time.perf_counter()
+                    warm_shift_steps = (
+                        0 if actions is None else max(step_idx - action_start_step, 0)
+                    )
                     if args.vlm_cost != "none":
                         vlm_bridge.advance(_debug_subtasks(env_obs_dict))
                     mpc_context = (
                         None
                         if standalone_role is not None
                         else (
-                            vlm_bridge.context(env, env_obs_dict)
+                            vlm_bridge.context(env, env_obs_dict, warm_shift_steps)
                             if args.vlm_cost != "none"
                             else build_mpc_context(env, env_obs_dict, args)
                         )
                     )
-                    warm_shift_steps = (
-                        0 if actions is None else max(step_idx - action_start_step, 0)
-                    )
+
                     actions, compare_stats = infer_actions_with_mpc(
                         base_policy,
                         task_policy,
@@ -3789,7 +3933,7 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                         warm_shift_steps=warm_shift_steps,
                     )
                     if args.vlm_cost != "none":
-                        vlm_bridge.observe_plan(actions, steps_per_inference)
+                        vlm_bridge.observe_plan(actions)
                     infer_elapsed = time.perf_counter() - infer_start
                     if args.mpc_debug:
                         _write_mpc_debug_log(
@@ -3901,6 +4045,12 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                         axis_length=args.mpc_debug_axis_length,
                     ),
                 }
+            if vlm_bridge is not None:
+                debug_overlay = debug_overlay or {"env": env, "axes": {}}
+                try:
+                    debug_overlay["vlm"] = vlm_bridge.viz()
+                except Exception as exc:
+                    print(f"[vlm_dp] viz overlay failed: {exc}", flush=True)
             vis_image = _build_rollout_frame(
                 obs,
                 use_thermal_overlay=False,
