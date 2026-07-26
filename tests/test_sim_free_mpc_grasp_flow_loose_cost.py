@@ -10,6 +10,7 @@ torch = pytest.importorskip("torch")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sim_free_mpc.costs_grasp_flow_loose import (  # noqa: E402
+    GraspFlowCostWeights,
     GraspFlowStateCost as LooseGraspFlowStateCost,
 )
 from sim_free_mpc.costs_explore import (  # noqa: E402
@@ -260,7 +261,10 @@ def test_grasp_has_no_recovery_gripper_gate() -> None:
 
 
 def test_straddle_uses_effective_radius_at_each_finger_height() -> None:
-    cost = LooseGraspFlowStateCost("Isaac-Weight-Droid-Visuomotor-v0")
+    cost = LooseGraspFlowStateCost(
+        "Isaac-Weight-Droid-Visuomotor-v0",
+        weights=GraspFlowCostWeights(straddle=30.0),
+    )
     half_height = _WEIGHT_OBJECT_HALF_HEIGHT["pear"]
     context = {
         "eef_pos": torch.zeros(3),
@@ -285,5 +289,3 @@ def test_straddle_uses_effective_radius_at_each_finger_height() -> None:
 
     assert terms["straddle"][0] > 0.0
     assert terms["straddle"][1] == pytest.approx(0.0, abs=1e-7)
-
-
