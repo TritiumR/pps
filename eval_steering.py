@@ -2421,6 +2421,13 @@ def _debug_subtasks(env_obs_dict) -> dict[str, bool]:
     }
 
 
+def _observe_mpc_subtasks(mpc_planner, subtasks: dict[str, bool]) -> None:
+    cost = getattr(mpc_planner, "cost", None)
+    observer = getattr(cost, "observe_subtasks", None)
+    if callable(observer):
+        observer(subtasks)
+
+
 def _debug_phase_from_subtasks(task_name: str, subtasks: dict[str, bool]) -> str:
     task = task_name.lower()
     if "weight" in task:
@@ -4576,6 +4583,7 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
         vlm_bridge.reset(env)
 
     current_subtasks = _debug_subtasks(env_obs_dict)
+    _observe_mpc_subtasks(mpc_planner, current_subtasks)
     current_phase = _debug_phase_from_subtasks(args.task, current_subtasks)
     print(f"phase seed={seed} step=0 {current_phase} subtasks={current_subtasks}", flush=True)
     _write_mpc_debug_log(
@@ -4725,6 +4733,7 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                     env_obs_dict = env.observation_manager.compute(update_history=True)
 
             next_subtasks = _debug_subtasks(env_obs_dict)
+            _observe_mpc_subtasks(mpc_planner, next_subtasks)
             next_phase = _debug_phase_from_subtasks(args.task, next_subtasks)
             if next_phase != current_phase:
                 print(
