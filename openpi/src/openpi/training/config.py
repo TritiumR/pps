@@ -6302,6 +6302,27 @@ _CONFIGS = [
         batch_size=32,
     ),
     TrainConfig(
+        name="score_task_tea",
+        model=proxy_score_config.ProxyScoreConfig(
+            action_horizon=15,
+            action_dim=8,
+            action_expert_variant="gemma_12m",
+            dino_model_name="facebook/dinov3-vits16-pretrain-lvd1689m",
+            ddim_num_train_timesteps=100,
+            prediction_type="epsilon",
+        ),
+        data=ProxyLeRobotDROIDJointPosDataConfig(
+            repo_id="local/isaaclab_tea_score",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="local/isaaclab_tea_score"),
+            norm_stats_dir="checkpoints/pytorch/pi05_droid_jointpos/assets/droid",
+            use_quantile_norm=True,
+        ),
+        num_train_steps=30_000,
+        save_interval=1_000,
+        batch_size=32,
+    ),
+    TrainConfig(
         name="proxy_isaaclab_droid_tea_new_pi05_jointpos",
         model=proxy_config.ProxyConfig(
             action_horizon=15,

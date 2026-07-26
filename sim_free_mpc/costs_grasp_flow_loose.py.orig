@@ -22,8 +22,7 @@ from .costs_explore import (
 )
 
 _GRASP_FLOW_TCP_TO_TIP_Z = 0.0
-_GRASP_FLOW_CENTER_REGION_RADIUS_SCALE = 0.40
-_GRASP_FLOW_CLOSE_REGION_RADIUS_SCALE = 0.40
+_GRASP_FLOW_CENTER_REGION_RADIUS_SCALE = 1.00
 _GRASP_FLOW_PLACE_RELEASE_CLEARANCE_Z = 0.04
 _GRASP_FLOW_PLACE_CARRY_CLEARANCE_Z = 0.20
 _GRASP_FLOW_LIFT_HEIGHT = 0.15
@@ -391,35 +390,13 @@ class GraspFlowStateCost:
             terms["straddle"] = weights.straddle * torch.mean(penetration, dim=1)
 
             if real_actions.shape[-1] > 7:
-                close_xy_radius = float(
-                    context.get(
-                        "gripper_close_region_radius",
-                        _GRASP_FLOW_CLOSE_REGION_RADIUS_SCALE * object_radius,
-                    )
+                center_excess = torch.clamp(center_err - center_radius, min=0.0)
+                outside_fraction = torch.clamp(
+                    center_excess / max(center_radius, 1e-3),
+                    max=1.0,
                 )
-                close_z_tolerance = float(
-                    context.get("gripper_close_z_tolerance", finger_r)
-                )
-                observed_tcp = _first_tensor(
-                    context,
-                    "eef_pos",
-                    device=device,
-                    dtype=dtype,
-                )
-                if observed_tcp is None:
-                    close_ready = torch.zeros((), device=device, dtype=dtype)
-                else:
-                    observed_xy_error = torch.linalg.vector_norm(
-                        observed_tcp[:2] - grasp_center[:2]
-                    )
-                    observed_z_error = (observed_tcp[2] - grasp_center[2]).abs()
-                    close_ready = torch.logical_and(
-                        observed_xy_error <= close_xy_radius,
-                        observed_z_error <= close_z_tolerance,
-                    ).to(dtype=dtype)
-
+                close_target = 1.0 - outside_fraction
                 gripper = real_actions[..., 7]
-                close_target = close_ready.view(1, 1).expand_as(gripper)
                 terms["close_gripper"] = weights.close_gripper * torch.mean(
                     (gripper - close_target).pow(2),
                     dim=1,
