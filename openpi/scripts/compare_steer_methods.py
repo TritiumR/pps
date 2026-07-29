@@ -35,6 +35,7 @@ from openpi.serving.websocket_policy_server import (
     infer_actions,
     infer_actions_compiled,
 )
+from openpi.models_pytorch.proxy_pytorch import build_proxy_expert_masks
 from openpi.training import config as _config
 
 
@@ -204,7 +205,7 @@ def step_by_step_comparison(
         use_cache=True,
     )
 
-    orig_steer_prefix_embs, orig_steer_prefix_pad_masks, _ = steer_model.embed_prefix(images, img_masks)
+    orig_steer_prefix_embs, orig_steer_prefix_pad_masks, orig_steer_prefix_att_masks = steer_model.embed_prefix(images, img_masks)
 
     share_proxy_dino = (
         steer_model.config.freeze_dino_encoder
@@ -214,8 +215,9 @@ def step_by_step_comparison(
     if share_proxy_dino:
         orig_mimic_prefix_embs = orig_steer_prefix_embs
         orig_mimic_prefix_pad_masks = orig_steer_prefix_pad_masks
+        orig_mimic_prefix_att_masks = orig_steer_prefix_att_masks
     else:
-        orig_mimic_prefix_embs, orig_mimic_prefix_pad_masks, _ = mimic_model.embed_prefix(images, img_masks)
+        orig_mimic_prefix_embs, orig_mimic_prefix_pad_masks, orig_mimic_prefix_att_masks = mimic_model.embed_prefix(images, img_masks)
 
     # ---------- COMPILED PATH (eager mode of _steer_forward_all) ----------
     base_model.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"
@@ -248,12 +250,12 @@ def step_by_step_comparison(
         )
 
         if denoise_time >= steer_args.steer_step:
-            steer_suffix_embs, steer_suffix_pad_masks, _, steer_adarms_cond = (
+            steer_suffix_embs, steer_suffix_pad_masks, steer_suffix_att_masks, steer_adarms_cond = (
                 steer_model.embed_suffix(
                     state[:, :proxy_action_dim], orig_x_t[:, :, :proxy_action_dim], expanded_time,
                 )
             )
-            mimic_suffix_embs, mimic_suffix_pad_masks, _, mimic_adarms_cond = (
+            mimic_suffix_embs, mimic_suffix_pad_masks, mimic_suffix_att_masks, mimic_adarms_cond = (
                 mimic_model.embed_suffix(
                     state[:, :proxy_action_dim], orig_x_t[:, :, :proxy_action_dim], expanded_time,
                 )
@@ -261,14 +263,20 @@ def step_by_step_comparison(
 
             steer_embs = torch.cat([orig_steer_prefix_embs, steer_suffix_embs], dim=1)
             mimic_embs = torch.cat([orig_mimic_prefix_embs, mimic_suffix_embs], dim=1)
-            steer_pad_masks = torch.cat([orig_steer_prefix_pad_masks, steer_suffix_pad_masks], dim=1)
-            mimic_pad_masks = torch.cat([orig_mimic_prefix_pad_masks, mimic_suffix_pad_masks], dim=1)
+            steer_attention_mask, steer_pad_masks = build_proxy_expert_masks(
+                steer_model, orig_steer_prefix_pad_masks, orig_steer_prefix_att_masks,
+                steer_suffix_pad_masks, steer_suffix_att_masks,
+            )
+            mimic_attention_mask, mimic_pad_masks = build_proxy_expert_masks(
+                mimic_model, orig_mimic_prefix_pad_masks, orig_mimic_prefix_att_masks,
+                mimic_suffix_pad_masks, mimic_suffix_att_masks,
+            )
 
             steer_position_ids = (torch.cumsum(steer_pad_masks, dim=1) - 1).to(dtype=torch.long)
             mimic_position_ids = (torch.cumsum(mimic_pad_masks, dim=1) - 1).to(dtype=torch.long)
 
             steer_hidden_states, _ = steer_model.expert_model.forward(
-                attention_mask=steer_pad_masks,
+                attention_mask=steer_attention_mask,
                 position_ids=steer_position_ids,
                 past_key_values=None,
                 inputs_embeds=steer_embs,
@@ -276,7 +284,7 @@ def step_by_step_comparison(
                 adarms_cond=steer_adarms_cond,
             )
             mimic_hidden_states, _ = mimic_model.expert_model.forward(
-                attention_mask=mimic_pad_masks,
+                attention_mask=mimic_attention_mask,
                 position_ids=mimic_position_ids,
                 past_key_values=None,
                 inputs_embeds=mimic_embs,

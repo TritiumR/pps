@@ -31,6 +31,7 @@ from openpi.serving.websocket_policy_server import (
     infer_actions_fast,
     infer_actions_compiled,
 )
+from openpi.models_pytorch.proxy_pytorch import build_proxy_expert_masks
 from openpi.training import config as _config
 
 
@@ -242,7 +243,7 @@ def run_component_breakdown(base_policy, steer_policy, mimic_policy, obs, steer_
             # --- Proxy prefix (one-time) ---
             ev_start.record()
 
-            steer_prefix_embs, steer_prefix_pad_masks, _ = steer_model.embed_prefix(images, img_masks)
+            steer_prefix_embs, steer_prefix_pad_masks, steer_prefix_att_masks = steer_model.embed_prefix(images, img_masks)
             if (
                 steer_model.config.freeze_dino_encoder
                 and mimic_model.config.freeze_dino_encoder
@@ -250,8 +251,9 @@ def run_component_breakdown(base_policy, steer_policy, mimic_policy, obs, steer_
             ):
                 mimic_prefix_embs = steer_prefix_embs
                 mimic_prefix_pad_masks = steer_prefix_pad_masks
+                mimic_prefix_att_masks = steer_prefix_att_masks
             else:
-                mimic_prefix_embs, mimic_prefix_pad_masks, _ = mimic_model.embed_prefix(images, img_masks)
+                mimic_prefix_embs, mimic_prefix_pad_masks, mimic_prefix_att_masks = mimic_model.embed_prefix(images, img_masks)
 
             ev_end.record()
             torch.cuda.synchronize()
@@ -275,7 +277,7 @@ def run_component_breakdown(base_policy, steer_policy, mimic_policy, obs, steer_
 
             # steer embed_suffix
             ev_start.record()
-            steer_suffix_embs, steer_suffix_pad_masks, _, steer_adarms_cond = (
+            steer_suffix_embs, steer_suffix_pad_masks, steer_suffix_att_masks, steer_adarms_cond = (
                 steer_model.embed_suffix(state[:, :proxy_action_dim], x_t[:, :, :proxy_action_dim], expanded_time)
             )
             ev_end.record()
@@ -284,7 +286,7 @@ def run_component_breakdown(base_policy, steer_policy, mimic_policy, obs, steer_
 
             # mimic embed_suffix
             ev_start.record()
-            mimic_suffix_embs, mimic_suffix_pad_masks, _, mimic_adarms_cond = (
+            mimic_suffix_embs, mimic_suffix_pad_masks, mimic_suffix_att_masks, mimic_adarms_cond = (
                 mimic_model.embed_suffix(state[:, :proxy_action_dim], x_t[:, :, :proxy_action_dim], expanded_time)
             )
             ev_end.record()
@@ -293,12 +295,15 @@ def run_component_breakdown(base_policy, steer_policy, mimic_policy, obs, steer_
 
             # steer expert forward
             steer_embs = torch.cat([steer_prefix_embs, steer_suffix_embs], dim=1)
-            steer_pad_masks = torch.cat([steer_prefix_pad_masks, steer_suffix_pad_masks], dim=1)
+            steer_attention_mask, steer_pad_masks = build_proxy_expert_masks(
+                steer_model, steer_prefix_pad_masks, steer_prefix_att_masks,
+                steer_suffix_pad_masks, steer_suffix_att_masks,
+            )
             steer_position_ids = torch.cumsum(steer_pad_masks, dim=1).to(dtype=torch.long) - 1
 
             ev_start.record()
             steer_hidden_states, _ = steer_model.expert_model.forward(
-                attention_mask=steer_pad_masks,
+                attention_mask=steer_attention_mask,
                 position_ids=steer_position_ids,
                 past_key_values=None,
                 inputs_embeds=steer_embs,
@@ -311,12 +316,15 @@ def run_component_breakdown(base_policy, steer_policy, mimic_policy, obs, steer_
 
             # mimic expert forward
             mimic_embs = torch.cat([mimic_prefix_embs, mimic_suffix_embs], dim=1)
-            mimic_pad_masks = torch.cat([mimic_prefix_pad_masks, mimic_suffix_pad_masks], dim=1)
+            mimic_attention_mask, mimic_pad_masks = build_proxy_expert_masks(
+                mimic_model, mimic_prefix_pad_masks, mimic_prefix_att_masks,
+                mimic_suffix_pad_masks, mimic_suffix_att_masks,
+            )
             mimic_position_ids = torch.cumsum(mimic_pad_masks, dim=1).to(dtype=torch.long) - 1
 
             ev_start.record()
             mimic_hidden_states, _ = mimic_model.expert_model.forward(
-                attention_mask=mimic_pad_masks,
+                attention_mask=mimic_attention_mask,
                 position_ids=mimic_position_ids,
                 past_key_values=None,
                 inputs_embeds=mimic_embs,

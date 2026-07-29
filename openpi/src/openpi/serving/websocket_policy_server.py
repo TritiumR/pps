@@ -12,6 +12,10 @@ import websockets.frames
 import copy
 import torch
 from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
+from openpi.models_pytorch.proxy_pytorch import (
+    build_proxy_expert_masks,
+    build_proxy_prefix_mask,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -120,12 +124,13 @@ def _steer_forward_all(
     )
 
     # --- Proxy prefix (DINO) ---
-    steer_prefix_embs, steer_prefix_pad_masks, _ = steer_model.embed_prefix(images, img_masks)
+    steer_prefix_embs, steer_prefix_pad_masks, steer_prefix_att_masks = steer_model.embed_prefix(images, img_masks)
     if share_proxy_dino:
         mimic_prefix_embs = steer_prefix_embs
         mimic_prefix_pad_masks = steer_prefix_pad_masks
+        mimic_prefix_att_masks = steer_prefix_att_masks
     else:
-        mimic_prefix_embs, mimic_prefix_pad_masks, _ = mimic_model.embed_prefix(images, img_masks)
+        mimic_prefix_embs, mimic_prefix_pad_masks, mimic_prefix_att_masks = mimic_model.embed_prefix(images, img_masks)
 
     # --- Denoising loop ---
     bsize = x_t.shape[0]
@@ -140,12 +145,12 @@ def _steer_forward_all(
             state, base_prefix_pad_masks, base_past_key_values, x_t, expanded_time,
         )
 
-        steer_suffix_embs, steer_suffix_pad_masks, _, steer_adarms_cond = (
+        steer_suffix_embs, steer_suffix_pad_masks, steer_suffix_att_masks, steer_adarms_cond = (
             steer_model.embed_suffix(
                 state[:, :proxy_action_dim], x_t[:, :, :proxy_action_dim], expanded_time,
             )
         )
-        mimic_suffix_embs, mimic_suffix_pad_masks, _, mimic_adarms_cond = (
+        mimic_suffix_embs, mimic_suffix_pad_masks, mimic_suffix_att_masks, mimic_adarms_cond = (
             mimic_model.embed_suffix(
                 state[:, :proxy_action_dim], x_t[:, :, :proxy_action_dim], expanded_time,
             )
@@ -153,14 +158,20 @@ def _steer_forward_all(
 
         steer_embs = torch.cat([steer_prefix_embs, steer_suffix_embs], dim=1)
         mimic_embs = torch.cat([mimic_prefix_embs, mimic_suffix_embs], dim=1)
-        steer_pad_masks = torch.cat([steer_prefix_pad_masks, steer_suffix_pad_masks], dim=1)
-        mimic_pad_masks = torch.cat([mimic_prefix_pad_masks, mimic_suffix_pad_masks], dim=1)
+        steer_attention_mask, steer_pad_masks = build_proxy_expert_masks(
+            steer_model, steer_prefix_pad_masks, steer_prefix_att_masks,
+            steer_suffix_pad_masks, steer_suffix_att_masks,
+        )
+        mimic_attention_mask, mimic_pad_masks = build_proxy_expert_masks(
+            mimic_model, mimic_prefix_pad_masks, mimic_prefix_att_masks,
+            mimic_suffix_pad_masks, mimic_suffix_att_masks,
+        )
 
         steer_position_ids = (torch.cumsum(steer_pad_masks, dim=1) - 1).to(dtype=torch.long)
         mimic_position_ids = (torch.cumsum(mimic_pad_masks, dim=1) - 1).to(dtype=torch.long)
 
         steer_hidden_states, _ = steer_model.expert_model.forward(
-            attention_mask=steer_pad_masks,
+            attention_mask=steer_attention_mask,
             position_ids=steer_position_ids,
             past_key_values=None,
             inputs_embeds=steer_embs,
@@ -168,7 +179,7 @@ def _steer_forward_all(
             adarms_cond=steer_adarms_cond,
         )
         mimic_hidden_states, _ = mimic_model.expert_model.forward(
-            attention_mask=mimic_pad_masks,
+            attention_mask=mimic_attention_mask,
             position_ids=mimic_position_ids,
             past_key_values=None,
             inputs_embeds=mimic_embs,
@@ -399,8 +410,8 @@ def infer_actions_fast(
     )
 
     # ========== Proxy models prefix embedding and KV caching ==========
-    steer_prefix_embs, steer_prefix_pad_masks, _ = steer_model.embed_prefix(
-        images, img_masks
+    steer_prefix_embs, steer_prefix_pad_masks, steer_prefix_att_masks = (
+        steer_model.embed_prefix(images, img_masks)
     )
 
     # If the DINO encoder is frozen and the model names are the same,
@@ -412,9 +423,10 @@ def infer_actions_fast(
     ):
         mimic_prefix_embs = steer_prefix_embs
         mimic_prefix_pad_masks = steer_prefix_pad_masks
+        mimic_prefix_att_masks = steer_prefix_att_masks
     else:
-        mimic_prefix_embs, mimic_prefix_pad_masks, _ = mimic_model.embed_prefix(
-            images, img_masks
+        mimic_prefix_embs, mimic_prefix_pad_masks, mimic_prefix_att_masks = (
+            mimic_model.embed_prefix(images, img_masks)
         )
 
     # Cache KV for steer proxy model
@@ -424,7 +436,9 @@ def infer_actions_fast(
     logger.debug(f"Proxy prefix seq len: {steer_prefix_embs.shape[1]}")
 
     _, steer_past_key_values = steer_model.expert_model.forward(
-        attention_mask=steer_prefix_pad_masks,
+        attention_mask=build_proxy_prefix_mask(
+            steer_model, steer_prefix_pad_masks, steer_prefix_att_masks
+        ),
         position_ids=steer_prefix_position_ids,
         past_key_values=None,
         inputs_embeds=steer_prefix_embs,
@@ -437,7 +451,9 @@ def infer_actions_fast(
     mimic_prefix_position_ids = mimic_prefix_position_ids.to(dtype=torch.long)
 
     _, mimic_past_key_values = mimic_model.expert_model.forward(
-        attention_mask=mimic_prefix_pad_masks,
+        attention_mask=build_proxy_prefix_mask(
+            mimic_model, mimic_prefix_pad_masks, mimic_prefix_att_masks
+        ),
         position_ids=mimic_prefix_position_ids,
         past_key_values=None,
         inputs_embeds=mimic_prefix_embs,
@@ -486,7 +502,7 @@ def infer_actions_fast(
         )
 
         if denoise_time >= args.steer_step:
-            steer_suffix_embs, steer_suffix_pad_masks, _, steer_adarms_cond = (
+            steer_suffix_embs, steer_suffix_pad_masks, steer_suffix_att_masks, steer_adarms_cond = (
                 steer_model.embed_suffix(
                     state[:, :proxy_action_dim],
                     x_t[:, :, :proxy_action_dim],
@@ -494,7 +510,7 @@ def infer_actions_fast(
                 )
             )
 
-            mimic_suffix_embs, mimic_suffix_pad_masks, _, mimic_adarms_cond = (
+            mimic_suffix_embs, mimic_suffix_pad_masks, mimic_suffix_att_masks, mimic_adarms_cond = (
                 mimic_model.embed_suffix(
                     state[:, :proxy_action_dim],
                     x_t[:, :, :proxy_action_dim],
@@ -514,11 +530,23 @@ def infer_actions_fast(
             )
             mimic_suffix_position_ids = mimic_suffix_position_ids.to(dtype=torch.long)
 
-            steer_attention_mask = torch.cat(
-                [steer_prefix_pad_masks, steer_suffix_pad_masks], dim=1
+            # The prefix is already in the KV cache, so only the suffix tokens
+            # are queried -> pass the prefix length as the query offset.
+            steer_attention_mask, _ = build_proxy_expert_masks(
+                steer_model,
+                steer_prefix_pad_masks,
+                steer_prefix_att_masks,
+                steer_suffix_pad_masks,
+                steer_suffix_att_masks,
+                query_offset=steer_prefix_pad_masks.shape[1],
             )
-            mimic_attention_mask = torch.cat(
-                [mimic_prefix_pad_masks, mimic_suffix_pad_masks], dim=1
+            mimic_attention_mask, _ = build_proxy_expert_masks(
+                mimic_model,
+                mimic_prefix_pad_masks,
+                mimic_prefix_att_masks,
+                mimic_suffix_pad_masks,
+                mimic_suffix_att_masks,
+                query_offset=mimic_prefix_pad_masks.shape[1],
             )
 
             if concurrent_proxies:
@@ -688,8 +716,8 @@ def infer_actions(base_policy, steer_policy, mimic_policy, raw_obs, args, noise=
         use_cache=True,
     )
 
-    steer_prefix_embs, steer_prefix_pad_masks, _ = steer_model.embed_prefix(
-        images, img_masks
+    steer_prefix_embs, steer_prefix_pad_masks, steer_prefix_att_masks = (
+        steer_model.embed_prefix(images, img_masks)
     )
 
     if (
@@ -699,9 +727,10 @@ def infer_actions(base_policy, steer_policy, mimic_policy, raw_obs, args, noise=
     ):
         mimic_prefix_embs = steer_prefix_embs
         mimic_prefix_pad_masks = steer_prefix_pad_masks
+        mimic_prefix_att_masks = steer_prefix_att_masks
     else:
-        mimic_prefix_embs, mimic_prefix_pad_masks, _ = mimic_model.embed_prefix(
-            images, img_masks
+        mimic_prefix_embs, mimic_prefix_pad_masks, mimic_prefix_att_masks = (
+            mimic_model.embed_prefix(images, img_masks)
         )
 
     dt = -1.0 / args.num_steps
@@ -744,7 +773,7 @@ def infer_actions(base_policy, steer_policy, mimic_policy, raw_obs, args, noise=
         )
 
         if denoise_time >= args.steer_step:
-            steer_suffix_embs, steer_suffix_pad_masks, _, steer_adarms_cond = (
+            steer_suffix_embs, steer_suffix_pad_masks, steer_suffix_att_masks, steer_adarms_cond = (
                 steer_model.embed_suffix(
                     state[:, :proxy_action_dim],
                     x_t[:, :, :proxy_action_dim],
@@ -752,7 +781,7 @@ def infer_actions(base_policy, steer_policy, mimic_policy, raw_obs, args, noise=
                 )
             )
 
-            mimic_suffix_embs, mimic_suffix_pad_masks, _, mimic_adarms_cond = (
+            mimic_suffix_embs, mimic_suffix_pad_masks, mimic_suffix_att_masks, mimic_adarms_cond = (
                 mimic_model.embed_suffix(
                     state[:, :proxy_action_dim],
                     x_t[:, :, :proxy_action_dim],
@@ -762,15 +791,20 @@ def infer_actions(base_policy, steer_policy, mimic_policy, raw_obs, args, noise=
 
             steer_embs = torch.cat([steer_prefix_embs, steer_suffix_embs], dim=1)
             mimic_embs = torch.cat([mimic_prefix_embs, mimic_suffix_embs], dim=1)
-            steer_pad_masks = torch.cat(
-                [steer_prefix_pad_masks, steer_suffix_pad_masks], dim=1
+            steer_attention_mask, steer_pad_masks = build_proxy_expert_masks(
+                steer_model,
+                steer_prefix_pad_masks,
+                steer_prefix_att_masks,
+                steer_suffix_pad_masks,
+                steer_suffix_att_masks,
             )
-            mimic_pad_masks = torch.cat(
-                [mimic_prefix_pad_masks, mimic_suffix_pad_masks], dim=1
+            mimic_attention_mask, mimic_pad_masks = build_proxy_expert_masks(
+                mimic_model,
+                mimic_prefix_pad_masks,
+                mimic_prefix_att_masks,
+                mimic_suffix_pad_masks,
+                mimic_suffix_att_masks,
             )
-
-            steer_attention_mask = steer_pad_masks
-            mimic_attention_mask = mimic_pad_masks
             steer_position_ids = torch.cumsum(steer_pad_masks, dim=1) - 1
             mimic_position_ids = torch.cumsum(mimic_pad_masks, dim=1) - 1
             steer_position_ids = steer_position_ids.to(dtype=torch.long)
@@ -1143,8 +1177,8 @@ def guide_actions(base_policy, steer_policy, raw_obs, args):
         use_cache=True,
     )
 
-    steer_prefix_embs, steer_prefix_pad_masks, _ = steer_model.embed_prefix(
-        images, img_masks
+    steer_prefix_embs, steer_prefix_pad_masks, steer_prefix_att_masks = (
+        steer_model.embed_prefix(images, img_masks)
     )
 
     # print(f"Embed prefix latency: {time.time() - time_start}")
@@ -1172,7 +1206,7 @@ def guide_actions(base_policy, steer_policy, raw_obs, args):
         # time_denoise_start = time.time()
 
         if denoise_time >= args.steer_step:
-            steer_suffix_embs, steer_suffix_pad_masks, _, steer_adarms_cond = (
+            steer_suffix_embs, steer_suffix_pad_masks, steer_suffix_att_masks, steer_adarms_cond = (
                 steer_model.embed_suffix(
                     state[:, :proxy_action_dim],
                     x_t[:, :, :proxy_action_dim],
@@ -1181,11 +1215,13 @@ def guide_actions(base_policy, steer_policy, raw_obs, args):
             )
 
             steer_embs = torch.cat([steer_prefix_embs, steer_suffix_embs], dim=1)
-            steer_pad_masks = torch.cat(
-                [steer_prefix_pad_masks, steer_suffix_pad_masks], dim=1
+            steer_attention_mask, steer_pad_masks = build_proxy_expert_masks(
+                steer_model,
+                steer_prefix_pad_masks,
+                steer_prefix_att_masks,
+                steer_suffix_pad_masks,
+                steer_suffix_att_masks,
             )
-
-            steer_attention_mask = steer_pad_masks
             steer_position_ids = torch.cumsum(steer_pad_masks, dim=1) - 1
             steer_position_ids = steer_position_ids.to(dtype=torch.long)
 
@@ -1354,8 +1390,8 @@ def consecutive_actions(base_policy, steer_policy, raw_obs, args):
         use_cache=True,
     )
 
-    steer_prefix_embs, steer_prefix_pad_masks, _ = steer_model.embed_prefix(
-        images, img_masks
+    steer_prefix_embs, steer_prefix_pad_masks, steer_prefix_att_masks = (
+        steer_model.embed_prefix(images, img_masks)
     )
 
     # print(f"Embed prefix latency: {time.time() - time_start}")
@@ -1383,7 +1419,7 @@ def consecutive_actions(base_policy, steer_policy, raw_obs, args):
         # time_denoise_start = time.time()
         expanded_time = denoise_time.expand(bsize)
 
-        steer_suffix_embs, steer_suffix_pad_masks, _, steer_adarms_cond = (
+        steer_suffix_embs, steer_suffix_pad_masks, steer_suffix_att_masks, steer_adarms_cond = (
             steer_model.embed_suffix(
                 state[:, :proxy_action_dim],
                 x_t[:, :, :proxy_action_dim],
@@ -1392,11 +1428,13 @@ def consecutive_actions(base_policy, steer_policy, raw_obs, args):
         )
 
         steer_embs = torch.cat([steer_prefix_embs, steer_suffix_embs], dim=1)
-        steer_pad_masks = torch.cat(
-            [steer_prefix_pad_masks, steer_suffix_pad_masks], dim=1
+        steer_attention_mask, steer_pad_masks = build_proxy_expert_masks(
+            steer_model,
+            steer_prefix_pad_masks,
+            steer_prefix_att_masks,
+            steer_suffix_pad_masks,
+            steer_suffix_att_masks,
         )
-
-        steer_attention_mask = steer_pad_masks
         steer_position_ids = torch.cumsum(steer_pad_masks, dim=1) - 1
         steer_position_ids = steer_position_ids.to(dtype=torch.long)
 
@@ -1583,8 +1621,8 @@ def classifier_free_actions(base_policy, steer_policy, raw_obs, args):
         use_cache=True,
     )
 
-    steer_prefix_embs, steer_prefix_pad_masks, _ = steer_model.embed_prefix(
-        images, img_masks
+    steer_prefix_embs, steer_prefix_pad_masks, steer_prefix_att_masks = (
+        steer_model.embed_prefix(images, img_masks)
     )
 
     dt = -1.0 / args.num_steps
@@ -1620,7 +1658,7 @@ def classifier_free_actions(base_policy, steer_policy, raw_obs, args):
         )
 
         if denoise_time >= args.steer_step:
-            steer_suffix_embs, steer_suffix_pad_masks, _, steer_adarms_cond = (
+            steer_suffix_embs, steer_suffix_pad_masks, steer_suffix_att_masks, steer_adarms_cond = (
                 steer_model.embed_suffix(
                     state[:, :proxy_action_dim],
                     x_t[:, :, :proxy_action_dim],
@@ -1629,11 +1667,13 @@ def classifier_free_actions(base_policy, steer_policy, raw_obs, args):
             )
 
             steer_embs = torch.cat([steer_prefix_embs, steer_suffix_embs], dim=1)
-            steer_pad_masks = torch.cat(
-                [steer_prefix_pad_masks, steer_suffix_pad_masks], dim=1
+            steer_attention_mask, steer_pad_masks = build_proxy_expert_masks(
+                steer_model,
+                steer_prefix_pad_masks,
+                steer_prefix_att_masks,
+                steer_suffix_pad_masks,
+                steer_suffix_att_masks,
             )
-
-            steer_attention_mask = steer_pad_masks
             steer_position_ids = torch.cumsum(steer_pad_masks, dim=1) - 1
             steer_position_ids = steer_position_ids.to(dtype=torch.long)
 
@@ -1724,8 +1764,8 @@ def _classifier_free_forward_all(
         use_cache=True,
     )
 
-    steer_prefix_embs, steer_prefix_pad_masks, _ = steer_model.embed_prefix(
-        images, img_masks
+    steer_prefix_embs, steer_prefix_pad_masks, steer_prefix_att_masks = (
+        steer_model.embed_prefix(images, img_masks)
     )
 
     bsize = x_t.shape[0]
@@ -1744,7 +1784,7 @@ def _classifier_free_forward_all(
             expanded_time,
         )
 
-        steer_suffix_embs, steer_suffix_pad_masks, _, steer_adarms_cond = (
+        steer_suffix_embs, steer_suffix_pad_masks, steer_suffix_att_masks, steer_adarms_cond = (
             steer_model.embed_suffix(
                 state[:, :proxy_action_dim],
                 x_t[:, :, :proxy_action_dim],
@@ -1753,15 +1793,19 @@ def _classifier_free_forward_all(
         )
 
         steer_embs = torch.cat([steer_prefix_embs, steer_suffix_embs], dim=1)
-        steer_pad_masks = torch.cat(
-            [steer_prefix_pad_masks, steer_suffix_pad_masks], dim=1
+        steer_attention_mask, steer_pad_masks = build_proxy_expert_masks(
+            steer_model,
+            steer_prefix_pad_masks,
+            steer_prefix_att_masks,
+            steer_suffix_pad_masks,
+            steer_suffix_att_masks,
         )
         steer_position_ids = (torch.cumsum(steer_pad_masks, dim=1) - 1).to(
             dtype=torch.long
         )
 
         steer_hidden_states, _ = steer_model.expert_model.forward(
-            attention_mask=steer_pad_masks,
+            attention_mask=steer_attention_mask,
             position_ids=steer_position_ids,
             past_key_values=None,
             inputs_embeds=steer_embs,

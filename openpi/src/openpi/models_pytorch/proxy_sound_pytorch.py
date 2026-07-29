@@ -113,15 +113,21 @@ class ProxySoundPytorch(ProxyPytorch):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks, sound)
-        suffix_embs, suffix_pad_masks, _, adarms_cond = self.embed_suffix(state, x_t, time)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, sound
+        )
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+            state, x_t, time
+        )
 
         embs = torch.cat([prefix_embs, suffix_embs], dim=1)
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        attention_mask, pad_masks = self.build_expert_masks(
+            prefix_pad_masks, prefix_att_masks, suffix_pad_masks, suffix_att_masks
+        )
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
         hidden_states, _ = self.expert_model.forward(
-            attention_mask=pad_masks,
+            attention_mask=attention_mask,
             position_ids=position_ids.to(dtype=torch.long),
             past_key_values=None,
             inputs_embeds=embs,
@@ -135,7 +141,9 @@ class ProxySoundPytorch(ProxyPytorch):
 
     def forward_distill(self, observation, noises, times, gradients, actions, use_noise=True):
         images, img_masks, sound, state = self._preprocess_observation(observation, train=True)
-        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks, sound)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, sound
+        )
 
         initial_noise = noises[:, 0, :, : self.config.action_dim]
         noises = noises[:, 1:, :, : self.config.action_dim]
@@ -168,7 +176,7 @@ class ProxySoundPytorch(ProxyPytorch):
 
         flat_state = state[:, None, :].expand(batch_size, num_steps, state.shape[-1])
         flat_state = flat_state.reshape(batch_size * num_steps, state.shape[-1])
-        suffix_embs, suffix_pad_masks, _, adarms_cond = self.embed_suffix(
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
             flat_state, flat_x_t, flat_times
         )
 
@@ -184,13 +192,21 @@ class ProxySoundPytorch(ProxyPytorch):
         prefix_pad_masks = prefix_pad_masks.reshape(
             batch_size * num_steps, prefix_pad_masks.shape[2]
         )
+        prefix_att_masks = prefix_att_masks[:, None, :].expand(
+            batch_size, num_steps, prefix_att_masks.shape[1]
+        )
+        prefix_att_masks = prefix_att_masks.reshape(
+            batch_size * num_steps, prefix_att_masks.shape[2]
+        )
 
         embs = torch.cat([prefix_embs, suffix_embs], dim=1)
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        attention_mask, pad_masks = self.build_expert_masks(
+            prefix_pad_masks, prefix_att_masks, suffix_pad_masks, suffix_att_masks
+        )
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
         hidden_states, _ = self.expert_model.forward(
-            attention_mask=pad_masks,
+            attention_mask=attention_mask,
             position_ids=position_ids.to(dtype=torch.long),
             past_key_values=None,
             inputs_embeds=embs,
@@ -227,7 +243,9 @@ class ProxySoundPytorch(ProxyPytorch):
         actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
         initial_noise = self.sample_noise(actions_shape, device)
         time_schedule = self.sample_bin_times(bsize, num_steps, device)
-        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks, sound)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, sound
+        )
 
         x_t = initial_noise
         current_time = torch.tensor(1.0, dtype=torch.float32, device=device).expand(bsize)
@@ -245,15 +263,17 @@ class ProxySoundPytorch(ProxyPytorch):
             noises.append(x_t.clone())
             times.append(current_time.clone())
 
-            suffix_embs, suffix_pad_masks, _, adarms_cond = self.embed_suffix(
+            suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
                 state, x_t, current_time
             )
             embs = torch.cat([prefix_embs, suffix_embs], dim=1)
-            pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+            attention_mask, pad_masks = self.build_expert_masks(
+                prefix_pad_masks, prefix_att_masks, suffix_pad_masks, suffix_att_masks
+            )
             position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
             hidden_states, _ = self.expert_model.forward(
-                attention_mask=pad_masks,
+                attention_mask=attention_mask,
                 position_ids=position_ids.to(dtype=torch.long),
                 past_key_values=None,
                 inputs_embeds=embs,
@@ -279,7 +299,9 @@ class ProxySoundPytorch(ProxyPytorch):
             noise = self.sample_noise(actions_shape, device)
 
         images, img_masks, sound, state = self._preprocess_observation(observation, train=False)
-        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks, sound)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, sound
+        )
 
         dt = torch.tensor(-1.0 / num_steps, dtype=torch.float32, device=device)
         x_t = noise
@@ -287,15 +309,17 @@ class ProxySoundPytorch(ProxyPytorch):
 
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
-            suffix_embs, suffix_pad_masks, _, adarms_cond = self.embed_suffix(
+            suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
                 state, x_t, expanded_time
             )
             embs = torch.cat([prefix_embs, suffix_embs], dim=1)
-            pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+            attention_mask, pad_masks = self.build_expert_masks(
+                prefix_pad_masks, prefix_att_masks, suffix_pad_masks, suffix_att_masks
+            )
             position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
             hidden_states, _ = self.expert_model.forward(
-                attention_mask=pad_masks,
+                attention_mask=attention_mask,
                 position_ids=position_ids.to(dtype=torch.long),
                 past_key_values=None,
                 inputs_embeds=embs,

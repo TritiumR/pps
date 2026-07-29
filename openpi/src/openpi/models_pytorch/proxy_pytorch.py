@@ -72,36 +72,74 @@ def sample_bin(start, end, bsize, num_samples, device):
     return offsets + noise
 
 
-# def make_att_2d_masks(pad_masks, att_masks):
-#     """Copied from big_vision.
+def make_att_2d_masks(pad_masks, att_masks):
+    """Copied from big_vision.
 
-#     Tokens can attend to valid inputs tokens which have a cumulative mask_ar
-#     smaller or equal to theirs. This way `mask_ar` int[B, N] can be used to
-#     setup several types of attention, for example:
+    Tokens can attend to valid inputs tokens which have a cumulative mask_ar
+    smaller or equal to theirs. This way `mask_ar` int[B, N] can be used to
+    setup several types of attention, for example:
 
-#       [[1 1 1 1 1 1]]: pure causal attention.
+      [[1 1 1 1 1 1]]: pure causal attention.
 
-#       [[0 0 0 1 1 1]]: prefix-lm attention. The first 3 tokens can attend between
-#           themselves and the last 3 tokens have a causal attention. The first
-#           entry could also be a 1 without changing behaviour.
+      [[0 0 0 1 1 1]]: prefix-lm attention. The first 3 tokens can attend between
+          themselves and the last 3 tokens have a causal attention. The first
+          entry could also be a 1 without changing behaviour.
 
-#       [[1 0 1 0 1 0 0 1 0 0]]: causal attention between 4 blocks. Tokens of a
-#           block can attend all previous blocks and all tokens on the same block.
+      [[1 0 1 0 1 0 0 1 0 0]]: causal attention between 4 blocks. Tokens of a
+          block can attend all previous blocks and all tokens on the same block.
 
-#     Args:
-#       input_mask: bool[B, N] true if its part of the input, false if padding.
-#       mask_ar: int32[B, N] mask that's 1 where previous tokens cannot depend on
-#         it and 0 where it shares the same attention mask as the previous token.
-#     """
-#     if att_masks.ndim != 2:
-#         raise ValueError(att_masks.ndim)
-#     if pad_masks.ndim != 2:
-#         raise ValueError(pad_masks.ndim)
+    Args:
+      input_mask: bool[B, N] true if its part of the input, false if padding.
+      mask_ar: int32[B, N] mask that's 1 where previous tokens cannot depend on
+        it and 0 where it shares the same attention mask as the previous token.
+    """
+    if att_masks.ndim != 2:
+        raise ValueError(att_masks.ndim)
+    if pad_masks.ndim != 2:
+        raise ValueError(pad_masks.ndim)
 
-#     cumsum = torch.cumsum(att_masks, dim=1)
-#     att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
-#     pad_2d_masks = pad_masks[:, None, :] * pad_masks[:, :, None]
-#     return att_2d_masks & pad_2d_masks
+    cumsum = torch.cumsum(att_masks.to(torch.int32), dim=1)
+    att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
+    pad_masks = pad_masks.to(torch.bool)
+    pad_2d_masks = pad_masks[:, None, :] & pad_masks[:, :, None]
+    return att_2d_masks & pad_2d_masks
+
+
+def build_proxy_expert_masks(
+    model,
+    prefix_pad_masks,
+    prefix_att_masks,
+    suffix_pad_masks,
+    suffix_att_masks,
+    *,
+    query_offset=0,
+):
+    """Build `(attention_mask, pad_masks)` for any proxy-style action expert.
+
+    Used by the callers that inline the proxy forward pass (eval_steering.py,
+    the steering policy servers). Models that do not implement
+    `build_expert_masks` (e.g. the pointcloud/sound proxies) keep the legacy
+    behavior of passing the 2D pad mask straight through.
+    """
+    build = getattr(model, "build_expert_masks", None)
+    if build is not None and prefix_att_masks is not None and suffix_att_masks is not None:
+        return build(
+            prefix_pad_masks,
+            prefix_att_masks,
+            suffix_pad_masks,
+            suffix_att_masks,
+            query_offset=query_offset,
+        )
+    pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+    return pad_masks, pad_masks
+
+
+def build_proxy_prefix_mask(model, prefix_pad_masks, prefix_att_masks):
+    """Mask for a prefix-only forward pass (KV cache construction)."""
+    build = getattr(model, "build_attention_mask", None)
+    if build is None or prefix_att_masks is None:
+        return prefix_pad_masks
+    return build(prefix_pad_masks, prefix_att_masks)
 
 
 class ProxyPytorch(nn.Module):
@@ -119,6 +157,10 @@ class ProxyPytorch(nn.Module):
             precision=config.dtype,
             freeze_dino_encoder=getattr(config, "freeze_dino_encoder", False),
         )
+
+        # pi0-style block attention over [images | state | actions] instead of the
+        # token-level causal mask HF applies when only a 2D pad mask is passed.
+        self.bidirectional_attention = getattr(config, "bidirectional_attention", False)
 
         ACTION_DIM = 8  # for droid setup
 
@@ -157,10 +199,56 @@ class ProxyPytorch(nn.Module):
         except ImportError:
             raise ValueError(msg) from None
 
-    # def _prepare_attention_masks_4d(self, att_2d_masks):
-    #     """Helper method to prepare 4D attention masks for transformer."""
-    #     att_2d_masks_4d = att_2d_masks[:, None, :, :]
-    #     return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
+    def _prepare_attention_masks_4d(self, att_2d_masks):
+        """Helper method to prepare 4D attention masks for transformer."""
+        att_2d_masks_4d = att_2d_masks[:, None, :, :]
+        return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
+
+    def build_attention_mask(self, pad_masks, att_masks, *, query_offset=0):
+        """Build the mask handed to the Gemma expert.
+
+        With `bidirectional_attention` disabled we pass the 2D pad mask, and
+        HuggingFace builds a token-level causal mask from it (legacy behavior).
+        With it enabled we build the pi0-style block mask ourselves and pass it
+        as a 4D additive mask, which HF forwards as-is.
+
+        `pad_masks` / `att_masks` always cover the *full* sequence (prefix +
+        suffix). When only the tail of the sequence is being queried (KV-cached
+        decoding, where the prefix is already in `past_key_values`), pass
+        `query_offset` = number of cached tokens so the returned mask has the
+        matching [B, 1, q_len, kv_len] shape.
+        """
+        if not self.bidirectional_attention:
+            # HF wants the pad mask over the full kv length, which is what we
+            # already have, so `query_offset` needs no handling here.
+            return pad_masks
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        if query_offset:
+            att_2d_masks = att_2d_masks[:, query_offset:, :]
+        return self._prepare_attention_masks_4d(att_2d_masks)
+
+    def build_expert_masks(
+        self,
+        prefix_pad_masks,
+        prefix_att_masks,
+        suffix_pad_masks,
+        suffix_att_masks,
+        *,
+        query_offset=0,
+    ):
+        """Concatenate prefix/suffix masks and build the expert attention mask.
+
+        Returns `(attention_mask, pad_masks)`; `pad_masks` is the full-sequence
+        2D pad mask, which callers also need for `position_ids`.
+        """
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat(
+            [prefix_att_masks.to(torch.int32), suffix_att_masks.to(torch.int32)], dim=1
+        )
+        attention_mask = self.build_attention_mask(
+            pad_masks, att_masks, query_offset=query_offset
+        )
+        return attention_mask, pad_masks
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
@@ -343,23 +431,24 @@ class ProxyPytorch(nn.Module):
         u_t = noise - actions
 
         # Prefix: image features from DINO
-        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks
+        )
 
         # print(prefix_embs.shape)
 
         # Suffix: state + (action, time) tokens
-        suffix_embs, suffix_pad_masks, _, adarms_cond = self.embed_suffix(
-            state, x_t, time
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
+            self.embed_suffix(state, x_t, time)
         )
 
         # print(suffix_embs.shape)
 
         # Concatenate prefix and suffix sequences
         embs = torch.cat([prefix_embs, suffix_embs], dim=1)
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-
-        # Use pad mask as attention mask (True == valid)
-        attention_mask = pad_masks
+        attention_mask, pad_masks = self.build_expert_masks(
+            prefix_pad_masks, prefix_att_masks, suffix_pad_masks, suffix_att_masks
+        )
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
         position_ids = position_ids.to(dtype=torch.long)
 
@@ -408,7 +497,9 @@ class ProxyPytorch(nn.Module):
         images, img_masks, state = self._preprocess_observation(observation, train=True)
 
         # Prefix: image features from DINO (static across all steps)
-        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks
+        )
 
         initial_noise = noises[:, 0, :, : self.config.action_dim]
 
@@ -450,8 +541,8 @@ class ProxyPytorch(nn.Module):
         flat_state = state[:, None, :].expand(batch_size, num_steps, state.shape[-1])
         flat_state = flat_state.reshape(batch_size * num_steps, state.shape[-1])
 
-        suffix_embs, suffix_pad_masks, _, adarms_cond = self.embed_suffix(
-            flat_state, flat_x_t, flat_times
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
+            self.embed_suffix(flat_state, flat_x_t, flat_times)
         )
 
         prefix_embs = prefix_embs[:, None, :, :].expand(
@@ -466,11 +557,17 @@ class ProxyPytorch(nn.Module):
         prefix_pad_masks = prefix_pad_masks.reshape(
             batch_size * num_steps, prefix_pad_masks.shape[2]
         )
+        prefix_att_masks = prefix_att_masks[:, None, :].expand(
+            batch_size, num_steps, prefix_att_masks.shape[1]
+        )
+        prefix_att_masks = prefix_att_masks.reshape(
+            batch_size * num_steps, prefix_att_masks.shape[2]
+        )
 
         embs = torch.cat([prefix_embs, suffix_embs], dim=1)
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-
-        attention_mask = pad_masks
+        attention_mask, pad_masks = self.build_expert_masks(
+            prefix_pad_masks, prefix_att_masks, suffix_pad_masks, suffix_att_masks
+        )
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
         position_ids = position_ids.to(dtype=torch.long)
 
@@ -534,7 +631,9 @@ class ProxyPytorch(nn.Module):
         initial_noise = self.sample_noise(actions_shape, device)
         time_schedule = self.sample_bin_times(bsize, num_steps, device)
 
-        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks
+        )
 
         x_t = initial_noise
         current_time = torch.tensor(1.0, dtype=torch.float32, device=device).expand(
@@ -558,13 +657,14 @@ class ProxyPytorch(nn.Module):
             noises.append(x_t.clone())
             times.append(current_time.clone())
 
-            suffix_embs, suffix_pad_masks, _, adarms_cond = self.embed_suffix(
-                state, x_t, current_time
+            suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
+                self.embed_suffix(state, x_t, current_time)
             )
 
             embs = torch.cat([prefix_embs, suffix_embs], dim=1)
-            pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-            attention_mask = pad_masks
+            attention_mask, pad_masks = self.build_expert_masks(
+                prefix_pad_masks, prefix_att_masks, suffix_pad_masks, suffix_att_masks
+            )
             position_ids = torch.cumsum(pad_masks, dim=1) - 1
             position_ids = position_ids.to(dtype=torch.long)
 
@@ -607,7 +707,9 @@ class ProxyPytorch(nn.Module):
         )
 
         # Prefix embeddings are static across denoising steps
-        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks
+        )
 
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
@@ -619,14 +721,14 @@ class ProxyPytorch(nn.Module):
             expanded_time = time.expand(bsize)
 
             # Recompute suffix embeddings at current x_t and time
-            suffix_embs, suffix_pad_masks, _, adarms_cond = self.embed_suffix(
-                state, x_t, expanded_time
+            suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
+                self.embed_suffix(state, x_t, expanded_time)
             )
 
             embs = torch.cat([prefix_embs, suffix_embs], dim=1)
-            pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-
-            attention_mask = pad_masks
+            attention_mask, pad_masks = self.build_expert_masks(
+                prefix_pad_masks, prefix_att_masks, suffix_pad_masks, suffix_att_masks
+            )
             position_ids = torch.cumsum(pad_masks, dim=1) - 1
             position_ids = position_ids.to(dtype=torch.long)
 

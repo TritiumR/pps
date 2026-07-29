@@ -20,6 +20,12 @@ class ProxySoundConfig(_model.BaseModelConfig):
     dino_model_name: str = "facebook/dinov3-vits16plus-pretrain-lvd1689m"
     freeze_dino_encoder: bool = False
 
+    # See ProxyConfig.bidirectional_attention. Here the prefix block covers both
+    # the image tokens and the sound tokens, so with the flag on they attend to
+    # each other (and to themselves) bidirectionally.
+    # Defaults to False to preserve the behavior of existing checkpoints.
+    bidirectional_attention: bool = False
+
     sound_channels: int = 2
     sound_mel_bins: int = 80
     sound_time_bins: int = 198

@@ -56,6 +56,7 @@ from tqdm import tqdm
 
 # import scipy.spatial.transform as R
 from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
+from openpi.models_pytorch.proxy_pytorch import build_proxy_expert_masks
 
 
 _SOUND_VIDEO_SCALE = None
@@ -246,6 +247,8 @@ def _run_sequence_proxy_expert(
     suffix_embs,
     suffix_pad_masks,
     adarms_cond,
+    prefix_att_masks=None,
+    suffix_att_masks=None,
 ):
     if hasattr(model, "_run_action_expert"):
         return model._run_action_expert(
@@ -257,12 +260,14 @@ def _run_sequence_proxy_expert(
         )
 
     embs = torch.cat([prefix_embs, suffix_embs], dim=1)
-    pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+    attention_mask, pad_masks = build_proxy_expert_masks(
+        model, prefix_pad_masks, prefix_att_masks, suffix_pad_masks, suffix_att_masks
+    )
     position_ids = torch.cumsum(pad_masks, dim=1) - 1
     position_ids = position_ids.to(dtype=torch.long)
 
     hidden_states, _ = model.expert_model.forward(
-        attention_mask=pad_masks,
+        attention_mask=attention_mask,
         position_ids=position_ids,
         past_key_values=None,
         inputs_embeds=embs,
@@ -279,24 +284,30 @@ def _prepare_proxy_steering(model, observation):
 
     if model_type == _model.ModelType.PROXY:
         images, img_masks, state = model._preprocess_observation(observation, train=False)
-        prefix_embs, prefix_pad_masks, _ = model.embed_prefix(images, img_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = model.embed_prefix(
+            images, img_masks
+        )
         return {
             "kind": "sequence",
             "state": state,
             "prefix_embs": prefix_embs,
             "prefix_pad_masks": prefix_pad_masks,
+            "prefix_att_masks": prefix_att_masks,
         }
 
     if model_type == _model.ModelType.PROXY_SOUND:
         images, img_masks, sound, state = model._preprocess_observation(
             observation, train=False
         )
-        prefix_embs, prefix_pad_masks, _ = model.embed_prefix(images, img_masks, sound)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = model.embed_prefix(
+            images, img_masks, sound
+        )
         return {
             "kind": "sequence",
             "state": state,
             "prefix_embs": prefix_embs,
             "prefix_pad_masks": prefix_pad_masks,
+            "prefix_att_masks": prefix_att_masks,
         }
 
     if model_type == _model.ModelType.PROXY_POINTCLOUD:
@@ -344,7 +355,7 @@ def _predict_proxy_flow(prepared_proxy, model, x_t_path, time_cond):
     if prepared_proxy["kind"] == "dp3":
         return model._run_dp3(x_t_model, time_cond, prepared_proxy["obs_features"])
 
-    suffix_embs, suffix_pad_masks, _, adarms_cond = model.embed_suffix(
+    suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = model.embed_suffix(
         prepared_proxy["state"],
         x_t_model,
         time_cond,
@@ -356,6 +367,8 @@ def _predict_proxy_flow(prepared_proxy, model, x_t_path, time_cond):
         suffix_embs,
         suffix_pad_masks,
         adarms_cond,
+        prefix_att_masks=prepared_proxy.get("prefix_att_masks"),
+        suffix_att_masks=suffix_att_masks,
     )
 
 
@@ -367,19 +380,22 @@ def _sequence_proxy_flow_from_prefix(
     x_t_path,
     time_cond,
     action_dim: int,
+    prefix_att_masks=None,
 ):
     x_t_model = x_t_path[:, :, :action_dim]
-    suffix_embs, suffix_pad_masks, _, adarms_cond = model.embed_suffix(
+    suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = model.embed_suffix(
         state,
         x_t_model,
         time_cond,
     )
     embs = torch.cat([prefix_embs, suffix_embs], dim=1)
-    pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+    attention_mask, pad_masks = build_proxy_expert_masks(
+        model, prefix_pad_masks, prefix_att_masks, suffix_pad_masks, suffix_att_masks
+    )
     position_ids = (torch.cumsum(pad_masks, dim=1) - 1).to(dtype=torch.long)
 
     hidden_states, _ = model.expert_model.forward(
-        attention_mask=pad_masks,
+        attention_mask=attention_mask,
         position_ids=position_ids,
         past_key_values=None,
         inputs_embeds=embs,
@@ -433,15 +449,16 @@ def _eval_steer_forward_all(
         use_cache=True,
     )
 
-    task_prefix_embs, task_prefix_pad_masks, _ = task_model.embed_prefix(
-        task_images, task_img_masks
+    task_prefix_embs, task_prefix_pad_masks, task_prefix_att_masks = (
+        task_model.embed_prefix(task_images, task_img_masks)
     )
     if share_proxy_dino:
         ref_prefix_embs = task_prefix_embs
         ref_prefix_pad_masks = task_prefix_pad_masks
+        ref_prefix_att_masks = task_prefix_att_masks
     else:
-        ref_prefix_embs, ref_prefix_pad_masks, _ = ref_model.embed_prefix(
-            ref_images, ref_img_masks
+        ref_prefix_embs, ref_prefix_pad_masks, ref_prefix_att_masks = (
+            ref_model.embed_prefix(ref_images, ref_img_masks)
         )
 
     bsize = x_t.shape[0]
@@ -466,6 +483,7 @@ def _eval_steer_forward_all(
             x_t,
             expanded_time,
             proxy_action_dim,
+            prefix_att_masks=task_prefix_att_masks,
         )
         ref_v_t = _sequence_proxy_flow_from_prefix(
             ref_model,
@@ -475,6 +493,7 @@ def _eval_steer_forward_all(
             x_t,
             expanded_time,
             proxy_action_dim,
+            prefix_att_masks=ref_prefix_att_masks,
         )
 
         steer_mask = (denoise_time >= steer_step).to(dtype=base_v_t.dtype)

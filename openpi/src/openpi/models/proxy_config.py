@@ -22,6 +22,16 @@ class ProxyConfig(_model.BaseModelConfig):
     dino_model_name: str = "facebook/dinov3-vits16plus-pretrain-lvd1689m"
     freeze_dino_encoder: bool = False  # freeze DINO
 
+    # When True, use pi0-style block ("prefix-LM") attention instead of the
+    # token-level causal mask that HF applies when only a 2D pad mask is given:
+    #   - image tokens attend to each other bidirectionally,
+    #   - the state token attends to all image tokens,
+    #   - action tokens attend to the prefix, the state, and each other
+    #     bidirectionally (no autoregressive ordering within the chunk),
+    #   - the prefix still cannot attend to state/action tokens.
+    # Defaults to False to preserve the behavior of existing checkpoints.
+    bidirectional_attention: bool = False
+
     # Set the model specific defaults.
     action_dim: int = 8
     action_horizon: int = 10
