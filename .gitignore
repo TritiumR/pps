@@ -38,6 +38,11 @@ sim_free_mpc/sampler_for_ref.py
 # results
 results
 
+# Experiment runtime state (keep manifests and queue definitions tracked)
+/experiments/**/status/
+/experiments/**/progress.md
+/experiments/**/hourly_health_*
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

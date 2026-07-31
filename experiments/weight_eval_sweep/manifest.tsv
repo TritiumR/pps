@@ -1,0 +1,14 @@
+experiment	kind	scale	job	slot	gpus	workers
+task_only_eps_bidir_seed1_20	task_only	-	628885	existing_task_only	0	1
+base_grasp_flow_loose	base	-	628845	base	0	1
+grasp_flow_loose_task_steer_scale_0p0	task_steer	0.0	628845	jjs_scan	0	1
+grasp_flow_loose_task_steer_scale_0p1	task_steer	0.1	628845	jjs_scan	0	1
+grasp_flow_loose_task_steer_scale_0p2	task_steer	0.2	628845	jjs_scan	0	1
+grasp_flow_loose_task_steer_scale_0p4	task_steer	0.4	628885	gal_scan_a	0	1
+grasp_flow_loose_task_steer_scale_0p3	task_steer	0.3	628885	gal_scan_b	0	1
+grasp_flow_loose_task_steer_scale_0p5	task_steer	0.5	640102	portal_supp	0,1,2,3	4
+grasp_flow_loose_task_steer_scale_0p6	task_steer	0.6	640102	portal_scan_a	0,1	2
+grasp_flow_loose_task_steer_scale_0p7	task_steer	0.7	640102	portal_scan_a	0,1	2
+grasp_flow_loose_task_steer_scale_0p8	task_steer	0.8	640102	portal_scan_a	0,1	2
+grasp_flow_loose_task_steer_scale_0p9	task_steer	0.9	640102	portal_scan_b	2,3	2
+grasp_flow_loose_task_steer_scale_1p0	task_steer	1.0	640102	portal_scan_b	2,3	2
