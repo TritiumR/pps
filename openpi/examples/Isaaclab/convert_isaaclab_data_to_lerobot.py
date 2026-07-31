@@ -33,16 +33,22 @@ def main(
     *,
     push_to_hub: bool = False,
     droid_action: bool = False,
+    resume: bool = False,
 ):
-    # Clean up any existing dataset in the output directory
     output_path = HF_LEROBOT_HOME / repo_name
-    if output_path.exists():
+    dataset = None
+    if resume:
+        if not output_path.exists():
+            raise FileNotFoundError(f"Cannot resume missing dataset: {output_path}")
+        dataset = LeRobotDataset(repo_id=repo_name, root=output_path)
+    elif output_path.exists():
+        # A non-resume conversion starts from a clean output directory.
         shutil.rmtree(output_path)
 
     # Create LeRobot dataset, define features to store
     # We will follow the DROID data naming conventions here.
     # LeRobot assumes that dtype of image data is `image`
-    dataset = LeRobotDataset.create(
+    dataset = dataset or LeRobotDataset.create(
         repo_id=repo_name,
         robot_type="panda",
         fps=15,  # DROID data is typically recorded at 15fps
@@ -104,6 +110,32 @@ def main(
     file = h5py.File(data_file, "r")
     demos = file["data"]
     demo_name_list = sorted(demos.keys())
+    if resume:
+        completed_episodes = dataset.meta.total_episodes
+        if completed_episodes > len(demo_name_list):
+            raise ValueError(
+                f"Existing dataset has {completed_episodes} episodes but source has only {len(demo_name_list)}"
+            )
+        completed_frames = sum(
+            len(demos[name]["obs/table_cam"])
+            for name in demo_name_list[:completed_episodes]
+        )
+        if completed_frames != dataset.meta.total_frames:
+            raise ValueError(
+                "Existing dataset is not a valid prefix of the source: "
+                f"metadata has {dataset.meta.total_frames} frames, expected {completed_frames}"
+            )
+        demo_name_list = demo_name_list[completed_episodes:]
+        print(
+            f"Resuming {repo_name} at episode {completed_episodes}; "
+            f"converting {len(demo_name_list)} remaining episodes"
+        )
+        dataset.start_image_writer(num_processes=5, num_threads=10)
+        # Discard PNGs for an episode that was never committed to metadata.
+        # Completed image episodes are embedded in parquet and already removed.
+        dataset.episode_buffer = dataset.create_episode_buffer()
+        dataset.clear_episode_buffer()
+
 
     # We will loop over each dataset_name and write episodes to the LeRobot dataset
     for demo_name in tqdm(demo_name_list, desc="Converting episodes"):
@@ -166,6 +198,8 @@ def main(
                 }
             )
         dataset.save_episode()
+
+    dataset.stop_image_writer()
 
     # Optionally push to the Hugging Face Hub
     if push_to_hub:
