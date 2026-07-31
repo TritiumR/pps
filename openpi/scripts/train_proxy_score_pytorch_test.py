@@ -3,9 +3,11 @@ from types import SimpleNamespace
 import sys
 
 import numpy as np
+import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
+import train_mpc_proxy_score_pytorch as train_mpc
 import train_proxy_score_pytorch as train_score
 
 
@@ -90,3 +92,49 @@ def test_task_cache_reuses_preprocessed_tensors(monkeypatch, tmp_path):
     assert noise is None
     assert tuple(input_batch["image"]["base_0_rgb"].shape) == (2, 224, 224, 3)
     assert tuple(action_batch.shape) == (2, 3, 2)
+
+
+def test_ref_cache_defaults_match_eval_truncated_teacher():
+    args = train_mpc.build_parser().parse_args(
+        [
+            "generate-cache",
+            "--config",
+            "score_ref_weight",
+            "--hdf5_path",
+            "dataset.hdf5",
+            "--cache_path",
+            "cache.npz",
+        ]
+    )
+
+    assert args.num_steps == 10
+    assert args.mpc_num_samples == 4096
+    assert args.mpc_iterations == 1
+    assert args.mpc_noise == 1.0
+    assert args.mpc_temperature == 0.15
+    assert args.mpc_joint_delta_clip == 0.15
+    assert args.mpc_cost == "grasp_flow_loose"
+    assert args.sampler == "truncated"
+    assert args.mpc_interpolation_method == "bspline"
+    assert args.control_frequency == 40.0
+    assert args.interpolate_frequency == 10.0
+
+
+def test_old_score_cache_is_rejected_before_array_loading(tmp_path):
+    cache_path = tmp_path / "old_score_cache.npz"
+    np.savez(
+        cache_path,
+        score=np.zeros((1, 3, 2), dtype=np.float32),
+        metadata_json=np.asarray(
+            '{"cache_format_version": 3, "label_type": "mpc_score_action_prox_reverse_trajectory"}'
+        ),
+    )
+    config = SimpleNamespace(model=SimpleNamespace(prediction_type="epsilon"))
+
+    with pytest.raises(ValueError, match="format is stale"):
+        train_mpc.MPCScoreDataset(
+            hdf5_path="unused.hdf5",
+            cache_path=str(cache_path),
+            config=config,
+            prompt="unused",
+        )

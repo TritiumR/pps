@@ -102,6 +102,34 @@ def ddim_iteration_alphas(
     return alpha_t, alpha_prev, time_cond
 
 
+def score_to_epsilon(score: torch.Tensor, alpha_bar: torch.Tensor) -> torch.Tensor:
+    sqrt_beta = torch.sqrt(torch.clamp(1.0 - alpha_bar, min=1e-6))
+    while sqrt_beta.ndim < score.ndim:
+        sqrt_beta = sqrt_beta.unsqueeze(-1)
+    return -sqrt_beta * score
+
+
+def make_att_2d_masks(
+    pad_masks: torch.Tensor,
+    att_masks: torch.Tensor,
+) -> torch.Tensor:
+    """Build pi0-style block attention from padding and block-boundary masks."""
+    if pad_masks.ndim != 2:
+        raise ValueError(f"pad_masks must be rank 2, got {pad_masks.ndim}.")
+    if att_masks.ndim != 2:
+        raise ValueError(f"att_masks must be rank 2, got {att_masks.ndim}.")
+    if pad_masks.shape != att_masks.shape:
+        raise ValueError(
+            f"pad_masks and att_masks must have the same shape, got "
+            f"{tuple(pad_masks.shape)} and {tuple(att_masks.shape)}."
+        )
+
+    block_ids = torch.cumsum(att_masks.to(torch.int32), dim=1)
+    block_mask = block_ids[:, None, :] <= block_ids[:, :, None]
+    valid = pad_masks.to(torch.bool)
+    return block_mask & valid[:, None, :] & valid[:, :, None]
+
+
 class ProxyScorePytorch(nn.Module):
     """Image/state-conditioned score proxy for DDIM/MBD score-space PPS steering."""
 
@@ -117,6 +145,7 @@ class ProxyScorePytorch(nn.Module):
             precision=config.dtype,
             freeze_dino_encoder=getattr(config, "freeze_dino_encoder", False),
         )
+        self.bidirectional_attention = getattr(config, "bidirectional_attention", True)
 
         action_dim = config.action_dim
         self.action_in_proj = nn.Linear(action_dim, action_expert_config.width)
@@ -257,6 +286,36 @@ class ProxyScorePytorch(nn.Module):
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
         return embs, pad_masks, att_masks, None
 
+    @staticmethod
+    def _prepare_attention_masks_4d(att_2d_masks: torch.Tensor) -> torch.Tensor:
+        att_2d_masks_4d = att_2d_masks[:, None, :, :]
+        return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
+
+    def build_attention_mask(
+        self,
+        pad_masks: torch.Tensor,
+        att_masks: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self.bidirectional_attention:
+            return pad_masks
+        return self._prepare_attention_masks_4d(
+            make_att_2d_masks(pad_masks, att_masks)
+        )
+
+    def build_expert_masks(
+        self,
+        prefix_pad_masks: torch.Tensor,
+        prefix_att_masks: torch.Tensor,
+        suffix_pad_masks: torch.Tensor,
+        suffix_att_masks: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat(
+            [prefix_att_masks.to(torch.int32), suffix_att_masks.to(torch.int32)],
+            dim=1,
+        )
+        return self.build_attention_mask(pad_masks, att_masks), pad_masks
+
     def _run_diffusion_head(
         self,
         prefix_embs,
@@ -264,13 +323,23 @@ class ProxyScorePytorch(nn.Module):
         suffix_embs,
         suffix_pad_masks,
         adarms_cond,
+        prefix_att_masks=None,
+        suffix_att_masks=None,
     ) -> torch.Tensor:
         embs = torch.cat([prefix_embs, suffix_embs], dim=1)
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        attention_mask = pad_masks
+        if prefix_att_masks is not None and suffix_att_masks is not None:
+            attention_mask, pad_masks = self.build_expert_masks(
+                prefix_pad_masks,
+                prefix_att_masks,
+                suffix_pad_masks,
+                suffix_att_masks,
+            )
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
         position_ids = position_ids.to(dtype=torch.long)
         hidden_states, _ = self.expert_model.forward(
-            attention_mask=pad_masks,
+            attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=None,
             inputs_embeds=embs,
@@ -288,8 +357,9 @@ class ProxyScorePytorch(nn.Module):
         prefix_pad_masks,
         x_t,
         time_cond,
+        prefix_att_masks=None,
     ) -> torch.Tensor:
-        suffix_embs, suffix_pad_masks, _, adarms_cond = self.embed_suffix(
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
             state,
             x_t,
             time_cond,
@@ -300,6 +370,8 @@ class ProxyScorePytorch(nn.Module):
             suffix_embs,
             suffix_pad_masks,
             adarms_cond,
+            prefix_att_masks,
+            suffix_att_masks,
         )
 
     def predict_score_from_prefix(
@@ -309,6 +381,7 @@ class ProxyScorePytorch(nn.Module):
         prefix_pad_masks,
         x_t,
         time_cond,
+        prefix_att_masks=None,
     ) -> torch.Tensor:
         output = self._predict_model_output_from_prefix(
             state,
@@ -316,6 +389,7 @@ class ProxyScorePytorch(nn.Module):
             prefix_pad_masks,
             x_t,
             time_cond,
+            prefix_att_masks,
         )
         if self.config.prediction_type == "score":
             return output
@@ -331,6 +405,7 @@ class ProxyScorePytorch(nn.Module):
         noise=None,
         time=None,
         score_target=None,
+        epsilon_target=None,
         *,
         mode="train",
         **_,
@@ -339,17 +414,25 @@ class ProxyScorePytorch(nn.Module):
             raise ValueError(f"Unsupported forward mode for ProxyScorePytorch: {mode}")
         if actions is None:
             raise ValueError("actions must be provided for score training.")
+        if score_target is not None and epsilon_target is not None:
+            raise ValueError("score_target and epsilon_target are mutually exclusive.")
 
         actions = actions[..., : self.config.action_dim]
         images, img_masks, state = self._preprocess_observation(observation, train=True)
         loss_weight = None
         direct_score_target = score_target is not None
+        direct_epsilon_target = epsilon_target is not None
 
-        if score_target is not None:
+        if direct_score_target or direct_epsilon_target:
             if time is None:
-                raise ValueError("time must be provided when training from direct score targets.")
+                raise ValueError("time must be provided when training from direct targets.")
+            if direct_epsilon_target and self.config.prediction_type != "epsilon":
+                raise ValueError(
+                    "epsilon_target requires ProxyScoreConfig.prediction_type='epsilon'."
+                )
             x_t = actions
-            target = score_target[..., : self.config.action_dim].to(
+            direct_target = score_target if direct_score_target else epsilon_target
+            target = direct_target[..., : self.config.action_dim].to(
                 device=actions.device,
                 dtype=actions.dtype,
             )
@@ -381,7 +464,9 @@ class ProxyScorePytorch(nn.Module):
                 target = -noise / sqrt_beta[:, None, None]
                 loss_weight = beta[:, None, None]
 
-        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks
+        )
         grouped_labels = x_t.ndim == 4
         if grouped_labels:
             if target.ndim != 4 or time.ndim != 2:
@@ -399,6 +484,9 @@ class ProxyScorePytorch(nn.Module):
             prefix_pad_masks = prefix_pad_masks.repeat_interleave(
                 labels_per_observation, dim=0
             )
+            prefix_att_masks = prefix_att_masks.repeat_interleave(
+                labels_per_observation, dim=0
+            )
             state = state.repeat_interleave(labels_per_observation, dim=0)
             x_t = x_t.flatten(0, 1)
             target = target.flatten(0, 1)
@@ -408,7 +496,14 @@ class ProxyScorePytorch(nn.Module):
             if direct_score_target or self.config.prediction_type == "score"
             else self._predict_model_output_from_prefix
         )
-        pred = predict(state, prefix_embs, prefix_pad_masks, x_t, time)
+        pred = predict(
+            state,
+            prefix_embs,
+            prefix_pad_masks,
+            x_t,
+            time,
+            prefix_att_masks,
+        )
         loss = F.mse_loss(pred, target, reduction="none")
         if loss_weight is not None:
             loss = loss * loss_weight
@@ -434,7 +529,9 @@ class ProxyScorePytorch(nn.Module):
         images, img_masks, state = self._preprocess_observation(
             observation, train=False
         )
-        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks
+        )
         x_t = noise
         for iteration in range(int(num_steps)):
             alpha, alpha_prev, time_cond = ddim_iteration_alphas(
@@ -451,6 +548,7 @@ class ProxyScorePytorch(nn.Module):
                 prefix_pad_masks,
                 x_t,
                 expanded_time,
+                prefix_att_masks,
             )
             beta = torch.clamp(1.0 - alpha, min=1e-6)
             sqrt_alpha = torch.sqrt(torch.clamp(alpha, min=1e-6))

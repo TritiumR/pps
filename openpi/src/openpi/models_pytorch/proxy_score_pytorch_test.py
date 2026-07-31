@@ -1,11 +1,14 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
 from openpi.models_pytorch.proxy_score_pytorch import (
     ProxyScorePytorch,
     ddim_iteration_alphas,
+    make_att_2d_masks,
+    score_to_epsilon,
 )
 
 
@@ -20,6 +23,7 @@ class _TinyProxyScore(ProxyScorePytorch):
             ddim_num_train_timesteps=100,
             prediction_type="score",
         )
+        self.bidirectional_attention = True
         self.prefix_scale = nn.Parameter(torch.tensor(0.5))
         self.prefix_batch_sizes = []
 
@@ -45,8 +49,9 @@ class _TinyProxyScore(ProxyScorePytorch):
         prefix_pad_masks,
         x_t,
         time_cond,
+        prefix_att_masks=None,
     ):
-        del prefix_pad_masks
+        del prefix_pad_masks, prefix_att_masks
         condition = prefix_embs[:, :1, :1] + state[:, :1, None] + time_cond[:, None, None]
         return x_t + condition
 
@@ -162,3 +167,90 @@ def test_epsilon_prediction_drives_ddim_sampling_directly():
     eps_pred = noise + model.prefix_scale
     expected = (noise - sqrt_beta * eps_pred) / sqrt_alpha
     torch.testing.assert_close(actions, expected)
+
+
+def test_block_attention_matches_proxy_prefix_state_action_layout():
+    pad_masks = torch.ones(1, 5, dtype=torch.bool)
+    # [image, image | state | action, action]
+    block_boundaries = torch.tensor([[0, 0, 1, 1, 0]], dtype=torch.bool)
+
+    actual = make_att_2d_masks(pad_masks, block_boundaries)[0]
+    expected = torch.tensor(
+        [
+            [1, 1, 0, 0, 0],
+            [1, 1, 0, 0, 0],
+            [1, 1, 1, 0, 0],
+            [1, 1, 1, 1, 1],
+            [1, 1, 1, 1, 1],
+        ],
+        dtype=torch.bool,
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+def test_attention_flag_preserves_legacy_2d_mask_when_disabled():
+    model = _TinyProxyScore()
+    pad_masks = torch.ones(2, 5, dtype=torch.bool)
+    block_boundaries = torch.tensor(
+        [[0, 0, 1, 1, 0], [0, 0, 1, 1, 0]],
+        dtype=torch.bool,
+    )
+
+    model.bidirectional_attention = False
+    torch.testing.assert_close(
+        model.build_attention_mask(pad_masks, block_boundaries),
+        pad_masks,
+    )
+
+    model.bidirectional_attention = True
+    attention_mask = model.build_attention_mask(pad_masks, block_boundaries)
+    assert tuple(attention_mask.shape) == (2, 1, 5, 5)
+    torch.testing.assert_close(
+        attention_mask[:, 0] == 0,
+        make_att_2d_masks(pad_masks, block_boundaries),
+    )
+
+
+def test_direct_epsilon_target_supervises_raw_model_output():
+    model = _TinyProxyScore()
+    model.config.prediction_type = "epsilon"
+    observation = SimpleNamespace(state=torch.zeros(2, 2))
+    x_t = torch.randn(2, 3, 2)
+    time = torch.tensor([0.2, 0.7])
+    epsilon_target = torch.randn_like(x_t)
+
+    loss = model(
+        observation,
+        x_t,
+        time=time,
+        epsilon_target=epsilon_target,
+    )
+
+    raw_prediction = x_t + model.prefix_scale + time[:, None, None]
+    torch.testing.assert_close(loss, (raw_prediction - epsilon_target).square())
+
+
+def test_direct_targets_are_mutually_exclusive_and_epsilon_requires_epsilon_model():
+    model = _TinyProxyScore()
+    observation = SimpleNamespace(state=torch.zeros(1, 2))
+    x_t = torch.zeros(1, 3, 2)
+    target = torch.zeros_like(x_t)
+    time = torch.zeros(1)
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        model(
+            observation,
+            x_t,
+            time=time,
+            score_target=target,
+            epsilon_target=target,
+        )
+    with pytest.raises(ValueError, match="prediction_type='epsilon'"):
+        model(observation, x_t, time=time, epsilon_target=target)
+
+
+def test_score_to_epsilon_uses_vp_parameterization():
+    score = torch.ones(2, 3, 2)
+    alpha_bar = torch.tensor([0.25, 0.75])
+    expected = -torch.sqrt(1.0 - alpha_bar)[:, None, None] * score
+    torch.testing.assert_close(score_to_epsilon(score, alpha_bar), expected)

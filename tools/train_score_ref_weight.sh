@@ -6,9 +6,9 @@ ROOT="${ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 DATA_FILE="${DATA_FILE:-${ROOT}/data/weight/generated_dataset.hdf5}"
 MPC_NUM_SAMPLES="${MPC_NUM_SAMPLES:-4096}"
 MPC_ITERATIONS="${MPC_ITERATIONS:-1}"
-MPC_NOISE="${MPC_NOISE:-0.8}"
-MPC_TEMPERATURE="${MPC_TEMPERATURE:-0.1}"
-CACHE_FILE="${CACHE_FILE:-${ROOT}/data/weight/ref_action_prox_reverse_${MPC_NUM_SAMPLES}x${MPC_ITERATIONS}_n${MPC_NOISE}.npz}"
+MPC_NOISE="${MPC_NOISE:-1.0}"
+MPC_TEMPERATURE="${MPC_TEMPERATURE:-0.15}"
+CACHE_FILE="${CACHE_FILE:-${ROOT}/data/weight/ref_eps_grasp_flow_loose_truncated_${MPC_NUM_SAMPLES}x${MPC_ITERATIONS}_n${MPC_NOISE}.npz}"
 OBSERVATION_CACHE_FILE="${OBSERVATION_CACHE_FILE:-${CACHE_FILE}.observations}"
 stage="${1:-all}"
 GPU_NUM="${2:-${GPU_NUM:-1}}"
@@ -81,10 +81,10 @@ generate_cache() {
         --mpc_noise "${MPC_NOISE}" \
         --mpc_temperature "${MPC_TEMPERATURE}" \
         --mpc_joint_delta_clip 0.15 \
-        --mpc_cost grasp_flow \
-        --mpc_interpolate \
+        --mpc_cost grasp_flow_loose \
+        --sampler truncated \
         --control_frequency 40 \
-        --interpolate_frequency 5 \
+        --interpolate_frequency 10 \
         "${args[@]}"
 }
 
@@ -92,7 +92,7 @@ train_ref() {
     mode=()
     if [[ -n "${TRAIN_MODE:-}" ]]; then
         mode+=("${TRAIN_MODE}")
-    elif compgen -G "checkpoints/score_ref_weight/ref/[0-9]*" >/dev/null; then
+    elif compgen -G "checkpoints/score_ref_weight/ref_eps_bidir/[0-9]*" >/dev/null; then
         mode+=(--resume)
     else
         mode+=(--overwrite)
@@ -108,7 +108,7 @@ train_ref() {
         --observation_cache_path "${OBSERVATION_CACHE_FILE}" \
         --batch_size "${BATCH_SIZE}" \
         --num_workers 0 \
-        --exp_name ref \
+        --exp_name ref_eps_bidir \
         "${mode[@]}"
 }
 

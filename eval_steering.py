@@ -842,12 +842,15 @@ def _prepare_proxy_steering(model, observation):
 
     if model_type in (_model.ModelType.PROXY, _model.ModelType.PROXY_SCORE):
         images, img_masks, state = model._preprocess_observation(observation, train=False)
-        prefix_embs, prefix_pad_masks, _ = model.embed_prefix(images, img_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = model.embed_prefix(
+            images, img_masks
+        )
         return {
             "kind": "sequence",
             "state": state,
             "prefix_embs": prefix_embs,
             "prefix_pad_masks": prefix_pad_masks,
+            "prefix_att_masks": prefix_att_masks,
         }
 
     if model_type == _model.ModelType.PROXY_SOUND:
@@ -972,6 +975,7 @@ def _predict_proxy_score(prepared_proxy, model, x_t_path, time_cond):
         prepared_proxy["prefix_pad_masks"],
         x_t_model,
         time_cond,
+        prepared_proxy.get("prefix_att_masks"),
     )
 
 
@@ -1522,6 +1526,8 @@ def _infer_actions_eager(
     ):
         prepared_ref["prefix_embs"] = prepared_task["prefix_embs"]
         prepared_ref["prefix_pad_masks"] = prepared_task["prefix_pad_masks"]
+        if "prefix_att_masks" in prepared_task:
+            prepared_ref["prefix_att_masks"] = prepared_task["prefix_att_masks"]
 
     dt = -1.0 / args.num_steps
     dt = torch.tensor(dt, dtype=torch.float32, device=device)

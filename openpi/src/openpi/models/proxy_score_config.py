@@ -21,6 +21,7 @@ class ProxyScoreConfig(_model.BaseModelConfig):
     freeze_dino_encoder: bool = False
     ddim_num_train_timesteps: int = 100
     prediction_type: Literal["score", "epsilon"] = "score"
+    bidirectional_attention: bool = True
     compile_sample_actions: bool = False
 
     action_dim: int = 8

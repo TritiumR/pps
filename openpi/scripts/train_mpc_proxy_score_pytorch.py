@@ -1,14 +1,15 @@
 """Distill an MPC score policy for score-space PPS steering.
 
 This is the score-space replacement for the old policy distillation path.  The
-reference target is not a pi0/pi05 teacher action.  Instead, labels are generated
-by querying the same FK/cost MPC score estimator used at evaluation time:
+reference target is not a pi0/pi05 teacher action.  Instead, the same FK/cost MPC
+score estimator used at evaluation time is converted to epsilon supervision:
 
     s_ref(x_t, o, t) = MPC.estimate_mbd_score_action_prox(x_t, o, context, t)
+    epsilon_ref(x_t, o, t) = -sqrt(1 - alpha_bar_t) * s_ref(x_t, o, t)
 
 For each cached observation, generation starts at Gaussian action noise and
 follows the complete online ``mbd_score_action_prox`` reverse trajectory.  Each
-visited state is paired with its MPC score target.  Expert actions are not used
+visited state is paired with its MPC-derived epsilon target.  Expert actions are not used
 to construct the diffusion states.
 
 The script has two explicit stages so expensive MPC labels can be inspected and
@@ -25,7 +26,7 @@ reused:
       --cache_path ../data/weight/ref_action_prox_reverse_512x8_n0.8.npz \
       --exp_name ref --overwrite
 
-Training groups every reverse trajectory by observation.  Its 11 score labels
+Training groups every reverse trajectory by observation.  Its 11 epsilon labels
 share one DINO visual prefix, while a persistent mmap sidecar stores the
 once-resized uint8 observations for all DataLoader workers and DDP ranks.
 """
@@ -94,8 +95,8 @@ DEFAULT_BASE_CHECKPOINT_DIR = os.path.join(
     "pi05_droid_jointpos",
 )
 DEFAULT_PROMPT = "put pear and apple on the scale"
-CACHE_FORMAT_VERSION = 3
-CACHE_LABEL_TYPE = "mpc_score_action_prox_reverse_trajectory"
+CACHE_FORMAT_VERSION = 4
+CACHE_LABEL_TYPE = "mpc_epsilon_action_prox_reverse_trajectory"
 CACHE_STATE_SOURCE = "action_prox_reverse_trajectory_from_gaussian"
 ACTION_PROX_NOISE_SCHEDULE = "mpc_noise_times_sqrt_one_minus_alpha_bar"
 OBSERVATION_CACHE_FORMAT_VERSION = 1
@@ -283,6 +284,23 @@ def _time_from_iteration(
     return timestep / max(float(num_train_timesteps - 1), 1.0)
 
 
+def _epsilon_target_from_score(
+    score: torch.Tensor,
+    *,
+    iteration: int,
+    num_iterations: int,
+    num_train_timesteps: int,
+) -> torch.Tensor:
+    alpha_t, _, _ = _proxy_score.ddim_iteration_alphas(
+        iteration=iteration,
+        num_iterations=num_iterations,
+        num_train_timesteps=num_train_timesteps,
+        device=score.device,
+        dtype=score.dtype,
+    )
+    return _proxy_score.score_to_epsilon(score, alpha_t)
+
+
 def _sample_indices(
     hdf5_path: pathlib.Path,
     *,
@@ -311,6 +329,10 @@ def generate_cache(args: argparse.Namespace) -> None:
     config = _config.get_config(args.config)
     if not isinstance(config.model, openpi.models.proxy_score_config.ProxyScoreConfig):
         raise ValueError(f"{args.config!r} must use ProxyScoreConfig.")
+    if config.model.prediction_type != "epsilon":
+        raise ValueError(
+            "MPC reference distillation requires prediction_type='epsilon'."
+        )
 
     device_name = args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu"
     device = torch.device(device_name)
@@ -335,6 +357,7 @@ def generate_cache(args: argparse.Namespace) -> None:
         use_quantile_norm=base_data_config.use_quantile_norm,
     )
 
+    use_interpolation = bool(args.mpc_interpolate or args.sampler == "truncated")
     planner = SimFreeMPC(
         action_decoder,
         SimFreeMPCConfig(
@@ -350,9 +373,12 @@ def generate_cache(args: argparse.Namespace) -> None:
             cost_style=args.mpc_cost,
             optimize_space="action",
             ddim_num_train_timesteps=config.model.ddim_num_train_timesteps,
-            interpolate=args.mpc_interpolate,
+            interpolate=use_interpolation,
             control_frequency=args.control_frequency,
             interpolate_frequency=args.interpolate_frequency,
+            interpolation_method=args.mpc_interpolation_method,
+            sampler=args.sampler,
+            grad_calc="mbd",
         ),
     )
 
@@ -375,7 +401,7 @@ def generate_cache(args: argparse.Namespace) -> None:
     iterations: list[int] = []
     times: list[float] = []
     diffusion_states: list[np.ndarray] = []
-    target_scores: list[np.ndarray] = []
+    target_epsilons: list[np.ndarray] = []
     min_costs: list[float] = []
     score_norms: list[float] = []
 
@@ -427,8 +453,16 @@ def generate_cache(args: argparse.Namespace) -> None:
                             num_train_timesteps=config.model.ddim_num_train_timesteps,
                         )
                     )
+                    epsilon_target = _epsilon_target_from_score(
+                        score,
+                        iteration=iteration,
+                        num_iterations=num_iterations,
+                        num_train_timesteps=config.model.ddim_num_train_timesteps,
+                    )
                     diffusion_states.append(x_t[0].detach().cpu().numpy().astype(np.float32))
-                    target_scores.append(score[0].detach().cpu().numpy().astype(np.float32))
+                    target_epsilons.append(
+                        epsilon_target[0].detach().cpu().numpy().astype(np.float32)
+                    )
                     min_costs.append(float(diagnostics.get("cost_min", np.nan)))
                     score_norms.append(float(diagnostics.get("score_norm", np.nan)))
 
@@ -454,6 +488,8 @@ def generate_cache(args: argparse.Namespace) -> None:
         "cache_format_version": CACHE_FORMAT_VERSION,
         "label_type": CACHE_LABEL_TYPE,
         "state_source": CACHE_STATE_SOURCE,
+        "prediction_type": "epsilon",
+        "target_transform": "epsilon=-sqrt(1-alpha_bar_t)*mpc_score",
         "initial_state_distribution": "standard_gaussian",
         "trajectory_update": "mbd_score",
         "num_trajectories": len(indices),
@@ -484,7 +520,13 @@ def generate_cache(args: argparse.Namespace) -> None:
             "beta_horizon": float(args.mpc_beta_horizon),
             "joint_delta_clip": float(args.mpc_joint_delta_clip),
             "cost_style": args.mpc_cost,
-            "interpolate": bool(args.mpc_interpolate),
+            "sampler": args.sampler,
+            "grad_calc": "mbd",
+            "optimize_space": "action",
+            "interpolate": use_interpolation,
+            "interpolation_method": args.mpc_interpolation_method,
+            "interpolate_frequency": float(args.interpolate_frequency),
+            "control_frequency": float(args.control_frequency),
         },
     }
     cache_path = pathlib.Path(args.cache_path)
@@ -497,12 +539,12 @@ def generate_cache(args: argparse.Namespace) -> None:
         iteration=np.asarray(iterations, dtype=np.int64),
         time=np.asarray(times, dtype=np.float32),
         x_t=np.asarray(diffusion_states, dtype=np.float32),
-        score=np.asarray(target_scores, dtype=np.float32),
+        epsilon=np.asarray(target_epsilons, dtype=np.float32),
         cost_min=np.asarray(min_costs, dtype=np.float32),
         score_norm=np.asarray(score_norms, dtype=np.float32),
         metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
     )
-    logging.info("Wrote %s MPC score labels to %s", len(demo_names), cache_path)
+    logging.info("Wrote %s MPC epsilon labels to %s", len(demo_names), cache_path)
 
 
 class MPCScoreDataset(torch.utils.data.Dataset):
@@ -518,25 +560,32 @@ class MPCScoreDataset(torch.utils.data.Dataset):
     ):
         self.hdf5_path = hdf5_path
         self.cache = np.load(cache_path, allow_pickle=False)
+        metadata = json.loads(str(self.cache["metadata_json"].item()))
+        self.metadata = metadata
+        if int(metadata.get("cache_format_version", -1)) != CACHE_FORMAT_VERSION:
+            raise ValueError(
+                "MPC epsilon cache format is stale. Regenerate it with the current action-prox sampler."
+            )
+        if metadata.get("label_type") != CACHE_LABEL_TYPE:
+            raise ValueError("MPC cache does not contain epsilon action-prox reverse trajectories.")
+        if metadata.get("prediction_type") != "epsilon":
+            raise ValueError("MPC cache prediction type is not epsilon.")
+        if metadata.get("target_transform") != "epsilon=-sqrt(1-alpha_bar_t)*mpc_score":
+            raise ValueError("MPC cache uses an unknown score-to-epsilon transform.")
+        if config.model.prediction_type != "epsilon":
+            raise ValueError("MPC epsilon cache requires a prediction_type='epsilon' model.")
+
         self.demo_names = self.cache["demo_name"].astype(str)
         self.step_indices = self.cache["step_index"].astype(np.int64)
         self.trajectory_ids = self.cache["trajectory_id"].astype(np.int64)
         self.iterations = self.cache["iteration"].astype(np.int64)
         self.diffusion_states = self.cache["x_t"].astype(np.float32)
-        self.target_scores = self.cache["score"].astype(np.float32)
+        self.target_epsilons = self.cache["epsilon"].astype(np.float32)
         self.times = self.cache["time"].astype(np.float32)
         self.prompt = prompt
         self.config = config
         self.data_config, self.input_transform = _build_data_pipeline(config)
 
-        metadata = json.loads(str(self.cache["metadata_json"].item()))
-        self.metadata = metadata
-        if int(metadata.get("cache_format_version", -1)) != CACHE_FORMAT_VERSION:
-            raise ValueError(
-                "MPC score cache format is stale. Regenerate it with the current action-prox sampler."
-            )
-        if metadata.get("label_type") != CACHE_LABEL_TYPE:
-            raise ValueError("MPC score cache does not contain action-prox reverse trajectories.")
         if metadata.get("state_source") != CACHE_STATE_SOURCE:
             raise ValueError("MPC score cache x_t states were not sampled from base reverse denoising.")
         if metadata.get("initial_state_distribution") != "standard_gaussian":
@@ -570,10 +619,10 @@ class MPCScoreDataset(torch.utils.data.Dataset):
                 "MPC score cache x_t must have shape [N, action_horizon, action_dim]; "
                 f"got {self.diffusion_states.shape}."
             )
-        if self.diffusion_states.shape != self.target_scores.shape:
+        if self.diffusion_states.shape != self.target_epsilons.shape:
             raise ValueError(
-                "MPC score cache x_t/score shapes differ: "
-                f"{self.diffusion_states.shape} vs {self.target_scores.shape}."
+                "MPC epsilon cache x_t/epsilon shapes differ: "
+                f"{self.diffusion_states.shape} vs {self.target_epsilons.shape}."
             )
         if self.diffusion_states.shape[-1] < config.model.action_dim:
             raise ValueError(
@@ -621,8 +670,8 @@ class MPCScoreDataset(torch.utils.data.Dataset):
         step_grid = self.step_indices.reshape(num_trajectories, labels_per_trajectory)
         if np.any(demo_grid != demo_grid[:, :1]) or np.any(step_grid != step_grid[:, :1]):
             raise ValueError("MPC score cache changes observation inside a reverse trajectory.")
-        if not np.isfinite(self.diffusion_states).all() or not np.isfinite(self.target_scores).all():
-            raise ValueError("MPC score cache contains non-finite x_t or score values.")
+        if not np.isfinite(self.diffusion_states).all() or not np.isfinite(self.target_epsilons).all():
+            raise ValueError("MPC epsilon cache contains non-finite x_t or epsilon values.")
         if not np.isfinite(self.times).all() or np.any((self.times < 0.0) | (self.times > 1.0)):
             raise ValueError("MPC score cache contains invalid normalized diffusion times.")
 
@@ -825,18 +874,18 @@ class MPCScoreDataset(torch.utils.data.Dataset):
         return (
             inputs,
             torch.from_numpy(self.diffusion_states[label_start:label_end]),
-            torch.from_numpy(self.target_scores[label_start:label_end]),
+            torch.from_numpy(self.target_epsilons[label_start:label_end]),
             torch.from_numpy(self.times[label_start:label_end]),
         )
 
 
 def _collate_cache_batch(batch):
-    inputs, x_t, score, time_cond = zip(*batch, strict=True)
+    inputs, x_t, epsilon, time_cond = zip(*batch, strict=True)
     inputs = torch.utils.data.default_collate(inputs)
     return (
         inputs,
         torch.stack(x_t, dim=0),
-        torch.stack(score, dim=0),
+        torch.stack(epsilon, dim=0),
         torch.stack(time_cond, dim=0),
     )
 
@@ -859,6 +908,10 @@ def train(args: argparse.Namespace) -> None:
     )
     if not isinstance(config.model, openpi.models.proxy_score_config.ProxyScoreConfig):
         raise ValueError(f"{args.config!r} must use ProxyScoreConfig.")
+    if config.model.prediction_type != "epsilon":
+        raise ValueError(
+            "MPC reference distillation requires prediction_type='epsilon'."
+        )
 
     use_ddp, local_rank, device = setup_ddp()
     rank = torch.distributed.get_rank() if use_ddp else 0
@@ -1019,7 +1072,7 @@ def train(args: argparse.Namespace) -> None:
 
     model.train()
     pbar = (
-        tqdm.tqdm(total=config.num_train_steps, initial=global_step, desc="MPC score ref")
+        tqdm.tqdm(total=config.num_train_steps, initial=global_step, desc="MPC epsilon ref")
         if is_main
         else None
     )
@@ -1031,13 +1084,13 @@ def train(args: argparse.Namespace) -> None:
     data_iter = iter(train_loader)
     while global_step < config.num_train_steps:
         try:
-            input_batch, x_t, score_target, time_cond = next(data_iter)
+            input_batch, x_t, epsilon_target, time_cond = next(data_iter)
         except StopIteration:
             epoch += 1
             if sampler is not None:
                 sampler.set_epoch(epoch)
             data_iter = iter(train_loader)
-            input_batch, x_t, score_target, time_cond = next(data_iter)
+            input_batch, x_t, epsilon_target, time_cond = next(data_iter)
 
         # Keep cached images as compact uint8 tensors through the worker/pinned-memory
         # path. Conversion to float, channel permutation, and augmentations happen as
@@ -1045,7 +1098,7 @@ def train(args: argparse.Namespace) -> None:
         input_batch = move_to_device(input_batch, device)
         observation = _model.Observation.from_dict(input_batch)
         x_t = x_t.to(torch.float32).to(device)
-        score_target = score_target.to(torch.float32).to(device)
+        epsilon_target = epsilon_target.to(torch.float32).to(device)
         time_cond = time_cond.to(torch.float32).to(device)
 
         for group in optimizer.param_groups:
@@ -1055,7 +1108,7 @@ def train(args: argparse.Namespace) -> None:
             observation,
             x_t,
             time=time_cond,
-            score_target=score_target,
+            epsilon_target=epsilon_target,
         )
         losses = ensure_tensor_loss(losses, device)
         loss = losses.mean()
@@ -1085,7 +1138,7 @@ def train(args: argparse.Namespace) -> None:
             avg_lr = sum(item["lr"] for item in metrics) / len(metrics)
             avg_grad_norm = sum(item["grad_norm"] for item in metrics) / len(metrics)
             logging.info(
-                "step=%s mpc_score_loss=%.4f lr=%.2e grad_norm=%.2f time=%.1fs",
+                "step=%s mpc_epsilon_loss=%.4f lr=%.2e grad_norm=%.2f time=%.1fs",
                 completed_step,
                 avg_loss,
                 avg_lr,
@@ -1095,7 +1148,7 @@ def train(args: argparse.Namespace) -> None:
             if config.wandb_enabled:
                 wandb.log(
                     {
-                        "mpc_score_loss": avg_loss,
+                        "mpc_epsilon_loss": avg_loss,
                         "learning_rate": avg_lr,
                         "grad_norm": avg_grad_norm,
                         "time_per_step": elapsed / config.log_interval,
@@ -1111,7 +1164,7 @@ def train(args: argparse.Namespace) -> None:
             pbar.update(1)
             pbar.set_postfix(
                 {
-                    "mpc_score_loss": f"{loss.item():.4f}",
+                    "mpc_epsilon_loss": f"{loss.item():.4f}",
                     "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
                 }
             )
@@ -1150,17 +1203,31 @@ def build_parser() -> argparse.ArgumentParser:
     cache_parser.add_argument("--stride", type=int, default=4)
     cache_parser.add_argument("--num_steps", type=int, default=10)
     cache_parser.add_argument("--subtask_mode", choices=("heuristic", "empty"), default="heuristic")
-    cache_parser.add_argument("--mpc_num_samples", type=int, default=512)
-    cache_parser.add_argument("--mpc_iterations", type=int, default=8)
-    cache_parser.add_argument("--mpc_noise", type=float, default=0.8)
-    cache_parser.add_argument("--mpc_temperature", type=float, default=0.1)
+    cache_parser.add_argument("--mpc_num_samples", type=int, default=4096)
+    cache_parser.add_argument("--mpc_iterations", type=int, default=1)
+    cache_parser.add_argument("--mpc_noise", type=float, default=1.0)
+    cache_parser.add_argument("--mpc_temperature", type=float, default=0.15)
     cache_parser.add_argument("--mpc_beta_opt_iter", type=float, default=1.0)
     cache_parser.add_argument("--mpc_beta_horizon", type=float, default=1.0)
     cache_parser.add_argument("--mpc_joint_delta_clip", type=float, default=0.15)
     cache_parser.add_argument(
         "--mpc_cost",
-        default="grasp_flow",
-        choices=("priority", "ref_style", "explore", "grasp_flow", "grasp_flow_fake"),
+        default="grasp_flow_loose",
+        choices=(
+            "priority",
+            "ref_style",
+            "explore",
+            "grasp_flow",
+            "grasp_flow_ex",
+            "grasp_flow_fake",
+            "grasp_flow_loose",
+            "capsule_flow",
+        ),
+    )
+    cache_parser.add_argument(
+        "--sampler",
+        choices=("base", "truncated"),
+        default="truncated",
     )
     cache_parser.add_argument("--mpc_interpolate", action="store_true")
     cache_parser.add_argument(
@@ -1169,7 +1236,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="bspline",
     )
     cache_parser.add_argument("--control_frequency", type=float, default=40.0)
-    cache_parser.add_argument("--interpolate_frequency", type=float, default=5.0)
+    cache_parser.add_argument("--interpolate_frequency", type=float, default=10.0)
     cache_parser.set_defaults(func=generate_cache)
 
     train_parser = subparsers.add_parser("train")
@@ -1182,7 +1249,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Shared mmap observation cache directory (default: <cache_path>.observations).",
     )
     train_parser.add_argument("--prompt", default=DEFAULT_PROMPT)
-    train_parser.add_argument("--exp_name", default="ref")
+    train_parser.add_argument("--exp_name", default="ref_eps_bidir")
     train_parser.add_argument("--overwrite", action="store_true")
     train_parser.add_argument("--resume", action="store_true")
     train_parser.add_argument("--no_wandb", action="store_true")

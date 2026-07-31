@@ -6,7 +6,7 @@ ROOT="${ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 DATA_FILE="${DATA_FILE:-${ROOT}/data/weight/generated_dataset.hdf5}"
 DATASET_DIR="${HF_LEROBOT_HOME:-${HOME}/.cache/huggingface/lerobot}/local/isaaclab_weight_score"
 TASK_CACHE_DIR="${TASK_CACHE_DIR:-${ROOT}/data/weight/score_task_weight.observations}"
-EXP_NAME="${EXP_NAME:-task_eps}"
+EXP_NAME="${EXP_NAME:-task_eps_bidir}"
 GPU_NUM="${1:-${GPU_NUM:-1}}"
 BATCH_SIZE="${2:-${BATCH_SIZE:-32}}"
 if [[ -n "${3:-}" ]]; then

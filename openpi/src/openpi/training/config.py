@@ -5503,6 +5503,7 @@ _CONFIGS = [
             action_expert_variant="gemma_12m",
             dino_model_name="facebook/dinov3-vits16-pretrain-lvd1689m",
             ddim_num_train_timesteps=100,
+            prediction_type="epsilon",
         ),
         data=ProxyLeRobotDROIDJointPosDataConfig(
             repo_id="local/isaaclab_weight_score",
