@@ -503,6 +503,7 @@ from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
 from sim_free_mpc import AccelActionMPC, AccelMPCConfig, SimFreeMPC, SimFreeMPCConfig
 from sim_free_mpc.action_space import clamp_real_action_chunk
 from sim_free_mpc.ddim import ddim_iteration_alphas
+from sim_free_mpc.recover_debug import RecoverDebugController
 from sim_free_mpc.score_steering import combine_scores, steer_scale_for_stage
 
 
@@ -3079,6 +3080,8 @@ def _video_config_slug(args) -> str:
     ]
     if args.determine:
         parts.append("det")
+    if getattr(args, "recover_debug", None) is not None:
+        parts.append(f"recover-{args.recover_debug}")
     for prefix, name in (
         ("sg", "grasp_steer_scale"),
         ("sl", "lift_steer_scale"),
@@ -3116,7 +3119,7 @@ def _write_experiment_results(path: str, payload: dict[str, Any]) -> None:
 
 
 def _video_config_lines(args, *, seed: int) -> list[str]:
-    return [
+    lines = [
         f"seed={seed} task={args.task} prompt={args.prompt}",
         (
             f"base={_base_source_name(args)} update={args.mpc_update} "
@@ -3132,6 +3135,9 @@ def _video_config_lines(args, *, seed: int) -> list[str]:
             f"joint_clip={args.mpc_joint_delta_clip:g} determine={int(args.determine)}"
         ),
     ]
+    if getattr(args, "recover_debug", None) is not None:
+        lines.append(f"recover_debug={args.recover_debug} (drop once, then require re-grasp)")
+    return lines
 
 
 def _add_video_header(frame: np.ndarray, lines: list[str]) -> np.ndarray:
@@ -3201,6 +3207,23 @@ def _subtask_flag_from_obs(env_obs_dict, key: str) -> bool:
     if key not in raw:
         return False
     return _first_bool(raw[key])
+
+
+def _observe_recover_debug(env, controller: RecoverDebugController, *, grasped: bool) -> bool:
+    """Feed live Weight-scene state to the one-shot recovery controller."""
+    try:
+        fruit = env.scene[controller.object_name]
+        board = env.scene["board"]
+        return controller.observe(
+            grasped=grasped,
+            object_pos_w=fruit.data.root_pos_w.detach(),
+            board_pos_w=board.data.root_pos_w.detach(),
+            board_quat_w=board.data.root_quat_w.detach(),
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"--recover_debug could not read {controller.object_name!r} and board poses"
+        ) from exc
 
 
 def _apply_debug_object_xy_guard(env, guard_state, *, release: bool) -> bool:
@@ -3656,6 +3679,16 @@ def parse_args():
     )
     parser.add_argument("--task_debug", action="store_true")
     parser.add_argument(
+        "--recover_debug",
+        choices=("pear", "apple"),
+        default=None,
+        help=(
+            "Weight-policy debug: after the selected fruit is grasped and its center "
+            "leaves the chopping-board footprint, hold the arm and open the gripper for "
+            "0.5 seconds, then evaluate whether the policy re-grasps it."
+        ),
+    )
+    parser.add_argument(
         "--debug_hold_pear",
         action="store_true",
         help=(
@@ -3826,6 +3859,15 @@ if score_steering_mode in ("full", "task"):
         )
 if score_steering_mode == "base" and (args.only_steer or args.compare_difference):
     parser.error("--vlm_base is base-only and cannot be combined with --only_steer or --compare_difference.")
+if args.recover_debug is not None:
+    if "weight" not in args.task.lower():
+        parser.error("--recover_debug is only supported for a Weight task.")
+    if args.recover_debug == "pear" and args.debug_hold_pear:
+        parser.error(
+            "--recover_debug pear cannot be combined with --debug_hold_pear because "
+            "the XY guard would move the dropped pear back onto the chopping board."
+        )
+
 if args.sampler == "truncated":
     if not _uses_vlm_mpc_base(args):
         parser.error("--sampler truncated requires a VLM/MPC base mode.")
@@ -4351,6 +4393,22 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
             )
         )
 
+    recover_controller = None
+    if args.recover_debug is not None:
+        recover_controller = RecoverDebugController(
+            args.recover_debug,
+            release_steps=max(1, round(0.5 * CONTROL_FREQUENCY)),
+        )
+        print(
+            f"recover_debug enabled object={args.recover_debug} "
+            f"release_steps={recover_controller.release_steps}",
+            flush=True,
+        )
+        _write_mpc_debug_log(
+            mpc_debug_log_file, "recover_debug_enabled", seed=seed,
+            object_name=args.recover_debug, release_steps=recover_controller.release_steps,
+        )
+
     current_subtasks = _debug_subtasks(env_obs_dict)
     _observe_mpc_subtasks(mpc_planner, current_subtasks)
     current_phase = _debug_phase_from_subtasks(args.task, current_subtasks)
@@ -4473,6 +4531,14 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                 action_start_step = step_idx
 
             action_step = actions[step_idx - action_start_step]
+            recover_release_finished = False
+            if recover_controller is not None and recover_controller.releasing:
+                current_joint_pos = _to_numpy_unbatched(
+                    env_obs_dict["policy"]["joint_pos"]
+                )
+                action_step, recover_release_finished = recover_controller.override_action(
+                    action_step, current_joint_pos
+                )
 
             # perform step
             env_obs_dict, rewards, terminated, truncated, extras = env.step(
@@ -4493,6 +4559,38 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                     env_obs_dict = env.observation_manager.compute(update_history=True)
 
             next_subtasks = _debug_subtasks(env_obs_dict)
+            if recover_controller is not None:
+                recover_grasped = next_subtasks.get(
+                    f"grasp_{recover_controller.object_name}", False
+                )
+                recover_triggered = _observe_recover_debug(
+                    env, recover_controller, grasped=recover_grasped
+                )
+                if recover_triggered:
+                    print(
+                        f"recover_debug_trigger seed={seed} step={step_idx + 1} "
+                        f"object={recover_controller.object_name}",
+                        flush=True,
+                    )
+                    _write_mpc_debug_log(
+                        mpc_debug_log_file,
+                        "recover_debug_trigger",
+                        seed=seed,
+                        step=step_idx + 1,
+                        object_name=recover_controller.object_name,
+                        object_pos=_debug_scene_root_pos(env, recover_controller.object_name),
+                        board_pos=_debug_scene_root_pos(env, "board"),
+                    )
+                if recover_release_finished:
+                    force_replan = True
+                    print(
+                        f"recover_debug_release_complete seed={seed} step={step_idx + 1}",
+                        flush=True,
+                    )
+                    _write_mpc_debug_log(
+                        mpc_debug_log_file, "recover_debug_release_complete",
+                        seed=seed, step=step_idx + 1,
+                    )
             _observe_mpc_subtasks(mpc_planner, next_subtasks)
             next_phase = _debug_phase_from_subtasks(args.task, next_subtasks)
             if next_phase != current_phase:
@@ -4535,7 +4633,10 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
             obs["prompt"] = args.prompt
 
             # Check for task success using success_term
-            task_success = bool(success_term.func(env, **success_term.params)[0])
+            raw_task_success = bool(success_term.func(env, **success_term.params)[0])
+            task_success = raw_task_success and (
+                recover_controller is None or recover_controller.success_allowed
+            )
 
             # save visualization
             debug_overlay = None
@@ -4688,6 +4789,14 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
         )
     else:
         avg_infer_ms = None
+    recover_summary = None
+    if recover_controller is not None:
+        recover_summary = {
+            "object": recover_controller.object_name,
+            "injected": recover_controller.injected,
+            "seen_drop": recover_controller.seen_drop,
+            "seen_regrasp": recover_controller.seen_regrasp,
+        }
 
     experiment_results["episodes"].append(
         {
@@ -4699,6 +4808,7 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
             "thermal_video": thermal_video_name,
             "inference_calls": episode_inference_calls,
             "average_inference_ms": avg_infer_ms,
+            "recover_debug": recover_summary,
         }
     )
     _write_experiment_results(experiment_results_path, experiment_results)
