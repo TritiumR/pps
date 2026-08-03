@@ -1,0 +1,86 @@
+# insert_min -- insert_nhcal with the pose-shaping stack removed (10 terms dropped).
+#
+# The aggressive floor, ported from the parity39_min idea: attractors + feasibility +
+# hold/gripper only. Tests whether a broader cost lets a proxy proposal compete at all.
+#
+# Derived from: insert_nhcal.yaml
+
+cost:
+  terms:
+    reach: 8.0
+    terminal_reach: 40.0
+    smooth: 5.04
+    joint_delta: 3.5
+    clear: 0.1
+    floor: 40.0
+    close_gripper: 2.0
+    carry_hold: 40.0
+    release_gripper: 40.0
+    gripper_smooth: 0.5
+    lift_reach: 100.0
+    place_reach: 100.0
+    place_terminal: 60.0
+    carry_clear: 40.0
+    release_rise_first: 1.0
+    not_hold: 8.0
+  geometry:
+    ee_r: 0.035
+    coll_clear: 0.02
+    finger_r: 0.012
+    open_half: 0.04
+    tool_back: 0.06
+    tcp_to_tip: 0.0
+    center_scale: 0.4
+    grasp_dead_zone: proportional
+    close_z_scale: 0.025
+    preshape_z: 0.025
+    release_step_motion_cap: 0.008
+    retreat_margin: 0.02
+    retreat_clear: 0.04
+    rise_first_span: 0.05
+    rise_first_step: 0.02
+    not_hold_sigma: 0.0085
+    carry_clear_include_placed: true
+    carry_clear_margin: 0.005
+    preshape_xy_tol: 0.02
+    corridor_margin: 0.01
+    grasp_approach_cap: 0.016
+    grasp_brake_slope: 0.5
+    place_approach_cap: 0.024
+    place_brake_slope: 0.5
+    grasp_descend_closing_only: true
+    approach_hover: 0.08
+    approach_xy_tol: 0.02
+    close_xy_floor: 0.008
+    aperture_margin: 0.006
+    release_xy: 0.06
+    release_z: 0.02
+    place_approach_margin: 0.01
+    release_commit_aniso: true
+    commit_measured_gate: true
+    release_commit_band: 3.0
+    place_descend_radius: 0.08
+    place_release_clearance: 0.012
+    clear_max_radius: 0.1
+    insert_gate_band: 1.0
+    insert_descend_step: 0.02
+    insert_floor_span: 0.05
+advance:
+  flag_fallback: false
+  release_debug: true
+  grasp_advance_on_hold: true
+  ground_error_debug: true
+grounding:
+  rotate_grasp_offset: false
+  support_extents: false
+  seat_from_plane: true
+  lift_latch_xy: false
+steering:
+  # gate_stats: <path>/gate_stats.json   # demo-distribution thresholds for the failure
+  #                                      # gate; none ship for MimicGen, so it stays closed
+  dwell_k: 2.0
+planner:
+  interpolate: 'on'
+  interpolation_method: bspline
+  interpolate_frequency: 10.0
+  interpolate_high_frequency: 20.0

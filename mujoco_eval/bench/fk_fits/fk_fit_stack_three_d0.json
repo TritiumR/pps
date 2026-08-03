@@ -1,0 +1,53 @@
+{
+ "task": "stack_three_d0",
+ "n_frames": 3778,
+ "n_demos": 30,
+ "stride": 2,
+ "base_pos": [
+  -0.55999984,
+  -7.7e-07,
+  0.91200132
+ ],
+ "base_quat_wxyz": [
+  1.0,
+  4.6e-07,
+  5.5e-07,
+  5.2e-07
+ ],
+ "tcp_offset_link8": [
+  -1.1e-07,
+  7e-08,
+  0.09649989
+ ],
+ "pos_residual_mm": {
+  "mean": 0.00019814654435188606,
+  "p95": 0.000352753320178062,
+  "max": 0.0005657934005028546
+ },
+ "orientation": {
+  "xyzw": {
+   "R_off_quat_wxyz": [
+    0.923785,
+    -0.0,
+    -0.0,
+    -0.382911
+   ],
+   "geodesic_deg_mean": 0.0,
+   "geodesic_deg_p95": 0.0,
+   "geodesic_deg_max": 0.0
+  },
+  "wxyz": {
+   "R_off_quat_wxyz": [
+    0.016216,
+    -0.914842,
+    0.402289,
+    0.031059
+   ],
+   "geodesic_deg_mean": 40.33391599491206,
+   "geodesic_deg_p95": 96.09014135646338,
+   "geodesic_deg_max": 121.56999867972442
+  }
+ },
+ "stored_quat_convention": "xyzw",
+ "gate_p95_lt_5mm": true
+}
