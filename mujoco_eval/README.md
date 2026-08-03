@@ -238,7 +238,14 @@ is trained, this flag selects the substitute for `v_ref`:
 
 The `-gamma*s_base` term is the entire distinction. `none` forms an unbounded sum and equals neither
 policy at gamma=1. `base` implements Eq. (3), `pi_base^(1-gamma) * pi_task^gamma`; it is bounded for
-gamma in [0, 1], and gamma=1 must reproduce `--steer expert`, providing a direct correctness check.
+gamma in [0, 1].
+
+The identity check is at **gamma=0**, where the addend is exactly zero and the run must reproduce
+`--steer off` on the same seed. gamma=1 does **not** reproduce `--steer expert`: that mode bypasses
+the planner and executes the proxy chunk directly (`cost_min` is NaN), while additive still runs the
+full sampler -- finite candidate set, `delta_clip`, its own noise schedule -- with only the score
+replaced. The two agree only if the sampler exactly inverts the score field, which a Monte Carlo
+cost-weighted mean does not.
 
 Both substitutes are weaker than the full method; the paper reports a 64% -> 55% drop when ablating to
 `v_ref := v_base`.
