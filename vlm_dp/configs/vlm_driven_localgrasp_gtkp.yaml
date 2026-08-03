@@ -1,0 +1,70 @@
+# vlm_driven_localgrasp_gtkp -- vlm_driven_localgrasp with GT keypoints injected.
+
+cost:
+  terms:
+    # -- attractors
+    reach: 8.0
+    terminal_reach: 40.0
+    rekep_subgoal: 30.0
+    rekep_path: 200.0
+    # -- regularizers
+    smooth: 5.04
+    joint_delta: 3.5
+    # -- grasp / pinch
+    orientation: 8.0
+    straddle: 30.0
+    # -- keepout
+    clear: 0.1
+    floor: 40.0
+    # -- grasp / pinch
+    tip_z: 80.0
+    yaw: 5.0
+    grasp_axis: 15.0
+    center_region: 120.0
+    aperture_region: 80.0
+    close_gripper: 2.0
+    # -- lift / carry
+    carry_hold: 40.0
+    # -- keepout
+    carry_clear: 150.0
+    # -- lift / carry
+    carry_altitude: 40.0
+    # -- place
+    place_setdown: 100.0
+    # -- release / departure
+    release_gripper: 40.0
+    # -- regularizers
+    gripper_smooth: 0.5
+    # -- grasp / pinch
+    grasp_approach_corridor: 120.0
+    grasp_descend_rate: 40.0
+    grasp_standoff: 40.0
+  geometry:
+    ee_r: 0.035
+    coll_clear: 0.02
+    finger_r: 0.012
+    open_half: 0.04
+    tool_back: 0.06
+    tcp_to_tip: 0.0
+    center_scale: 0.4
+    close_z_scale: 0.025
+    preshape_z: 0.025
+    preshape_xy_tol: 0.02
+    close_xy_floor: 0.008
+    aperture_margin: 0.006
+    subgoal_mean: true
+    release_on_subgoal: false
+    release_xy: 0.06
+    release_z: 0.02
+    place_release_clearance: 0.012
+    place_descend_radius: 0.1
+    carry_altitude_clear: 0.12
+    clear_max_radius: 0.1
+    carry_clear_margin: 0.05
+grounding:
+  local_grasp: true
+  local_grasp_radius: 0.05
+  kp_source: gt
+advance:
+  mode: subgoal
+  flag_fallback: false

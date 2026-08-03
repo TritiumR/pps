@@ -163,7 +163,8 @@ advances the stage. All positions share the simulator world frame (`context.py`)
 | `bridge.py`, `context.py`, `stage.py` | planner attachment, per-replan context, stage predicates |
 | `world.py` | object-state seam: simulator (`GTWorld`) or sensors (`SensedWorld`) |
 | `perception.py`, `grasp_sensor.py`, `visual_tracker.py`, `grasp_recovery.py` | the sensed-state stack |
-| `configs/` | term weights + gripper/collision geometry (`base.yaml` and task/ablation variants) |
+| `configs/` | term weights + gripper/collision geometry: the **working** configs |
+| `configs/test_configs/` | the parity ablation ladder — the experimental record, one change per file |
 | `tests/` | CPU-only regression tests |
 
 External deps: `rekep/` (keypoint proposal + constraint generation), `sim_free_mpc/` (the planner,

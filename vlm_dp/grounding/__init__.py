@@ -49,6 +49,9 @@ class Stage:
     place_point: Optional[Callable[[], np.ndarray]] = None    # calibrated top-surface seat point
     carry_z: Optional[Callable[[], float]] = None             # carry altitude for the place transit
     advance_on_done: bool = False             # hold stages: advance on done() instead of the height gate
+    # Called by the bridge on every entry (advance or backtrack) to this stage. Lets a stage latch a
+    # world anchor at the moment it begins, rather than tracking a live estimate that its own motion moves.
+    on_enter: Optional[Callable[[], None]] = None
     # ReKep constraint-as-cost (optional): torch callables fn(ee_pos[K,H,3], kp[N,K,H,3]) -> [K,H]. When
     # constraint is set it becomes J_task, and held_idx are keypoints riding the gripper.
     constraint: Optional[Callable] = None
@@ -57,9 +60,22 @@ class Stage:
     # pinch: straddle-grasp a free object. press: contact-and-hold an articulated part such as a lid, with
     # no pinch-certification, advancing on contact so the sub-goal drives it.
     contact: str = "pinch"
+    # Articulated-fixture geometry from the joint the stage drives. FK is contact-blind, so these
+    # describe the end-effector trajectory that WOULD produce it; keys are documented on
+    # cost.terms.hook_pull / press_axis, the only readers. None on free-body stages.
+    pull: Optional[Callable[[], Optional[dict]]] = None
+    press: Optional[Callable[[], Optional[dict]]] = None
+    # Insertion-corridor geometry, measured from the receptacle and the payload that passes through
+    # it. The keys are documented on cost.terms._insert, the only reader. None on every stage whose
+    # place is a set-down, and every configuration that does not list the insert terms is unaffected.
+    insert: Optional[Callable[[], Optional[dict]]] = None
     # surface: set down on the destination's top. container: the VLM put it inside, and a container's top
     # is its rim, so the set-down terms must not seat it there.
     place_mode: str = "surface"
+    # Steering authority policy, authored by the plan (never / on_failure / always). None means the
+    # plan did not speak: the gate stays closed. The expert term may modify the sampler only under
+    # this policy, evaluated by the bridge's failure gate.
+    steer_policy: Optional[str] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -108,5 +124,8 @@ def get_source(name: str, **kwargs) -> GroundingSource:
                               local_grasp_radius=kwargs.get("local_grasp_radius", 0.05),
                               kp_source=kwargs.get("kp_source", "perception"),
                               contact_criterion=kwargs.get("contact_criterion", "feasibility"),
-                              open_half=kwargs.get("open_half", 0.04))
+                              open_half=kwargs.get("open_half", 0.04),
+                              rotate_grasp_offset=kwargs.get("rotate_grasp_offset", False),
+                              lift_latch_xy=kwargs.get("lift_latch_xy", False),
+                              seat_from_plane=kwargs.get("seat_from_plane", False))
     raise ValueError(f"unknown grounding source: {name!r}")

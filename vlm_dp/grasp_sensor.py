@@ -1,7 +1,9 @@
-"""Grasp detection from the finger joint. A close that meets an object stalls short of the free-close
-angle (calibrated: air 0.785 rad, pear 0.258, apple 0.166). Settling is judged on the angle, never
-joint_vel, since a held object reads a steady nonzero velocity.
+"""Detect grasps from the finger joint angle.
+
+A grasp stalls below the free-close angle. Settling is measured from joint
+position because a held object may report a steady nonzero joint velocity.
 """
+
 from __future__ import annotations
 
 import collections
@@ -10,76 +12,139 @@ import numpy as np
 
 
 class ApertureGraspSensor:
-    """Reports whether something is between the fingers and which object it is.
+    """Detects whether the gripper is holding an object.
 
-    Call observe once per control step. holding and held_object report the verdict.
+    Call observe() once per control step. Window sizes are measured in control
+    steps and are designed to remain stable across observation frequencies.
     """
 
-    def __init__(self, q_free=0.7854, stall_margin=0.15, q_touch=0.05, settle_steps=3,
-                 settle_eps=0.01, close_steps=3, proximity=0.10):
-        self.q_free = q_free                  # rad, angle a free close settles at (commanded close angle)
-        self.stall_margin = stall_margin      # rad short of q_free that counts as blocked
-        self.q_touch = q_touch                # rad the fingers must travel, guards a still-opening hand
-        self.settle_steps = settle_steps      # steps the angle must hold steady before it is read
-        self.settle_eps = settle_eps          # rad of drift allowed inside the settle window
-        self.close_steps = close_steps        # steps the close must have been commanded for
-        self.proximity = proximity            # m, how near the TCP an object must be to be the one held
+    def __init__(
+        self,
+        q_free=0.7854,
+        stall_margin=0.15,
+        q_touch=0.05,
+        settle_steps=12,
+        settle_eps=0.01,
+        close_steps=12,
+        proximity=0.10,
+        settle_probe_stride=4,
+        close_duty=0.75,
+        legacy=False,
+        stall_margin_enter=None,
+        stall_margin_exit=None,
+    ):
+        # Restore the original continuous-close and dense-settling gates.
+        self.legacy = bool(legacy)
+        if self.legacy:
+            settle_steps, close_steps, settle_probe_stride = 3, 3, 1
+
+        self.q_free = q_free
+        self.stall_margin = stall_margin
+
+        # Separate acquisition and release thresholds to prevent boundary oscillation.
+        self.hysteresis = (
+            stall_margin_enter is not None or stall_margin_exit is not None
+        )
+        self.stall_margin_enter = (
+            stall_margin
+            if stall_margin_enter is None
+            else float(stall_margin_enter)
+        )
+        self.stall_margin_exit = (
+            stall_margin
+            if stall_margin_exit is None
+            else float(stall_margin_exit)
+        )
+
+        self.q_touch = q_touch
+        self.settle_steps = settle_steps
+        self.settle_eps = settle_eps
+        self.close_steps = close_steps
+        self.proximity = proximity
+
+        # Decimation keeps the settling test independent of observation frequency.
+        self.settle_probe_stride = max(int(settle_probe_stride), 1)
+
+        # A duty cycle tolerates brief open commands during an otherwise active close.
+        self.close_duty = float(close_duty)
+
         self._q = collections.deque(maxlen=max(settle_steps + 1, 2))
+        self._cmd = collections.deque(maxlen=max(close_steps, 1))
         self._closed_for = 0
 
     def observe(self, env, commanded_close: bool) -> None:
-        """Record one control step. commanded_close is the gripper command that was just applied."""
+        """Record the gripper state after one control step."""
         self._closed_for = self._closed_for + 1 if commanded_close else 0
+        self._cmd.append(bool(commanded_close))
         self._q.append(env.gripper_q())
 
-    # The finger angle distinguishes exactly three states, each named here so callers express intent
-    # rather than re-deriving a band from q_free/stall_margin/q_touch. A caller that rebuilds the band
-    # inline can invert it (measured: a press advance read as closed for a fully open hand because it
-    # dropped the q_touch bound) and the arithmetic gives no hint that it is wrong.
-
     def is_open(self) -> bool:
-        """The fingers have not travelled: nothing has been closed on."""
+        """Return whether the fingers have not moved beyond the touch threshold."""
         return self.aperture() <= self.q_touch
 
     def closed_on_air(self) -> bool:
-        """The close ran to the free-close angle: the fingers met nothing."""
-        return self.aperture() >= self.q_free - self.stall_margin
+        """Return whether the fingers reached the free-close range."""
+        return self.aperture() >= self.q_free - self.stall_margin_exit
 
     def closed(self) -> bool:
-        """The commanded close has completed: the fingers travelled past q_touch and settled.
-
-        Deliberately weaker than holding: it says the close finished, not that anything is between the
-        fingers. A press contact closes on a thin or articulated part whose angle can run near the
-        free-close value, so the sensor cannot certify it, and a press advance may assert only this much.
-        """
-        if self._closed_for < self.close_steps or len(self._q) < self.settle_steps + 1:
+        """Return whether a commanded close has travelled and settled."""
+        if not self._close_commanded() or len(self._q) < self.settle_steps + 1:
             return False
-        window = list(self._q)[-(self.settle_steps + 1):]
-        if max(window) - min(window) > self.settle_eps:   # still travelling, the transient of any close
-            return False                                  # (empty ones included), so do not read it yet
+        if self._settle_spread() > self.settle_eps:
+            return False
         return not self.is_open()
 
+    def _close_commanded(self) -> bool:
+        """Return whether closing was commanded for enough of the window."""
+        if self.legacy:
+            return self._closed_for >= self.close_steps
+        if len(self._cmd) < self.close_steps:
+            return False
+        return (sum(self._cmd) / len(self._cmd)) >= self.close_duty
+
+    def _settle_spread(self) -> float:
+        """Return the peak-to-peak aperture across decimated settling probes."""
+        window = list(self._q)[-(self.settle_steps + 1) :]
+        probes = window[::-1][:: self.settle_probe_stride][::-1]
+        return max(probes) - min(probes)
+
     def holding(self) -> bool:
-        """Certifiable width between the fingers: a settled close that stalled short of the free-close
-        angle. The strongest claim the angle supports."""
-        return self.closed() and not self.closed_on_air()
+        """Return whether a settled close stalled below the free-close range."""
+        return (
+            self.closed()
+            and self.aperture() < self.q_free - self.stall_margin_enter
+        )
+
+    def hold_lost(self) -> bool:
+        """Return whether a latched grasp has opened or reached free close."""
+        return self.is_open() or (self.hysteresis and self.closed_on_air())
 
     def held_object(self, positions: dict, tcp) -> str | None:
-        """Nearest estimated centroid to the TCP when the fingers report a hold (else None).
-
-        Proximity names the object and rejects closes blocked by the table or the arm itself.
-        """
+        """Return the nearest object within reach when a grasp is detected."""
         if not self.holding() or not positions:
             return None
+
         tcp = np.asarray(tcp, dtype=np.float64)
-        name, dist = min(((n, float(np.linalg.norm(np.asarray(p, dtype=np.float64) - tcp)))
-                          for n, p in positions.items()), key=lambda kv: kv[1])
+        name, dist = min(
+            (
+                (
+                    name,
+                    float(
+                        np.linalg.norm(
+                            np.asarray(position, dtype=np.float64) - tcp
+                        )
+                    ),
+                )
+                for name, position in positions.items()
+            ),
+            key=lambda item: item[1],
+        )
         return name if dist <= self.proximity else None
 
     def aperture(self) -> float:
-        """Current finger angle in rad. Larger is more closed, and it encodes the held object's width."""
+        """Return the latest finger joint angle in radians."""
         return self._q[-1] if self._q else 0.0
 
     def released(self) -> bool:
-        """Nothing held: fingers open, or run to the free-close angle (either side of the stall band)."""
+        """Return whether the gripper is open or closed without an obstruction."""
         return self.is_open() or self.closed_on_air()
