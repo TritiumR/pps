@@ -9,8 +9,8 @@ data
 data_local
 slurm
 .secrets/
-core
-core.*
+/core
+/core.*
 .vscode
 _wandb
 /droid/results
