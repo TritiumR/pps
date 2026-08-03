@@ -1,35 +1,40 @@
-# Rekep-grounding rung: parity13 shape, perception-scale grasp tolerances, no constraint terms.
-# Derived from base_parity13; original header follows.
-# Full weight/shape parity with sim_free_mpc's grasp_flow cost (H=10 chunk), from the 2026-07-22
-# differential audit. Changes vs base_parity12: smooth/joint_delta converted at the true H=10;
-# consistency dropped (grasp_flow has none; prox lives in the sampler proposal); grasp reach 8;
-# + lift_reach; grasp_flow place shape (binary descend 0.08, lift-altitude carry, one-sided carry
-# floor, +0.04 release hover); collision -> grasp_flow's clear (TCP sphere, compact movables only).
-# Kept deliberate divergences: center_scale 0.12, measured-TCP close gate, floor, Algorithm-1 stages.
+# parity13_rekep_legacy_deadzone -- the ReKep base config the README's commands run.
+#
+# Keeps the legacy grasp dead zone; parity13_rekep_flagfree is the flag-free twin.
 
 cost:
   terms:
-    reach: 8.0              # grasp_flow reach (grasp phase; gates off while a payload is held)
-    terminal_reach: 40.0    # grasp_flow terminal
-    smooth: 5.04            # = grasp_flow's 0.08 x 7 joints x (H-1)=9 (hers sums; ours means)
-    joint_delta: 3.5        # = grasp_flow's local 0.05 x 7 x H=10
-    orientation: 8.0        # grasp_flow orient
+    # -- attractors
+    reach: 8.0                   # grasp_flow reach (grasp phase; gates off while a payload is ...
+    terminal_reach: 40.0         # grasp_flow terminal
+    # -- regularizers
+    smooth: 5.04                 # = grasp_flow's 0.08 x 7 joints x (H-1)=9 (hers sums; ours ...
+    joint_delta: 3.5             # = grasp_flow's local 0.05 x 7 x H=10
+    # -- grasp / pinch
+    orientation: 8.0             # grasp_flow orient
     straddle: 30.0
-    clear: 0.1              # grasp_flow clear (fixtures are never sphere obstacles)
+    # -- keepout
+    clear: 0.1                   # grasp_flow clear (fixtures are never sphere obstacles)
     floor: 40.0
+    # -- grasp / pinch
     tip_z: 80.0
-    yaw: 5.0                # mild world-axis default (round objects)
-    grasp_axis: 15.0        # close across the object's narrow axis when elongated (dominates yaw)
+    yaw: 5.0                     # mild world-axis default (round objects)
+    grasp_axis: 15.0             # close across the object's narrow axis when elongated ...
     center_region: 120.0
     aperture_region: 80.0
     close_gripper: 2.0
-    carry_hold: 40.0        # grasp_flow lift_gripper / place_gripper
-    release_gripper: 40.0   # reopen recovery (closed-empty at target)
+    # -- lift / carry
+    carry_hold: 40.0             # grasp_flow lift_gripper / place_gripper
+    # -- release / departure
+    release_gripper: 40.0        # reopen recovery (closed-empty at target)
+    # -- regularizers
     gripper_smooth: 0.5
+    # -- lift / carry
     lift_reach: 12.0
     lift_xy: 80.0
     lift_z: 120.0
     lift_terminal: 80.0
+    # -- place
     place_reach: 12.0
     place_xy: 120.0
     place_z: 80.0
@@ -42,16 +47,16 @@ cost:
     open_half: 0.04
     tool_back: 0.06
     tcp_to_tip: 0.0
-    center_scale: 0.40      # perception-scale dead-zone (grounding error ~17mm >> GT's 6mm zone)
-    grasp_dead_zone: proportional   # CONTROL arm: the pre-unification dead-zone
+    center_scale: 0.40           # perception-scale dead-zone (grounding error ~17mm >> GT's 6mm ...
+    grasp_dead_zone: proportional  # CONTROL arm: the pre-unification dead-zone
     close_z_scale: 0.025
-    close_xy_floor: 0.008   # gate wider than grounding wobble
+    close_xy_floor: 0.008        # gate wider than grounding wobble
     aperture_margin: 0.006
     release_xy: 0.06
-    release_z: 0.02          # release near the surface (with clearance 0.012 -> ~3cm max set-down, was ~7.5cm)
-    place_descend_radius: 0.08      # grasp_flow's binary descend gate
-    place_release_clearance: 0.012   # gentle set-down near the surface (was 0.04 drop -> pear scatter/roll-off)
-    clear_max_radius: 0.10          # wider objects are fixtures, not sphere obstacles
+    release_z: 0.02              # release near the surface (with clearance 0.012 -> ~3cm max ...
+    place_descend_radius: 0.08   # grasp_flow's binary descend gate
+    place_release_clearance: 0.012  # gentle set-down near the surface (was 0.04 drop -> pear ...
+    clear_max_radius: 0.10       # wider objects are fixtures, not sphere obstacles
 
 # Ablation: no env flag ever touches the control loop (place advance = geometric done() only).
 advance:

@@ -1,36 +1,39 @@
-# Capsule task (open lid + insert pod): parity13 weights + the release-intent term.
-# Original header follows.
-# Full weight/shape parity with sim_free_mpc's grasp_flow cost (H=10 chunk), from the 2026-07-22
-# differential audit. Changes vs base_parity12: smooth/joint_delta converted at the true H=10;
-# consistency dropped (grasp_flow has none; prox lives in the sampler proposal); grasp reach 8;
-# + lift_reach; grasp_flow place shape (binary descend 0.08, lift-altitude carry, one-sided carry
-# floor, +0.04 release hover); collision -> grasp_flow's clear (TCP sphere, compact movables only).
-# Kept deliberate divergences: center_scale 0.12, measured-TCP close gate, floor, Algorithm-1 stages.
+# capsule -- cost for the capsule task (articulated lid).
 
 cost:
   terms:
-    reach: 8.0              # grasp_flow reach (grasp phase; gates off while a payload is held)
-    terminal_reach: 40.0    # grasp_flow terminal
+    # -- attractors
+    reach: 8.0                   # grasp_flow reach (grasp phase; gates off while a payload is ...
+    terminal_reach: 40.0         # grasp_flow terminal
     rekep_subgoal: 25.0
     rekep_path: 200.0
-    smooth: 5.04            # = grasp_flow's 0.08 x 7 joints x (H-1)=9 (hers sums; ours means)
-    joint_delta: 3.5        # = grasp_flow's local 0.05 x 7 x H=10
-    orientation: 8.0        # grasp_flow orient
+    # -- regularizers
+    smooth: 5.04                 # = grasp_flow's 0.08 x 7 joints x (H-1)=9 (hers sums; ours ...
+    joint_delta: 3.5             # = grasp_flow's local 0.05 x 7 x H=10
+    # -- grasp / pinch
+    orientation: 8.0             # grasp_flow orient
     straddle: 30.0
-    clear: 0.1              # grasp_flow clear (fixtures are never sphere obstacles)
+    # -- keepout
+    clear: 0.1                   # grasp_flow clear (fixtures are never sphere obstacles)
     floor: 40.0
+    # -- grasp / pinch
     tip_z: 80.0
     yaw: 5.0
     center_region: 120.0
     aperture_region: 80.0
     close_gripper: 2.0
-    carry_hold: 40.0        # grasp_flow lift_gripper / place_gripper
-    release_gripper: 40.0   # open the gripper on release-intent stages (letting go of the lid)
+    # -- lift / carry
+    carry_hold: 40.0             # grasp_flow lift_gripper / place_gripper
+    # -- release / departure
+    release_gripper: 40.0        # open the gripper on release-intent stages (letting go of the ...
+    # -- regularizers
     gripper_smooth: 0.5
+    # -- lift / carry
     lift_reach: 12.0
     lift_xy: 80.0
     lift_z: 120.0
     lift_terminal: 80.0
+    # -- place
     place_reach: 12.0
     place_xy: 120.0
     place_z: 80.0
@@ -43,17 +46,17 @@ cost:
     open_half: 0.04
     tool_back: 0.06
     tcp_to_tip: 0.0
-    center_scale: 0.12      # deliberate: 0.40 pairs with flag-advance; our centered-TCP advance needs it tight
+    center_scale: 0.12           # deliberate: 0.40 pairs with flag-advance; our centered-TCP ...
     close_z_scale: 0.025
-    close_xy_floor: 0.012   # tiny pod: keep the close gate wider than TCP wobble
+    close_xy_floor: 0.012        # tiny pod: keep the close gate wider than TCP wobble
     aperture_margin: 0.006
     release_xy: 0.06
     release_z: 0.035
-    place_descend_radius: 0.08      # grasp_flow's binary descend gate
-    place_release_clearance: 0.15   # release ABOVE the bay mouth (machine top 0.598 vs seat 0.448): drop in
-    clear_max_radius: 0.10          # wider objects are fixtures, not sphere obstacles
+    place_descend_radius: 0.08   # grasp_flow's binary descend gate
+    place_release_clearance: 0.15  # release ABOVE the bay mouth (machine top 0.598 vs seat ...
+    clear_max_radius: 0.10       # wider objects are fixtures, not sphere obstacles
 
 # Thin-lip grip: a ~1cm pinch stalls ~0.70 rad; the default 0.15 margin (cutoff 0.635) reads it empty.
 advance:
   stall_margin: 0.06
-  settle_eps: 0.03      # a 30g can jitters in the grip; milliradian stillness never happens
+  settle_eps: 0.03               # a 30g can jitters in the grip; milliradian stillness never ...

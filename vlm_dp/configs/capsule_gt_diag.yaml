@@ -1,32 +1,39 @@
-# Capsule GT-keypoint DIAGNOSTIC: de-confound perception/occlusion from the downstream cost/control.
-# Identical driven cost + LOCAL grasp as vlm_driven_localgrasp.yaml, but keypoints come from GT part poses
-# (grounding.kp_source: gt) and the plan from the capsule fake-VLM. So the question is isolated to: given a
-# keypoint correctly on the lid lip (+ pod + bay), does the DRIVEN cost grasp the lip and open the lid + seat
-# the pod? Pair with --vlm_cost rekep_fake_vlm --vlm_state gt. NOT the honest base -- a privileged rung.
+# capsule_gt_diag -- capsule with GT keypoints, the privileged diagnostic rung.
 
 cost:
   terms:
+    # -- attractors
     reach: 8.0
     terminal_reach: 40.0
     rekep_subgoal: 30.0
     rekep_path: 200.0
+    # -- regularizers
     smooth: 5.04
     joint_delta: 3.5
+    # -- grasp / pinch
     orientation: 8.0
     straddle: 30.0
+    # -- keepout
     clear: 0.1
     floor: 40.0
+    # -- grasp / pinch
     tip_z: 80.0
     yaw: 5.0
     grasp_axis: 15.0
     center_region: 120.0
     aperture_region: 80.0
     close_gripper: 2.0
+    # -- lift / carry
     carry_hold: 40.0
+    # -- keepout
     carry_clear: 150.0
+    # -- lift / carry
     carry_altitude: 40.0
+    # -- place
     place_setdown: 100.0
+    # -- release / departure
     release_gripper: 40.0
+    # -- regularizers
     gripper_smooth: 0.5
   geometry:
     ee_r: 0.035
@@ -50,9 +57,9 @@ cost:
     carry_clear_margin: 0.05
 
 grounding:
-  local_grasp: true          # grasp AT the GT lid keypoint (the lip), not the whole-machine centroid
+  local_grasp: true              # grasp AT the GT lid keypoint (the lip), not the whole-machine ...
   local_grasp_radius: 0.05
-  kp_source: gt              # keypoints from GT part poses (occlusion-free) -- the diagnostic switch
+  kp_source: gt                  # keypoints from GT part poses (occlusion-free) -- the ...
 
 advance:
   mode: subgoal
