@@ -7,6 +7,7 @@ from pathlib import Path
 import jax.numpy as jnp
 
 import openpi.models.model as _model
+import openpi.policies.decode_only as _decode_only
 import openpi.policies.policy as _policy
 import openpi.shared.download as download
 from openpi.training import checkpoints as _checkpoints
@@ -80,6 +81,7 @@ def create_trained_policy(
     default_prompt: str | None = None,
     norm_stats: dict[str, transforms.NormStats] | None = None,
     pytorch_device: str | None = None,
+    load_weights: bool = True,
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
 
@@ -95,6 +97,9 @@ def create_trained_policy(
             from the checkpoint directory.
         pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda", "cuda:0").
                       If None and is_pytorch=True, will use "cuda" if available, otherwise "cpu".
+        load_weights: If False, skip instantiating and loading the network and return a
+            decode-only policy: same transforms, same norm stats, no model parameters. Only
+            valid for callers that never forward-pass the model (see `decode_only`).
 
     Note:
         The function automatically detects whether the model is PyTorch-based by checking for the
@@ -106,11 +111,17 @@ def create_trained_policy(
     # Check if this is a PyTorch model by looking for model.safetensors
     weight_path = os.path.join(checkpoint_dir, "model.safetensors")
     is_pytorch = os.path.exists(weight_path)
+    if not load_weights:
+        # obs_to_input builds torch tensors, so the stub always takes the torch branch.
+        is_pytorch = True
 
     print(f"is_pytorch: {is_pytorch}")
 
     logging.info("Loading model...")
-    if is_pytorch:
+    if not load_weights:
+        logging.info("Decode-only policy requested; skipping model weight load.")
+        model = _decode_only.DecodeOnlyModel(train_config.model)
+    elif is_pytorch:
         model = train_config.model.load_pytorch(train_config, weight_path)
         if train_config.model.model_type in [
             ModelType.PI0,
@@ -162,7 +173,8 @@ def create_trained_policy(
     output_norm_stats = _output_norm_stats(norm_stats)
 
     logging.info("Creating policy wrapper...")
-    policy = _policy.Policy(
+    policy_cls = _policy.Policy if load_weights else _decode_only.DecodeOnlyPolicy
+    policy = policy_cls(
         model,
         transforms=[
             *repack_transforms.inputs,
@@ -191,6 +203,7 @@ def create_trained_policy(
         "output_norm_stats": output_norm_stats,
         "output_norm_stats_source": norm_stats_source,
         "use_quantile_norm": data_config.use_quantile_norm,
+        "decode_only": not load_weights,
     }
     logging.info("Policy wrapper created.")
     return policy

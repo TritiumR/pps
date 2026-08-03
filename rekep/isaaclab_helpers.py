@@ -9,6 +9,7 @@
 Imports IsaacLab; use after ``AppLauncher`` has started.
 """
 
+import os
 import re
 
 import numpy as np
@@ -59,6 +60,14 @@ def camera_to_rekep_inputs(camera, env_index: int = 0):
         camera.data.quat_w_ros[env_index : env_index + 1],
     ).squeeze(0)
     points = points_world.reshape(height, width, 3).detach().cpu().numpy().astype(np.float32)
+    # Invalid depth must stay invalid: zeroing it lifts those pixels to the CAMERA position, a
+    # finite in-workspace point every isfinite() check accepts, so background silently joins object
+    # clouds. NaN is the sentinel consumers already test for.
+    # REKEP_INVALID_DEPTH=camera restores the old behaviour, so this can be ablated against the
+    # sensor-cadence and debounce changes it shipped with.
+    if os.environ.get("REKEP_INVALID_DEPTH", "nan").lower() != "camera":
+        invalid = ~(torch.isfinite(depth) & (depth > 0.0))
+        points[invalid.detach().cpu().numpy()] = np.nan
 
     seg = camera.data.output["instance_id_segmentation_fast"]
     if seg.dim() == 4 and seg.shape[-1] == 1:

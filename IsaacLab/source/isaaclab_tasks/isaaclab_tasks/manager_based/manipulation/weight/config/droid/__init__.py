@@ -12,6 +12,7 @@ from . import (
     weight_joint_pos_pointcloud_masked_env_cfg,
     weight_joint_pos_pointcloud_env_cfg,
     weight_joint_pos_visuomotor_env_cfg,
+    weight_joint_pos_visuomotor_simple_env_cfg,
 )
 
 
@@ -20,6 +21,16 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     kwargs={
         "env_cfg_entry_point": weight_joint_pos_visuomotor_env_cfg.DroidWeightJointPosVisuomotorEnvCfg,
+    },
+    disable_env_checker=True,
+)
+
+
+gym.register(
+    id="Isaac-Weight-Droid-Visuomotor-Simple-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": weight_joint_pos_visuomotor_simple_env_cfg.DroidWeightSimpleJointPosVisuomotorEnvCfg,
     },
     disable_env_checker=True,
 )

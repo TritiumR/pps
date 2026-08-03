@@ -49,6 +49,7 @@
     "grasp_obj": "teapot",
     "place_obj": "teacup",
     "task_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_tea_pi05_jointpos/task/32000",
+    "score_task_checkpoint_dir": "openpi/checkpoints/score_task_tea/task_eps/30000",
     "ref_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_tea_pi05_jointpos/reference/20000",
     "objects": {
       "teapot": "teapot",

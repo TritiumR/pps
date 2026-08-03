@@ -19,23 +19,28 @@ from rekep.utils import filter_points_by_bounds
 
 
 class KeypointProposer:
-    def __init__(self, config):
+    def __init__(self, config, feature_fn=None):
         self.config = config
         self.device = torch.device(self.config["device"])
-        # Load DINOv2 from the local torch.hub cache when present, so grounding never hits github (its
-        # ref check runs on every seed and a flaky response there crashed mid-run). Download once if absent.
-        dino_model = self.config.get("dino_model", "dinov2_vits14")
-        hub_local = os.path.join(torch.hub.get_dir(), "facebookresearch_dinov2_main")
-        if os.path.isdir(hub_local):
-            self.dinov2 = torch.hub.load(hub_local, dino_model, source="local").eval().to(self.device)
+        # Optional injected feature source: (transformed_rgb, shape_info) -> [H*W, D] on device.
+        # None = the deployed DINOv2 path (default, unchanged).
+        self.feature_fn = feature_fn
+        if feature_fn is not None:
+            self.dinov2 = None
         else:
-            self.dinov2 = torch.hub.load("facebookresearch/dinov2", dino_model).eval().to(self.device)
+            # Load DINOv2 from the local torch.hub cache when present, so grounding never hits github (its
+            # ref check runs on every seed and a flaky response there crashed mid-run). Download once if absent.
+            dino_model = self.config.get("dino_model", "dinov2_vits14")
+            hub_local = os.path.join(torch.hub.get_dir(), "facebookresearch_dinov2_main")
+            if os.path.isdir(hub_local):
+                self.dinov2 = torch.hub.load(hub_local, dino_model, source="local").eval().to(self.device)
+            else:
+                self.dinov2 = torch.hub.load("facebookresearch/dinov2", dino_model).eval().to(self.device)
         self.bounds_min = np.array(self.config["bounds_min"])
         self.bounds_max = np.array(self.config["bounds_max"])
-        # n_jobs=1, NOT 32: the parallel reduction makes the cluster count/ordering non-deterministic, so the
-        # same scene yielded a different keypoint list (and hence different keypoint INDICES, which the VLM
-        # constraints reference) on every run -- no ReKep rollout replayed. This clusters a few hundred
-        # points; the workers bought nothing.
+        # n_jobs=1: the parallel reduction makes cluster count and ordering non-deterministic, so
+        # the same scene yielded different keypoint INDICES every run and no rollout replayed. At a
+        # few hundred points the workers bought nothing.
         self.mean_shift = MeanShift(bandwidth=self.config["min_dist_bt_keypoints"], bin_seeding=True, n_jobs=1)
         self.patch_size = 14  # dinov2
         np.random.seed(self.config["seed"])
@@ -43,23 +48,32 @@ class KeypointProposer:
         torch.cuda.manual_seed(self.config["seed"])
 
     def get_keypoints(self, rgb, points, masks):
-        # Re-seed HERE, not only in __init__. `_cluster_features` calls torch.pca_lowrank, which is a
-        # RANDOMIZED algorithm, and by the time this runs the global RNG has been advanced by everything
-        # else in the process (the env reset, the MPC sampler, DINOv2's own forward). Seeding once at
-        # construction therefore does not make the proposal reproducible: the same scene proposed
-        # different keypoints on different runs, so no ReKep rollout replayed and no success rate on the
-        # perception path was measurable. Seeding at the call site pins the proposal to (image, config).
+        # Re-seed here, not only in __init__: _cluster_features calls the randomized
+        # torch.pca_lowrank, and by now the global RNG has been advanced by the env reset, the
+        # sampler and DINOv2's forward. Seeding at the call site pins the proposal to
+        # (image, config).
         np.random.seed(self.config["seed"])
         torch.manual_seed(self.config["seed"])
         torch.cuda.manual_seed_all(self.config["seed"])
         torch.backends.cudnn.deterministic = True   # DINOv2's forward otherwise perturbs the PCA input
         torch.backends.cudnn.benchmark = False      # autotuning picks different kernels run-to-run
         transformed_rgb, rgb, points, masks, shape_info = self._preprocess(rgb, points, masks)
-        features_flat = self._get_features(transformed_rgb, shape_info)
+        features_flat = (self.feature_fn(transformed_rgb, shape_info) if self.feature_fn is not None
+                         else self._get_features(transformed_rgb, shape_info))
         # cluster each mask's features into candidate keypoints
         candidate_keypoints, candidate_pixels, candidate_rigid_group_ids = self._cluster_features(
             points, features_flat, masks
         )
+        if candidate_keypoints.size == 0:
+            # Every mask was skipped (too large, or fewer pixels than num_candidates_per_mask). Say so
+            # here: the downstream bounds filter would raise an opaque IndexError on the empty array.
+            sizes = sorted((int(m.sum()) for m in masks), reverse=True)[:8]
+            raise ValueError(
+                f"keypoint proposal produced no candidates from {len(masks)} masks "
+                f"(largest pixel counts {sizes}, max_mask_ratio={self.config['max_mask_ratio']}, "
+                f"num_candidates_per_mask={self.config['num_candidates_per_mask']}): the scene has no "
+                "clusterable object masks in view"
+            )
         # drop candidates outside the workspace
         within_space = filter_points_by_bounds(candidate_keypoints, self.bounds_min, self.bounds_max, strict=True)
         candidate_keypoints = candidate_keypoints[within_space]
@@ -166,6 +180,15 @@ self, transformed_rgb, shape_info):
             obj_features_flat = features_flat[binary_mask.reshape(-1)]
             feature_pixels = np.argwhere(binary_mask)
             feature_points = points[binary_mask]
+            # Drop non-finite depth points: a room-scale scene's masks include invalid-depth pixels
+            # (windows, far plane), and one NaN row makes every kmeans centre-shift NaN -- the loop
+            # then never meets tol and spins forever (measured: 400k+ iterations on the tea scene).
+            finite = np.isfinite(feature_points).all(axis=-1)
+            if not finite.all():
+                obj_features_flat = obj_features_flat[torch.as_tensor(finite, device=obj_features_flat.device)] \
+                    if torch.is_tensor(obj_features_flat) else obj_features_flat[finite]
+                feature_pixels = feature_pixels[finite]
+                feature_points = feature_points[finite]
             # skip masks too small to form num_candidates clusters
             if obj_features_flat.shape[0] < self.config["num_candidates_per_mask"]:
                 continue

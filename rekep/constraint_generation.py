@@ -34,9 +34,10 @@ class ConstraintGenerator:
             self.prompt_template = f.read()
         self.task_dir = None
 
-    def _build_prompt(self, image_path, instruction):
+    def _build_prompt(self, image_path, instruction, geometry=""):
         img_base64 = encode_image(image_path)
-        prompt_text = self.prompt_template.format(instruction=instruction)
+        # geometry fills the grounded template's {geometry} slot; str.format ignores it elsewhere.
+        prompt_text = self.prompt_template.format(instruction=instruction, geometry=geometry)
         # save prompt
         with open(os.path.join(self.task_dir, "prompt.txt"), "w", encoding="utf-8") as f:
             f.write(prompt_text)
@@ -121,18 +122,19 @@ class ConstraintGenerator:
             json.dump(metadata, f)
         print(f"Metadata saved to {os.path.join(self.task_dir, 'metadata.json')}")
 
-    def generate(self, img, instruction, metadata, task_dir):
+    def generate(self, img, instruction, metadata, task_dir, geometry=""):
         """Query GPT-4o and save the constraint program under ``task_dir`` (returns it).
 
         ``img`` is the (H,W,3) uint8 RGB keypoint-annotated scene; ``instruction`` the task
-        text; ``metadata`` a dict merged with the parsed num_stages + grasp/release keypoints.
+        text; ``metadata`` a dict merged with the parsed num_stages + grasp/release keypoints;
+        ``geometry`` an optional measured-scene text block (grounded prompt templates).
         """
         self.task_dir = task_dir
         os.makedirs(self.task_dir, exist_ok=True)
         # save query image (cv2 expects BGR)
         image_path = os.path.join(self.task_dir, "query_img.png")
         cv2.imwrite(image_path, img[..., ::-1])
-        messages = self._build_prompt(image_path, instruction)
+        messages = self._build_prompt(image_path, instruction, geometry)
         # stream back the response
         stream = self.client.chat.completions.create(
             model=self.config["model"],

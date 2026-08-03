@@ -27,11 +27,14 @@ def combine_scores(
     task_score: torch.Tensor,
     *,
     mode: ScoreSteeringMode,
-    steer_scale: float,
+    steer_scale: float | torch.Tensor,
     ref_score: torch.Tensor | None = None,
     base_scale: float = 1.0,
 ) -> torch.Tensor:
-    """Combine score fields on one shared diffusion state."""
+    """Combine score fields on one shared diffusion state.
+
+    steer_scale may be a scalar or a per-dim tensor broadcastable against the score's
+    last axis (per-channel gamma, e.g. a distinct gripper-channel gain)."""
     if base_score.shape != task_score.shape:
         raise ValueError(
             "base/task score shapes must match: "
@@ -55,4 +58,8 @@ def combine_scores(
     else:
         raise ValueError(f"Unknown score steering mode: {mode!r}.")
 
-    return scaled_base + float(steer_scale) * residual
+    if isinstance(steer_scale, torch.Tensor):
+        scale = steer_scale.to(device=residual.device, dtype=residual.dtype)
+    else:
+        scale = float(steer_scale)
+    return scaled_base + scale * residual

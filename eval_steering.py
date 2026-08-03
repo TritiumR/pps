@@ -19,7 +19,109 @@ _WORKER_PROGRESS_HANDLE_PATH = None
 _INIT_PROCESS_START = time.perf_counter()
 _INIT_LAST_STAGE_TIME = _INIT_PROCESS_START
 _INIT_LAST_STAGE = "process start"
+# Per-episode wall accumulators for --profile. Timing is unconditional so the profiled and
+# unprofiled step paths are identical; only the report and the sim wrappers are opt-in.
+_PROFILE_TOTALS: dict[str, float] = {}
 
+
+# ================================================================== per-bucket runtime profiling
+
+def _prof_toc(bucket: str, start: float) -> None:
+    """Accumulate elapsed wall since `start` into a named profiling bucket."""
+    _PROFILE_TOTALS[bucket] = _PROFILE_TOTALS.get(bucket, 0.0) + (
+        time.perf_counter() - start
+    )
+
+
+def _prof_wrap(owner: Any, name: str, bucket: str) -> None:
+    """Wrap `owner.name` in place so its wall time lands in `bucket`."""
+    original = getattr(owner, name)
+
+    def timed(*call_args: Any, **call_kwargs: Any) -> Any:
+        start = time.perf_counter()
+        try:
+            return original(*call_args, **call_kwargs)
+        finally:
+            _prof_toc(bucket, start)
+
+    setattr(owner, name, timed)
+
+
+def _prof_install(env) -> None:
+    """Install --profile wrappers on the sim/scene calls inside env.step.
+
+    Sensors are deliberately not wrapped: the closure holds a bound method, and the
+    resulting reference cycle defers Camera.__del__ past the replicator teardown, which
+    aborts the process at env.close(). scene.update covers the sensor fetch in aggregate.
+    """
+    _prof_wrap(env.sim, "step", "sim.physx")
+    _prof_wrap(env.sim, "render", "sim.render")
+    _prof_wrap(env.scene, "update", "scene.update")
+    _prof_wrap(env.observation_manager, "compute", "obs.compute")
+
+
+# Buckets that partition the control loop; the sim.* / scene.* / sensor.* wrappers are
+# nested inside env.step and are reported separately as its internal split.
+_PROFILE_LOOP_BUCKETS = (
+    "planner.replan",
+    "env.step",
+    "vlm.observe_step",
+    "debug.step_log",
+    "obs.to_policy",
+    "success_term",
+    "video.frame_build",
+)
+
+
+def _build_profile_report(
+    *, reset_s: float, loop_s: float, encode_s: float, steps: int
+) -> dict[str, Any]:
+    """Per-episode wall budget: top-level buckets plus the env.step internal split."""
+    totals = dict(_PROFILE_TOTALS)
+    loop = {name: totals.get(name, 0.0) for name in _PROFILE_LOOP_BUCKETS}
+    inside_step = {
+        name: value
+        for name, value in totals.items()
+        if name not in _PROFILE_LOOP_BUCKETS
+    }
+    episode_s = reset_s + loop_s + encode_s
+    return {
+        "steps": steps,
+        "episode_s": episode_s,
+        "reset_s": reset_s,
+        "loop_s": loop_s,
+        "video_encode_s": encode_s,
+        "loop_buckets_s": loop,
+        "loop_unaccounted_s": loop_s - sum(loop.values()),
+        "env_step_internal_s": inside_step,
+    }
+
+
+def _print_profile_report(seed: int, report: dict[str, Any]) -> None:
+    """Print the per-episode budget as seconds and percent of episode wall."""
+    episode_s = report["episode_s"] or 1.0
+    steps = max(report["steps"], 1)
+    print(f"[PROFILE] seed={seed} episode_s={report['episode_s']:.1f} steps={steps}")
+    rows = [
+        ("reset (env + grounding)", report["reset_s"]),
+        ("video encode + transcode", report["video_encode_s"]),
+        *report["loop_buckets_s"].items(),
+        ("loop unaccounted", report["loop_unaccounted_s"]),
+    ]
+    for name, value in sorted(rows, key=lambda item: -item[1]):
+        print(
+            f"[PROFILE]   {name:<26} {value:8.2f}s  {100.0 * value / episode_s:5.1f}%  "
+            f"{1000.0 * value / steps:7.2f} ms/step"
+        )
+    print("[PROFILE]   -- inside env.step --")
+    for name, value in sorted(report["env_step_internal_s"].items(), key=lambda i: -i[1]):
+        print(
+            f"[PROFILE]   {name:<26} {value:8.2f}s  {100.0 * value / episode_s:5.1f}%  "
+            f"{1000.0 * value / steps:7.2f} ms/step"
+        )
+
+
+# ========================================================================= multi-worker launcher
 
 def _parse_gpu_ids(value: str) -> list[int]:
     tokens = value.replace(",", " ").split()
@@ -468,14 +570,12 @@ for _isaaclab_pkg in (
     if _isaaclab_pkg_src not in sys.path:
         sys.path.insert(0, _isaaclab_pkg_src)
 from isaaclab.app import AppLauncher
-import pinocchio
+import pinocchio  # noqa: F401  -- must import before Isaac Sim (load order)
 
 from openpi.models import model as _model
 from openpi.training import config as _config
 from openpi.policies import policy_config
-from openpi.shared import download
 
-# from openpi.policies import libero_policy
 
 import cv2
 import h5py
@@ -483,27 +583,14 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-# import dill
-# import hydra
 import copy
 import re
 
-# from botocore.exceptions import NoCredentialsError
-
-# # from diffusion_policy.common.precise_sleep import precise_wait
-# from diffusion_policy.common.pytorch_util import dict_apply
-# from diffusion_policy.workspace.base_workspace import BaseWorkspace
-# from diffusion_policy.policy.base_image_policy import BaseImagePolicy
-# from diffusion_policy.real_world.real_inference_util import (
-#     get_real_obs_resolution,
-#     get_real_obs_dict_droid,
-# )
-
-# import scipy.spatial.transform as R
 from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
 from sim_free_mpc import AccelActionMPC, AccelMPCConfig, SimFreeMPC, SimFreeMPCConfig
 from sim_free_mpc.action_space import clamp_real_action_chunk
 from sim_free_mpc.ddim import ddim_iteration_alphas
+from sim_free_mpc.planner import task_tilt_weight
 from sim_free_mpc.score_steering import combine_scores, steer_scale_for_stage
 
 
@@ -521,6 +608,8 @@ _LAST_INFERENCE_RUNTIME = {}
 _WEIGHT_SCALE_CENTER_OFFSET_DEBUG = (-0.0470425, 0.0, 0.0272255)
 _WEIGHT_SCALE_TOP_OFFSET_Z_DEBUG = 0.0523800
 
+
+# =========================================================================== runtime determinism
 
 def _seed_runtime(seed: int) -> None:
     """Seed policy, MPC, and environment-facing random number generators."""
@@ -565,6 +654,8 @@ def _phone_ringtone_path():
     )
 
 
+# ===================================================== policy inputs and norm-stat compatibility
+
 def _to_numpy_unbatched(value):
     if isinstance(value, torch.Tensor):
         value = value.detach().cpu().numpy()
@@ -588,6 +679,10 @@ def _policy_uses_thermal_inputs(policy) -> bool:
 
 
 def _validate_policy_environment_inputs(policy, raw_obs: dict, role: str) -> None:
+    if (getattr(policy, "_metadata", {}) or {}).get("decode_only"):
+        # A decode-only policy has no network, so it consumes no sensor stream to validate.
+        return
+
     model_type = policy._model.config.model_type
 
     has_rgb = (
@@ -803,6 +898,8 @@ def _assert_score_space_compatibility(base_policy, task_policy, ref_policy, args
                     )
 
 
+# ======================================================== proxy prediction: flow and score heads
+
 def _run_sequence_proxy_expert(
     model,
     prefix_embs,
@@ -1008,6 +1105,8 @@ def _sequence_proxy_flow_from_prefix(
     return model.action_out_proj(suffix_out)
 
 
+# ===================================================================== compiled steering forward
+
 def _eval_steer_forward_all(
     base_model,
     task_model,
@@ -1137,6 +1236,32 @@ def _get_compiled_eval_steer_forward():
     return _compiled_eval_steer_forward_all
 
 
+_STAGE_CTX_KEYS = ("grasp_obj", "payload", "place_target", "constraint", "path_fns",
+                   "held_idx", "held_offset", "keypoints", "place_point", "carry_z",
+                   "destination", "task_tilt", "steer_events")
+
+
+def _stage_stripped_context(ctx):
+    """The unconditioned twin of a stage context: scene intact, stage structure neutralized.
+
+    Stage-gated terms self-gate off (no grasp_obj/payload), the reach target becomes the hand
+    itself (no pull), and only the stage-agnostic prior (smoothness, floor, keepouts) remains --
+    the cost-space analog of CFG's unconditional branch."""
+    out = {k: v for k, v in ctx.items() if k not in _STAGE_CTX_KEYS}
+    out["grasp_obj"] = None
+    out["payload"] = None
+    out["place_target"] = None
+    out["gripper_intent"] = None
+    out["subtasks"] = {}
+    out["placed"] = frozenset()
+    eef = out.get("eef_pos")
+    if eef is not None:
+        out["target"] = np.asarray(eef, dtype=np.float32).reshape(-1)[:3]
+    return out
+
+
+# ====================================================== which arms are on, and what each forbids
+
 def _score_steering_mode(args) -> str | None:
     if getattr(args, "full_steer", False):
         return "full"
@@ -1165,8 +1290,11 @@ def _required_policy_roles(args) -> set[str]:
         return {standalone_role}
 
     score_mode = _score_steering_mode(args)
+    # Proposal injection needs the task proxy loaded even in base-only mode: it supplies candidates,
+    # not a score residual, so no reference is required.
+    inject = float(getattr(args, "inject_proxy", 0.0)) > 0.0
     if score_mode == "base" or getattr(args, "no_steer", False):
-        return {"base"}
+        return {"base", "task"} if inject else {"base"}
     if score_mode == "task":
         return {"base", "task"}
     return {"base", "task", "ref"}
@@ -1204,6 +1332,126 @@ def _base_source_name(args) -> str:
         return "mbd_task_steer"
     return "mbd_base"
 
+
+def _base_decode_only_blockers(args) -> list[str]:
+    """Reasons --base_decode_only cannot be honored; empty when the base network is unused.
+
+    Only the geometric MBD base drives the chunk entirely from the planner.
+    """
+    blockers = []
+    if _base_source_name(args) != "mbd_base":
+        blockers.append(
+            f"base_source={_base_source_name(args)} forward-passes the base network "
+            "(only mbd_base decodes without it)"
+        )
+    if getattr(args, "compare_difference", False):
+        blockers.append("--compare_difference runs the base velocity field")
+    return blockers
+
+
+def _disable_out_of_reach_colliders(env, env_ids, prim_path_regex, center, radius):
+    """Prestartup: disable colliders in a static asset that the robot can never reach.
+
+    Contact needs proximity, so a collider outside the robot's reach box cannot make one. Only
+    `physics:collisionEnabled` is written, so prims stay visible and the rendered image -- the
+    perception front-end's input -- is unchanged.
+    """
+    del env_ids
+    import isaaclab.sim as sim_utils
+    from isaacsim.core.utils.stage import get_current_stage
+    from pxr import Usd, UsdGeom, UsdPhysics
+
+    stage = get_current_stage()
+    # Bounds are world-space, `center` is env-relative: the box must follow each env origin.
+    origins = getattr(getattr(env, "scene", None), "env_origins", None)
+    cache = UsdGeom.BBoxCache(
+        Usd.TimeCode.Default(),
+        [UsdGeom.Tokens.default_, UsdGeom.Tokens.render, UsdGeom.Tokens.proxy],
+        useExtentsHint=True,
+    )
+    kept, disabled, unbounded = 0, 0, 0
+    for env_index, root_path in enumerate(
+        sorted(sim_utils.find_matching_prim_paths(prim_path_regex, stage))
+    ):
+        root = stage.GetPrimAtPath(root_path)
+        if not root.IsValid():
+            continue
+        origin = (
+            [float(v) for v in origins[env_index]]
+            if origins is not None and env_index < len(origins)
+            else [0.0, 0.0, 0.0]
+        )
+        lo = [origin[i] + center[i] - radius for i in range(3)]
+        hi = [origin[i] + center[i] + radius for i in range(3)]
+        for prim in Usd.PrimRange(root):
+            # Joints carry the same attribute, where it filters jointed-body collision instead.
+            if not prim.HasAPI(UsdPhysics.CollisionAPI) or prim.IsA(UsdPhysics.Joint):
+                continue
+            attr = prim.GetAttribute("physics:collisionEnabled")
+            box = cache.ComputeWorldBound(prim).ComputeAlignedRange()
+            if box.IsEmpty():
+                # No usable bound: keep the collider. A diet must never guess a prim away.
+                unbounded += 1
+                kept += 1
+                continue
+            bmin, bmax = box.GetMin(), box.GetMax()
+            if all(bmin[i] <= hi[i] and bmax[i] >= lo[i] for i in range(3)):
+                kept += 1
+                continue
+            if not (attr and attr.IsValid()):
+                attr = UsdPhysics.CollisionAPI(prim).CreateCollisionEnabledAttr()
+            attr.Set(False)
+            disabled += 1
+    print(
+        f"[scene] collider diet: disabled {disabled}, kept {kept} "
+        f"({unbounded} kept for having no bound); reach box center={tuple(center)} "
+        f"radius={radius} m; visuals untouched",
+        flush=True,
+    )
+
+
+def _fast_gt_blockers(args) -> list[str]:
+    """Reasons --fast_gt is unsafe here; empty only for a fully ground-truth-grounded run.
+
+    It drops every camera and thins physics, which is free of decision content only when nothing
+    in the loop reads pixels.
+    """
+    blockers = []
+    if args.vlm_state != "gt":
+        blockers.append(f"--vlm_state {args.vlm_state} (needs gt)")
+    if args.vlm_track != "fk":
+        blockers.append(f"--vlm_track {args.vlm_track} (needs fk)")
+    if args.vlm_cost.startswith("rekep"):
+        blockers.append(f"--vlm_cost {args.vlm_cost} proposes keypoints from images (needs gt)")
+    if not getattr(args, "vlm_base", False):
+        blockers.append("--fast_gt only applies to the geometric MBD base (--vlm_base)")
+    # Catch-all: anything that reads pixels for any other reason.
+    seen = " ".join(blockers)
+    for consumer in _pixel_consumers(args):
+        if consumer.split(" (")[0] not in seen:
+            blockers.append(consumer)
+    return blockers
+
+
+def _pixel_consumers(args) -> list[str]:
+    """Everything in this configuration that reads camera pixels."""
+    consumers = []
+    if not getattr(args, "base_decode_only", False) and _base_source_name(args) != "mbd_base":
+        consumers.append("the base policy network")
+    if _required_policy_roles(args) & {"task", "ref"}:
+        consumers.append("a proxy policy (task/ref)")
+    if args.vlm_state == "real":
+        consumers.append("--vlm_state real (perception front-end)")
+    if args.vlm_track != "fk":
+        consumers.append(f"--vlm_track {args.vlm_track}")
+    if args.vlm_cost.startswith("rekep"):
+        consumers.append(f"--vlm_cost {args.vlm_cost} (ReKep keypoint proposal reads table_cam)")
+    if getattr(args, "mpc_debug_video_overlay", False):
+        consumers.append("--mpc_debug_video_overlay")
+    return consumers
+
+
+# ================================================================= action inference entry points
 
 def _can_use_compiled_infer(base_policy, task_policy, ref_policy, args) -> bool:
     if _uses_vlm_mpc_base(args):
@@ -1348,10 +1596,8 @@ def infer_actions_with_mpc(
         _validate_policy_environment_inputs(standalone_policy, raw_obs, standalone_role)
         outputs = standalone_policy.infer(raw_obs)
         actions = np.asarray(outputs["actions"], dtype=np.float32)
-        # Policy.infer() has already decoded and unnormalized the proxy output.
-        # Clamp in executable joint space: the first target is relative to the
-        # current robot state, and each later target is relative to the preceding
-        # clamped target in the chunk.
+        # Clamp in executable joint space: the first target is relative to the current robot
+        # state, each later one to the preceding clamped target.
         max_joint_delta = (
             args.mpc_joint_delta_clip if args.mpc_joint_delta_clip > 0.0 else None
         )
@@ -1427,6 +1673,10 @@ def _infer_actions_eager(
     else:
         need_task = (not disable_steering) or need_compare
         need_ref = need_task
+    # Proposal injection needs the task proxy to propose candidates, but no reference: it extends the
+    # candidate support and the geometric cost still weights every candidate.
+    if float(getattr(args, "inject_proxy", 0.0)) > 0.0:
+        need_task = True
     need_task_and_ref = need_task and need_ref
     if need_compare and use_vlm_mpc_base:
         raise ValueError(
@@ -1650,8 +1900,47 @@ def _infer_actions_eager(
 
     mpc_denoise_iteration = 0
     mpc_denoise_iterations = args.num_steps + 1
+    if mpc_planner is not None:
+        # Per-level planner traces (inject_weight_share) accumulate across the denoise chain; the
+        # diagnostics for this inference are only emitted from the LAST level, so the trace has to
+        # start empty here or it would carry over from the previous inference.
+        mpc_planner.begin_inference()
     while denoise_time >= -dt / 2:
         expanded_time = denoise_time.expand(bsize)
+
+        if use_vlm_mpc_base and float(getattr(args, "inject_proxy", 0.0)) > 0.0:
+            # Proposal injection: the task proxy's Tweedie clean action becomes the centre for a
+            # fraction of the MBD candidates, so the expert extends the candidate SUPPORT while the
+            # geometric cost still decides which candidate wins.
+            _inj_alpha, _ = ddim_iteration_alphas(
+                iteration=mpc_denoise_iteration,
+                num_iterations=mpc_denoise_iterations,
+                num_train_timesteps=args.mpc_ddim_train_timesteps,
+            )
+            # Schedule BEFORE the model call: under frontload the late levels carry rho ~1e-4, so
+            # paying the proxy forward there cost 6.2 s/replan against the base's 3.5 for
+            # candidates the schedule then wiped out.
+            _inj_beta = max(1.0 - float(_inj_alpha), 1e-6)
+            _inj_rho = float(args.inject_proxy)
+            if args.inject_schedule == "frontload":
+                _inj_rho *= _inj_beta
+            if args.gated_inject:
+                _inj_rho *= float(mpc_context.get("steer_authority", 0.0))
+            if _inj_rho >= 1e-3:
+                _inj_time = _proxy_score_time_cond(
+                    args, mpc_denoise_iteration, x_t.device, x_t.dtype
+                ).expand(bsize)
+                _inj_score = _predict_proxy_score(
+                    prepared_task, task_model, x_t, _inj_time
+                )
+                _inj_x0 = (
+                    x_t[:, :, : _inj_score.shape[-1]] + _inj_beta * _inj_score
+                ) / max(float(_inj_alpha), 1e-6) ** 0.5
+                mpc_context["inject"] = {"x0": _inj_x0.detach()[0], "rho": _inj_rho}
+            else:
+                mpc_context.pop("inject", None)
+        elif isinstance(mpc_context, dict):
+            mpc_context.pop("inject", None)
 
         if use_vlm_mpc_base and disable_steering:
             if args.mpc_update == "legacy_score":
@@ -1669,6 +1958,45 @@ def _infer_actions_eager(
                     iteration=mpc_denoise_iteration,
                     num_iterations=mpc_denoise_iterations,
                     score_scale=args.gamma_base,
+                )
+            elif args.mpc_update == "mbd_score_action_prox" and args.exact_cfg > 0.0:
+                # Exact cost-space CFG, no proxies: conditioned is the base's own estimate,
+                # unconditioned the SAME estimator on a stage-stripped context. One measure and one
+                # schedule, so measure mismatch and calibration drift cannot occur.
+                base_score, base_numerator, geom_stats = (
+                    mpc_planner.estimate_mbd_score_action_prox_terms(
+                        x_t,
+                        base_inputs,
+                        mpc_context,
+                        iteration=mpc_denoise_iteration,
+                        num_iterations=mpc_denoise_iterations,
+                    )
+                )
+                empty_score, _, _ = mpc_planner.estimate_mbd_score_action_prox_terms(
+                    x_t,
+                    base_inputs,
+                    _stage_stripped_context(mpc_context),
+                    iteration=mpc_denoise_iteration,
+                    num_iterations=mpc_denoise_iterations,
+                )
+                cfg_residual = base_score - empty_score
+                cfg_gamma = float(args.exact_cfg)
+                if args.gated_tilt:
+                    cfg_gamma *= float(mpc_context.get("steer_authority", 0.0))
+                x_t = mpc_planner.step_from_mbd_residual(
+                    x_t,
+                    base_numerator,
+                    cfg_residual,
+                    iteration=mpc_denoise_iteration,
+                    num_iterations=mpc_denoise_iterations,
+                    base_scale=args.gamma_base,
+                    residual_scale=cfg_gamma,
+                    active_dims=int(geom_stats.get("active_dims", x_t.shape[-1])),
+                )
+                geom_stats = dict(geom_stats)
+                geom_stats["exact_cfg_gamma"] = cfg_gamma
+                geom_stats["exact_cfg_residual_norm"] = float(
+                    torch.linalg.vector_norm(cfg_residual.detach()).cpu()
                 )
             elif args.mpc_update == "mbd_score_action_prox":
                 x_t, geom_stats = mpc_planner.step_mbd_score_action_prox(
@@ -1726,6 +2054,70 @@ def _infer_actions_eager(
                     "Score steering does not support --mpc_update legacy_score."
                 )
 
+            score_time = _proxy_score_time_cond(
+                args,
+                mpc_denoise_iteration,
+                device,
+                x_t.dtype,
+            ).expand(bsize)
+            task_score = None
+            if args.task_tilt > 0.0:
+                # Tilted selection: the proxy enters as a per-candidate Gaussian
+                # tilt inside the MBD softmax; the additive combine below then
+                # runs with steer_scale forced to 0.
+                task_score = _predict_proxy_score(
+                    prepared_task,
+                    task_model,
+                    x_t,
+                    score_time,
+                )
+                tilt_dir = task_score
+                if score_steering_mode == "full":
+                    # Residual-direction tilt (PPS Eq. 2 in cost space): the expert direction is
+                    # task - ref, so what the pair AGREES on cancels and the tilt carries only the
+                    # conditioning-induced change. Requires --ref_checkpoint_dir.
+                    ref_score_tilt = _predict_proxy_score(
+                        prepared_ref,
+                        ref_model,
+                        x_t,
+                        score_time,
+                    )
+                    tilt_dir = task_score - ref_score_tilt
+                tilt_abar, _ = ddim_iteration_alphas(
+                    iteration=mpc_denoise_iteration,
+                    num_iterations=mpc_denoise_iterations,
+                    num_train_timesteps=args.mpc_ddim_train_timesteps,
+                )
+                tilt_beta = max(1.0 - float(tilt_abar), 1e-6)
+                tilt_dims = tilt_dir.shape[-1]
+                tilt_target = (
+                    x_t[0, :, :tilt_dims].detach() + tilt_beta * tilt_dir[0].detach()
+                ) / max(float(tilt_abar), 1e-6) ** 0.5
+                mpc_context["task_tilt"] = {
+                    "target": tilt_target,
+                    "weight": task_tilt_weight(
+                        args.task_tilt,
+                        args.mpc_temperature,
+                        args.mpc_noise,
+                        float(tilt_abar),
+                    ),
+                    "dims": args.task_tilt_dims if args.task_tilt_dims > 0 else None,
+                    "dim_weights": (
+                        [1.0] * 7 + [args.task_tilt_gripper_weight]
+                        if args.task_tilt_gripper_weight >= 0.0 else None
+                    ),
+                }
+                if args.gated_tilt:
+                    # Track-2 gated expert: authority from the bridge's plan-authored failure
+                    # gate; discrimination + ESS cap are the implicit factors in the planner.
+                    mpc_context["task_tilt"]["authority"] = float(
+                        mpc_context.get("steer_authority", 0.0)
+                    )
+                    mpc_context["task_tilt"]["discrimination"] = True
+                    mpc_context["task_tilt"]["ess_cap"] = args.tilt_ess_cap
+            else:
+                mpc_context.pop("task_tilt", None)
+
             if args.mpc_update == "mbd_score_action_prox":
                 base_score, base_numerator, geom_stats = (
                     mpc_planner.estimate_mbd_score_action_prox_terms(
@@ -1756,18 +2148,13 @@ def _infer_actions_eager(
                         num_iterations=mpc_denoise_iterations,
                     )
                 )
-            score_time = _proxy_score_time_cond(
-                args,
-                mpc_denoise_iteration,
-                device,
-                x_t.dtype,
-            ).expand(bsize)
-            task_score = _predict_proxy_score(
-                prepared_task,
-                task_model,
-                x_t,
-                score_time,
-            )
+            if task_score is None:
+                task_score = _predict_proxy_score(
+                    prepared_task,
+                    task_model,
+                    x_t,
+                    score_time,
+                )
             if task_score.shape[:2] != x_t.shape[:2] or task_score.shape[-1] > x_t.shape[-1]:
                 raise ValueError(
                     "Task score shape is incompatible with x_t: "
@@ -1800,6 +2187,29 @@ def _infer_actions_eager(
                 lift=args.lift_steer_scale,
                 place=args.place_steer_scale,
             )
+            if args.steer_anneal:
+                # Ramp lambda across the denoise trajectory instead of holding it constant.
+                frac = mpc_denoise_iteration / max(mpc_denoise_iterations - 1, 1)
+                step_steer_scale = float(
+                    args.steer_anneal_start
+                    + (args.steer_anneal_end - args.steer_anneal_start) * frac
+                )
+            if args.task_tilt > 0.0:
+                # Steering already happened inside the softmax; no additive term.
+                step_steer_scale = 0.0
+            if args.steer_gamma_gripper is not None:
+                # Per-channel gamma: arm dims keep the stage scale, the gripper channel
+                # (action dim 7) gets its own gain. Dims beyond the action layout keep
+                # the arm scale (the residual is zero there anyway).
+                per_dim = torch.full(
+                    (task_full_score.shape[-1],),
+                    float(step_steer_scale),
+                    dtype=task_full_score.dtype,
+                    device=task_full_score.device,
+                )
+                if per_dim.shape[0] > 7:
+                    per_dim[7] = float(args.steer_gamma_gripper)
+                step_steer_scale = per_dim
             combined_score = combine_scores(
                 base_score,
                 task_full_score,
@@ -1823,7 +2233,12 @@ def _infer_actions_eager(
             base_proxy_norm = torch.linalg.vector_norm(base_proxy_score.detach())
             task_proxy_norm = torch.linalg.vector_norm(task_proxy_score.detach())
             residual_proxy_norm = torch.linalg.vector_norm(residual_proxy_score.detach())
-            applied_residual_norm = abs(step_steer_scale) * residual_proxy_norm
+            if isinstance(step_steer_scale, torch.Tensor):
+                applied_residual_norm = torch.linalg.vector_norm(
+                    (step_steer_scale[:proxy_dims] * residual_proxy_score).detach()
+                )
+            else:
+                applied_residual_norm = abs(step_steer_scale) * residual_proxy_norm
 
             active_dims = int(geom_stats.get("active_dims", task_score.shape[-1]))
             score_update_mode = _score_update_mode_for_mpc_update(args.mpc_update)
@@ -1876,7 +2291,11 @@ def _infer_actions_eager(
                     "score_applied_residual_ratio": float(
                         (applied_residual_norm / base_proxy_norm.clamp_min(1e-8)).cpu()
                     ),
-                    "score_steer_scale": step_steer_scale,
+                    "score_steer_scale": (
+                        step_steer_scale.detach().cpu().tolist()
+                        if isinstance(step_steer_scale, torch.Tensor)
+                        else step_steer_scale
+                    ),
                     "score_combined_norm": float(torch.linalg.vector_norm(combined_score.detach()).cpu()),
                     "score_base_task_cosine": _score_cosine(
                         base_proxy_score, task_proxy_score
@@ -1907,6 +2326,14 @@ def _infer_actions_eager(
                     base_proxy_score, ref_score
                 )
                 geom_stats["score_task_ref_cosine"] = _score_cosine(task_score, ref_score)
+            # Direction, not just magnitude: norms alone cannot tell a quiet proxy from an opposed one.
+            if base_proxy_score.shape[-1] > 7:
+                geom_stats["score_base_task_cosine_gripper"] = _score_cosine(
+                    base_proxy_score[..., 7:8], task_proxy_score[..., 7:8]
+                )
+                geom_stats["score_base_task_cosine_arm"] = _score_cosine(
+                    base_proxy_score[..., :7], task_proxy_score[..., :7]
+                )
             if combined_score.shape[-1] > 7:
                 score_components = {
                     "base": base_score,
@@ -1937,6 +2364,9 @@ def _infer_actions_eager(
                     f"task/base={geom_stats['score_task_base_ratio']:.4f} "
                     f"lambda={geom_stats['score_steer_scale']:.4f} "
                     f"lambda_residual/base={geom_stats['score_applied_residual_ratio']:.4f} "
+                    f"cos_bt={geom_stats.get('score_base_task_cosine', float('nan')):+.3f} "
+                    f"cos_arm={geom_stats.get('score_base_task_cosine_arm', float('nan')):+.3f} "
+                    f"cos_grip={geom_stats.get('score_base_task_cosine_gripper', float('nan')):+.3f} "
                     f"base_grip0={geom_stats.get('score_base_gripper_first', float('nan')):.4f} "
                     f"task_grip0={geom_stats.get('score_task_gripper_first', float('nan')):.4f} "
                     f"base_grip_mean={geom_stats.get('score_base_gripper_mean', float('nan')):.4f} "
@@ -2128,6 +2558,8 @@ def _infer_actions_eager(
     return actions, compare_stats
 
 
+# ============================================================ environment observation extraction
+
 def get_pi_observation(env_obs_dict):
     obs = dict()
     joint_pos = _to_numpy_unbatched(env_obs_dict["joint_pos"])
@@ -2294,6 +2726,8 @@ def _extract_capsule_mpc_state(env, env_origin=None):
     return lid_objects, lid_joint_pos
 
 
+# ========================================================================== MPC context assembly
+
 def build_mpc_context(env, env_obs_dict, args):
     policy_obs = env_obs_dict["policy"]
     env_origin = None
@@ -2367,6 +2801,8 @@ def build_mpc_context(env, env_obs_dict, args):
         context["capsule_lid_joint_pos"] = capsule_lid_joint_pos
     return context
 
+
+# ================================================================ MPC debug logging and overlays
 
 def _format_mpc_term_debug(stats: dict[str, Any], *, limit: int = 8) -> str:
     terms = []
@@ -2455,6 +2891,42 @@ def _mpc_debug_stats(stats: dict[str, Any] | None) -> dict[str, Any]:
         "weight_max",
         "weight_ess",
         "weight_entropy",
+        "task_tilt_weight",
+        "task_tilt_base_cost_mean",
+        "task_tilt_authority",
+        "task_tilt_lambda_eff",
+        "exact_cfg_gamma",
+        "exact_cfg_residual_norm",
+        "steer_authority",
+        "steer_events_closed_empty",
+        "steer_events_backtracks",
+        "stage_env_steps",
+        "fk_fork_m",
+        "fk_best_cost",
+        "fk_cost_spread",
+        "inject_rho",
+        "inject_weight_share",
+        "inject_share_first",
+        "inject_share_max",
+        "inject_share_mean",
+        "inject_share_levels",
+        "cost_feasibility_best",
+        "cost_feasibility_min",
+        "cost_feasibility_weighted",
+        "cost_task_best",
+        "cost_task_min",
+        "cost_task_weighted",
+        "cost_prior_best",
+        "cost_prior_min",
+        "cost_prior_weighted",
+        # Under --rank_mode roles, cost_* is the RANKING scalar; cost_true_total_* is the real cost,
+        # logged so an arm that ranks differently stays comparable to one that ranked on the total.
+        "rank_mode",
+        "prior_weight",
+        "prior_weight_schedule",
+        "cost_true_total_best",
+        "cost_true_total_min",
+        "cost_true_total_weighted",
         "target_delta_norm",
         "accel_norm",
         "score_norm",
@@ -2501,6 +2973,13 @@ def _mpc_debug_stats(stats: dict[str, Any] | None) -> dict[str, Any]:
         "score_combined_values",
     )
     payload = {key: _jsonable_debug_value(stats[key]) for key in keys if key in stats}
+    # --mpc_eval_mean_plan: the cost of the plan that actually executes, which no whitelisted key
+    # carries. Grouped rather than listed one by one because the per-term rows are named after
+    # whichever cost terms the config selected.
+    mean_plan = {k[len("mean_plan_"):]: _jsonable_debug_value(v)
+                 for k, v in stats.items() if k.startswith("mean_plan_")}
+    if mean_plan:
+        payload["mean_plan"] = dict(sorted(mean_plan.items()))
     best_terms = {}
     weighted_terms = {}
     best_debug = {}
@@ -3083,21 +3562,25 @@ def _draw_vlm_overlay(image: np.ndarray, env, camera_name: str, vlm: dict) -> np
 
 def _build_rollout_frame(obs, use_thermal_overlay=False, debug_overlay=None):
     table_image = _to_uint8_image(obs["observation/exterior_image_1_left"])
-    wrist_image = _to_uint8_image(obs["observation/wrist_image_left"])
+    # Under a render diet the wrist camera may be gone; the frame is then table-only.
+    wrist_raw = obs.get("observation/wrist_image_left")
+    wrist_image = None if wrist_raw is None else _to_uint8_image(wrist_raw)
 
     if use_thermal_overlay and _has_thermal_observation(obs):
         table_image = _overlay_thermal_on_rgb(
             table_image, obs["observation/thermal_exterior_image_1_left"]
         )
-        wrist_image = _overlay_thermal_on_rgb(
-            wrist_image, obs["observation/thermal_wrist_image_left"]
-        )
+        if wrist_image is not None:
+            wrist_image = _overlay_thermal_on_rgb(
+                wrist_image, obs["observation/thermal_wrist_image_left"]
+            )
 
     if debug_overlay is not None:
         env = debug_overlay.get("env")
         axes = debug_overlay.get("axes", {})
         table_image = _draw_projected_debug_axes(table_image, env, "table_cam", axes)
-        wrist_image = _draw_projected_debug_axes(wrist_image, env, "wrist_cam", axes)
+        if wrist_image is not None:
+            wrist_image = _draw_projected_debug_axes(wrist_image, env, "wrist_cam", axes)
         vlm = debug_overlay.get("vlm")
         if vlm is not None:
             try:
@@ -3105,7 +3588,11 @@ def _build_rollout_frame(obs, use_thermal_overlay=False, debug_overlay=None):
             except Exception as exc:
                 print(f"[vlm_dp] overlay draw failed: {exc}", flush=True)
 
-    frame = np.concatenate((table_image, wrist_image), axis=1)
+    frame = (
+        table_image
+        if wrist_image is None
+        else np.concatenate((table_image, wrist_image), axis=1)
+    )
     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
     if _has_sound_observation(obs):
@@ -3181,13 +3668,72 @@ def _episode_video_name(seed, success, *, suffix=""):
     return f"{seed}_{status}{suffix_part}.mp4"
 
 
+def _code_provenance(config_paths=()):
+    """Identify the CODE this run executed, not just its flags.
+
+    The working tree is normally dirty (this is a research branch), so a git hash alone is not
+    enough: two runs an hour apart can share a HEAD and execute materially different code. That is
+    exactly what happened on 2026-07-30 -- a 4/14 arm was labelled "old code" in a handoff and the
+    claim could not be checked afterwards, because results.json recorded flags only. So record HEAD,
+    the dirty flag, and a content digest of the files that decide behaviour.
+    """
+    import hashlib
+    import pathlib
+    import subprocess
+
+    def _git(*a):
+        """stdout, or None if git could not answer. None means UNKNOWN, never 'clean'."""
+        try:
+            r = subprocess.run(("git", *a), cwd=_REPO_DIR, capture_output=True, text=True,
+                               timeout=10)
+            return r.stdout.strip() if r.returncode == 0 else None
+        except Exception:
+            return None
+
+    watched = (
+        "eval_steering.py", "sim_free_mpc/planner.py", "sim_free_mpc/dial_sampler.py",
+        "sim_free_mpc/action_space.py", "vlm_dp/bridge.py", "vlm_dp/world.py",
+        "vlm_dp/grasp_sensor.py", "vlm_dp/context.py", "vlm_dp/stage.py",
+        "vlm_dp/cost/base_cost.py", "vlm_dp/cost/terms.py", "vlm_dp/perception.py",
+        "vlm_dp/visual_tracker.py", "rekep/isaaclab_helpers.py",
+    )
+    # The active cost YAML decides as much behaviour as any source file and is edited far more
+    # often -- one was modified between arms that were then compared as if only code had changed.
+    files = {}
+    combined = hashlib.sha256()
+    for rel in (*watched, *(str(p) for p in config_paths if p)):
+        try:
+            path = pathlib.Path(rel)
+            raw = (path if path.is_absolute() else pathlib.Path(_REPO_DIR, rel)).read_bytes()
+        except OSError:
+            continue
+        files[rel] = hashlib.sha256(raw).hexdigest()[:12]
+        combined.update(rel.encode())
+        combined.update(raw)
+    # git is often absent inside the eval container. Report None (unknown) rather than False, so a
+    # missing git can never be read as a clean tree. code_digest is the load-bearing field either way:
+    # it identifies the executed source regardless of git.
+    dirty = _git("status", "--porcelain")
+    return {
+        "git_head": _git("rev-parse", "HEAD"),
+        "git_dirty": None if dirty is None else bool(dirty),
+        "git_dirty_files": None if dirty is None else len([l for l in dirty.splitlines() if l.strip()]),
+        "code_digest": combined.hexdigest()[:16],
+        "file_digests": files,
+    }
+
+
 def _write_experiment_results(path: str, payload: dict[str, Any]) -> None:
     episodes = payload.get("episodes", [])
-    successes = sum(bool(episode.get("success")) for episode in episodes)
+    # Errored episodes (e.g. an ungroundable scene) are not policy failures, so they are excluded
+    # from the denominator rather than silently counted against the success rate.
+    scored = [episode for episode in episodes if not episode.get("errored")]
+    successes = sum(bool(episode.get("success")) for episode in scored)
     payload["summary"] = {
-        "num_episodes": len(episodes),
+        "num_episodes": len(scored),
         "num_successes": successes,
-        "success_rate": successes / len(episodes) if episodes else 0.0,
+        "success_rate": successes / len(scored) if scored else 0.0,
+        "num_errored": len(episodes) - len(scored),
     }
     tmp_path = f"{path}.tmp"
     with open(tmp_path, "w", encoding="utf-8") as handle:
@@ -3565,7 +4111,23 @@ def parse_args():
         default=None,
         help="Optional steering scale for MPC place stages; defaults to --steer_scale.",
     )
+    parser.add_argument(
+        "--steer_gamma_gripper",
+        type=float,
+        default=None,
+        help="Optional distinct steering scale for the gripper action channel (dim 7). "
+        "Arm channels keep the stage steering scale. Per-channel gamma: the A3 mechanism "
+        "data localizes steering damage to gripper anti-tracking, so gamma_g=0 tests "
+        "arm-only additive steering.",
+    )
     parser.add_argument("--num_steps", type=int, default=10)
+    parser.add_argument(
+        "--abort_no_subtask_by",
+        type=int,
+        default=0,
+        help="End a rollout early (as a failure) if NO subtask flag has fired by this env step. "
+        "0 disables. A screens-only speed lever: decided-stuck episodes stop burning the step cap.",
+    )
     parser.add_argument(
         "--task_num_steps",
         type=int,
@@ -3602,6 +4164,204 @@ def parse_args():
         dest="full_steer",
         action="store_true",
         help="Run score-space MBD base + steer_scale * (task - ref).",
+    )
+    parser.add_argument(
+        "--steer_anneal",
+        action="store_true",
+        help=(
+            "Ramp the steering scale linearly across the denoise trajectory instead of holding it "
+            "constant, from --steer_anneal_start (highest noise) to --steer_anneal_end (lowest)."
+        ),
+    )
+    parser.add_argument("--steer_anneal_start", type=float, default=0.0,
+                        help="Steering scale at the highest-noise denoise step.")
+    parser.add_argument("--steer_anneal_end", type=float, default=1.0,
+                        help="Steering scale at the lowest-noise denoise step.")
+    parser.add_argument(
+        "--task_tilt",
+        type=float,
+        default=0.0,
+        help=(
+            "FK/SVDD-style tilted selection: weight lambda for a per-candidate Gaussian tilt "
+            "toward the task proxy's implied clean action inside the MBD softmax (SNR-tempered "
+            "per denoise step). Replaces the additive combine: steer_scale is forced to 0. "
+            "0 disables. Use with --task_steer to load the task proxy."
+        ),
+    )
+    parser.add_argument(
+        "--task_tilt_dims",
+        type=int,
+        default=0,
+        help=(
+            "Restrict the tilt penalty to the first N action dims (7 = arm only, plan_ref "
+            "convention; keeps the near-binary gripper dim from dominating at high lambda). "
+            "0 = all dims."
+        ),
+    )
+    parser.add_argument(
+        "--mpc_mode_window",
+        type=float,
+        default=float("inf"),
+        help=(
+            "Restrict the DIAL softmax to candidates within this many temperature units of the "
+            "best before the weighted mean. Averaging then happens inside one mode instead of "
+            "across two, where the mean is a plan neither mode supports. inf disables."
+        ),
+    )
+    parser.add_argument(
+        "--mpc_eval_mean_plan",
+        action="store_true",
+        help=(
+            "Also score the plan the sampler RETURNS, not only the population it drew. Every logged "
+            "term is a statistic of the candidates (value at the argmin, or the softmax-weighted "
+            "mean of the values); the plan that executes is the weighted mean of the candidates, "
+            "whose cost is different for any non-convex term and is never otherwise computed. Logs "
+            "mean_plan_cost, mean_plan_cost_excess and per-term mean_plan_term_*."
+        ),
+    )
+    parser.add_argument(
+        "--mpc_logit_norm",
+        choices=("raw", "std"),
+        default="raw",
+        help=(
+            "Softmax logit normalization for the MBD sampler. 'std' divides costs by the batch "
+            "std before the temperature (DIAL-style): temperature becomes sharpness in std "
+            "units, constant across denoise levels. 'raw' is the historical behavior."
+        ),
+    )
+    parser.add_argument(
+        "--mpc_ancestral_eta",
+        type=float,
+        default=0.0,
+        help=(
+            "Marginal re-noising between denoise levels: x_{k-1} += eta*sqrt(1-abar_prev)*z "
+            "(never at the final level). 0 = deterministic chain (historical); 1 = full "
+            "ancestral sampling."
+        ),
+    )
+    parser.add_argument(
+        "--rank_mode",
+        choices=("total", "roles"),
+        default="total",
+        help=(
+            "What the MBD softmax ranks candidates by. 'total' is the plain cost sum (deployed "
+            "behaviour). 'roles' uses the TERM_ROLES split, feasibility + task + "
+            "prior_weight*prior, so the execution/search prior shapes rather than decides. "
+            "Measured motivation: near contact the task signal separating a good chunk from doing "
+            "nothing is ~1.5 units against a +12..22 prior charge, so the prior decides alone."
+        ),
+    )
+    parser.add_argument(
+        "--prior_weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Multiplier on the TERM_ROLES 'prior' bucket under --rank_mode roles. 1.0 reproduces "
+            "--rank_mode total exactly; 0.0 removes the prior from selection. A scalar rather than "
+            "a switch because the prior exists to protect a weak sampler and the base IS that "
+            "sampler -- removing it outright is a hypothesis, not a fix."
+        ),
+    )
+    parser.add_argument(
+        "--prior_weight_high",
+        type=float,
+        default=1.0,
+        help=(
+            "Prior weight at HIGH noise under --prior_weight_schedule alpha. At the first denoise "
+            "levels the base's candidates are decoded noise whose cost is almost entirely the prior "
+            "(measured: ~53,632 of ~53,676), so the prior is the garbage filter there and must be "
+            "kept. --prior_weight then applies at LOW noise, where candidates are plausible and the "
+            "prior mostly blocks demo-shaped motion."
+        ),
+    )
+    parser.add_argument(
+        "--prior_weight_schedule",
+        choices=("flat", "alpha"),
+        default="flat",
+        help=(
+            "flat: --prior_weight at every level (default; 1.0 reproduces --rank_mode total). "
+            "alpha: interpolate prior_weight_high -> prior_weight linearly in alpha_bar, i.e. keep "
+            "the prior while the candidates are noise and stand it down as they become plausible. A "
+            "constant is wrong at both ends in opposite directions -- see --prior_weight_high."
+        ),
+    )
+    parser.add_argument(
+        "--feasibility_gate",
+        type=float,
+        default=0.0,
+        help=(
+            "Under --rank_mode roles, exclude candidates whose feasibility cost exceeds the best "
+            "feasibility by more than this margin. 0 disables the hard gate (feasibility still "
+            "competes on magnitude). If nothing passes, the whole population is kept."
+        ),
+    )
+    parser.add_argument(
+        "--task_tilt_gripper_weight",
+        type=float,
+        default=-1.0,
+        help=(
+            "Calibrated per-dim tilt: arm dims at weight 1, gripper dim at this weight "
+            "(e.g. 0.01 = variance-matched for a near-binary channel). Negative = disabled; "
+            "overrides --task_tilt_dims when set."
+        ),
+    )
+    parser.add_argument(
+        "--fk_fork",
+        type=int,
+        default=1,
+        help="Window-scoped best-of-M Feynman-Kac fork: inside open failure windows, run M "
+        "independent denoise chains and commit to the lowest-cost plan. 1 disables. Requires "
+        "the failure gate (steer_authority in context).",
+    )
+    parser.add_argument(
+        "--fk_always",
+        action="store_true",
+        help="Ungated fork: run the best-of-M fork on EVERY inference, ignoring the failure "
+        "gate. Isolates the selection mechanism from the gate (M x inference cost).",
+    )
+    parser.add_argument(
+        "--inject_proxy",
+        type=float,
+        default=0.0,
+        help="Proposal injection: draw this fraction of MBD candidates from the task proxy's "
+        "implied clean action instead of the noise prior, extending the candidate support. The "
+        "cost still weights every candidate. 0 disables. Needs the task proxy, not a reference.",
+    )
+    parser.add_argument(
+        "--inject_schedule",
+        choices=["flat", "frontload"],
+        default="flat",
+        help="How the injection fraction varies over denoise levels: flat holds it constant; "
+        "frontload scales it by (1 - alpha_bar), concentrating the expert where the sampler is "
+        "still choosing global structure.",
+    )
+    parser.add_argument(
+        "--gated_inject",
+        action="store_true",
+        help="Scope proposal injection to open failure windows (multiply the fraction by the "
+        "bridge's steer_authority). Off isolates the mechanism from the gate.",
+    )
+    parser.add_argument(
+        "--exact_cfg",
+        type=float,
+        default=0.0,
+        help="Exact cost-space CFG gamma: steer the base by (conditioned - unconditioned) scores "
+        "computed by the base's own estimator (second call on a stage-stripped context). No "
+        "proxies. 0 disables. Combine with --gated_tilt to scope to failure windows.",
+    )
+    parser.add_argument(
+        "--gated_tilt",
+        action="store_true",
+        help="Track-2 gated expert: multiply the tilt weight by the bridge's plan-authored "
+        "failure-gate authority, enable the candidate-discrimination implicit gate and the "
+        "ESS cap. Requires --task_tilt > 0 and a config with a steering: block.",
+    )
+    parser.add_argument(
+        "--tilt_ess_cap",
+        type=float,
+        default=3.0,
+        help="Gated tilt: bound the tilt's logit dispersion to this many temperature units "
+        "(closed-form guard against collapsing the candidate population).",
     )
     score_mode_group.add_argument(
         "--task_steer",
@@ -3791,6 +4551,14 @@ def parse_args():
     )
     parser.add_argument("--task_debug", action="store_true")
     parser.add_argument(
+        "--profile",
+        action="store_true",
+        help=(
+            "Report a per-episode wall-time budget (physics, render, sensors, planner, "
+            "video, reset) to stdout and into the --mpc_debug rollout_end record."
+        ),
+    )
+    parser.add_argument(
         "--debug_hold_pear",
         action="store_true",
         help=(
@@ -3823,6 +4591,108 @@ def parse_args():
         "--dry_run",
         action="store_true",
         help="Run one warmup inference, print base-source and shape diagnostics, then exit.",
+    )
+    parser.add_argument(
+        "--base_decode_only",
+        action="store_true",
+        help=(
+            "Build the base policy's decode surface (transforms + norm stats) from the "
+            "checkpoint WITHOUT loading model weights. Only valid where the base network is "
+            "never forward-passed (the geometric MBD base, --vlm_base). Saves the pi0.5 load "
+            "at startup and its GPU residency."
+        ),
+    )
+    parser.add_argument(
+        "--static_collision_off",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated static scene assets whose colliders are disabled. Decorative geometry "
+            "a task never contacts still costs PhysX broadphase, and that cost is superlinear in "
+            "num_envs -- the measured blocker for vectorized multi-env eval. Visuals are untouched. "
+            "Empty (default) leaves the scene exactly as configured. MEASURED WARNING: on "
+            "Isaac-Weight-Droid-*, 'interactive_kitchen' is LOAD-BEARING -- it is the support "
+            "surface, and disabling it drops the pear through the floor and terminates every "
+            "episode at step 1. Gate any asset before using it here."
+        ),
+    )
+    parser.add_argument(
+        "--fast_gt",
+        action="store_true",
+        help=(
+            "Named fast configuration for GROUND-TRUTH-GROUNDED runs only. Expands to "
+            "--render none plus the collider diet on --fast_gt_asset. Refuses to run unless the "
+            "grounding, world state and tracking are all ground truth (--vlm_cost gt, "
+            "--vlm_state gt, --vlm_track fk) and nothing else reads pixels, so it cannot be "
+            "applied silently to a perception run."
+        ),
+    )
+    parser.add_argument(
+        "--fast_gt_asset",
+        type=str,
+        default="interactive_kitchen",
+        help="Scene asset --fast_gt runs the collider diet on. Empty disables that half.",
+    )
+    parser.add_argument(
+        "--collider_diet",
+        type=str,
+        default="",
+        help=(
+            "Scene asset to run a PER-PRIM collider diet on (e.g. 'interactive_kitchen'). "
+            "Colliders whose world bound lies outside --collider_diet_radius of the robot base "
+            "are disabled at prestartup; everything within reach, including the support surface, "
+            "is kept. Prims stay active and visible, so the rendered image is unchanged. Unlike "
+            "--static_collision_off this works on assets that are decorative AND load-bearing."
+        ),
+    )
+    parser.add_argument(
+        "--collider_diet_radius",
+        type=float,
+        default=1.5,
+        help=(
+            "Half-extent in meters of the reach box around the robot base used by "
+            "--collider_diet. Must exceed the arm's maximum reach plus the largest distance a "
+            "manipulated object can travel."
+        ),
+    )
+    parser.add_argument(
+        "--render",
+        choices=("policy", "video", "none"),
+        default="policy",
+        help=(
+            "Camera budget. 'policy' (default) keeps today's behaviour: both 720p cameras "
+            "rendered every control step. 'video' keeps only the table camera, for the artifact "
+            "video. 'none' removes all cameras -- valid only when nothing consumes pixels."
+        ),
+    )
+    parser.add_argument(
+        "--render_stride",
+        type=int,
+        default=1,
+        help=(
+            "Render (and record) one frame every N control steps under --render video. "
+            "1 keeps the control-rate render."
+        ),
+    )
+    parser.add_argument(
+        "--video_stride",
+        type=int,
+        default=1,
+        help=(
+            "Keep one artifact-video frame every N control steps. Unlike --render_stride this "
+            "does NOT touch sim.render_interval, so every pixel consumer still sees a freshly "
+            "rendered frame on every control step; only the mp4 is thinned. Playback stays "
+            "real-time (fps is divided to match)."
+        ),
+    )
+    parser.add_argument(
+        "--seeds",
+        type=str,
+        default=None,
+        help=(
+            "Explicit seed list (e.g. '42,43,44') run back-to-back inside one booted app, "
+            "instead of the --seed_start/--seed_end range. Amortizes app boot across arms."
+        ),
     )
     return parser
 
@@ -3886,6 +4756,10 @@ def _apply_task_prompt_defaults(args, parser: argparse.ArgumentParser) -> None:
         if field.endswith("_checkpoint_dir") and (
             _score_steering_mode(args) in ("full", "task")
             or _standalone_policy_role(args) is not None
+            # Proposal injection reads the proxy through _predict_proxy_score, so it needs a
+            # PROXY_SCORE checkpoint; defaulting to the flow proxy either fails at load or silently
+            # loads the wrong model and raises at the first denoise step.
+            or float(getattr(args, "inject_proxy", 0.0)) > 0.0
         ):
             entry_field = f"score_{field}"
         value = entry.get(entry_field)
@@ -4008,6 +4882,57 @@ if _uses_accel_action_mpc(args):
         )
 if args.steps_per_inference <= 0:
     raise ValueError("--steps_per_inference must be positive.")
+if args.base_decode_only:
+    _decode_only_blockers = _base_decode_only_blockers(args)
+    if _decode_only_blockers:
+        parser.error(
+            "--base_decode_only cannot be used here: " + "; ".join(_decode_only_blockers)
+        )
+if args.fast_gt:
+    _fast_gt_reasons = _fast_gt_blockers(args)
+    if _fast_gt_reasons:
+        parser.error(
+            "--fast_gt is only valid for a ground-truth-grounded run: "
+            + "; ".join(_fast_gt_reasons)
+        )
+    # An explicit --render wins: dropping every camera also drops the artifact video, and a
+    # rollout nobody can watch is its own kind of cost.
+    if not any(a == "--render" or a.startswith("--render=") for a in sys.argv[1:]):
+        args.render = "none"
+    if args.fast_gt_asset and not args.collider_diet:
+        args.collider_diet = args.fast_gt_asset
+    print(
+        f"[fast_gt] render={args.render} collider_diet={args.collider_diet or 'off'} "
+        f"(grounding/state/tracking are all ground truth)",
+        flush=True,
+    )
+if args.render == "none":
+    _render_none_blockers = _pixel_consumers(args)
+    if _render_none_blockers:
+        parser.error(
+            "--render none removes all cameras, but this run consumes pixels: "
+            + "; ".join(_render_none_blockers)
+        )
+if args.render_stride < 1:
+    parser.error("--render_stride must be >= 1.")
+if args.render_stride > 1 and args.render != "video":
+    parser.error("--render_stride only applies to --render video.")
+if args.render_stride > 1:
+    # Widening sim.render_interval makes a per-step pixel consumer re-read a held frame.
+    _render_stride_blockers = _pixel_consumers(args)
+    if _render_stride_blockers:
+        parser.error(
+            "--render_stride > 1 starves the pixel consumers in this run "
+            f"({'; '.join(_render_stride_blockers)}); use --video_stride to thin the video."
+        )
+if args.video_stride < 1:
+    parser.error("--video_stride must be >= 1.")
+# Explicit seed lists are a single-process convenience; the multi-worker launcher splits ranges.
+if args.seeds is not None:
+    if args.workers > 1:
+        parser.error("--seeds is single-process; use --seed_start/--seed_end with --workers.")
+    if args.load_init_from_dataset is not None:
+        parser.error("--seeds and --load_init_from_dataset both index episodes; use one.")
 
 _report_initialization_stage(
     args,
@@ -4024,29 +4949,23 @@ if not os.path.exists(output_path):
     os.makedirs(output_path)
 
 # Make the robot env
+# No cameras -> AppLauncher picks the lighter camera-free headless kit experience.
+if args.render == "none":
+    args.enable_cameras = False
 _report_initialization_stage(args, "starting Isaac Sim")
 app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
 _report_initialization_stage(args, "Isaac Sim ready")
 
 _report_initialization_stage(args, "importing Isaac extensions and task registry")
-import asyncio
 import gymnasium as gym
-import inspect
 
-import omni
-
-from isaaclab.envs import ManagerBasedRLMimicEnv
-
-import isaaclab_mimic.envs  # noqa: F401
-import isaaclab.utils.math as math_utils
-
-import isaaclab_mimic.envs.pinocchio_envs  # noqa: F401
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
-# from isaaclab_mimic.datagen.utils import get_env_name_from_dataset, setup_output_paths
-
-import isaaclab_tasks  # noqa: F401
+# Side-effect imports: these register the gym task ids the rollout looks up.
+import isaaclab_mimic.envs                 # noqa: F401
+import isaaclab_mimic.envs.pinocchio_envs  # noqa: F401
+import isaaclab_tasks                      # noqa: F401
 _report_initialization_stage(args, "Isaac extensions and task registry ready")
 
 
@@ -4072,6 +4991,63 @@ if args.vlm_cost.startswith("rekep") or args.vlm_state == "real":
     from rekep import isaaclab_helpers as _rekep_helpers
 
     _rekep_helpers.augment_table_cam_with_depth_and_seg(env_cfg)
+
+# Control steps between recorded video frames; render_stride already thins the render itself.
+_video_record_period = args.render_stride * args.video_stride
+
+if args.render != "policy":
+    # Render diet: drop the cameras nothing in this configuration reads. Sensors AND their
+    # observation terms have to go together, or the obs manager asks a missing sensor for pixels.
+    _dropped_cams = ("table_cam", "wrist_cam") if args.render == "none" else ("wrist_cam",)
+    for _cam in _dropped_cams:
+        setattr(env_cfg.scene, _cam, None)
+        setattr(env_cfg.observations.policy, _cam, None)
+    if args.render == "none":
+        env_cfg.rerender_on_reset = False
+    if args.render_stride > 1:
+        # render_interval counts PHYSICS substeps; decimation of them is one control step.
+        env_cfg.sim.render_interval = env_cfg.decimation * args.render_stride
+    print(
+        f"[render] mode={args.render} dropped={list(_dropped_cams)} "
+        f"stride={args.render_stride} enable_cameras={args.enable_cameras}",
+        flush=True,
+    )
+
+if args.static_collision_off:
+    # Physics diet, visuals untouched: a static asset the task never contacts still pays PhysX
+    # broadphase, superlinearly in num_envs. Fails loudly on a bad name, since a silent no-op would
+    # look like a speedup that never happened.
+    _diet_names = [n.strip() for n in args.static_collision_off.split(",") if n.strip()]
+    for _name in _diet_names:
+        _asset_cfg = getattr(env_cfg.scene, _name, None)
+        if _asset_cfg is None:
+            raise SystemExit(f"--static_collision_off: no scene asset named {_name!r}")
+        _collision = getattr(getattr(_asset_cfg, "spawn", None), "collision_props", None)
+        if _collision is None:
+            raise SystemExit(
+                f"--static_collision_off: {_name!r} has no spawn.collision_props to disable"
+            )
+        _collision.collision_enabled = False
+    print(f"[scene] colliders disabled on {_diet_names} (visuals unchanged)", flush=True)
+
+if args.collider_diet:
+    # Per-prim, because --static_collision_off is whole-asset and this asset is both
+    # decorative and load-bearing.
+    from isaaclab.managers import EventTermCfg as _EventTerm
+
+    _diet_root = args.collider_diet
+    if getattr(env_cfg.scene, _diet_root, None) is None:
+        raise SystemExit(f"--collider_diet: no scene asset named {_diet_root!r}")
+    _reach_center = tuple(float(v) for v in env_cfg.scene.robot.init_state.pos)
+    env_cfg.events.collider_diet = _EventTerm(
+        func=_disable_out_of_reach_colliders,
+        mode="prestartup",
+        params={
+            "prim_path_regex": f"/World/envs/env_.*/{_diet_root}",
+            "center": _reach_center,
+            "radius": args.collider_diet_radius,
+        },
+    )
 
 env_cfg.env_name = env_name
 if args.determine:
@@ -4101,12 +5077,13 @@ else:
 # Create environment
 _report_initialization_stage(args, "creating simulation environment")
 env = gym.make(env_name, cfg=env_cfg).unwrapped
+if args.profile:
+    _prof_install(env)
 _report_initialization_stage(args, "simulation environment ready")
 
-# Derive each training-config name from its checkpoint dir so the model names do
-# not need to be passed on the command line. Checkpoints follow the layout
-# ".../checkpoints/<config_name>/<exp_name>/<step>" (proxies) or
-# ".../checkpoints/pytorch/<config_name>" (base policy).
+# Derive the training-config name from the checkpoint dir, whose layout is
+# ".../checkpoints/<config_name>/<exp_name>/<step>" for proxies and
+# ".../checkpoints/pytorch/<config_name>" for the base.
 def _config_name_from_checkpoint_dir(checkpoint_dir):
     if checkpoint_dir is None:
         raise ValueError(
@@ -4139,11 +5116,17 @@ required_policy_roles = _required_policy_roles(args)
 if "base" in required_policy_roles:
     base_config_name = _config_name_from_checkpoint_dir(base_checkpoint_dir)
     base_config = _config.get_config(base_config_name)
-    _report_initialization_stage(args, "loading base policy", config=base_config_name)
+    _report_initialization_stage(
+        args,
+        "loading base policy",
+        config=base_config_name,
+        decode_only=args.base_decode_only,
+    )
     base_policy = policy_config.create_trained_policy(
         base_config,
         base_checkpoint_dir,
         pytorch_device=args.device,
+        load_weights=not args.base_decode_only,
     )
     _report_initialization_stage(args, "base policy ready", config=base_config_name)
 if "task" in required_policy_roles:
@@ -4229,6 +5212,15 @@ if _uses_vlm_mpc_base(args):
                 cost_style=args.mpc_cost,
                 optimize_space=args.mpc_optimize_space,
                 grad_calc=args.grad_calc,
+                logit_norm=args.mpc_logit_norm,
+                mode_window=args.mpc_mode_window,
+                eval_mean_plan=args.mpc_eval_mean_plan,
+                ancestral_eta=args.mpc_ancestral_eta,
+                rank_mode=args.rank_mode,
+                prior_weight=args.prior_weight,
+                prior_weight_high=args.prior_weight_high,
+                prior_weight_schedule=args.prior_weight_schedule,
+                feasibility_gate=args.feasibility_gate,
             ),
         )
     print(
@@ -4249,6 +5241,7 @@ vlm_bridge = None
 if args.vlm_cost != "none":
     import yaml
 
+    from vlm_dp import config_paths as vlm_config_paths
     from vlm_dp.bridge import VlmDpBridge
 
     if mpc_planner is None:
@@ -4291,7 +5284,7 @@ if args.vlm_cost != "none":
             _vlm_roles["grasp_obj"] = _derived["grasp_objs"][0]
         print(f"[vocabulary] derived from the instruction: objects={_vlm_vocab} "
               f"grasp_objs={_derived['grasp_objs']} place_obj={_derived['place_obj']}", flush=True)
-    with open(os.path.join(_REPO_DIR, args.vlm_cost_config)) as _f:
+    with open(vlm_config_paths.resolve(args.vlm_cost_config, _REPO_DIR)) as _f:
         _vlm_cost_cfg = yaml.safe_load(_f)
     vlm_bridge = VlmDpBridge(
         args.vlm_cost,
@@ -4486,6 +5479,10 @@ experiment_results = {
     "config_slug": _video_config_slug(args),
     "command": sys.argv,
     "config": vars(args),
+    # Which CODE ran, so an arm's identity survives an uncommitted working tree (see _code_provenance).
+    # The active cost YAML is hashed alongside it: editing weights changes behaviour as much as
+    # editing a term, and it is the change most likely to go unrecorded between two compared arms.
+    "code": _code_provenance((getattr(args, "vlm_cost_config", None),)),
     "episodes": [],
 }
 _write_experiment_results(experiment_results_path, experiment_results)
@@ -4517,7 +5514,14 @@ if args.mpc_debug:
         steps_per_inference=steps_per_inference,
         task_num_steps=args.task_num_steps,
     )
-for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
+# One booted app serves every seed in the queue; boot is paid once per process, not per episode.
+eval_seeds = (
+    [int(s) for s in args.seeds.split(",") if s.strip()]
+    if args.seeds
+    else list(range(args.seed_start, args.seed_end))
+)
+print(f"[queue] {len(eval_seeds)} episode(s) in one app: seeds={eval_seeds}", flush=True)
+for rollout_idx, seed in enumerate(eval_seeds):
     success = None
     episode_comparison_stats = {
         path_name: {
@@ -4541,6 +5545,8 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
 
     if mpc_planner is not None:
         mpc_planner.reset_episode()
+
+    _profile_reset_start = time.perf_counter()
 
     # Reset before starting
     if dataset_file is not None:
@@ -4573,10 +5579,26 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
         )
 
     if args.vlm_cost != "none":
-        vlm_bridge.reset(env)
+        try:
+            vlm_bridge.reset(env)
+        except (ValueError, AssertionError, IndexError) as exc:
+            # An ungroundable scene must cost one episode, not the rest of the run. Recorded as
+            # errored and excluded from the success denominator: it is not a policy failure.
+            print(f"[eval] seed {seed}: grounding failed ({exc}); episode skipped", flush=True)
+            experiment_results["episodes"].append({
+                "rollout_index": rollout_idx,
+                "seed": seed,
+                "errored": True,
+                "error": f"grounding: {exc}",
+            })
+            _write_experiment_results(experiment_results_path, experiment_results)
+            continue
 
     current_subtasks = _debug_subtasks(env_obs_dict)
     current_phase = _debug_phase_from_subtasks(args.task, current_subtasks)
+    # Ever-fired set for the futility abort: flags are INSTANTANEOUS (grasp_pear drops on release,
+    # pear_on_scale drops if the pear slides off), so an episode mid-recovery reads all-false.
+    subtasks_ever_fired = {k for k, v in (current_subtasks or {}).items() if v}
     print(f"phase seed={seed} step=0 {current_phase} subtasks={current_subtasks}", flush=True)
     _write_mpc_debug_log(
         mpc_debug_log_file,
@@ -4619,12 +5641,19 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
     obs["prompt"] = args.prompt
     video_header_lines = _video_config_lines(args, seed=seed)
 
+    # Reset (env + grounding) is charged whole; the loop buckets start clean so the sim
+    # wrappers only report per-step cost.
+    _profile_reset_s = time.perf_counter() - _profile_reset_start
+    _PROFILE_TOTALS.clear()
+    _profile_loop_start = time.perf_counter()
+
     # ========== policy control loop ==============
     step_idx = 0
     success = False
     force_replan = False
     action_start_step = -steps_per_inference
     actions = None
+    latch_raw = {}
     for step_idx in tqdm(
         range(args.task_num_steps),
         desc="Policy Control Loop",
@@ -4655,20 +5684,83 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                         )
                     )
 
-                    actions, compare_stats = infer_actions_with_mpc(
-                        base_policy,
-                        task_policy,
-                        ref_policy,
-                        copy.deepcopy(obs),
-                        args,
-                        mpc_planner=mpc_planner,
-                        mpc_context=mpc_context,
-                        warm_shift_steps=warm_shift_steps,
+                    fk_m = int(getattr(args, "fk_fork", 1))
+                    fk_active = fk_m > 1 and (
+                        bool(getattr(args, "fk_always", False))
+                        or (isinstance(mpc_context, dict)
+                            and float(mpc_context.get("steer_authority", 0.0)) > 0.0)
                     )
+                    if fk_active:
+                        # Window-scoped best-of-M fork: inside an open failure window the base's
+                        # basin has just been shown wrong, so run M independent chains from fresh
+                        # noise and commit to the cheapest -- selection, not in-basin tilting.
+                        fk_best = None
+                        fk_costs = []
+                        for _fk in range(fk_m):
+                            a_i, s_i = infer_actions_with_mpc(
+                                base_policy,
+                                task_policy,
+                                ref_policy,
+                                copy.deepcopy(obs),
+                                args,
+                                mpc_planner=mpc_planner,
+                                mpc_context=mpc_context,
+                                warm_shift_steps=warm_shift_steps,
+                            )
+                            # Converged cost lives in the module-level runtime record, not in the
+                            # returned stats (those stay empty unless --compare_difference).
+                            last = _LAST_INFERENCE_RUNTIME.get("mpc_last") or {}
+                            j_i = float(last.get("cost_min", float("inf")))
+                            fk_costs.append(j_i)
+                            if fk_best is None or j_i < fk_best[0]:
+                                fk_best = (j_i, a_i, s_i)
+                        _, actions, compare_stats = fk_best
+                        compare_stats = dict(compare_stats or {})
+                        compare_stats["fk_fork_m"] = fk_m
+                        compare_stats["fk_best_cost"] = fk_best[0]
+                        finite = [c for c in fk_costs if c != float("inf")]
+                        if len(finite) > 1:
+                            compare_stats["fk_cost_spread"] = max(finite) - min(finite)
+                    else:
+                        actions, compare_stats = infer_actions_with_mpc(
+                            base_policy,
+                            task_policy,
+                            ref_policy,
+                            copy.deepcopy(obs),
+                            args,
+                            mpc_planner=mpc_planner,
+                            mpc_context=mpc_context,
+                            warm_shift_steps=warm_shift_steps,
+                        )
+                    # Gate observability: stamp authority + evidence every inference (active or
+                    # not), so window behavior is auditable from mpc_debug alone.
+                    if isinstance(mpc_context, dict) and "steer_authority" in mpc_context:
+                        compare_stats = dict(compare_stats or {})
+                        compare_stats["steer_authority"] = float(mpc_context["steer_authority"])
+                        ev = mpc_context.get("steer_events") or {}
+                        compare_stats["steer_events_closed_empty"] = int(ev.get("closed_empty", 0))
+                        compare_stats["steer_events_backtracks"] = int(ev.get("backtracks", 0))
+                        if "stage_env_steps" in mpc_context:
+                            compare_stats["stage_env_steps"] = int(mpc_context["stage_env_steps"])
                     if args.vlm_cost != "none":
+                        # Filter before observe_plan: the hold sensor must see what will actually
+                        # be commanded. Costs, scores and plan_ref (arm-only) are untouched.
+                        actions, latch_suppressed = vlm_bridge.filter_plan(
+                            actions, steps_per_inference
+                        )
+                        latch_raw = dict(latch_suppressed)
                         vlm_bridge.observe_plan(actions)
                     infer_elapsed = time.perf_counter() - infer_start
+                    _prof_toc("planner.replan", infer_start)
                     if args.mpc_debug:
+                        # Gate/fork observability rides the eval loop (compare_stats), not the
+                        # planner's mpc_last — merge those keys in explicitly or they are lost.
+                        _gate_keys = ("steer_authority", "steer_events_closed_empty",
+                                      "steer_events_backtracks", "stage_env_steps",
+                                      "fk_fork_m", "fk_best_cost", "fk_cost_spread")
+                        _mpc_logged = dict(_mpc_debug_stats(_LAST_INFERENCE_RUNTIME.get("mpc_last")) or {})
+                        _mpc_logged.update({k: compare_stats[k] for k in _gate_keys
+                                            if isinstance(compare_stats, dict) and k in compare_stats})
                         _write_mpc_debug_log(
                             mpc_debug_log_file,
                             "inference",
@@ -4677,7 +5769,7 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                             phase=current_phase,
                             subtasks=current_subtasks,
                             elapsed_s=infer_elapsed,
-                            mpc=_mpc_debug_stats(_LAST_INFERENCE_RUNTIME.get("mpc_last")),
+                            mpc=_mpc_logged,
                             mpc_trace=_LAST_INFERENCE_RUNTIME.get("mpc_trace", []),
                         )
                     episode_inference_time_s += infer_elapsed
@@ -4705,8 +5797,15 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                 action_start_step = step_idx
 
             action_step = actions[step_idx - action_start_step]
+            if args.vlm_cost != "none":
+                # One sensor sample per APPLIED action, before the step that applies it: the
+                # aperture reflects the previous command and pairs with the one now being sent.
+                _prof_start = time.perf_counter()
+                vlm_bridge.observe_step(action_step)
+                _prof_toc("vlm.observe_step", _prof_start)
 
             # perform step
+            _prof_start = time.perf_counter()
             env_obs_dict, rewards, terminated, truncated, extras = env.step(
                 torch.as_tensor(
                     action_step[None],
@@ -4714,6 +5813,7 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                     device=env.device,
                 )
             )
+            _prof_toc("env.step", _prof_start)
             if args.debug_hold_pear:
                 pear_grasped = _subtask_flag_from_obs(env_obs_dict, "grasp_pear")
                 pose_changed = _apply_debug_object_xy_guard(
@@ -4744,13 +5844,49 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                 force_replan = True
             current_phase = next_phase
             current_subtasks = next_subtasks
+            # Futility abort (screens only): a rollout with no subtask EVER fired by the deadline
+            # is already decided. Ever-fired, not currently-true -- flags are instantaneous and all
+            # drop during a recovery, exactly when the episode must not be culled.
+            subtasks_ever_fired |= {k for k, v in (next_subtasks or {}).items() if v}
+            if (getattr(args, "abort_no_subtask_by", 0) > 0
+                    and step_idx + 1 >= int(args.abort_no_subtask_by)
+                    and next_subtasks
+                    and not subtasks_ever_fired):
+                print(f"futility_abort seed={seed} step={step_idx + 1}: no subtask ever fired", flush=True)
+                _write_mpc_debug_log(mpc_debug_log_file, "futility_abort", seed=seed, step=step_idx + 1)
+                break
+            _prof_start = time.perf_counter()
             policy_step_obs = env_obs_dict["policy"]
             step_trace = {
                 "action": np.asarray(action_step),
                 "joint_pos": _to_numpy_unbatched(policy_step_obs["joint_pos"]),
             }
+            # Keep the raw command visible when the gripper latch suppressed it, so log mining
+            # still sees the glitch at the decision level.
+            _latch_g = latch_raw.get(step_idx - action_start_step)
+            if _latch_g is not None:
+                step_trace["action_gripper_raw"] = _latch_g
             if "eef_pos" in policy_step_obs:
                 step_trace["eef_pos"] = _to_numpy_unbatched(policy_step_obs["eef_pos"])
+            # Object poses per step: without these a rollout log cannot rebuild the cost context
+            # offline, so executed plans cannot be re-scored against demonstrations.
+            _rigid = getattr(env.scene, "rigid_objects", None) or {}
+            if _rigid:
+                step_trace["object_poses"] = {
+                    _n: _to_numpy_unbatched(_o.data.root_state_w[:, :7])
+                    for _n, _o in _rigid.items()
+                }
+            # The controller's BELIEF, beside the ground truth above. Under --vlm_state real the
+            # arm descends toward the belief, so an upward-biased one stops the gripper short and
+            # reads as a cost fault; logging both makes estimate quality checkable per step.
+            _bel = getattr(vlm_bridge, "world", None) if "vlm_bridge" in dir() else None
+            if _bel is not None and getattr(_bel, "_pos", None):
+                try:
+                    step_trace["object_beliefs"] = {
+                        _n: np.asarray(_p, dtype=np.float64) for _n, _p in _bel._pos.items()
+                    }
+                except Exception:      # diagnostics must never take down a rollout
+                    pass
             _write_mpc_debug_log(
                 mpc_debug_log_file,
                 "step",
@@ -4761,16 +5897,23 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                 action_gripper=_debug_action_gripper(action_step),
                 **step_trace,
             )
+            _prof_toc("debug.step_log", _prof_start)
 
+            _prof_start = time.perf_counter()
             obs = get_pi_observation(env_obs_dict["policy"])
             obs["prompt"] = args.prompt
+            _prof_toc("obs.to_policy", _prof_start)
 
             # Check for task success using success_term
+            _prof_start = time.perf_counter()
             task_success = bool(success_term.func(env, **success_term.params)[0])
+            _prof_toc("success_term", _prof_start)
 
             # save visualization
+            _prof_start = time.perf_counter()
+            record_frame = args.render != "none" and (step_idx % _video_record_period == 0)
             debug_overlay = None
-            if args.mpc_debug_video_overlay:
+            if record_frame and args.mpc_debug_video_overlay:
                 debug_overlay = {
                     "env": env,
                     "axes": _collect_mpc_debug_frames(
@@ -4778,19 +5921,20 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                         axis_length=args.mpc_debug_axis_length,
                     ),
                 }
-            if vlm_bridge is not None:
+            if record_frame and vlm_bridge is not None:
                 debug_overlay = debug_overlay or {"env": env, "axes": {}}
                 try:
                     debug_overlay["vlm"] = vlm_bridge.viz()
                 except Exception as exc:
                     print(f"[vlm_dp] viz overlay failed: {exc}", flush=True)
-            vis_image = _build_rollout_frame(
-                obs,
-                use_thermal_overlay=False,
-                debug_overlay=debug_overlay,
-            )
-            excute_frames.append(_add_video_header(vis_image, video_header_lines))
-            if _has_sound_observation(obs):
+            if record_frame:
+                vis_image = _build_rollout_frame(
+                    obs,
+                    use_thermal_overlay=False,
+                    debug_overlay=debug_overlay,
+                )
+                excute_frames.append(_add_video_header(vis_image, video_header_lines))
+            if record_frame and _has_sound_observation(obs):
                 sound_audio_frame = _build_stereo_sound_audio_frame(
                     env,
                     frame_index=len(sound_audio_frames),
@@ -4809,6 +5953,7 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
                         video_header_lines,
                     )
                 )
+            _prof_toc("video.frame_build", _prof_start)
 
             step_idx += 1
             _emit_worker_progress(
@@ -4848,6 +5993,9 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
             print("Interrupted!")
             break
 
+    _profile_loop_s = time.perf_counter() - _profile_loop_start
+    _profile_encode_start = time.perf_counter()
+
     # save excute_frames as video
     video_name = _episode_video_name(seed, success)
     if success:
@@ -4856,25 +6004,35 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
         print("fail")
 
     video_path = os.path.join(experiment_output_path, video_name)
-    audio_path = _write_stereo_sound_audio(
-        os.path.join(experiment_output_path, f"{seed}_recording.wav"),
-        sound_audio_frames,
-    )
-    video_write_path = (
-        os.path.join(experiment_output_path, f"{seed}_recording.mp4")
-        if audio_path is not None
-        else video_path
-    )
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(
-        video_write_path, fourcc, 15, (excute_frames[0].shape[1], excute_frames[0].shape[0])
-    )
-    for frame in excute_frames:
-        out.write(frame)
-    out.release()
-    _transcode_h264(video_write_path, "rollout video")
-    if audio_path is not None:
-        _mux_audio_into_video(video_write_path, video_path, audio_path, "rollout")
+    if not excute_frames:
+        # --render none: no camera, so no artifact video. Logs and results.json still land.
+        print(f"[render] no frames recorded for seed {seed}; skipping video", flush=True)
+        video_name = None
+    else:
+        audio_path = _write_stereo_sound_audio(
+            os.path.join(experiment_output_path, f"{seed}_recording.wav"),
+            sound_audio_frames,
+        )
+        video_write_path = (
+            os.path.join(experiment_output_path, f"{seed}_recording.mp4")
+            if audio_path is not None
+            else video_path
+        )
+        # A strided recording holds fewer frames per second of rollout; keep playback real-time.
+        video_fps = CONTROL_FREQUENCY / _video_record_period
+        out = cv2.VideoWriter(
+            video_write_path,
+            fourcc,
+            video_fps,
+            (excute_frames[0].shape[1], excute_frames[0].shape[0]),
+        )
+        for frame in excute_frames:
+            out.write(frame)
+        out.release()
+        _transcode_h264(video_write_path, "rollout video")
+        if audio_path is not None:
+            _mux_audio_into_video(video_write_path, video_path, audio_path, "rollout")
 
     thermal_video_name = None
     if thermal_overlay_frames:
@@ -4899,6 +6057,15 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
         _transcode_h264(thermal_video_path, "thermal video")
 
     print("video saved")
+    _profile_extra = {}
+    if args.profile:
+        _profile_extra["profile"] = _build_profile_report(
+            reset_s=_profile_reset_s,
+            loop_s=_profile_loop_s,
+            encode_s=time.perf_counter() - _profile_encode_start,
+            steps=step_idx,
+        )
+        _print_profile_report(seed, _profile_extra["profile"])
     _write_mpc_debug_log(
         mpc_debug_log_file,
         "rollout_end",
@@ -4909,6 +6076,7 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
         subtasks=current_subtasks,
         success=success,
         video_path=video_path,
+        **_profile_extra,
     )
     _emit_worker_progress(
         args,

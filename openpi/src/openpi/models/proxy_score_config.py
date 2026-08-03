@@ -20,7 +20,9 @@ class ProxyScoreConfig(_model.BaseModelConfig):
     dino_model_name: str = "facebook/dinov3-vits16plus-pretrain-lvd1689m"
     freeze_dino_encoder: bool = False
     ddim_num_train_timesteps: int = 100
-    prediction_type: Literal["score", "epsilon"] = "score"
+    # "regress": plain chunked regression (no noising, no score); training only -- the
+    # score-space serve path (predict_score_from_prefix) has no meaning for it.
+    prediction_type: Literal["score", "epsilon", "x0", "regress"] = "score"
     compile_sample_actions: bool = False
 
     action_dim: int = 8
@@ -32,8 +34,10 @@ class ProxyScoreConfig(_model.BaseModelConfig):
             object.__setattr__(self, "max_token_len", 48)
         if self.ddim_num_train_timesteps <= 1:
             raise ValueError("ddim_num_train_timesteps must be greater than 1.")
-        if self.prediction_type not in ("score", "epsilon"):
-            raise ValueError("prediction_type must be 'score' or 'epsilon'.")
+        if self.prediction_type not in ("score", "epsilon", "x0", "regress"):
+            raise ValueError(
+                "prediction_type must be 'score', 'epsilon', 'x0' or 'regress'."
+            )
 
     @property
     @override
