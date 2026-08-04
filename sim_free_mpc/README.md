@@ -7,6 +7,8 @@ score-space PPS.  For the current path, focus on:
 - `action_space.py`: decodes normalized model actions to real robot joint actions.
 - `ddim.py`: DDIM alpha schedule used by MPC and score policies.
 - `dial_sampler.py`: MPPI/DIAL optimizer.
+- `rectified_flow_mbd.py`: simulator-independent rectified-flow proposals,
+  external-cost weighting, token-block blending, and memoryless-SDE KL.
 - `costs_*.py`: geometric task costs. `costs_grasp_flow.py` implements the staged weight cost;
   `costs_capsule_flow.py` implements the capsule open/grasp/place cost.
 
@@ -48,6 +50,42 @@ trajectory is shifted by the number of executed actions and padded by repeating
 its final action. Its arm deltas are then rebased from the previous joint state
 to the current joint state so the absolute joint targets stay unchanged; the
 first replan in each rollout still starts from Gaussian noise.
+
+### Rectified-flow API
+
+Downstream simulators should pass task semantics in through a cost callback;
+PPS does not import their robot, scene, FK, or collision implementations:
+
+```python
+from sim_free_mpc import RectifiedFlowMBD, RectifiedFlowMBDConfig
+
+guide = RectifiedFlowMBD(
+    RectifiedFlowMBDConfig(
+        proposals_per_particle=256,
+        temperature=0.01,
+        proposal_std=0.4,
+        proposal_sampler="truncated_gaussian",
+    )
+)
+
+result = guide.guide_score(
+    x_t_waypoints,
+    policy_velocity_waypoints,
+    time_value=t,
+    lower=normalized_action_lower,
+    upper=normalized_action_upper,
+    cost_fn=cost_clean_trajectories,  # [P, N, W, D] -> [P, N]
+    generator=generator,
+    trajectory_coefficient=0.6,
+    keypose_coefficient=0.9,
+)
+```
+
+`TokenBlockLayout`, `FlowBlendCoefficients`, and
+`memoryless_sde_kl_blocks` support action/waypoint/keypose guidance after a
+task-specific endpoint transform. Dependency direction is intentionally
+one-way: an application may import this PPS module, but this module must not
+import the application or its simulator.
 
 ## What the module does
 
