@@ -8,14 +8,17 @@ from torch import nn
 import torch.nn.functional as F  # noqa: N812
 
 import openpi.models.gemma as _gemma
+from openpi.models_pytorch.concerto_pytorch import ConcertoPointCloudPrefix
 from openpi.models_pytorch.expert_pytorch import DINOExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
+
+# Kept as the legacy two-camera default for proxy_sound_pytorch and external imports.
+# ProxyPytorch itself uses config.image_keys so bimanual configs can select three views.
 IMAGE_KEYS = (
     "base_0_rgb",
     "left_wrist_0_rgb",
 )
-
 
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
@@ -72,38 +75,6 @@ def sample_bin(start, end, bsize, num_samples, device):
     return offsets + noise
 
 
-# def make_att_2d_masks(pad_masks, att_masks):
-#     """Copied from big_vision.
-
-#     Tokens can attend to valid inputs tokens which have a cumulative mask_ar
-#     smaller or equal to theirs. This way `mask_ar` int[B, N] can be used to
-#     setup several types of attention, for example:
-
-#       [[1 1 1 1 1 1]]: pure causal attention.
-
-#       [[0 0 0 1 1 1]]: prefix-lm attention. The first 3 tokens can attend between
-#           themselves and the last 3 tokens have a causal attention. The first
-#           entry could also be a 1 without changing behaviour.
-
-#       [[1 0 1 0 1 0 0 1 0 0]]: causal attention between 4 blocks. Tokens of a
-#           block can attend all previous blocks and all tokens on the same block.
-
-#     Args:
-#       input_mask: bool[B, N] true if its part of the input, false if padding.
-#       mask_ar: int32[B, N] mask that's 1 where previous tokens cannot depend on
-#         it and 0 where it shares the same attention mask as the previous token.
-#     """
-#     if att_masks.ndim != 2:
-#         raise ValueError(att_masks.ndim)
-#     if pad_masks.ndim != 2:
-#         raise ValueError(pad_masks.ndim)
-
-#     cumsum = torch.cumsum(att_masks, dim=1)
-#     att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
-#     pad_2d_masks = pad_masks[:, None, :] * pad_masks[:, :, None]
-#     return att_2d_masks & pad_2d_masks
-
-
 class ProxyPytorch(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -118,12 +89,27 @@ class ProxyPytorch(nn.Module):
             use_adarms=[False, False],
             precision=config.dtype,
             freeze_dino_encoder=getattr(config, "freeze_dino_encoder", False),
+            initialize_dino=getattr(config, "use_dino_prefix", True),
         )
 
-        ACTION_DIM = 8  # for droid setup
+        self.pointcloud_prefix = None
+        if getattr(config, "use_pointcloud_prefix", False):
+            self.pointcloud_prefix = ConcertoPointCloudPrefix(
+                pointcloud_keys=config.pointcloud_keys,
+                output_dim=action_expert_config.width,
+                tokens_per_camera=config.pointcloud_prefix_tokens_per_camera,
+                model_name=config.concerto_model_name,
+                repo_id=config.concerto_repo_id,
+                checkpoint_dir=config.concerto_checkpoint_dir,
+                grid_size=config.concerto_grid_size,
+                enable_flash=config.concerto_enable_flash,
+                freeze_encoder=config.freeze_concerto_encoder,
+            )
 
-        self.action_in_proj = nn.Linear(ACTION_DIM, action_expert_config.width)
-        self.action_out_proj = nn.Linear(action_expert_config.width, ACTION_DIM)
+        action_dim = int(config.action_dim)
+
+        self.action_in_proj = nn.Linear(action_dim, action_expert_config.width)
+        self.action_out_proj = nn.Linear(action_expert_config.width, action_dim)
 
         # if self.pi05:
         #     self.time_mlp_in = nn.Linear(
@@ -133,7 +119,7 @@ class ProxyPytorch(nn.Module):
         #         action_expert_config.width, action_expert_config.width
         #     )
         # else:
-        self.state_proj = nn.Linear(ACTION_DIM, action_expert_config.width)
+        self.state_proj = nn.Linear(action_dim, action_expert_config.width)
         self.action_time_mlp_in = nn.Linear(
             2 * action_expert_config.width, action_expert_config.width
         )
@@ -142,7 +128,11 @@ class ProxyPytorch(nn.Module):
         )
 
         torch.set_float32_matmul_precision("high")
-        if os.environ.get("OPENPI_DISABLE_TORCH_COMPILE", "").lower() not in ("1", "true", "yes"):
+        # Sparse ConvNet execution is not compatible with torch.compile.
+        if (
+            self.pointcloud_prefix is None
+            and os.environ.get("OPENPI_DISABLE_TORCH_COMPILE", "").lower() not in ("1", "true", "yes")
+        ):
             self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
 
         # Initialize gradient checkpointing flag
@@ -162,15 +152,64 @@ class ProxyPytorch(nn.Module):
     #     att_2d_masks_4d = att_2d_masks[:, None, :, :]
     #     return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
 
+    def gradient_checkpointing_enable(self):
+        """Enable checkpointing in the Gemma action expert."""
+        self.gradient_checkpointing_enabled = True
+        self.expert_model.gemma_expert.model.gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self):
+        """Disable checkpointing in the Gemma action expert."""
+        self.gradient_checkpointing_enabled = False
+        self.expert_model.gemma_expert.model.gradient_checkpointing = False
+
+    def is_gradient_checkpointing_enabled(self):
+        return self.gradient_checkpointing_enabled
+
+    def _make_attention_mask(
+        self,
+        prefix_pad_masks: torch.Tensor,
+        suffix_pad_masks: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build two-block non-diffusion/diffusion attention."""
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        if self.config.attention_mode != "two_block_diffusion":
+            raise ValueError(
+                "Only two_block_diffusion attention is supported, got "
+                f"{self.config.attention_mode!r}"
+            )
+        expected_suffix = 1 + int(self.config.action_horizon)
+        if int(suffix_pad_masks.shape[1]) != expected_suffix:
+            raise ValueError(
+                "two-block attention expects one state token followed by "
+                f"{self.config.action_horizon} diffusion tokens; got "
+                f"suffix length {suffix_pad_masks.shape[1]}"
+            )
+        total_tokens = int(pad_masks.shape[1])
+        diffusion_start = int(prefix_pad_masks.shape[1]) + 1
+        token_indices = torch.arange(total_tokens, device=pad_masks.device)
+        query_is_diffusion = token_indices[:, None] >= diffusion_start
+        key_is_diffusion = token_indices[None, :] >= diffusion_start
+        allowed = query_is_diffusion | ~key_is_diffusion
+        allowed = allowed[None, :, :] & pad_masks[:, None, :]
+        additive = torch.zeros(
+            (), dtype=torch.float32, device=pad_masks.device
+        )
+        blocked = torch.full(
+            (), torch.finfo(torch.float32).min,
+            dtype=torch.float32, device=pad_masks.device,
+        )
+        return torch.where(allowed[:, None, :, :], additive, blocked)
+
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
         observation = _preprocessing.preprocess_observation_pytorch(
-            observation, image_keys=IMAGE_KEYS, train=train
+            observation, image_keys=self.config.image_keys, train=train
         )
         return (
             list(observation.images.values()),
             list(observation.image_masks.values()),
             observation.state,
+            observation.pointcloud,
         )
 
     def sample_noise(self, shape, device):
@@ -193,9 +232,9 @@ class ProxyPytorch(nn.Module):
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
-        self, images, img_masks
+        self, images, img_masks, pointclouds=None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Embed images with DINO."""
+        """Embed RGB images with DINO and camera point clouds with Concerto."""
         embs = []
         pad_masks = []
         att_masks = []
@@ -214,6 +253,18 @@ class ProxyPytorch(nn.Module):
 
             # Create attention masks so that image tokens attend to each other
             att_masks += [0] * num_img_embs
+
+        if self.pointcloud_prefix is not None:
+            if not isinstance(pointclouds, dict):
+                raise ValueError("Concerto prefix requires a camera-keyed pointcloud dictionary.")
+            expert_dtype = next(self.expert_model.gemma_expert.parameters()).dtype
+            point_tokens = self.pointcloud_prefix(pointclouds).to(expert_dtype)
+            bsize, num_point_tokens = point_tokens.shape[:2]
+            embs.append(point_tokens)
+            pad_masks.append(
+                torch.ones(bsize, num_point_tokens, dtype=torch.bool, device=point_tokens.device)
+            )
+            att_masks += [0] * num_point_tokens
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -330,7 +381,7 @@ class ProxyPytorch(nn.Module):
         if actions is None:
             raise ValueError("actions must be provided for training mode.")
 
-        images, img_masks, state = self._preprocess_observation(observation, train=True)
+        images, img_masks, state, pointclouds = self._preprocess_observation(observation, train=True)
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -343,7 +394,7 @@ class ProxyPytorch(nn.Module):
         u_t = noise - actions
 
         # Prefix: image features from DINO
-        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks)
+        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks, pointclouds)
 
         # print(prefix_embs.shape)
 
@@ -359,7 +410,9 @@ class ProxyPytorch(nn.Module):
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
 
         # Use pad mask as attention mask (True == valid)
-        attention_mask = pad_masks
+        attention_mask = self._make_attention_mask(
+            prefix_pad_masks, suffix_pad_masks
+        )
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
         position_ids = position_ids.to(dtype=torch.long)
 
@@ -405,10 +458,10 @@ class ProxyPytorch(nn.Module):
         Returns:
             Loss tensor with shape (batch_size, num_steps, action_horizon, action_dim)
         """
-        images, img_masks, state = self._preprocess_observation(observation, train=True)
+        images, img_masks, state, pointclouds = self._preprocess_observation(observation, train=True)
 
         # Prefix: image features from DINO (static across all steps)
-        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks)
+        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks, pointclouds)
 
         initial_noise = noises[:, 0, :, : self.config.action_dim]
 
@@ -470,7 +523,9 @@ class ProxyPytorch(nn.Module):
         embs = torch.cat([prefix_embs, suffix_embs], dim=1)
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
 
-        attention_mask = pad_masks
+        attention_mask = self._make_attention_mask(
+            prefix_pad_masks, suffix_pad_masks
+        )
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
         position_ids = position_ids.to(dtype=torch.long)
 
@@ -518,7 +573,7 @@ class ProxyPytorch(nn.Module):
             - actions: Final denoised actions after all updates
               Shape: (batch_size, action_horizon, action_dim)
         """
-        images, img_masks, state = self._preprocess_observation(observation, train=False)
+        images, img_masks, state, pointclouds = self._preprocess_observation(observation, train=False)
         bsize = state.shape[0]
         device = state.device
 
@@ -534,7 +589,7 @@ class ProxyPytorch(nn.Module):
         initial_noise = self.sample_noise(actions_shape, device)
         time_schedule = self.sample_bin_times(bsize, num_steps, device)
 
-        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks)
+        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks, pointclouds)
 
         x_t = initial_noise
         current_time = torch.tensor(1.0, dtype=torch.float32, device=device).expand(
@@ -564,7 +619,9 @@ class ProxyPytorch(nn.Module):
 
             embs = torch.cat([prefix_embs, suffix_embs], dim=1)
             pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-            attention_mask = pad_masks
+            attention_mask = self._make_attention_mask(
+                prefix_pad_masks, suffix_pad_masks
+            )
             position_ids = torch.cumsum(pad_masks, dim=1) - 1
             position_ids = position_ids.to(dtype=torch.long)
 
@@ -602,12 +659,12 @@ class ProxyPytorch(nn.Module):
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        images, img_masks, state = self._preprocess_observation(
+        images, img_masks, state, pointclouds = self._preprocess_observation(
             observation, train=False
         )
 
         # Prefix embeddings are static across denoising steps
-        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks)
+        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks, pointclouds)
 
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
@@ -626,7 +683,9 @@ class ProxyPytorch(nn.Module):
             embs = torch.cat([prefix_embs, suffix_embs], dim=1)
             pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
 
-            attention_mask = pad_masks
+            attention_mask = self._make_attention_mask(
+                prefix_pad_masks, suffix_pad_masks
+            )
             position_ids = torch.cumsum(pad_masks, dim=1) - 1
             position_ids = position_ids.to(dtype=torch.long)
 

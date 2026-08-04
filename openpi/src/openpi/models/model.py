@@ -108,8 +108,8 @@ class Observation(Generic[ArrayT]):
     # Image masks, with same keys as images.
     image_masks: dict[str, at.Bool[ArrayT, "*b"]] | None = None
 
-    # Pointcloud, float32. The last dimension can hold XYZ only or extra per-point features.
-    pointcloud: at.Float[ArrayT, "*b n p"] | None = None
+    # Point clouds, float32. Multi-camera models use a camera-keyed dictionary.
+    pointcloud: dict[str, at.Float[ArrayT, "*b n p"]] | at.Float[ArrayT, "*b n p"] | None = None
 
     # Sound spectrograms, float32. Expected canonical shape is [*b, mic, mel, time].
     sound: at.Float[ArrayT, "*b m f t"] | None = None

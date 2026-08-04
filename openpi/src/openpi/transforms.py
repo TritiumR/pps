@@ -217,7 +217,17 @@ class ResizePointCloud(DataTransformFn):
         if "pointcloud" not in data:
             return data
 
-        pointcloud = np.asarray(data["pointcloud"])
+        pointcloud_data = data["pointcloud"]
+        if isinstance(pointcloud_data, dict):
+            data["pointcloud"] = {
+                key: self._resize(np.asarray(pointcloud))
+                for key, pointcloud in pointcloud_data.items()
+            }
+        else:
+            data["pointcloud"] = self._resize(np.asarray(pointcloud_data))
+        return data
+
+    def _resize(self, pointcloud: np.ndarray) -> np.ndarray:
         if pointcloud.ndim != 2:
             raise ValueError(
                 f"Expected unbatched pointcloud with shape (num_points, channels), got {pointcloud.shape}."
@@ -225,16 +235,16 @@ class ResizePointCloud(DataTransformFn):
 
         num_points = pointcloud.shape[0]
         if num_points == self.num_points:
-            return data
+            return pointcloud
+        if num_points == 0:
+            raise ValueError("Cannot resize an empty point cloud.")
 
         if num_points > self.num_points:
             indices = np.linspace(0, num_points - 1, num=self.num_points)
-            data["pointcloud"] = pointcloud[np.rint(indices).astype(np.int64)]
-            return data
+            return pointcloud[np.rint(indices).astype(np.int64)]
 
         repeat = int(np.ceil(self.num_points / num_points))
-        data["pointcloud"] = np.tile(pointcloud, (repeat, 1))[: self.num_points]
-        return data
+        return np.tile(pointcloud, (repeat, 1))[: self.num_points]
 
 
 @dataclasses.dataclass(frozen=True)

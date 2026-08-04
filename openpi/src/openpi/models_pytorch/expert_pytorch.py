@@ -1,4 +1,5 @@
 from typing import Literal
+import os
 from pathlib import Path
 
 import torch
@@ -16,6 +17,7 @@ class DINOExpertModel(nn.Module):
         use_adarms=None,
         precision: Literal["bfloat16", "float32"] = "float32",
         freeze_dino_encoder: bool = False,
+        initialize_dino: bool = True,
     ):
         if use_adarms is None:
             use_adarms = [False, False]
@@ -28,6 +30,7 @@ class DINOExpertModel(nn.Module):
         openpi_dir = current_file.parent.parent.parent.parent
         dinov3_dir = openpi_dir / "dinov3"
 
+        self.dino_model = None
         model_name = str(
             dino_model_name.split("/")[-1].split("-")[0]
             + "_"
@@ -38,18 +41,35 @@ class DINOExpertModel(nn.Module):
 
         # Convert to absolute path string for torch.hub.load
         dinov3_path = str(dinov3_dir.resolve())
-        weights_path = str((dinov3_dir / "checkpoints" / checkpoint_name).resolve())
+        default_weights_path = (dinov3_dir / "checkpoints" / checkpoint_name).resolve()
+        weights_path = Path(
+            os.environ.get("OPENPI_DINOV3_WEIGHTS", str(default_weights_path))
+        ).expanduser().resolve()
+        random_init = os.environ.get("OPENPI_DINOV3_RANDOM_INIT", "").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        if initialize_dino and not random_init and (not weights_path.is_file() or weights_path.stat().st_size == 0):
+            raise FileNotFoundError(
+                f"Missing DINOv3 checkpoint: {weights_path}\n"
+                "DINOv3 weights require accepting Meta's license. Download the "
+                f"{model_name} LVD-1689M .pth checkpoint, place it at that path, "
+                "or set OPENPI_DINOV3_WEIGHTS=/absolute/path/to/checkpoint.pth."
+            )
 
         # Initialize DINOv3 model for vision encoding
-        self.dino_model = torch.hub.load(
-            dinov3_path,
-            model_name,
-            source="local",
-            weights=weights_path,
-        )
+        if initialize_dino:
+            self.dino_model = torch.hub.load(
+                dinov3_path,
+                model_name,
+                source="local",
+                pretrained=not random_init,
+                weights=str(weights_path),
+            )
 
         # Freeze DINO encoder parameters if requested
-        if freeze_dino_encoder:
+        if freeze_dino_encoder and self.dino_model is not None:
             for param in self.dino_model.parameters():
                 param.requires_grad = False
 
@@ -109,6 +129,9 @@ class DINOExpertModel(nn.Module):
         Returns:
             Image features from DINOv3 model of shape (batch_size, num_patches, hidden_size)
         """
+        if self.dino_model is None:
+            raise RuntimeError("DINO image embedding is disabled for this model.")
+
         from torchvision.transforms import v2
 
         # print("image.shape", image.shape)
@@ -123,6 +146,9 @@ class DINOExpertModel(nn.Module):
                 f"Expected 4D tensor (batch, channels, height, width), "
                 f"got {image.dim()}D tensor with shape {image.shape}"
             )
+
+        if image.shape[-1] == 3 and image.shape[1] != 3:
+            image = image.permute(0, 3, 1, 2)
 
         batch_size, channels, height, width = image.shape
 
