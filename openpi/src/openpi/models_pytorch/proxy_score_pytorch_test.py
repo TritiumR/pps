@@ -24,6 +24,7 @@ class _TinyProxyScore(ProxyScorePytorch):
             prediction_type="score",
         )
         self.bidirectional_attention = True
+        self.legacy_gemma_input_scale = False
         self.prefix_scale = nn.Parameter(torch.tensor(0.5))
         self.prefix_batch_sizes = []
 
@@ -208,6 +209,48 @@ def test_attention_flag_preserves_legacy_2d_mask_when_disabled():
     torch.testing.assert_close(
         attention_mask[:, 0] == 0,
         make_att_2d_masks(pad_masks, block_boundaries),
+    )
+
+
+def test_legacy_gemma_input_scale_preserves_bidirectional_mask():
+    class CaptureExpert(nn.Module):
+        def forward(self, **kwargs):
+            self.inputs_embeds = kwargs["inputs_embeds"]
+            self.attention_mask = kwargs["attention_mask"]
+            return self.inputs_embeds, None
+
+    model = _TinyProxyScore()
+    model.legacy_gemma_input_scale = True
+    model.expert_model = CaptureExpert()
+    model.action_out_proj = nn.Identity()
+
+    prefix_embs = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+    suffix_embs = torch.tensor([[[5.0, 6.0], [7.0, 8.0], [9.0, 10.0]]])
+    prefix_pad = torch.ones(1, 2, dtype=torch.bool)
+    suffix_pad = torch.ones(1, 3, dtype=torch.bool)
+    prefix_blocks = torch.zeros(1, 2, dtype=torch.bool)
+    suffix_blocks = torch.tensor([[1, 1, 0]], dtype=torch.bool)
+
+    output = model._run_diffusion_head(
+        prefix_embs,
+        prefix_pad,
+        suffix_embs,
+        suffix_pad,
+        None,
+        prefix_blocks,
+        suffix_blocks,
+    )
+
+    expected_embs = torch.cat([prefix_embs, suffix_embs], dim=1) * (2.0**0.5)
+    torch.testing.assert_close(model.expert_model.inputs_embeds, expected_embs)
+    torch.testing.assert_close(output, expected_embs[:, -3:])
+    expected_mask = make_att_2d_masks(
+        torch.cat([prefix_pad, suffix_pad], dim=1),
+        torch.cat([prefix_blocks, suffix_blocks], dim=1),
+    )
+    torch.testing.assert_close(
+        model.expert_model.attention_mask[:, 0] == 0,
+        expected_mask,
     )
 
 

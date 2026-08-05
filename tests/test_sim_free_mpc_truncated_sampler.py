@@ -10,7 +10,10 @@ torch = pytest.importorskip("torch")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sim_free_mpc.action_space import decode_model_action_chunks  # noqa: E402
+from sim_free_mpc.action_space import (  # noqa: E402
+    NormStatsActionCodec,
+    decode_model_action_chunks,
+)
 from sim_free_mpc.dial_sampler import DIALSampler, DIALSamplerConfig  # noqa: E402
 from sim_free_mpc.fk import PANDA_JOINT_LIMITS  # noqa: E402
 from sim_free_mpc.planner import SimFreeMPC, SimFreeMPCConfig  # noqa: E402
@@ -63,6 +66,42 @@ def _assert_valid(decoded: torch.Tensor, current: torch.Tensor, delta: float):
 
     assert torch.all(decoded[..., 7] >= 0.0)
     assert torch.all(decoded[..., 7] <= 1.0)
+
+
+def test_norm_stats_action_codec_preserves_pi05_shape_and_decoding():
+    config = SimpleNamespace(action_dim=32, action_horizon=15, model_type="pi05")
+    state_stats = SimpleNamespace(
+        q01=torch.zeros(8),
+        q99=torch.full((8,), 2.0),
+    )
+    action_stats = SimpleNamespace(
+        q01=-torch.ones(8),
+        q99=torch.ones(8),
+    )
+    codec = NormStatsActionCodec(
+        config,
+        {"state": state_stats, "actions": action_stats},
+        use_quantile_norm=True,
+        norm_stats_source="test/norm_stats.json",
+        device="cpu",
+    )
+    raw_state = torch.tensor([0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 0.5])
+    observation, inputs = codec.obs_to_input(
+        {
+            "observation/joint_position": raw_state[:7],
+            "observation/gripper_position": raw_state[7:],
+        }
+    )
+
+    assert observation.state.shape == (1, 32)
+    assert torch.allclose(observation.state[0, :8], raw_state - 1.0, atol=1e-6)
+    assert torch.count_nonzero(observation.state[0, 8:]) == 0
+    assert codec._model.sample_noise((1, 15, 32), "cpu").shape == (1, 15, 32)
+
+    actions = codec.output_to_actions(inputs, torch.zeros(1, 15, 32))
+    assert actions.shape == (15, 8)
+    assert torch.allclose(torch.as_tensor(actions[:, :7]), raw_state[:7].expand(15, -1))
+    assert torch.allclose(torch.as_tensor(actions[:, 7]), torch.zeros(15), atol=1e-6)
 
 
 @pytest.mark.parametrize("use_quantile_norm", [False, True])

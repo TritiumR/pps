@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -19,6 +20,97 @@ class DecodedActionChunk:
 
     real_actions: torch.Tensor
     model_actions: torch.Tensor
+
+
+class _ActionCodecModel:
+    """Shape/noise interface used by eval without allocating a policy model."""
+
+    def __init__(self, config: Any):
+        self.config = config
+
+    @staticmethod
+    def sample_noise(shape, device):
+        # Match Pi0Pytorch.sample_noise exactly so deterministic eval keeps the
+        # same RNG behavior after the heavyweight base model is removed.
+        return torch.normal(
+            mean=0.0,
+            std=1.0,
+            size=shape,
+            dtype=torch.float32,
+            device=device,
+        )
+
+
+class NormStatsActionCodec:
+    """Minimal policy-shaped adapter for normalized Droid action-space MPC.
+
+    The geometric/score-space MPC paths do not run the base policy network. They
+    only need its normalized state, action decoder, action shape, and noise
+    sampler. Keeping those pieces here avoids loading the multi-billion-parameter
+    Pi0/Pi0.5 checkpoint while preserving its model-space conventions.
+    """
+
+    def __init__(
+        self,
+        config: Any,
+        norm_stats: dict[str, Any],
+        *,
+        use_quantile_norm: bool,
+        norm_stats_source: str | None,
+        device: str,
+    ):
+        missing = [key for key in ("state", "actions") if key not in norm_stats]
+        if missing:
+            raise ValueError(
+                f"Action codec requires state/actions normalization stats; missing {missing}."
+            )
+        self._model = _ActionCodecModel(config)
+        self._metadata = {
+            "input_norm_stats": norm_stats,
+            "output_norm_stats": norm_stats,
+            "output_norm_stats_source": norm_stats_source,
+            "use_quantile_norm": bool(use_quantile_norm),
+            "norm_stats_only_codec": True,
+        }
+        # Compatibility with eval helpers that inspect policy transforms.
+        self._input_transform = SimpleNamespace(transforms=())
+        self._pytorch_device = device
+
+    def obs_to_input(self, obs: dict[str, Any]):
+        joint_position = torch.as_tensor(
+            obs["observation/joint_position"],
+            device=self._pytorch_device,
+            dtype=torch.float32,
+        ).flatten()
+        gripper_position = torch.as_tensor(
+            obs["observation/gripper_position"],
+            device=self._pytorch_device,
+            dtype=torch.float32,
+        ).flatten()
+        state = torch.cat((joint_position, gripper_position), dim=-1)
+        state = _normalize_torch(
+            state,
+            self._metadata["input_norm_stats"]["state"],
+            use_quantile_norm=self._metadata["use_quantile_norm"],
+        )
+        if state is None:
+            raise ValueError("Action codec could not normalize the current robot state.")
+        state = _pad_to_dim_torch(
+            state,
+            int(self._model.config.action_dim),
+            fill_value=0.0,
+        ).unsqueeze(0)
+        inputs = {"state": state}
+        return SimpleNamespace(state=state), inputs
+
+    def output_to_actions(self, inputs: dict[str, Any], model_chunk: torch.Tensor):
+        decoded = decode_model_action_chunks(
+            self,
+            inputs,
+            model_chunk,
+            apply_clamp=False,
+        ).real_actions
+        return np.asarray(decoded[0].detach().cpu())
 
 
 def _state_for_sample(policy_inputs: dict[str, Any]) -> torch.Tensor:

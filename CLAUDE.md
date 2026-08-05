@@ -35,24 +35,21 @@ IsaacLab/
 ```
 
 `ModelType` (in `openpi/src/openpi/models/model.py`): `PI0`, `PI0_FAST`, `PI05`,
-and the steering proxies `PROXY`, `PROXY_POINTCLOUD`, `PROXY_DP3`, `PROXY_SOUND`.
+and the steering proxies `PROXY`, `PROXY_SCORE`, `PROXY_POINTCLOUD`, `PROXY_DP3`,
+`PROXY_SOUND`.
 
 ## How steering works (eval_steering.py)
 
-Three policies are loaded by config name + checkpoint dir:
-`base` (a `PI0`/`PI05`), `steer` (a `PROXY`), and `mimic` (a `PROXY`). During the
-base policy's flow-matching denoise loop (`infer_actions`), the velocity is
-combined as:
+Evaluation has four explicit modes: `--task_only`, `--vlm_base`, `--task_steer`,
+and `--full_steer`. Score-space MPC loads only the Pi0/Pi0.5 normalization stats
+for action encoding/decoding; it does not load the base model weights. Task and
+reference steering checkpoints are `PROXY_SCORE` policies, combined as geometric
+base score plus the configured task residual (and minus the reference score in
+full steering).
 
-```
-v_t = base_v_t
-v_t[:, :, :proxy_action_dim] += steer_scale * (steer_v_t - mimic_v_t)   # for denoise_time >= steer_step
-```
-
-`--only_steer` replaces the base velocity with the steer velocity instead.
-The rollout runs in the IsaacLab env and only the **trajectory video**
-(`<seed>_recording.mp4`, built from `_build_rollout_frame`) is written. The older
-EE-vector / arrow overlay visualization has been removed.
+The rollout writes the basic RGB trajectory video as `<seed>_{success|fail}.mp4`.
+Sound/thermal video variants and projected-axis/recovery debug overlays are not
+part of the eval path.
 
 ## Self-containment conventions (read before editing)
 

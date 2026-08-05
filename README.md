@@ -44,9 +44,10 @@ Run from the repo root. Steering combines a base policy with a `reference` and a
 TASK="Isaac-Pot-Droid-Visuomotor-v0"
 PROMPT="remove the lid of the pot and put egg in it"
 
-# Evaluate PPS
+# Evaluate full score steering
 python eval_steering.py \
   --task "$TASK" \
+  --full_steer \
   --exp_name eval_pps \
   --base_checkpoint_dir  openpi/checkpoints/pytorch/pi05_droid_jointpos \
   --task_checkpoint_dir openpi/checkpoints/<train-config>/task/24000 \
@@ -55,10 +56,11 @@ python eval_steering.py \
   --steer_scale 0.4 \
   --task_num_steps 1200
 
-# Evaluate pi0.5
+# Evaluate the sim-free MPC base (Pi0.5 norm stats only; model weights are skipped)
 python eval_steering.py \
   --task "$TASK" \
-  --exp_name eval_pi05 \
+  --vlm_base \
+  --exp_name eval_mpc_base \
   --base_checkpoint_dir  openpi/checkpoints/pytorch/pi05_droid_jointpos \
   --prompt "$PROMPT" \
   --task_num_steps 1200
@@ -67,8 +69,8 @@ python eval_steering.py \
 Each eval run is written to `results/<task>/<exp_name>/<run-id>_<config>/`, with
 `results.json` and short episode names such as `<seed>_success.mp4` or
 `<seed>_fail.mp4`.
-`--steer_scale` controls steering strength (0.4–0.8 typical); `--only_steer` uses
-the steer velocity alone.
+Choose exactly one mode: `--task_only`, `--vlm_base`, `--task_steer`, or
+`--full_steer`. `--steer_scale` controls task score steering strength.
 
 ## Evaluation in the real world
 

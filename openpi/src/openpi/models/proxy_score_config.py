@@ -22,6 +22,7 @@ class ProxyScoreConfig(_model.BaseModelConfig):
     ddim_num_train_timesteps: int = 100
     prediction_type: Literal["score", "epsilon"] = "score"
     bidirectional_attention: bool = True
+    legacy_gemma_input_scale: bool = False
     compile_sample_actions: bool = False
 
     action_dim: int = 8

@@ -146,6 +146,9 @@ class ProxyScorePytorch(nn.Module):
             freeze_dino_encoder=getattr(config, "freeze_dino_encoder", False),
         )
         self.bidirectional_attention = getattr(config, "bidirectional_attention", True)
+        self.legacy_gemma_input_scale = getattr(
+            config, "legacy_gemma_input_scale", False
+        )
 
         action_dim = config.action_dim
         self.action_in_proj = nn.Linear(action_dim, action_expert_config.width)
@@ -327,6 +330,17 @@ class ProxyScorePytorch(nn.Module):
         suffix_att_masks=None,
     ) -> torch.Tensor:
         embs = torch.cat([prefix_embs, suffix_embs], dim=1)
+        if self.legacy_gemma_input_scale:
+            # Stock Transformers Gemma scales all ``inputs_embeds`` before the
+            # first decoder layer. Keep this checkpoint-compatibility behavior
+            # local to ProxyScore; OpenPI's replacement intentionally omits the
+            # global scaling for its continuous embeddings.
+            normalizer = torch.tensor(
+                embs.shape[-1] ** 0.5,
+                dtype=embs.dtype,
+                device=embs.device,
+            )
+            embs = embs * normalizer
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         attention_mask = pad_masks
         if prefix_att_masks is not None and suffix_att_masks is not None:

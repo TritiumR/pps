@@ -96,7 +96,7 @@ while IFS=$'\t' read -r kind exp_name steer_scale; do
     )
     case "$current_kind" in
         base)
-            command+=(--vlm_base --no_steer)
+            command+=(--vlm_base)
             ;;
         task_steer)
             command+=(--task_steer --steer_scale "$current_scale")

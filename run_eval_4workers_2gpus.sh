@@ -9,7 +9,6 @@ pps_python="${PPS_PYTHON:-/home/cyf5/.conda/envs/pps/bin/python}"
 exec "$pps_python" eval_steering.py \
     --task Isaac-Weight-Droid-Visuomotor-v0 \
     --vlm_base \
-    --no_steer \
     --mpc_update mbd_score_action_prox \
     --mpc_cost grasp_flow \
     --mpc_optimize_space action \

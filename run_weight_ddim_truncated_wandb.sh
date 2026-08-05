@@ -16,7 +16,6 @@ results_root="$script_dir/results/Isaac-Weight-Droid-Visuomotor-v0/$exp_name"
 "$pps_python" eval_steering.py \
     --task Isaac-Weight-Droid-Visuomotor-v0 \
     --vlm_base \
-    --no_steer \
     --mpc_update ddim \
     --grad_calc backprop \
     --sampler truncated \

@@ -52,7 +52,6 @@ for spec in "$@"; do
     CUDA_VISIBLE_DEVICES="$GPU_ID" OMP_NUM_THREADS=8 "$PYTHON_BIN" eval_steering.py \
         --task Isaac-Weight-Droid-Visuomotor-v0 \
         --vlm_base \
-        --no_steer \
         --mpc_update mbd_score_action_prox \
         --mpc_cost grasp_flow \
         --mpc_optimize_space action \
