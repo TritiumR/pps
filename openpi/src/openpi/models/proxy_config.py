@@ -25,12 +25,17 @@ class ProxyConfig(_model.BaseModelConfig):
     # When True, use pi0-style block ("prefix-LM") attention instead of the
     # token-level causal mask that HF applies when only a 2D pad mask is given:
     #   - image tokens attend to each other bidirectionally,
-    #   - the state token attends to all image tokens,
-    #   - action tokens attend to the prefix, the state, and each other
+    #   - the state token (and optional binary token) attends to all image tokens,
+    #   - action tokens attend to the prefix, conditioning tokens, and each other
     #     bidirectionally (no autoregressive ordering within the chunk),
     #   - the prefix still cannot attend to state/action tokens.
     # Defaults to False to preserve the behavior of existing checkpoints.
     bidirectional_attention: bool = False
+
+    # Add a learned token for a per-observation binary conditioning value before
+    # the action tokens. Disabled by default so existing checkpoint structure and
+    # behavior remain unchanged.
+    use_action_expert_bit: bool = False
 
     # Set the model specific defaults.
     action_dim: int = 8
@@ -74,6 +79,11 @@ class ProxyConfig(_model.BaseModelConfig):
                     "right_wrist_0_rgb": image_mask_spec,
                 },
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
+                action_expert_bit=(
+                    jax.ShapeDtypeStruct([batch_size], jnp.int32)
+                    if self.use_action_expert_bit
+                    else None
+                ),
                 tokenized_prompt=jax.ShapeDtypeStruct(
                     [batch_size, self.max_token_len], jnp.int32
                 ),

@@ -75,6 +75,7 @@ IMAGE_RESOLUTION = (224, 224)
 #         ...  # Masks for additional views
 #     },
 #     "state": float32[*b, s],  # Low-dimensional robot state
+#     "action_expert_bit": int32[*b],  # Optional binary action-expert conditioning
 #     "tokenized_prompt": int32[*b, l],  # Optional, tokenized language prompt
 #     "tokenized_prompt_mask": bool[*b, l],  # Optional, mask for tokenized prompt
 #     "token_ar_mask": int32[*b, l],  # Optional, autoregressive mask for FAST model
@@ -111,6 +112,9 @@ class Observation(Generic[ArrayT]):
 
     # Sound spectrograms, float32. Expected canonical shape is [*b, mic, mel, time].
     sound: at.Float[ArrayT, "*b m f t"] | None = None
+
+    # Optional binary conditioning value consumed by compatible action experts.
+    action_expert_bit: at.Int[ArrayT, "*b"] | None = None
 
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
@@ -158,6 +162,7 @@ class Observation(Generic[ArrayT]):
             state=data["state"],
             pointcloud=data["pointcloud"] if "pointcloud" in data else None,
             sound=data["sound"] if "sound" in data else None,
+            action_expert_bit=data.get("action_expert_bit"),
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
@@ -249,6 +254,7 @@ def preprocess_observation(
         state=observation.state,
         pointcloud=observation.pointcloud,
         sound=observation.sound,
+        action_expert_bit=observation.action_expert_bit,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,

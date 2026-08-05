@@ -3,24 +3,28 @@
     "task_id": "Isaac-Pot-Droid-Visuomotor-v0",
     "prompt": "remove the lid of the pot and put egg in it",
     "task_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_pot_pi05_jointpos/task/24000",
-    "ref_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_pot_pi05_jointpos/reference/20000"
+    "ref_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_pot_pi05_jointpos/reference/20000",
+    "steer_scale": 0.4
   },
   "weight": {
     "task_id": "Isaac-Weight-Droid-Visuomotor-v0",
     "prompt": "put pear and apple on the scale",
     "task_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_weight_pi05_jointpos/task/24000",
-    "ref_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_weight_pi05_jointpos/reference/20000"
+    "ref_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_weight_pi05_jointpos/reference/20000",
+    "steer_scale": 0.4
   },
   "tea": {
     "task_id": "Isaac-Tea-Droid-Visuomotor-v0",
     "prompt": "pour the tea from the teapot into the cup",
     "task_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_tea_pi05_jointpos/task/32000",
-    "ref_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_tea_pi05_jointpos/reference/20000"
+    "ref_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_tea_pi05_jointpos/reference/20000",
+    "steer_scale": 0.4
   },
   "capsule": {
     "task_id": "Isaac-Capsule-Droid-Visuomotor-v0",
     "prompt": "open the coffee maker lid and put the pod inside",
     "task_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_capsule_pi05_jointpos/task/32000",
-    "ref_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_capsule_pi05_jointpos/reference/20000"
+    "ref_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_capsule_pi05_jointpos/reference/20000",
+    "steer_scale": 0.6
   }
 }

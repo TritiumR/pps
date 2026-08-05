@@ -40,6 +40,7 @@ import torch.nn.functional as F
 # import hydra
 import argparse
 import copy
+import dataclasses
 import re
 from tqdm import tqdm
 
@@ -355,10 +356,11 @@ def _predict_proxy_flow(prepared_proxy, model, x_t_path, time_cond):
     if prepared_proxy["kind"] == "dp3":
         return model._run_dp3(x_t_model, time_cond, prepared_proxy["obs_features"])
 
-    suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = model.embed_suffix(
-        prepared_proxy["state"],
-        x_t_model,
-        time_cond,
+    suffix_args = (prepared_proxy["state"], x_t_model, time_cond)
+    if "action_expert_bit" in prepared_proxy:
+        suffix_args += (prepared_proxy["action_expert_bit"],)
+    suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
+        model.embed_suffix(*suffix_args)
     )
     return _run_sequence_proxy_expert(
         model,
@@ -381,12 +383,14 @@ def _sequence_proxy_flow_from_prefix(
     time_cond,
     action_dim: int,
     prefix_att_masks=None,
+    action_expert_bit=None,
 ):
     x_t_model = x_t_path[:, :, :action_dim]
     suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = model.embed_suffix(
         state,
         x_t_model,
         time_cond,
+        action_expert_bit,
     )
     embs = torch.cat([prefix_embs, suffix_embs], dim=1)
     attention_mask, pad_masks = build_proxy_expert_masks(
@@ -422,6 +426,8 @@ def _eval_steer_forward_all(
     ref_images,
     ref_img_masks,
     ref_state,
+    task_action_expert_bit,
+    ref_action_expert_bit,
     x_t,
     num_steps: int,
     proxy_action_dim: int,
@@ -484,6 +490,7 @@ def _eval_steer_forward_all(
             expanded_time,
             proxy_action_dim,
             prefix_att_masks=task_prefix_att_masks,
+            action_expert_bit=task_action_expert_bit,
         )
         ref_v_t = _sequence_proxy_flow_from_prefix(
             ref_model,
@@ -494,6 +501,7 @@ def _eval_steer_forward_all(
             expanded_time,
             proxy_action_dim,
             prefix_att_masks=ref_prefix_att_masks,
+            action_expert_bit=ref_action_expert_bit,
         )
 
         steer_mask = (denoise_time >= steer_step).to(dtype=base_v_t.dtype)
@@ -515,6 +523,19 @@ def _eval_steer_forward_all(
 
 _compiled_eval_steer_forward_all = None
 _compiled_eval_steer_failed = False
+
+
+def _uses_bit_conditioned_steering(args) -> bool:
+    return getattr(args, "bit_conditioned_checkpoint_dir", None) is not None
+
+
+def _make_action_expert_bit(batch_size: int, value: int, device):
+    return torch.full(
+        (batch_size,),
+        value,
+        dtype=torch.long,
+        device=device,
+    )
 
 
 def _get_compiled_eval_steer_forward():
@@ -554,7 +575,10 @@ def _can_use_compiled_infer(base_policy, task_policy, ref_policy, args) -> bool:
 def _infer_actions_compiled(base_policy, task_policy, ref_policy, raw_obs, args):
     base_obs, base_inputs = _obs_to_input_checked(base_policy, raw_obs, "base")
     task_obs, _ = _obs_to_input_checked(task_policy, raw_obs, "task")
-    ref_obs, _ = _obs_to_input_checked(ref_policy, raw_obs, "ref")
+    if _uses_bit_conditioned_steering(args):
+        ref_obs = task_obs
+    else:
+        ref_obs, _ = _obs_to_input_checked(ref_policy, raw_obs, "ref")
 
     bsize = base_obs.state.shape[0]
     device = base_obs.state.device
@@ -578,18 +602,30 @@ def _infer_actions_compiled(base_policy, task_policy, ref_policy, raw_obs, args)
     task_images, task_img_masks, task_state = task_model._preprocess_observation(
         task_obs, train=False
     )
-    ref_images, ref_img_masks, ref_state = ref_model._preprocess_observation(
-        ref_obs, train=False
-    )
+    if _uses_bit_conditioned_steering(args):
+        ref_images = task_images
+        ref_img_masks = task_img_masks
+        ref_state = task_state
+        task_action_expert_bit = _make_action_expert_bit(bsize, 1, device)
+        ref_action_expert_bit = _make_action_expert_bit(bsize, 0, device)
+    else:
+        ref_images, ref_img_masks, ref_state = ref_model._preprocess_observation(
+            ref_obs, train=False
+        )
+        task_action_expert_bit = None
+        ref_action_expert_bit = None
 
     base_model.paligemma_with_expert.paligemma.language_model.config._attn_implementation = (
         "eager"  # noqa: SLF001
     )
     share_proxy_dino = (
-        getattr(task_model.config, "freeze_dino_encoder", False)
-        and getattr(ref_model.config, "freeze_dino_encoder", False)
-        and getattr(task_model.config, "dino_model_name", None)
-        == getattr(ref_model.config, "dino_model_name", None)
+        _uses_bit_conditioned_steering(args)
+        or (
+            getattr(task_model.config, "freeze_dino_encoder", False)
+            and getattr(ref_model.config, "freeze_dino_encoder", False)
+            and getattr(task_model.config, "dino_model_name", None)
+            == getattr(ref_model.config, "dino_model_name", None)
+        )
     )
 
     forward_fn = _get_compiled_eval_steer_forward()
@@ -608,6 +644,8 @@ def _infer_actions_compiled(base_policy, task_policy, ref_policy, raw_obs, args)
         ref_images,
         ref_img_masks,
         ref_state,
+        task_action_expert_bit,
+        ref_action_expert_bit,
         noise,
         args.num_steps,
         proxy_action_dim,
@@ -642,7 +680,10 @@ def infer_actions(base_policy, task_policy, ref_policy, raw_obs, args):
 def _infer_actions_eager(base_policy, task_policy, ref_policy, raw_obs, args):
     base_obs, base_inputs = _obs_to_input_checked(base_policy, raw_obs, "base")
     task_obs, _ = _obs_to_input_checked(task_policy, raw_obs, "task")
-    ref_obs, _ = _obs_to_input_checked(ref_policy, raw_obs, "ref")
+    if _uses_bit_conditioned_steering(args):
+        ref_obs = task_obs
+    else:
+        ref_obs, _ = _obs_to_input_checked(ref_policy, raw_obs, "ref")
 
     bsize = base_obs.state.shape[0]
     device = base_obs.state.device
@@ -691,7 +732,16 @@ def _infer_actions_eager(base_policy, task_policy, ref_policy, raw_obs, args):
     )
 
     prepared_task = _prepare_proxy_steering(task_model, task_obs)
-    prepared_ref = _prepare_proxy_steering(ref_model, ref_obs)
+    if _uses_bit_conditioned_steering(args):
+        prepared_ref = prepared_task.copy()
+        prepared_task["action_expert_bit"] = _make_action_expert_bit(
+            bsize, 1, device
+        )
+        prepared_ref["action_expert_bit"] = _make_action_expert_bit(
+            bsize, 0, device
+        )
+    else:
+        prepared_ref = _prepare_proxy_steering(ref_model, ref_obs)
 
     # if the DINO encoder is frozen and the model names are the same, use the same prefix embeddings for mimic
     if (
@@ -1367,6 +1417,16 @@ def parse_args():
         default=None,
         help="Path to the checkpoint directory. Required; the training config name is derived from this path.",
     )
+    parser.add_argument(
+        "--bit_conditioned_checkpoint_dir",
+        type=str,
+        default=None,
+        help=(
+            "Use one bit-conditioned proxy checkpoint for both steering roles: "
+            "bit 1 is the task flow and bit 0 is the reference flow. When set, "
+            "--task_checkpoint_dir and --ref_checkpoint_dir are ignored."
+        ),
+    )
     parser.add_argument("--steer_scale", type=float, default=0.4)
     parser.add_argument("--num_steps", type=int, default=10)
     parser.add_argument("--task_num_steps", type=int, default=1200)
@@ -1474,13 +1534,52 @@ base_checkpoint_dir = args.base_checkpoint_dir
 task_checkpoint_dir = args.task_checkpoint_dir
 ref_checkpoint_dir = args.ref_checkpoint_dir
 base_config = _config.get_config(_config_name_from_checkpoint_dir(base_checkpoint_dir))
-task_config = _config.get_config(_config_name_from_checkpoint_dir(task_checkpoint_dir))
-ref_config = _config.get_config(_config_name_from_checkpoint_dir(ref_checkpoint_dir))
-
-# Create the trained policies.
 base_policy = policy_config.create_trained_policy(base_config, base_checkpoint_dir)
-task_policy = policy_config.create_trained_policy(task_config, task_checkpoint_dir)
-ref_policy = policy_config.create_trained_policy(ref_config, ref_checkpoint_dir)
+
+if _uses_bit_conditioned_steering(args):
+    bit_checkpoint_dir = args.bit_conditioned_checkpoint_dir
+    task_config = _config.get_config(
+        _config_name_from_checkpoint_dir(bit_checkpoint_dir)
+    )
+    if task_config.model.model_type != _model.ModelType.PROXY:
+        raise ValueError(
+            "--bit_conditioned_checkpoint_dir must point to a ProxyConfig model, "
+            f"got {task_config.model.model_type}."
+        )
+    if not getattr(task_config.model, "use_action_expert_bit", False):
+        task_config = dataclasses.replace(
+            task_config,
+            model=dataclasses.replace(
+                task_config.model,
+                use_action_expert_bit=True,
+            ),
+        )
+        print(
+            "Enabled use_action_expert_bit for the shared steering checkpoint "
+            "configuration"
+        )
+    task_policy = policy_config.create_trained_policy(
+        task_config, bit_checkpoint_dir
+    )
+    ref_config = task_config
+    ref_policy = task_policy
+    task_checkpoint_dir = bit_checkpoint_dir
+    ref_checkpoint_dir = bit_checkpoint_dir
+    print(
+        "Using one bit-conditioned proxy for steering: bit 1 = task, "
+        "bit 0 = reference"
+    )
+else:
+    task_config = _config.get_config(
+        _config_name_from_checkpoint_dir(task_checkpoint_dir)
+    )
+    ref_config = _config.get_config(
+        _config_name_from_checkpoint_dir(ref_checkpoint_dir)
+    )
+    task_policy = policy_config.create_trained_policy(
+        task_config, task_checkpoint_dir
+    )
+    ref_policy = policy_config.create_trained_policy(ref_config, ref_checkpoint_dir)
 
 dataset_file = None
 dataset_demo_names = None
@@ -1560,6 +1659,7 @@ overall_comparison_stats = {
     for path_name, path_metadata in comparison_metadata.items()
 }
 episode_comparison_summaries = []
+episode_results = []
 total_comparison_observation_steps = 0
 total_inference_time_s = 0.0
 total_inference_calls = 0
@@ -1776,6 +1876,14 @@ for rollout_idx, seed in enumerate(range(args.seed_start, args.seed_end)):
         total_comparison_observation_steps += episode_comparison_observation_steps
         episode_comparison_summaries.append(episode_summary)
 
+    episode_results.append(
+        {
+            "rollout_index": rollout_idx,
+            "seed": seed,
+            "success": bool(success),
+        }
+    )
+
 env.close()
 if dataset_file is not None:
     dataset_file.close()
@@ -1815,6 +1923,28 @@ if args.compare_difference:
     with open(comparison_path, "w", encoding="utf-8") as f:
         json.dump(comparison_summary, f, indent=2)
     print(f"compare difference statistics saved to {comparison_path}")
+
+num_successes = sum(result["success"] for result in episode_results)
+evaluation_summary = {
+    "task": args.task,
+    "prompt": args.prompt,
+    "exp_name": args.exp_name,
+    "steer_scale": args.steer_scale,
+    "bit_conditioned_checkpoint_dir": args.bit_conditioned_checkpoint_dir,
+    "num_episodes": len(episode_results),
+    "num_successes": num_successes,
+    "success_rate": (
+        num_successes / len(episode_results) if episode_results else 0.0
+    ),
+    "episodes": episode_results,
+}
+evaluation_summary_path = os.path.join(output_path, "evaluation_summary.json")
+with open(evaluation_summary_path, "w", encoding="utf-8") as f:
+    json.dump(evaluation_summary, f, indent=2)
+print(
+    f"evaluation summary saved to {evaluation_summary_path}: "
+    f"{num_successes}/{len(episode_results)} successes"
+)
 
 if total_inference_calls:
     avg_infer_ms = 1000.0 * total_inference_time_s / total_inference_calls

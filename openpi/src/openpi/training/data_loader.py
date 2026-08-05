@@ -1,11 +1,13 @@
 from collections.abc import Iterator, Sequence
 import dataclasses
+import inspect
 import logging
 import multiprocessing
 import os
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
+import datasets.features.features as hf_features
 import jax
 import jax.numpy as jnp
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
@@ -20,6 +22,31 @@ import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
 _POINTCLOUD_NORM_STATS_CACHE: dict[tuple[str, tuple[int, ...] | None], _normalize.NormStats] = {}
+
+
+def _apply_hf_datasets_compatibility_patches() -> None:
+    """Bridge metadata/PyArrow changes newer than datasets 2.21.
+
+    The local LeRobot v2.1 parquet files encode fixed-size sequences as the
+    newer ``List`` feature type, while datasets 2.21 calls it ``Sequence``.
+    PyArrow 22 also passes ``maps_as_pydicts`` to extension-array ``to_pylist``
+    methods, which the datasets 2.21 ArrayExtensionArray does not accept.
+    """
+    hf_features._FEATURE_TYPES.setdefault(  # pyright: ignore[reportPrivateUsage]
+        "List", hf_features.Sequence
+    )
+
+    to_pylist = hf_features.ArrayExtensionArray.to_pylist
+    if "maps_as_pydicts" not in inspect.signature(to_pylist).parameters:
+
+        def to_pylist_compat(self, *args, **kwargs):
+            del args, kwargs
+            return to_pylist(self)
+
+        hf_features.ArrayExtensionArray.to_pylist = to_pylist_compat
+
+
+_apply_hf_datasets_compatibility_patches()
 
 
 class Dataset(Protocol[T_co]):

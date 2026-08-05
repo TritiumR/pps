@@ -158,14 +158,21 @@ class ProxyPytorch(nn.Module):
             freeze_dino_encoder=getattr(config, "freeze_dino_encoder", False),
         )
 
-        # pi0-style block attention over [images | state | actions] instead of the
-        # token-level causal mask HF applies when only a 2D pad mask is passed.
+        # pi0-style block attention over
+        # [images | state (+ optional bit) | actions] instead of the token-level
+        # causal mask HF applies when only a 2D pad mask is passed.
         self.bidirectional_attention = getattr(config, "bidirectional_attention", False)
+        self.use_action_expert_bit = getattr(config, "use_action_expert_bit", False)
 
         ACTION_DIM = 8  # for droid setup
 
         self.action_in_proj = nn.Linear(ACTION_DIM, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, ACTION_DIM)
+        self.action_expert_bit_embedding = (
+            nn.Embedding(2, action_expert_config.width)
+            if self.use_action_expert_bit
+            else None
+        )
 
         # if self.pi05:
         #     self.time_mlp_in = nn.Linear(
@@ -313,8 +320,39 @@ class ProxyPytorch(nn.Module):
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, state, noisy_actions, timestep):
-        """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
+    def _normalize_action_expert_bit(self, action_expert_bit, bsize, device):
+        """Return a validated `[batch]` tensor of binary token IDs.
+
+        A missing value maps to zero so code paths that call ``embed_suffix``
+        directly continue to work when binary conditioning is enabled.
+        """
+        if action_expert_bit is None:
+            return torch.zeros(bsize, dtype=torch.long, device=device)
+
+        action_expert_bit = torch.as_tensor(action_expert_bit, device=device)
+        if action_expert_bit.ndim == 0:
+            action_expert_bit = action_expert_bit.expand(bsize)
+        elif action_expert_bit.ndim == 2 and action_expert_bit.shape[1] == 1:
+            action_expert_bit = action_expert_bit[:, 0]
+        elif action_expert_bit.ndim != 1:
+            raise ValueError(
+                "action_expert_bit must be a scalar or have shape [batch] or "
+                f"[batch, 1], got {tuple(action_expert_bit.shape)}"
+            )
+        if action_expert_bit.shape[0] != bsize:
+            raise ValueError(
+                "action_expert_bit batch dimension must match the model input: "
+                f"expected {bsize}, got {action_expert_bit.shape[0]}"
+            )
+
+        torch._assert(
+            torch.all((action_expert_bit == 0) | (action_expert_bit == 1)),
+            "action_expert_bit values must be 0 or 1",
+        )
+        return action_expert_bit.to(dtype=torch.long)
+
+    def embed_suffix(self, state, noisy_actions, timestep, action_expert_bit=None):
+        """Embed state, optional binary conditioning, actions, and timestep."""
         embs = []
         pad_masks = []
         att_masks = []
@@ -333,8 +371,22 @@ class ProxyPytorch(nn.Module):
         state_mask = torch.ones(bsize, 1, dtype=torch.bool, device=device)
         pad_masks.append(state_mask)
 
-        # Set attention masks so that image inputs do not attend to state or actions
+        # Start a conditioning block after the image prefix.
         att_masks += [1]
+
+        if self.use_action_expert_bit:
+            bit_ids = self._normalize_action_expert_bit(
+                action_expert_bit, bsize, device
+            )
+            bit_emb = self.action_expert_bit_embedding(bit_ids)
+            bit_emb = bit_emb.to(dtype=state_emb.dtype)
+            embs.append(bit_emb[:, None, :])
+            pad_masks.append(
+                torch.ones(bsize, 1, dtype=torch.bool, device=device)
+            )
+            # Keep state and bit in the same conditioning block. Action tokens
+            # can attend to both, while the image prefix cannot attend to either.
+            att_masks += [0]
 
         # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = create_sinusoidal_pos_embedding(
@@ -385,7 +437,7 @@ class ProxyPytorch(nn.Module):
         )
         pad_masks.append(action_time_mask)
 
-        # Set attention masks so that image, language and state inputs do not attend to action tokens
+        # Start a new block for the action tokens.
         att_masks += [1] + ([0] * (self.config.action_horizon - 1))
 
         embs = torch.cat(embs, dim=1)
@@ -419,6 +471,7 @@ class ProxyPytorch(nn.Module):
             raise ValueError("actions must be provided for training mode.")
 
         images, img_masks, state = self._preprocess_observation(observation, train=True)
+        action_expert_bit = getattr(observation, "action_expert_bit", None)
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -439,7 +492,7 @@ class ProxyPytorch(nn.Module):
 
         # Suffix: state + (action, time) tokens
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
-            self.embed_suffix(state, x_t, time)
+            self.embed_suffix(state, x_t, time, action_expert_bit)
         )
 
         # print(suffix_embs.shape)
@@ -495,6 +548,7 @@ class ProxyPytorch(nn.Module):
             Loss tensor with shape (batch_size, num_steps, action_horizon, action_dim)
         """
         images, img_masks, state = self._preprocess_observation(observation, train=True)
+        action_expert_bit = getattr(observation, "action_expert_bit", None)
 
         # Prefix: image features from DINO (static across all steps)
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
@@ -541,8 +595,22 @@ class ProxyPytorch(nn.Module):
         flat_state = state[:, None, :].expand(batch_size, num_steps, state.shape[-1])
         flat_state = flat_state.reshape(batch_size * num_steps, state.shape[-1])
 
+        flat_action_expert_bit = None
+        if self.use_action_expert_bit and action_expert_bit is not None:
+            action_expert_bit = self._normalize_action_expert_bit(
+                action_expert_bit, batch_size, state.device
+            )
+            flat_action_expert_bit = action_expert_bit[:, None].expand(
+                batch_size, num_steps
+            )
+            flat_action_expert_bit = flat_action_expert_bit.reshape(
+                batch_size * num_steps
+            )
+
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
-            self.embed_suffix(flat_state, flat_x_t, flat_times)
+            self.embed_suffix(
+                flat_state, flat_x_t, flat_times, flat_action_expert_bit
+            )
         )
 
         prefix_embs = prefix_embs[:, None, :, :].expand(
@@ -616,6 +684,7 @@ class ProxyPytorch(nn.Module):
               Shape: (batch_size, action_horizon, action_dim)
         """
         images, img_masks, state = self._preprocess_observation(observation, train=False)
+        action_expert_bit = getattr(observation, "action_expert_bit", None)
         bsize = state.shape[0]
         device = state.device
 
@@ -658,7 +727,7 @@ class ProxyPytorch(nn.Module):
             times.append(current_time.clone())
 
             suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
-                self.embed_suffix(state, x_t, current_time)
+                self.embed_suffix(state, x_t, current_time, action_expert_bit)
             )
 
             embs = torch.cat([prefix_embs, suffix_embs], dim=1)
@@ -705,6 +774,7 @@ class ProxyPytorch(nn.Module):
         images, img_masks, state = self._preprocess_observation(
             observation, train=False
         )
+        action_expert_bit = getattr(observation, "action_expert_bit", None)
 
         # Prefix embeddings are static across denoising steps
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
@@ -722,7 +792,7 @@ class ProxyPytorch(nn.Module):
 
             # Recompute suffix embeddings at current x_t and time
             suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
-                self.embed_suffix(state, x_t, expanded_time)
+                self.embed_suffix(state, x_t, expanded_time, action_expert_bit)
             )
 
             embs = torch.cat([prefix_embs, suffix_embs], dim=1)
