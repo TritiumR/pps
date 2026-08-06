@@ -25,6 +25,15 @@ TASK_BODIES = {
     "stack_d0": ("cubeA", "cubeB"),
     "stack_three_d0": ("cubeA", "cubeB", "cubeC"),
     "square_d0": ("SquareNut",),
+    # MuJoCo body names, resolved through _body_name ("<name>_main" then "<name>"). These are the
+    # model's own names, which differ from the aliases gt.py's coffee grounding uses: the machine
+    # body is coffee_machine_body_main and the holder is coffee_machine_pod_holder_holder_main.
+    "coffee_d0": (
+        "coffee_pod",
+        "coffee_machine_body",
+        "coffee_machine_lid",
+        "coffee_machine_pod_holder_holder",
+    ),
 }
 
 
