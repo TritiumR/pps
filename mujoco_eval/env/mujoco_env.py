@@ -244,10 +244,11 @@ class MuJoCoEnv:
 class MGWorld(GTWorld):
     """Read exact MuJoCo object state with latched hold tracking."""
 
-    def __init__(self, env, sensor=None, names=()):
+    def __init__(self, env, sensor=None, names=(), slip_margin=None):
         self.env = env
         self.names = list(names)
-        self._latch = HoldLatch(sensor) if sensor is not None else None
+        self._latch = (HoldLatch(sensor, slip_margin=slip_margin)
+                       if sensor is not None else None)
 
     def object_pose(self, name):
         return self.env.object_pose(name)
