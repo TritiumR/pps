@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import math
 import subprocess
 import time
 
@@ -162,7 +163,7 @@ class ProxySteering:
 
     def __init__(self, mode, client, *, rho=0.15, schedule="flat", ddim_train_timesteps=100,
                  horizon=8, base_seed=0):
-        if mode not in ("inject", "proxy_only", "expert", "select", "verify", "tilt"):
+        if mode not in ("inject", "proxy_only", "expert", "select", "verify", "tilt", "fk"):
             raise ValueError(f"mode must be inject|proxy_only|expert|select, got {mode!r}")
         self.mode = mode
         self.client = client
@@ -198,6 +199,35 @@ class ProxySteering:
     def expert_chunk(self):
         """Return the proxy's final clean action chunk."""
         return np.array(self._x0_real[-1][: self.horizon], dtype=np.float32, copy=True)
+
+    def _pad_to_proxy(self, y):
+        """Extend a short chunk up to the proxy's own horizon, in proxy space.
+
+        See H1: the trailing rows of an AWE/keypose proxy are GOALS, not actions. Filling them by
+        repeating the last action row is off-distribution; the proxy's own predicted goal rows are
+        the in-distribution choice and are already computed by begin_replan.
+        """
+        need = self.proxy_horizon - y.shape[1]
+        if need <= 0:
+            return y
+        goals = self.goal_rows()
+        if goals is not None and len(goals) >= need:
+            block = np.asarray(goals[-need:], dtype=y.dtype)
+            pad = np.repeat(block[None], y.shape[0], axis=0)
+        else:
+            pad = np.repeat(y[:, -1:, :], need, axis=1)
+        return np.concatenate([y, pad], axis=1)
+
+    def goal_rows(self):
+        """Return the trailing GOAL rows: AWE waypoints then the keypose, or None.
+
+        Trained with --awe_waypoints K --keypose_tail, the chunk is [actions | W1..WK | keypose].
+        Everything past `horizon` is a goal rather than an action, so it is sliced off before
+        execution and was, until now, simply discarded.
+        """
+        if self._x0_real is None or self._x0_real.shape[1] <= self.horizon:
+            return None
+        return np.array(self._x0_real[-1][self.horizon:], dtype=np.float32, copy=True)
 
     def inject_for(self, iteration, num_iterations, policy):
         """Build the planner injection for one denoising level."""
@@ -235,6 +265,18 @@ class ProxySteering:
             out["discrimination"] = True
         return out
 
+    def fk_target(self, iteration, num_iterations, policy):
+        """Return this level's proxy target in model space and its alpha_bar.
+
+        Same target as `tilt_for`; the caller applies the strength, because FK standardizes the
+        potential across particles first and so needs to scale it afterwards.
+        """
+        alpha, _ = ddim_iteration_alphas(
+            iteration=iteration, num_iterations=num_iterations,
+            num_train_timesteps=self.ddim_train_timesteps)
+        target = self._to_model_space(self._x0_real[iteration][: self.horizon], policy)
+        return torch.as_tensor(target, dtype=torch.float32), float(alpha)
+
     def _to_model_space(self, x0_real, policy):
         """Convert proxy real actions into planner model space."""
         md = policy._metadata
@@ -254,8 +296,17 @@ class AdditiveScoreSteering:
     mode = "additive"
 
     def __init__(self, client, *, gamma, policy, horizon, mass_keep=0.9999, score_cap=0, seed=0,
-                 at="candidates", ref="none"):
+                 at="candidates", ref="none", ref_client=None, last_level=None):
         self.client = client
+        # PPS's third model. `ref="base"` subtracts the BASE score, which collapses Eq (4) to a
+        # convex blend; only a reference PROXY -- same architecture, same score space -- makes
+        # base + gamma*(task - ref) unbounded above max(base, task), which is the whole point.
+        self.ref_client = ref_client
+        self.ref_horizon = (int(ref_client.ready_info["action_horizon"])
+                            if ref_client is not None else 0)
+        self._ref_obs = None
+        # Highest denoising level that still receives the addend; None applies it everywhere.
+        self.last_level = None if last_level is None else int(last_level)
         self.gamma = float(gamma)
         self.horizon = int(horizon)
         self.mass_keep = float(mass_keep)
@@ -310,6 +361,10 @@ class AdditiveScoreSteering:
         t0 = time.perf_counter()
         self._obs, _ = self.client.embed(
             joint_pos=q0, gripper_pos=gripper, table=table, wrist=wrist)
+        if self.ref_client is not None:
+            # Same observation, its own server: the two score fields must differ only in weights.
+            self._ref_obs, _ = self.ref_client.embed(
+                joint_pos=q0, gripper_pos=gripper, table=table, wrist=wrist)
         self.last_embed_s = time.perf_counter() - t0
         self.level_trace = []
         self.replan_idx += 1
@@ -328,6 +383,181 @@ class AdditiveScoreSteering:
         n = x.shape[1]
         return (real_delta - self._rows(self._off, n)) / self._rows(self._scale, n) + self._bias
 
+    def _to_planner_space(self, y):
+        """Inverse of `_to_proxy_space`; needed to run the proxy's own chain in planner space."""
+        n = y.shape[1]
+        real_delta = (y - self._bias) * self._rows(self._scale, n) + self._rows(self._off, n)
+        return (real_delta - self._mean) / self._std
+
+    def policy_pair_step(self, x_t, iteration, num_iterations):
+        """One DDIM step under a CONVEX BLEND of two LEARNED score fields.
+
+        The control for Cory's symmetry claim: `(1-g)*s_A + g*s_B` is a product of experts and is
+        symmetric in A and B -- but only if both operands are score FUNCTIONS. Ours pairs a network
+        against MBD's cost-weighted Monte-Carlo ESTIMATE, whose validity is level-dependent
+        (measured: ||s_task - s_base||/||s_base|| runs 0.58 -> 12.20 across levels, against 0.45
+        between two learned proxies) and whose implied distribution is near-degenerate (ESS ~ 1).
+
+        This runs the SAME operator with both operands learned -- reference proxy as A, task proxy
+        as B. If proxy x proxy composes while proxy x MBD degrades monotonically, the estimator is
+        the cause and the symmetry argument holds only where both sides are functions.
+        """
+        # x_t arrives as a tensor from the planner path and as an ndarray from the pair path,
+        # which never touches the MBD step.
+        x = (x_t.detach().cpu().numpy() if hasattr(x_t, "detach")
+             else np.asarray(x_t)).astype(np.float32)
+        y = self._to_proxy_space(x)
+
+        def _score(client, horizon, obs):
+            yy = y[:, :horizon]
+            if yy.shape[1] < horizon:
+                yy = np.concatenate(
+                    [yy, np.repeat(yy[:, -1:, :], horizon - yy.shape[1], axis=1)], axis=1)
+            sc, _ = client.score_batch(obs=obs, iteration=iteration,
+                                       num_iterations=num_iterations, x=yy)
+            return np.asarray(sc)[:, : y.shape[1]]
+
+        t0 = time.perf_counter()
+        s_b = _score(self.client, self.proxy_horizon, self._obs)          # task proxy
+        s_a = _score(self.ref_client, self.ref_horizon, self._ref_obs)    # reference proxy
+        rows = min(s_a.shape[1], s_b.shape[1])
+        g = self.gamma
+        score = np.zeros_like(s_b)
+        score[:, :rows] = (1.0 - g) * s_a[:, :rows] + g * s_b[:, :rows]
+        score[:, rows:] = s_b[:, rows:]        # rows only the task proxy has
+
+        alpha, alpha_prev = ddim_iteration_alphas(
+            iteration=iteration, num_iterations=num_iterations,
+            num_train_timesteps=int(self.client.ready_info.get("ddim_num_train_timesteps", 100)))
+        beta = max(1.0 - float(alpha), 1e-6)
+        yy = y[:, : score.shape[1]]
+        x0 = (yy + beta * score) / math.sqrt(max(float(alpha), 1e-6))
+        eps = -math.sqrt(beta) * score
+        y_next = (math.sqrt(max(float(alpha_prev), 0.0)) * x0
+                  + math.sqrt(max(1.0 - float(alpha_prev), 0.0)) * eps)
+        na, nb = float(np.linalg.norm(s_a[:, :rows])), float(np.linalg.norm(s_b[:, :rows]))
+        self.level_trace.append({
+            "it": int(iteration), "wall_s": round(time.perf_counter() - t0, 3),
+            "ref_norm": round(na, 4), "task_norm": round(nb, 4),
+            "pair_ratio": round(float(np.linalg.norm(s_b[:, :rows] - s_a[:, :rows]))
+                                / max(nb, 1e-9), 4)})
+        out = self._to_planner_space(y_next[:, : x.shape[1]])
+        # The decode path wants a tensor, as policy_step returns.
+        return torch.as_tensor(out, dtype=torch.float32)
+
+    def policy_step(self, x_t, iteration, num_iterations):
+        """One DDIM step of the PROXY's own reverse chain, returned in planner space.
+
+        Replicates serve_mg_proxy_score.py's `chain` update exactly, but driven from the harness
+        so an MBD step can be blended in at every level -- the inverted direction, where the
+        trained policy is the base and the cost is the steering signal.
+        """
+        x = x_t.detach().cpu().numpy().astype(np.float32)
+        y = self._to_proxy_space(x)
+        if y.shape[1] < self.proxy_horizon:      # the model wants its full chunk
+            y = self._pad_to_proxy(y)
+        t0 = time.perf_counter()
+        score, server_s = self.client.score_batch(
+            obs=self._obs, iteration=iteration, num_iterations=num_iterations, x=y)
+        alpha, alpha_prev = ddim_iteration_alphas(
+            iteration=iteration, num_iterations=num_iterations,
+            num_train_timesteps=int(self.client.ready_info.get("ddim_num_train_timesteps", 100)))
+        beta = max(1.0 - float(alpha), 1e-6)
+        x0 = (y + beta * score) / math.sqrt(max(float(alpha), 1e-6))
+        eps = -math.sqrt(beta) * score
+        y_next = (math.sqrt(max(float(alpha_prev), 0.0)) * x0
+                  + math.sqrt(max(1.0 - float(alpha_prev), 0.0)) * eps)
+        self.level_trace.append({
+            "it": int(iteration), "wall_s": round(time.perf_counter() - t0, 3),
+            "server_s": round(float(server_s), 3)})
+        out = self._to_planner_space(y_next[:, : x.shape[1]])
+        # C4. x0 is the model's CLEAN prediction; y_next is the noisy next iterate. Ranking
+        # key-pose geometry needs the former -- FK of a noisy chunk is not a reachable pose --
+        # while the chain needs the latter. Both are already computed here; only y_next used to
+        # escape, so keypose_fk was costing x_{t-1} as though it were an action chunk.
+        self._last_step = {
+            "y0": x0,                      # proxy-space clean chunk, incl. real goal rows
+            "x0_hat": torch.as_tensor(self._to_planner_space(x0[:, : x.shape[1]]),
+                                      dtype=x_t.dtype, device=x_t.device),
+            "eps": eps, "alpha": float(alpha), "alpha_prev": float(alpha_prev),
+            "rows": int(x.shape[1]),
+            "x_prev": torch.as_tensor(out, dtype=x_t.dtype, device=x_t.device)}
+        return torch.as_tensor(out, dtype=x_t.dtype, device=x_t.device)
+
+    def _pad_to_proxy(self, y):
+        """Extend a short chunk up to the proxy's own horizon, in proxy space.
+
+        H1. The trailing rows of an AWE/keypose proxy are GOALS, not actions, so filling them by
+        repeating the last action row is off-distribution. When a proxy chain has run this level
+        (policy_base, keypose_fk) its own clean prediction supplies real goal rows. The plain
+        additive path runs no chain, so there is nothing in-distribution to use -- say so once
+        rather than let a fabricated goal block look like a measurement.
+        """
+        need = self.proxy_horizon - y.shape[1]
+        if need <= 0:
+            return y
+        st = getattr(self, "_last_step", None)
+        if st is not None and st.get("y0") is not None and st["y0"].shape[1] >= self.proxy_horizon:
+            block = st["y0"][:, -need:, :].astype(y.dtype)
+            pad = np.repeat(block[:1], y.shape[0], axis=0)
+            return np.concatenate([y, pad], axis=1)
+        if not getattr(self, "_warned_pad", False):
+            self._warned_pad = True
+            print(f"[proxy] H1: padding {need} goal row(s) by repeating the last ACTION row -- "
+                  f"the proxy expects waypoints/keypose there, so its score is read "
+                  f"off-distribution. Match --horizon to the proxy's chunk to avoid this.",
+                  flush=True)
+        return np.concatenate([y, np.repeat(y[:, -1:, :], need, axis=1)], axis=1)
+
+    def policy_step_full(self, x_t, iteration, num_iterations):
+        """policy_step, but returning {x0_hat, eps, x_prev, alpha, alpha_prev}.
+
+        Callers that RANK or MODIFY the chunk want x0_hat; callers that only advance the chain
+        want x_prev. Keeping policy_step's return type unchanged leaves every existing caller
+        (policy_base, the handoff paths) behaving exactly as before.
+        """
+        self.policy_step(x_t, iteration, num_iterations)
+        return dict(self._last_step)
+
+    def redo_ddim(self, x0_planner, iteration=None):
+        """Re-run the DDIM update from a MODIFIED clean chunk, in planner space.
+
+        The guided x0 has to re-enter the chain through the same operator the model's own step
+        used, or the guidance is applied in one parameterisation and integrated in another.
+        """
+        st = self._last_step
+        y0 = self._to_proxy_space(
+            x0_planner.detach().cpu().numpy().astype(np.float32))
+        eps = st["eps"][:, : y0.shape[1]]
+        y_next = (math.sqrt(max(st["alpha_prev"], 0.0)) * y0
+                  + math.sqrt(max(1.0 - st["alpha_prev"], 0.0)) * eps)
+        out = self._to_planner_space(y_next[:, : st["rows"]])
+        return torch.as_tensor(out, dtype=x0_planner.dtype, device=x0_planner.device)
+
+    def support_distance(self, samples, x0_proxy):
+        """How far the proxy's preferred chunk sits outside the base's proposal cloud, in sigmas.
+
+        The acceptance test for any composition. Two situations produce the same nonzero
+        ||s_task - s_base|| but demand opposite treatment:
+          d small -- the proxy prefers something the base already proposes. The product of experts
+                     REWEIGHTS shared support; composition is valid and selects.
+          d large -- the proxy's target lies in the base's tails. The product has no mass there, so
+                     composition INTERPOLATES into a region neither model endorses, and no gamma
+                     repairs it.
+        Cory measured 4.25 sigma on the gripper channel in the Isaac run; we measured a base that
+        converts 0 of 82 grasps at the place phase, which is the same condition by another route.
+        Returned per-dimension-pooled and per-row so a phase-structured gap is visible.
+        """
+        s = np.asarray(samples, dtype=np.float64)
+        s = s.reshape(s.shape[0], -1) if s.ndim > 2 else s
+        x = np.asarray(x0_proxy, dtype=np.float64).reshape(-1)[: s.shape[1]]
+        mu, sd = s.mean(axis=0), s.std(axis=0)
+        sd = np.where(sd < 1e-9, 1e-9, sd)
+        z = (x - mu[: x.shape[0]]) / sd[: x.shape[0]]
+        return {"d_mean": float(np.abs(z).mean()), "d_max": float(np.abs(z).max()),
+                "d_rms": float(np.sqrt((z ** 2).mean())),
+                "frac_outside_3sig": float((np.abs(z) > 3.0).mean())}
+
     def score_addend(self, *, samples, weights, x_t, base_score,
                      iteration, num_iterations, alpha_bar):
         """Return the proxy-derived score addend for one denoising level.
@@ -342,6 +572,11 @@ class AdditiveScoreSteering:
         conditioned on level t expects x_t-distributed chunks.
         """
         del alpha_bar
+        # PPS applies the addend only for denoise_time >= steer_step; we applied it at every
+        # level, and the measured addend/base ratio climbs 0.09 -> 9.6 across the chain, so the
+        # last levels were effectively "follow the task proxy". `last_level` drops them.
+        if self.last_level is not None and iteration > self.last_level:
+            return None
         if self.at == "xt":
             x = x_t.detach().cpu().numpy().astype(np.float32)
             w = np.ones(x.shape[0], dtype=np.float32) / x.shape[0]
@@ -366,9 +601,11 @@ class AdditiveScoreSteering:
             x, w = x[idx], w[idx] / max(float(w[idx].sum()), 1e-12)
         y = self._to_proxy_space(x)
         if y.shape[1] < self.proxy_horizon:
-
-            pad = np.repeat(y[:, -1:, :], self.proxy_horizon - y.shape[1], axis=1)
-            y = np.concatenate([y, pad], axis=1)
+            # H1. An AWE proxy expects [actions | W1..WK | keypose]. Repeating the last ACTION row
+            # into those goal slots hands the model an input unlike anything in training, and the
+            # score it returns is measured off-distribution. Prefer the proxy's OWN predicted goal
+            # rows when a chain has produced them; fall back to repetition only if none exist.
+            y = self._pad_to_proxy(y)
         t0 = time.perf_counter()
         s_proxy, server_s = self.client.score_batch(
             obs=self._obs, iteration=iteration, num_iterations=num_iterations, x=y)
@@ -378,7 +615,25 @@ class AdditiveScoreSteering:
             slope = slope[None, :]                 # one flat scale, broadcast over rows
         s_planner = s_proxy[:, : x.shape[1], :] * slope[None]
         addend = self.gamma * (w[:, None, None] * s_planner).sum(axis=0)
-        if self.ref == "base":
+        if self.ref == "proxy":
+            # PPS Eq (4) proper: the reference is a proxy distilled from the base, so the
+            # difference isolates the task increment while the shared prior cancels. Scored on
+            # the SAME y and level as the task proxy, so only the weights differ.
+            # The task proxy may carry a keypose tail the reference does not, so pad or trim y to
+            # the reference's own horizon. The extra row has no reference to cancel against and
+            # contributes nothing to the difference.
+            hr = self.ref_horizon
+            yr = (y[:, :hr] if y.shape[1] >= hr
+                  else np.concatenate([y, np.zeros((y.shape[0], hr - y.shape[1], y.shape[2]),
+                                                   np.float32)], axis=1))
+            s_ref, _ = self.ref_client.score_batch(
+                obs=self._ref_obs, iteration=iteration, num_iterations=num_iterations, x=yr)
+            rows_ref = min(x.shape[1], s_ref.shape[1])
+            r_planner = s_ref[:, :rows_ref, :] * slope[None, :rows_ref]
+            if rows_ref < addend.shape[0]:
+                r_planner = np.pad(r_planner, ((0, 0), (0, addend.shape[0] - rows_ref), (0, 0)))
+            addend = addend - self.gamma * (w[:, None, None] * r_planner).sum(axis=0)
+        elif self.ref == "base":
             # PPS Eq (4) with v_ref := v_base, i.e. Eq (3): (1-gamma)*base + gamma*task.
             # A convex interpolation, bounded at every gamma -- unlike base + gamma*task,
             # whose magnitude grows with gamma and went NaN at the paper's own optimum.
@@ -388,12 +643,44 @@ class AdditiveScoreSteering:
             addend = np.pad(addend, ((0, rows - addend.shape[0]), (0, 0)))
         base_norm = float(torch.linalg.vector_norm(base_score.detach()).cpu())
         add_norm = float(np.linalg.norm(addend))
+        # Support test (see support_distance): reconstruct the proxy's OWN preferred clean chunk
+        # from the score it returned, x0 = (y + beta*s)/sqrt(alpha), and measure how far that sits
+        # from the base's candidate cloud in units of the cloud's own spread.
+        _supp = {}
+        if samples is not None:
+            # score_addend does `del alpha_bar` at the top, so recover the level's alpha from the
+            # same DDIM schedule the proxy server reports.
+            _ab, _ = ddim_iteration_alphas(
+                iteration=iteration, num_iterations=num_iterations,
+                num_train_timesteps=int(self.client.ready_info.get("ddim_num_train_timesteps", 100)))
+            _ab = float(_ab)
+            _beta = max(1.0 - _ab, 1e-6)
+            _x0 = (y[:, : s_planner.shape[1]] + _beta * s_planner) / math.sqrt(max(_ab, 1e-6))
+            _cl = samples.detach().cpu().numpy() if hasattr(samples, "detach") else np.asarray(samples)
+            _supp = {("supp_" + k): round(v, 3)
+                     for k, v in self.support_distance(_cl, _x0[0]).items()}
+        # Direction vs magnitude. ||task - base|| / ||base|| alone conflates the two: a field that
+        # points the SAME way but is 10x larger looks identical to one pointing elsewhere. The
+        # first is a scaling bug (fixable by normalisation), the second is genuine disagreement
+        # (not fixable). Every claim about "they want different motions" rests on telling them
+        # apart, so log the cosine and the task field's own norm.
+        b_np = base_score.detach().cpu().numpy().astype(np.float64)[0]
+        b_rows = b_np[: addend.shape[0], : addend.shape[1]].reshape(-1)
+        # The addend is gamma*(task - ref); recover the task-side field for the comparison.
+        a_rows = (np.asarray(addend, dtype=np.float64).reshape(-1)
+                  / max(float(self.gamma), 1e-9))
+        task_dir = a_rows + b_rows if self.ref == "base" else a_rows
+        denom = np.linalg.norm(task_dir) * np.linalg.norm(b_rows)
+        cos = float(task_dir @ b_rows / denom) if denom > 1e-12 else float("nan")
         self.level_trace.append({
             "it": int(iteration),
             "n_scored": int(x.shape[0]),
             "base_norm": round(base_norm, 4),
             "add_norm": round(add_norm, 4),
+            "task_norm": round(float(np.linalg.norm(task_dir)), 4),
+            "cos_task_base": round(cos, 4),
             "ratio": round(add_norm / max(base_norm, 1e-9), 4),
+            **_supp,
             "wall_s": round(wall_s, 3),
             "server_s": round(server_s, 3)})
         return torch.as_tensor(addend, dtype=torch.float32)

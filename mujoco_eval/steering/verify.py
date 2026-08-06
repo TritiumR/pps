@@ -45,11 +45,18 @@ def _rank_cost_of(planner, real_chunk, inputs, ctx, rank="feasibility"):
     if value is None:
         return None
     out = float(torch.as_tensor(value).reshape(-1)[0])
-    if rank == "task_no_nh":
-        nh = (getattr(planner.cost, "last_terms", None) or {}).get("not_hold")
-        if nh is not None:
-            out -= float(torch.as_tensor(nh).reshape(-1)[0])
-    return out
+    terms = {
+        k: round(float(torch.as_tensor(v).reshape(-1)[0]), 4)
+        for k, v in (getattr(planner.cost, "last_terms", None) or {}).items()
+    }
+    if rank == "task_no_nh" and "not_hold" in terms:
+        out -= terms["not_hold"]
+    if rank == "task_no_ch" and "carry_hold" in terms:
+        # E4 measured carry_hold as ~98% of the judge inversion (+22 median at stage 2): its
+        # quasi-static at-the-seat release model charges the expert's working insertion. Keep it
+        # in the sampler, drop it from the veto.
+        out -= terms["carry_hold"]
+    return out, terms
 
 
 def verify_chunk(planner, env, ctx, args, base_plan, steer, inputs):
@@ -62,13 +69,17 @@ def verify_chunk(planner, env, ctx, args, base_plan, steer, inputs):
     """
     rank = getattr(args, "verify_rank", "feasibility")
     expert = steer.expert_chunk()
-    f_exp = _rank_cost_of(planner, expert, inputs, ctx, rank)
-    f_base = _rank_cost_of(planner, base_plan, inputs, ctx, rank)
-    if f_exp is None or f_base is None:            # cost has no role split -> expert drives
+    r_exp = _rank_cost_of(planner, expert, inputs, ctx, rank)
+    r_base = _rank_cost_of(planner, base_plan, inputs, ctx, rank)
+    if r_exp is None or r_base is None:            # cost has no role split -> expert drives
         return expert, {"verify": "expert", "verify_split": False}
+    (f_exp, t_exp), (f_base, t_base) = r_exp, r_base
     take_expert = f_exp <= f_base + float(args.verify_gate)
     return (expert if take_expert else base_plan), {
         "verify": "expert" if take_expert else "base",
         "verify_feas_expert": round(f_exp, 4),
         "verify_feas_base": round(f_base, 4),
+        # Per-term breakdown of BOTH chunks: names which term carries the deficit (E4).
+        "verify_terms_expert": t_exp,
+        "verify_terms_base": t_base,
     }
