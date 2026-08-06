@@ -48,6 +48,31 @@ class KeypointProposer:
         torch.cuda.manual_seed(self.config["seed"])
 
     def get_keypoints(self, rgb, points, masks):
+        """Propose keypoints reproducibly, without leaking the proposal seed downstream.
+
+        The seeding inside _get_keypoints_pinned is deliberate -- it pins the proposal to
+        (image, config). But it seeds the GLOBAL numpy/torch RNGs, and grounding runs once per
+        episode AFTER the eval loop seeds per-episode. Every downstream consumer -- above all
+        the MPC's noise sampling -- therefore resumed from a fixed seed of 0 each episode
+        regardless of the episode seed. Save and restore around the call so reproducibility of
+        the proposal stays local to the proposal.
+        """
+        np_state = np.random.get_state()
+        torch_state = torch.get_rng_state()
+        cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        cudnn_det = torch.backends.cudnn.deterministic
+        cudnn_bench = torch.backends.cudnn.benchmark
+        try:
+            return self._get_keypoints_pinned(rgb, points, masks)
+        finally:
+            np.random.set_state(np_state)
+            torch.set_rng_state(torch_state)
+            if cuda_states is not None:
+                torch.cuda.set_rng_state_all(cuda_states)
+            torch.backends.cudnn.deterministic = cudnn_det
+            torch.backends.cudnn.benchmark = cudnn_bench
+
+    def _get_keypoints_pinned(self, rgb, points, masks):
         # Re-seed here, not only in __init__: _cluster_features calls the randomized
         # torch.pca_lowrank, and by now the global RNG has been advanced by the env reset, the
         # sampler and DINOv2's forward. Seeding at the call site pins the proposal to

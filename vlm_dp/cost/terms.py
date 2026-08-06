@@ -151,6 +151,10 @@ def rekep_subgoal(I):
     if subgoal is None:
         return _zeros(I)
     v = subgoal(I.ee_pos, _rekep_keypoints(I))
+    # ReKep constraints are satisfied at f(x) <= 0, so only POSITIVE values are violations.
+    # Summing the raw signed output let a satisfied constraint cancel a violated one, which
+    # rekep_path (immediately below) already avoids with the same clamp.
+    v = torch.clamp(v, min=0)
     return v.mean(dim=1) if getattr(I.geom, "subgoal_mean", False) else v.sum(dim=1)
 
 
