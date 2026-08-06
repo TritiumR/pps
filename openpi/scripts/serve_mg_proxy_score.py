@@ -54,6 +54,7 @@ import base64
 import dataclasses
 import io
 import json
+import logging
 import os
 import sys
 import time
@@ -131,7 +132,6 @@ class ProxyChainServer:
                 model=dataclasses.replace(
                     config.model, action_expert_variant=args.action_expert_variant),
             )
-        self.model_config = config.model
         # A train-bc --action_norm demo_delta checkpoint ships its own [H, D] action scale;
         # serving MUST unnormalize with those exact numbers, so they are read from the
         # checkpoint rather than re-derived here.
@@ -142,6 +142,48 @@ class ProxyChainServer:
         )
         if args.action_norm_stats and self.action_norm_stats is None:
             raise ValueError(f"No action norm stats at {args.action_norm_stats}.")
+        # The checkpoint is the authority on chunk SHAPE too, not just scale: --keypose_tail adds
+        # a row, so a config-derived horizon would silently mismatch the state dict. Same reason
+        # --action_expert_variant has to be forwarded.
+        # H11. train-bc writes action_horizon / action_offset / awe_waypoints / keypose_tail at
+        # the TOP LEVEL of action_norm_stats.json -- there is no "meta" sub-dict. Reading under
+        # "meta" made every layout check below evaluate to None and silently pass, which is why a
+        # checkpoint whose chunk layout disagrees with --horizon loaded without complaint.
+        _meta = self.action_norm_stats or {}
+        _meta = _meta.get("meta") or _meta
+        # F1: a checkpoint declares which attention mask it was trained under; honour it rather
+        # than a process-wide default, so old (causal) and new (two-block) proxies can coexist.
+        _bidir = _meta.get("bidirectional_suffix")
+        if _bidir is not None:
+            os.environ["MG_PROXY_BIDIR_SUFFIX"] = "1" if _bidir else "0"
+            logging.info("attention: %s (from checkpoint)",
+                         "two-block suffix" if _bidir else "causal")
+        ckpt_horizon = _meta.get("action_horizon")
+        if ckpt_horizon and int(ckpt_horizon) != config.model.action_horizon:
+            logging.info(
+                "action_horizon %s -> %s (adopted from the checkpoint's action_norm_stats;"
+                " keypose_tail=%s)",
+                config.model.action_horizon, int(ckpt_horizon),
+                _meta.get("keypose_tail"),
+            )
+            config = dataclasses.replace(
+                config,
+                model=dataclasses.replace(config.model, action_horizon=int(ckpt_horizon)),
+            )
+        # Same argument on the FEATURE axis: --keypose_dims doubles action_dim ([action |
+        # keypose] per row), so a config-derived dim mismatches the state dict.
+        ckpt_dim = _meta.get("action_dim")
+        if ckpt_dim and int(ckpt_dim) != config.model.action_dim:
+            logging.info(
+                "action_dim %s -> %s (adopted from the checkpoint; keypose_dims=%s)",
+                config.model.action_dim, int(ckpt_dim),
+                _meta.get("keypose_dims"),
+            )
+            config = dataclasses.replace(
+                config,
+                model=dataclasses.replace(config.model, action_dim=int(ckpt_dim)),
+            )
+        self.model_config = config.model
         data_config, self.input_transform = _build_data_pipeline(
             config, action_norm_stats=self.action_norm_stats
         )
@@ -163,7 +205,19 @@ class ProxyChainServer:
         path = args.checkpoint
         if os.path.isdir(path):
             path = os.path.join(path, "model.safetensors")
-        safetensors.torch.load_model(self.model, path, device="cpu")
+        # cond_emb (the CFG conditioning) is zero-initialised and did not exist when the older
+        # checkpoints were written, so strict loading rejects every one of them. Allow exactly
+        # that key to be absent -- with zeros, both branches are identical and the checkpoint
+        # behaves as it always did -- and refuse anything else missing.
+        missing, unexpected = safetensors.torch.load_model(
+            self.model, path, device="cpu", strict=False)
+        allowed = {"cond_emb.weight"}
+        if set(missing) - allowed or unexpected:
+            raise RuntimeError(
+                f"checkpoint/model mismatch: missing={sorted(set(missing) - allowed)} "
+                f"unexpected={sorted(unexpected)}")
+        if missing:
+            logging.info("cond_emb absent (pre-CFG checkpoint); conditioning is a no-op")
         self.model = self.model.to(self.device, dtype=torch.float32).eval()
         self.checkpoint_path = path
         self._obs_cache = None      # (state, prefix_embs, prefix_pad_masks) for score_batch
@@ -220,6 +274,10 @@ class ProxyChainServer:
             raise ValueError(
                 f"x_b64 must be [N, {horizon}, {action_dim}], got {list(x.shape)}")
         state, prefix_embs, prefix_pad_masks, prefix_kv = self._obs_cache
+        # None keeps the historical forward pass bit-for-bit; the harness sends 0/1 only when it
+        # is running the CFG residual.
+        _c = req.get("cond")
+        _cond = None if _c is None else torch.tensor([int(_c)], device=self.device)
         x_t = torch.from_numpy(x).to(self.device)
         chunk = max(int(req.get("chunk", self.score_chunk or 256)), 1)
         # fp16 autocast: 2.4s -> 1.2s for 512x15x8 on the RTX 8000, rel err 1e-3 (measured);
@@ -238,13 +296,18 @@ class ProxyChainServer:
                 x_part = x_t[lo:lo + chunk]
                 n = x_part.shape[0]
                 with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
+                    # CFG conditioning: 1 = task branch, 0 = null branch. Both branches are the
+                    # SAME weights, so s(c=1) - s(c=0) is an exact density ratio -- unlike a
+                    # task-minus-reference residual across two independently trained models.
+                    # Absent (None) reproduces the pre-CFG forward exactly.
                     score = self.model.predict_score_from_prefix(
                         state.expand(n, -1),
                         prefix_embs.expand(n, -1, -1),
                         prefix_pad_masks.expand(n, -1),
                         x_part,
                         time_cond.expand(n),
-                        prefix_kv=prefix_kv)
+                        prefix_kv=prefix_kv,
+                        cond=_cond)
                 scores.append(score.float().cpu())
         if amp and not self.kv_cache:
             # Varying batch sizes fragment the caching allocator (measured: 7-12 GB held

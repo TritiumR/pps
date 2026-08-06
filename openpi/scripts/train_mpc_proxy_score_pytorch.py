@@ -78,6 +78,8 @@ import openpi.models.proxy_score_config
 import openpi.models_pytorch.proxy_score_pytorch as _proxy_score
 import openpi.training.config as _config
 from openpi.training import checkpoints as _checkpoints
+from openpi.training import awe_waypoints as awe_waypoints_mod
+from openpi.training import keypose_labels
 from openpi.shared import normalize as _normalize
 from sim_free_mpc import SimFreeMPC, SimFreeMPCConfig
 from sim_free_mpc.ddim import ddim_iteration_alphas
@@ -179,38 +181,87 @@ def demo_action_norm_stats(
     action_offset: int = 1,
     gripper_center: float = 0.5,
     gripper_scale: float = 0.5,
+    keypose_tail: bool = False,
+    awe_waypoints: int = 0,
+    keypose_dims: bool = False,
 ) -> dict[str, Any]:
     """Scale of the DeltaActions target a[t+offset+h] - q[t], measured on the training demos.
 
     Mirrors eval_mg.demo_delta_stats (per-dim std of the demos' own joint deltas) on the exact
     quantity that reaches the loss. Arm rows are centred at 0 and the gripper keeps eval_mg's
     ChunkDecodePolicy coding, so proxy model space matches the planner's.
+
+    The chunk partitions into [action | awe_waypoints | keypose]; only the action rows are
+    ordinary next-step targets, so only they take a pooled scale.
     """
     arm = 7
+    # Trailing blocks are goals, not action rows: waypoints tile the path to the phase end and
+    # the keypose IS the phase end.
+    action_rows = action_horizon - int(awe_waypoints) - int(keypose_tail)
     per_row = [[] for _ in range(action_horizon)]
     with h5py.File(hdf5_path, "r") as f:
         for name in demo_names:
             demo = f["data"][name]
             joint_actions = np.asarray(demo["obs/joint_actions"], dtype=np.float64)
             joint_pos = np.asarray(demo["obs/joint_pos"], dtype=np.float64)[:, :arm]
-            windows = len(joint_actions) - action_horizon
+            windows = len(joint_actions) - action_rows
             if windows <= 0:
                 continue
-            for h in range(action_horizon):
+            for h in range(action_rows):
                 start = action_offset + h
                 per_row[h].append(
                     joint_actions[start : start + windows, :arm] - joint_pos[:windows]
                 )
+            if awe_waypoints:
+                wps = awe_waypoints_mod.waypoint_targets(
+                    joint_actions.astype(np.float32), k=int(awe_waypoints))
+                for j in range(int(awe_waypoints)):
+                    per_row[action_rows + j].append(
+                        wps[:windows, j, :arm].astype(np.float64) - joint_pos[:windows]
+                    )
+            if keypose_tail:
+                targets = keypose_labels.keypose_targets(joint_actions)[:windows, :arm]
+                per_row[action_horizon - 1].append(targets - joint_pos[:windows])
     std = np.stack([np.concatenate(rows, 0).std(0) for rows in per_row])  # [H, arm]
     raw_mean = np.stack([np.concatenate(rows, 0).mean(0) for rows in per_row])
     if pooled:
-        # demo_delta_stats' own reduction: one per-dim scale for the whole chunk.
-        std = np.broadcast_to(np.sqrt((std**2).mean(0)), std.shape).copy()
+        # demo_delta_stats' own reduction: one per-dim scale for the whole chunk. The keypose row
+        # is EXCLUDED: it reaches a whole phase ahead and is an order of magnitude larger, so
+        # folding it in would inflate the scale of every action row.
+        action_std = std[:action_rows]
+        std = std.copy()
+        std[:action_rows] = np.broadcast_to(
+            np.sqrt((action_std**2).mean(0)), action_std.shape
+        )
     mean = np.zeros((action_horizon, arm + 1), dtype=np.float32)
     scale = np.ones((action_horizon, arm + 1), dtype=np.float32)
     mean[:, arm] = gripper_center
     scale[:, :arm] = std
     scale[:, arm] = gripper_scale
+    if keypose_dims:
+        # Cory's representation: every row is [action | keypose] on the FEATURE axis, the keypose
+        # receding per row. One pooled scale for the keypose half -- like the keypose ROW's scale,
+        # it reaches a phase ahead and must not be folded into the action half's.
+        kp_deltas = []
+        with h5py.File(hdf5_path, "r") as f:
+            for name in demo_names:
+                demo = f["data"][name]
+                joint_actions = np.asarray(demo["obs/joint_actions"], dtype=np.float64)
+                joint_pos = np.asarray(demo["obs/joint_pos"], dtype=np.float64)[:, :arm]
+                targets = keypose_labels.keypose_targets(joint_actions)[:, :arm]
+                windows = len(joint_actions) - action_rows
+                if windows <= 0:
+                    continue
+                for h in range(action_rows):
+                    kp_deltas.append(targets[h : h + windows] - joint_pos[:windows])
+        kp_std = np.concatenate(kp_deltas, 0).std(0)
+        kp_mean = np.zeros((action_horizon, arm + 1), dtype=np.float32)
+        kp_scale = np.ones((action_horizon, arm + 1), dtype=np.float32)
+        kp_mean[:, arm] = gripper_center
+        kp_scale[:, :arm] = np.broadcast_to(kp_std, (action_horizon, arm)).astype(np.float32)
+        kp_scale[:, arm] = gripper_scale
+        mean = np.concatenate([mean, kp_mean], axis=1)
+        scale = np.concatenate([scale, kp_scale], axis=1)
     return {
         "mean": mean.tolist(),
         "std": scale.tolist(),
@@ -219,6 +270,14 @@ def demo_action_norm_stats(
         "action_offset": int(action_offset),
         "hdf5_path": str(hdf5_path),
         "action_horizon": int(action_horizon),
+        "action_dim": int(mean.shape[1]),
+        "keypose_tail": bool(keypose_tail),
+        "awe_waypoints": int(awe_waypoints),
+        "keypose_dims": bool(keypose_dims),
+        # F1: record which attention mask this checkpoint was TRAINED under, so the server can
+        # reproduce it. Causal (the historical default) hides the goal rows from the action rows
+        # entirely -- measured: perturbing rows 15-20 moved the action outputs by exactly 0.0.
+        "bidirectional_suffix": os.environ.get("MG_PROXY_BIDIR_SUFFIX", "0") == "1",
         "num_demos": len(demo_names),
         # Diagnostics only: the arm is centred at 0 to match eval_mg's ChunkDecodePolicy.
         "arm_delta_mean": raw_mean.tolist(),
@@ -298,18 +357,37 @@ def _demo_sample(
     action_horizon: int,
     prompt: str,
     action_offset: int = 1,
+    keypose: Any = None,
+    waypoints: Any = None,
+    keypose_rows: Any = None,
 ) -> dict[str, Any]:
     # action_offset 1 is the shipped alignment; 0 makes row 0 the demo's IMMEDIATE next
     # action (joint_actions[t] == joint_pos[t+1]), which is what the verified replay shim
     # executes (setup/07_relabel_replay_gate.py, 19/20 on square).
     action_start = step_idx + action_offset
     action_end = action_start + action_horizon
+    actions = np.asarray(demo["obs/joint_actions"][action_start:action_end], dtype=np.float32)
+    # Trailing goal blocks ride in the same absolute-target space as the action rows, so they
+    # flow through the existing normalization and decode untouched. Order is
+    # [action | awe waypoints | keypose], matching demo_action_norm_stats.
+    if waypoints is not None:
+        actions = np.concatenate([actions, np.asarray(waypoints, dtype=np.float32)], axis=0)
+    if keypose is not None:
+        actions = np.concatenate(
+            [actions, np.asarray(keypose, dtype=np.float32)[None]], axis=0
+        )
+    if keypose_rows is not None:
+        # Cory's representation: [action | keypose] per row on the FEATURE axis, the keypose
+        # receding with the row. Guidance on the keypose then touches every row, not 1/H of them.
+        actions = np.concatenate(
+            [actions, np.asarray(keypose_rows, dtype=np.float32)], axis=-1
+        )
     return {
         "exterior_image_1_left": demo["obs/table_cam"][step_idx],
         "wrist_image_left": demo["obs/wrist_cam"][step_idx],
         "joint_position": np.asarray(demo["obs/joint_pos"][step_idx][:7], dtype=np.float32),
         "gripper_position": np.asarray(demo["obs/gripper_pos"][step_idx][:1], dtype=np.float32),
-        "actions": np.asarray(demo["obs/joint_actions"][action_start:action_end], dtype=np.float32),
+        "actions": actions,
         "prompt": prompt,
     }
 
@@ -509,17 +587,30 @@ def generate_cache(args: argparse.Namespace) -> None:
         base_data_config.asset_id,
     )
     score_data_config, input_transform = _build_data_pipeline(config)
-    if _norm_stats_fingerprint(base_norm_stats) != _norm_stats_fingerprint(score_data_config.norm_stats):
-        raise ValueError(
-            "Base policy and score config norm_stats differ. Use one shared norm_stats source "
-            "before generating MPC score labels."
+    if args.action_norm == "demo_delta":
+        # The fingerprint guard exists because the base is pi0.5 and its labels must land in
+        # DROID's action space. The MuJoCo base is the MPC itself, which has no pi0.5 norms to
+        # agree with -- and the proxies it must share a score space with are demo_delta. Same
+        # decoder the eval runner builds, so labels and rollouts decode identically.
+        from mujoco_eval.runner import ChunkDecodePolicy, demo_delta_stats
+
+        action_decoder = ChunkDecodePolicy(
+            demo_delta_stats(args.hdf5_path, config.model.action_horizon))
+        logging.info("action_norm=demo_delta: decoding with the eval runner's chunk policy "
+                     "(norm-stats fingerprint check skipped by request)")
+    else:
+        if _norm_stats_fingerprint(base_norm_stats) != _norm_stats_fingerprint(
+                score_data_config.norm_stats):
+            raise ValueError(
+                "Base policy and score config norm_stats differ. Use one shared norm_stats source "
+                "before generating MPC score labels."
+            )
+        if base_data_config.use_quantile_norm != score_data_config.use_quantile_norm:
+            raise ValueError("Base policy and score config use different normalization modes.")
+        action_decoder = _ActionDecoder(
+            base_norm_stats,
+            use_quantile_norm=base_data_config.use_quantile_norm,
         )
-    if base_data_config.use_quantile_norm != score_data_config.use_quantile_norm:
-        raise ValueError("Base policy and score config use different normalization modes.")
-    action_decoder = _ActionDecoder(
-        base_norm_stats,
-        use_quantile_norm=base_data_config.use_quantile_norm,
-    )
 
     planner = SimFreeMPC(
         action_decoder,
@@ -544,6 +635,14 @@ def generate_cache(args: argparse.Namespace) -> None:
         ),
     )
     task_module = _load_task_module(args.task_module) if args.task_module else None
+    # C5 root cause. offline_labels resolved its task from MG_OFFLINE_TASK at IMPORT time and
+    # defaulted to "stack"; nothing in the tree ever set that variable, so `generate-cache --task
+    # square` labelled square frames with the STACK ladder. Select it explicitly here -- this is
+    # the one place that knows which task the cache is being built for.
+    if task_module is not None and hasattr(task_module, "configure_task"):
+        task_module.configure_task(args.task)
+    elif task_module is not None and hasattr(task_module, "require_explicit_task"):
+        task_module.require_explicit_task()
     if task_module is not None and hasattr(task_module, "prepare_planner"):
         # e.g. the MimicGen port swaps in its fitted PandaGripper FK, as its eval harness does.
         task_module.prepare_planner(planner)
@@ -702,8 +801,36 @@ def generate_cache(args: argparse.Namespace) -> None:
                 }
             )
 
+    # C1 root cause, part 1. The cache is the only place that knows which action space the score
+    # labels live in, and it never recorded it -- so `train` had nothing to persist and the served
+    # reference silently fell back to DROID quantiles while task proxies used demo_delta. Measured
+    # in the addref_g050/pair_g050 logs: one server reported demo_delta, the other droid_quantile,
+    # in the same rollout, and s_task - s_ref was differenced across two coordinate systems.
+    _demo_stats = None
+    if args.action_norm == "demo_delta":
+        from mujoco_eval.runner import demo_delta_stats as _dds
+        # demo_delta_stats returns a PER-DIM std, shape [D] -- the same object ChunkDecodePolicy
+        # takes above. load_action_norm_stats expects [H, D], so broadcast it to the same layout
+        # train-bc writes; a [D] payload would load with the wrong shape and reintroduce exactly
+        # the coordinate mismatch this record exists to prevent.
+        _s = np.asarray(_dds(args.hdf5_path, config.model.action_horizon), dtype=np.float32)
+        _H, _D = int(config.model.action_horizon), int(_s.reshape(-1).shape[0])
+        _std = np.broadcast_to(_s.reshape(1, _D), (_H, _D)).astype(np.float32)
+        _demo_stats = {
+            "mean": np.zeros((_H, _D), dtype=np.float32).tolist(),
+            "std": _std.tolist(),
+            "source": "demo_delta_stats_broadcast",
+            "pooled": True,
+            "action_horizon": _H,
+            "action_dim": _D,
+            "hdf5_path": str(args.hdf5_path),
+            "bidirectional_suffix": os.environ.get("MG_PROXY_BIDIR_SUFFIX", "0") == "1",
+        }
     metadata = {
         "cache_format_version": CACHE_FORMAT_VERSION,
+        "action_norm": str(args.action_norm),
+        "action_norm_stats": _demo_stats,
+        "offline_task": str(getattr(args, "task", "") or ""),
         "label_type": CACHE_LABEL_TYPE,
         "state_source": CACHE_STATE_SOURCE,
         "initial_state_distribution": "standard_gaussian",
@@ -1115,15 +1242,30 @@ class BCDemoActionDataset(torch.utils.data.Dataset):
         action_norm_stats=None,
         exclude_demos: set[str] | None = None,
         action_offset: int = 1,
+        keypose_tail: bool = False,
+        awe_waypoints: int = 0,
+        keypose_dims: bool = False,
     ):
         self.hdf5_path = hdf5_path
         self.prompt = prompt
         self.config = config
         self.action_offset = int(action_offset)
+        self.keypose_tail = bool(keypose_tail)
+        self.awe_waypoints = int(awe_waypoints)
+        self.keypose_dims = bool(keypose_dims)
+        if self.keypose_dims and (self.keypose_tail or self.awe_waypoints):
+            raise ValueError("--keypose_dims widens rows; combining it with row-appending "
+                             "modes has never been tested and is refused rather than guessed at.")
+        # Trailing goal blocks: the model predicts [action | waypoints | keypose], so the action
+        # chunk is narrower than the model horizon by exactly those rows.
+        self.action_rows = (config.model.action_horizon
+                            - self.awe_waypoints - int(self.keypose_tail))
         self.data_config, self.input_transform = _build_data_pipeline(
             config, action_norm_stats=action_norm_stats
         )
         exclude_demos = exclude_demos or set()
+        self._keypose: dict[str, np.ndarray] = {}
+        self._waypoints: dict[str, np.ndarray] = {}
         with h5py.File(hdf5_path, "r") as f:
             self.demo_names = [
                 name
@@ -1132,10 +1274,22 @@ class BCDemoActionDataset(torch.utils.data.Dataset):
             ]
             self.index: list[tuple[str, int]] = []
             for name in self.demo_names:
-                num_windows = (
-                    len(f["data"][name]["obs/joint_actions"]) - config.model.action_horizon
-                )
+                joint_actions = f["data"][name]["obs/joint_actions"]
+                num_windows = len(joint_actions) - self.action_rows
                 self.index.extend((name, step) for step in range(0, max(num_windows, 0), stride))
+                if self.keypose_tail or self.keypose_dims:
+                    # Precomputed once per demo (~1 MB for the whole set): the alternative is an
+                    # h5 read of the gripper column on every __getitem__.
+                    self._keypose[name] = keypose_labels.keypose_targets(
+                        np.asarray(joint_actions)
+                    )
+                if self.awe_waypoints:
+                    # AWE runs an O(L^2) DP per phase segment, far too slow for __getitem__.
+                    # waypoint_targets returns k interior waypoints PLUS the phase endpoint;
+                    # the endpoint column duplicates the keypose row, so keep only the interior.
+                    self._waypoints[name] = awe_waypoints_mod.waypoint_targets(
+                        np.asarray(joint_actions, dtype=np.float32), k=self.awe_waypoints
+                    )[:, : self.awe_waypoints]
         if not self.index:
             raise ValueError("No BC windows found for the selected demo subset.")
         self._file = None
@@ -1154,9 +1308,15 @@ class BCDemoActionDataset(torch.utils.data.Dataset):
         raw = _demo_sample(
             self._demo(demo_name),
             step,
-            action_horizon=self.config.model.action_horizon,
+            action_horizon=self.action_rows,
             prompt=self.prompt,
             action_offset=self.action_offset,
+            keypose=self._keypose[demo_name][step] if self.keypose_tail else None,
+            waypoints=self._waypoints[demo_name][step] if self.awe_waypoints else None,
+            # Receding: row h carries the phase-end keypose as of the row's own timestep.
+            keypose_rows=(self._keypose[demo_name][step + self.action_offset:
+                                                   step + self.action_offset + self.action_rows]
+                          if self.keypose_dims else None),
         )
         inputs = self.input_transform(jax.tree.map(lambda x: x, raw))
         actions = torch.from_numpy(np.asarray(inputs["actions"], dtype=np.float32))
@@ -1348,6 +1508,9 @@ def _bc_action_norm_stats(args, config, val_demos: set[str]):
         demo_names=names,
         pooled=bool(args.action_norm_pooled),
         action_offset=int(args.action_offset),
+        keypose_tail=bool(getattr(args, "keypose_tail", False)),
+        awe_waypoints=int(getattr(args, "awe_waypoints", 0)),
+        keypose_dims=bool(getattr(args, "keypose_dims", False)),
     )
     return {
         "mean": np.asarray(raw["mean"], dtype=np.float32),
@@ -1378,6 +1541,16 @@ def train_bc(args: argparse.Namespace) -> None:
     model_overrides = {"prediction_type": args.prediction_type}
     if getattr(args, "action_expert_variant", None):
         model_overrides["action_expert_variant"] = args.action_expert_variant
+    extra_rows = int(getattr(args, "awe_waypoints", 0)) + int(getattr(args, "keypose_tail", False))
+    if extra_rows:
+        # Extra predicted rows carrying goal targets. The action chunk keeps the config's
+        # horizon, so these runs are the base run plus tokens, not a shorter chunk.
+        model_overrides["action_horizon"] = config.model.action_horizon + extra_rows
+    if getattr(args, "keypose_dims", False):
+        # Cory's representation: [action | keypose] per row, so the FEATURE axis doubles and the
+        # horizon stays the config's. The row-appending modes above are the other axis of the
+        # same idea; the dataset refuses the combination.
+        model_overrides["action_dim"] = config.model.action_dim * 2
     config = dataclasses.replace(
         config, model=dataclasses.replace(config.model, **model_overrides)
     )
@@ -1417,12 +1590,20 @@ def train_bc(args: argparse.Namespace) -> None:
         action_norm_stats=action_norm_stats,
         exclude_demos=val_demos,
         action_offset=args.action_offset,
+        keypose_tail=bool(args.keypose_tail),
+        awe_waypoints=int(args.awe_waypoints),
+        keypose_dims=bool(getattr(args, "keypose_dims", False)),
     )
     if is_main:
         logging.info(
             "BC action_norm=%s action_offset=%s held_out=%s",
             args.action_norm, args.action_offset, sorted(val_demos)
         )
+        if args.keypose_tail:
+            logging.info(
+                "BC keypose tail ON: %s action rows + 1 keypose row; keypose scale=%s",
+                dataset.action_rows, np.round(action_norm_stats["std"][-1, :7], 5)
+            )
         if action_norm_stats is not None:
             logging.info(
                 "BC action scale row0=%s row%s=%s",
@@ -1820,6 +2001,20 @@ def train(args: argparse.Namespace) -> None:
         collate_fn=_collate_cache_batch,
     )
     data_config = dataset.data_config
+    # C1: the reference must ship the action space its score labels were generated in. The cache
+    # records it (see generate_cache); carry it to every saved step so the server never has to
+    # guess and never silently falls back to DROID quantiles -- the mismatch measured in the
+    # addref_g050 / pair_g050 logs, where one server reported demo_delta and the other
+    # droid_quantile in the same rollout.
+    _ref_meta = getattr(dataset, "metadata", {}) or {}
+    _ref_norm_stats = _ref_meta.get("action_norm_stats")
+    if _ref_norm_stats is None and str(_ref_meta.get("action_norm", "")) == "demo_delta":
+        raise SystemExit(
+            "Cache says action_norm=demo_delta but carries no action_norm_stats. Regenerate it "
+            "with a build that records them, or this reference cannot declare its action space "
+            "and will be served under DROID quantiles.")
+    logging.info("reference action space: %s",
+                 _ref_meta.get("action_norm", "unrecorded (legacy cache)"))
 
     model = _proxy_score.ProxyScorePytorch(config.model).to(device)
 
@@ -1944,6 +2139,18 @@ def train(args: argparse.Namespace) -> None:
 
         global_step = completed_step
         save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
+        # C1 root cause, part 2. train() is the REFERENCE/score path and it never wrote
+        # action_norm_stats.json -- only train-bc did. So a reference checkpoint carried no
+        # declaration of its own action space and the server fell back to DROID. Persist the
+        # cache's recorded stats next to every step dir, exactly as train-bc does.
+        if is_main and _ref_norm_stats is not None:
+            # _write_action_norm_stats() takes the LOADED form ({mean, std, meta}); the cache
+            # stores the raw JSON payload (flat, mean/std alongside the descriptors). Write it
+            # directly rather than reshaping into a form only that helper wants.
+            config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            (config.checkpoint_dir / ACTION_NORM_STATS_FILENAME).write_text(
+                json.dumps(_ref_norm_stats, indent=2, sort_keys=True))
+            _copy_action_norm_stats(config, global_step)
         if pbar is not None:
             pbar.update(1)
             pbar.set_postfix(
@@ -1994,6 +2201,11 @@ def build_parser() -> argparse.ArgumentParser:
     cache_parser.add_argument("--stride", type=int, default=4)
     cache_parser.add_argument("--num_steps", type=int, default=10)
     cache_parser.add_argument("--subtask_mode", choices=("heuristic", "empty"), default="heuristic")
+    cache_parser.add_argument("--action_norm", choices=("base", "demo_delta"), default="base",
+                              help="'base' decodes with the base policy's norm stats (default, "
+                                   "unchanged). 'demo_delta' decodes with the eval runner's "
+                                   "chunk policy, so labels share a score space with the "
+                                   "demo_delta proxies -- required for PPS v_task - v_ref.")
     cache_parser.add_argument("--mpc_num_samples", type=int, default=512)
     cache_parser.add_argument("--mpc_iterations", type=int, default=8)
     cache_parser.add_argument("--mpc_noise", type=float, default=0.8)
@@ -2112,6 +2324,26 @@ def build_parser() -> argparse.ArgumentParser:
     bc_parser.add_argument("--action_norm_pooled", action="store_true",
                            help="demo_delta with one per-dim scale for the whole chunk "
                            "(eval_mg.demo_delta_stats' reduction) instead of per chunk row.")
+    bc_parser.add_argument("--awe_waypoints", type=int, default=0,
+                           help="predict K extra rows of AWE waypoints between the action chunk "
+                           "and the keypose. Waypoints are chosen by dynamic programming to "
+                           "minimise the WORST linear-interpolation error along the phase (see "
+                           "openpi.training.awe_waypoints), so they land where a straight line "
+                           "stops describing the motion -- which is what makes a waypoint block "
+                           "worth steering. 0 = off. Excluded from pooled normalization.")
+    bc_parser.add_argument("--keypose_dims", action="store_true",
+                           help="Cory's action representation: every row is [action | "
+                           "keypose] on the feature axis (action_dim doubles), the keypose "
+                           "receding per row. Keypose guidance then touches every row "
+                           "instead of 1/H of them. Mutually exclusive with the "
+                           "row-appending modes.")
+    bc_parser.add_argument("--keypose_tail", action="store_true",
+                           help="predict one extra row holding the phase-end joint target -- a "
+                           "distant goal rather than the next 0.75 s, so it is a different "
+                           "object from the action rows. Phase boundaries come from the "
+                           "commanded gripper channel (see openpi.training.keypose_labels; "
+                           "audit the dataset first, the labeler needs a uniform edge pattern). "
+                           "Pooled normalization excludes this row.")
     bc_parser.add_argument("--action_offset", type=int, default=1,
                            help="Chunk row 0 is joint_actions[t + offset]. 1 (default) is the "
                            "shipped alignment; 0 makes row 0 the demo's immediate next action, "
