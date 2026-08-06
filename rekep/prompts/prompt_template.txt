@@ -40,12 +40,31 @@ Suppose you are controlling a robot to perform manipulation tasks by writing con
 
 **Note:**
 - Each constraint takes a dummy end-effector point and a set of keypoints as input and returns a numerical cost, where the constraint is satisfied if the cost is smaller than or equal to zero.
+- IMPORTANT: the cost must be FLAT (exactly zero) across every configuration that satisfies the
+  stage, not merely small near one point. Clamp it at zero:
+      return max(0.0, np.linalg.norm(end_effector[..., -1, :] - keypoints[0]) - 0.02)
+  Writing `norm(...) - 0.02` WITHOUT the max() does nothing: the planner ranks candidates by a
+  softmax over cost, which is unchanged by subtracting a constant. Only clamping makes every
+  configuration inside the tolerance score identically, which is what lets the planner keep more
+  than one way of satisfying the stage. Choose the tolerance from the physical task (a graspable
+  object's half-width, a container's clearance), not a fixed number.
+- If several distinct configurations would satisfy the stage -- grasp from either side, place in
+  either of two bins, approach over or around an obstacle -- return the MINIMUM of the
+  alternatives, e.g. `return min(cost_left, cost_right)`. Do not pick one arbitrarily: the
+  planner can exploit genuine alternatives, and collapsing them to one removes that freedom.
 - For each stage, you may write 0 or more sub-goal constraints and 0 or more path constraints.
 - Avoid using "if" statements in your constraints.
 - Avoid using path constraints when manipulating deformable objects (e.g., clothing, towels).
 - You do not need to consider collision avoidance. Focus on what is necessary to complete the task.
 - Inputs to the constraints are as follows:
-  - `end_effector`: np.array of shape `(3,)` representing the end-effector position.
+  - `end_effector`: np.array of shape `(..., T, 3)` -- the PLANNED PATH of the end-effector
+    over the next T control steps, not a single point, and possibly with leading batch
+    dimensions. Index the TIME axis with an ellipsis so batching stays correct:
+    `end_effector[..., -1, :]` is the endpoint, `end_effector[..., 2]` is height over time.
+    NEVER write `end_effector[-1]` or `end_effector[0]`: those index the batch, not time.
+    Plain expressions like `end_effector - keypoints[i]` broadcast correctly and still mean
+    'be at keypoint i'. Because the whole path is visible you may also constrain the SHAPE
+    of the motion -- an endpoint, a height profile, or a via-point it should pass through.
   - `keypoints`: np.array of shape `(K, 3)` representing the keypoint positions.
 - For any path constraint that requires the robot to be still grasping a keypoint `i`, you may use the provided function `get_grasping_cost_by_keypoint_idx` by calling `return get_grasping_cost_by_keypoint_idx(i)` where `i` is the index of the keypoint.
 - Inside of each function, you may use native Python functions, any NumPy functions, and the provided `get_grasping_cost_by_keypoint_idx` function.

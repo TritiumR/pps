@@ -83,5 +83,26 @@
     "prompt": "put the knife in the holder",
     "grasp_obj": "knife",
     "place_obj": "holder"
+  },
+  "stack": {
+    "prompt": "stack the red block on the green block"
+  },
+  "square": {
+    "prompt": "put the square nut on the peg"
+  },
+  "can": {
+    "prompt": "put the can in the bin"
+  },
+  "lift": {
+    "prompt": "pick up the cube"
+  },
+  "coffee": {
+    "prompt": "put the coffee pod in the pod holder and close the lid"
+  },
+  "threading": {
+    "prompt": "thread the needle through the ring"
+  },
+  "mug_cleanup": {
+    "prompt": "open the drawer, put the mug inside, and close the drawer"
   }
 }

@@ -11,9 +11,11 @@ which object a label is. Only the front-end that joins names to pixels does.
 
 import numpy as np
 
-from rekep.isaaclab_helpers import (camera_to_rekep_inputs, restrict_masks_to_workspace,
-                                    task_object_ids, workspace_bounds_from_scene)
-from rekep.keypoint_proposal import KeypointProposer
+# isaaclab_helpers and KeypointProposer are imported lazily inside propose_keypoints: between them
+# they pull in `isaaclab` and `kmeans_pytorch`, neither of which exists in the MuJoCo eval env
+# (`mg`). Importing them at module scope made this module -- and therefore every ReKep grounding --
+# unimportable there, so `--ground rekep` died with ModuleNotFoundError before reaching any
+# planning code. Loading ReKep ARTIFACTS needs none of it; only live IsaacLab perception does.
 
 
 def propose_keypoints(camera, env, config, env_index=0, margin=0.6, perception=None):
@@ -24,6 +26,10 @@ def propose_keypoints(camera, env, config, env_index=0, margin=0.6, perception=N
     segmenter rather than the simulator; the workspace filter and the task-object filter are then
     redundant, because a segmenter only ever returns the objects it was asked to find.
     """
+    from rekep.isaaclab_helpers import (camera_to_rekep_inputs, restrict_masks_to_workspace,
+                                        task_object_ids, workspace_bounds_from_scene)
+    from rekep.keypoint_proposal import KeypointProposer
+
     rgb, points, masks, id_to_prim = camera_to_rekep_inputs(camera, env_index)
     bounds_min, bounds_max = workspace_bounds_from_scene(env, margin=config.get("margin", margin))
     kp_config = dict(config["keypoint_proposer"])
