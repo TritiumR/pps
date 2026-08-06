@@ -8,6 +8,35 @@ from torch import nn
 import torch.nn.functional as F  # noqa: N812
 from transformers.cache_utils import DynamicCache
 
+
+def _two_block_mask(pad_masks: Tensor, n_suffix: int, dtype: torch.dtype,
+                    n_query: int | None = None) -> Tensor:
+    """Build the [B, 1, Q, K] additive mask the diffusion head is supposed to use.
+
+    Block 1 -- prefix queries: causal within the prefix, padding respected.
+    Block 2 -- suffix (diffusion) queries: may see all valid prefix tokens AND every valid suffix
+               token, in both directions. That is what makes p(a, w | o) a joint distribution
+               rather than p(a | o) p(w | a, o); without it the goal rows are invisible to the
+               action rows and key-pose steering cannot reach the actions through the network.
+
+    Queries are the last `n_query` positions of the key axis (equal to K when there is no cached
+    prefix, and n_suffix when the prefix is cached).
+    """
+    b, k = pad_masks.shape
+    device = pad_masks.device
+    q = int(k if n_query is None else n_query)
+    # With a cached prefix only the suffix tokens are fed, so there are q queries against k keys.
+    # Query j sits at absolute position k - q + j.
+    q_abs = torch.arange(k - q, k, device=device)             # [Q]
+    k_abs = torch.arange(k, device=device)                    # [K]
+    is_suffix_k = k_abs >= (k - n_suffix)
+    is_suffix_q = q_abs >= (k - n_suffix)
+    causal = q_abs[:, None] >= k_abs[None, :]                 # [Q, K]
+    allow = causal | (is_suffix_q[:, None] & is_suffix_k[None, :])
+    allow = allow[None] & pad_masks.to(torch.bool)[:, None, :]   # [B, Q, K]
+    out = torch.zeros(b, 1, q, k, dtype=dtype, device=device)
+    return out.masked_fill(~allow[:, None], torch.finfo(dtype).min)
+
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.expert_pytorch import DINOExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
@@ -146,6 +175,13 @@ class ProxyScorePytorch(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        # F1. Two-block attention among the diffusion tokens (actions may see waypoints/keypose).
+        # DEFAULT OFF, deliberately: every existing checkpoint was TRAINED causally, and serving
+        # one bidirectionally feeds it an attention pattern it never saw -- silently degrading
+        # every proxy we already have. New training sets MG_PROXY_BIDIR_SUFFIX=1, which is also
+        # written into action_norm_stats.json so the server can adopt the checkpoint's own mask
+        # instead of a global default.
+        self.bidirectional_suffix = os.environ.get("MG_PROXY_BIDIR_SUFFIX", "0") == "1"
         action_expert_config = _gemma.get_config(config.action_expert_variant)
 
         self.expert_model = DINOExpertModel(
@@ -160,6 +196,14 @@ class ProxyScorePytorch(nn.Module):
         self.action_in_proj = nn.Linear(action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, action_dim)
         self.state_proj = nn.Linear(action_dim, action_expert_config.width)
+        # CFG-style conditioning. The model consumes images+state only -- the prompt is tokenized
+        # for transform parity and never reaches the network -- so "task vs null" cannot be
+        # signalled through language. Widening state_proj would break every existing checkpoint,
+        # so add a separate embedding instead: index 1 = task-conditioned, 0 = null.
+        # ZERO-INITIALISED, so at load time both branches are identical and a checkpoint trained
+        # before this existed behaves exactly as before. Training is what separates them.
+        self.cond_emb = nn.Embedding(2, action_expert_config.width)
+        nn.init.zeros_(self.cond_emb.weight)
         self.action_time_mlp_in = nn.Linear(
             2 * action_expert_config.width, action_expert_config.width
         )
@@ -247,7 +291,7 @@ class ProxyScorePytorch(nn.Module):
         att_masks = att_masks[None, :].expand(pad_masks.shape[0], len(att_masks))
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, state, noisy_actions, timestep):
+    def embed_suffix(self, state, noisy_actions, timestep, cond=None):
         embs = []
         pad_masks = []
         att_masks = []
@@ -256,6 +300,14 @@ class ProxyScorePytorch(nn.Module):
             state = state.to(torch.float32)
 
         state_emb = self.state_proj(state)
+        if cond is not None:
+            # cond: [B] long in {0, 1}. Added to the state token so both branches share every
+            # weight -- which is what makes s(c=1) - s(c=0) an exact density ratio rather than a
+            # difference between two independently trained models.
+            c = torch.as_tensor(cond, device=state_emb.device).reshape(-1).long()
+            if c.numel() == 1 and state_emb.shape[0] > 1:
+                c = c.expand(state_emb.shape[0])
+            state_emb = state_emb + self.cond_emb(c).to(state_emb.dtype)
         embs.append(state_emb[:, None, :])
         bsize = state_emb.shape[0]
         device = state_emb.device
@@ -343,8 +395,22 @@ class ProxyScorePytorch(nn.Module):
             position_ids = torch.cumsum(pad_masks, dim=1) - 1
             position_ids = position_ids[:, -suffix_embs.shape[1] :].to(dtype=torch.long)
             past_key_values = _expand_prefix_kv(prefix_kv, suffix_embs.shape[0])
+        # F1, CRITICAL. Passing a 2-D padding mask lets Gemma build its default CAUSAL mask, so a
+        # diffusion token at row i cannot attend to rows > i. The chunk is laid out
+        # [actions | AWE waypoints | keypose], so under causal attention the ACTION rows can never
+        # see the goal rows -- measured bitwise: perturbing rows 15-20 moved the goal outputs by up
+        # to 52.6 and the action outputs by exactly 0.0 at every level. That makes the whole
+        # premise of joint action/goal denoising inoperative: steering the key pose cannot reach
+        # the executed actions through the network.
+        # The intended mask is two-block: prefix stays causal-with-padding, and every diffusion
+        # token sees every other diffusion token. self.bidirectional_suffix=False restores the old
+        # behaviour exactly, for checkpoints trained under it.
+        attn = pad_masks
+        if getattr(self, "bidirectional_suffix", True):
+            attn = _two_block_mask(pad_masks, suffix_embs.shape[1], embs.dtype,
+                                   n_query=embs.shape[1])
         hidden_states, _ = self.expert_model.forward(
-            attention_mask=pad_masks,
+            attention_mask=attn,
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=embs,
@@ -363,11 +429,13 @@ class ProxyScorePytorch(nn.Module):
         x_t,
         time_cond,
         prefix_kv: DynamicCache | None = None,
+        cond=None,
     ) -> torch.Tensor:
         suffix_embs, suffix_pad_masks, _, adarms_cond = self.embed_suffix(
             state,
             x_t,
             time_cond,
+            cond=cond,
         )
         return self._run_diffusion_head(
             prefix_embs,
@@ -386,9 +454,12 @@ class ProxyScorePytorch(nn.Module):
         x_t,
         time_cond,
         prefix_kv: DynamicCache | None = None,
+        cond=None,
     ) -> torch.Tensor:
         # Forwarded only when set, so subclasses overriding the hook keep their signature.
         extra = {"prefix_kv": prefix_kv} if prefix_kv is not None else {}
+        if cond is not None:
+            extra["cond"] = cond
         output = self._predict_model_output_from_prefix(
             state,
             prefix_embs,
