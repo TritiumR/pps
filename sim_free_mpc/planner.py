@@ -95,6 +95,10 @@ class SimFreeMPCConfig:
     # Restrict the softmax to candidates within this many temperature units of the best before the
     # weighted mean, so averaging happens INSIDE a mode rather than across two. inf = old behaviour.
     mode_window: float = float("inf")
+    # "draw" makes the sampler return a categorical draw from the candidate weights instead of
+    # their mean -- see DIALSamplerConfig.estimator. Default "mean" reproduces MBD exactly.
+    estimator: str = "mean"
+    draw_below: float = float("inf")
     # Score the plan the sampler RETURNS, not the population it drew: sum_i w_i * term(sample_i)
     # equals term(sum_i w_i * sample_i) only for a linear cost, and ours is not. Measured gap on a
     # departure: 2.5e-6 across the population against 0.06 on the executed path. Off by default.
@@ -137,6 +141,8 @@ class SimFreeMPC:
                 action_dims=config.action_dims,
                 logit_norm=config.logit_norm,
                 mode_window=config.mode_window,
+                estimator=config.estimator,
+                draw_below=config.draw_below,
             )
         )
         self._warm_action: torch.Tensor | None = None
@@ -1054,11 +1060,18 @@ class SimFreeMPC:
                         lam = lam * (rel / (1.0 + rel))
                     ess_cap = tilt.get("ess_cap")
                     if ess_cap:
-                        # Closed-form ESS guard: bound the tilt's logit dispersion to ~ess_cap
-                        # temperature units so the tilt cannot collapse the softmax population.
+                        # Target EFFECTIVE SAMPLE SIZE, in candidates -- not a raw logit bound.
+                        # For softmax weights whose logits have std sigma, ESS/N ~= exp(-sigma^2),
+                        # so holding the tilt's OWN logit dispersion at sqrt(log(N/ess_cap)) stops
+                        # it from pushing the population below ess_cap by itself. The previous form
+                        # fed ess_cap in as the dispersion directly, so --tilt_ess_cap 64 asked for
+                        # 64 nats: measured ESS 1.0 of 512 at both 64 and 128, i.e. the guard
+                        # always collapsed the very population it was meant to protect.
                         std = float(flat.std())
-                        if std > 1e-9:
-                            lam = min(lam, float(ess_cap) * float(self.config.temperature) / std)
+                        n = int(flat.numel())
+                        if std > 1e-9 and n > float(ess_cap) > 0.0:
+                            sigma = math.sqrt(math.log(n / float(ess_cap)))
+                            lam = min(lam, sigma * float(self.config.temperature) / std)
                     cost = cost + lam * pen
                     self._last_tilt_lambda = lam
             return cost
@@ -1383,6 +1396,13 @@ class SimFreeMPC:
                 steer_addend, device=x_t.device, dtype=x_t.dtype)
             if addend.ndim == 2:
                 addend = addend.unsqueeze(0)
+            # H20: a non-finite addend silently poisons the whole plan, and 0 * NaN is NaN, so
+            # even gamma=0 was not a safe identity. Drop the level's steering and say so rather
+            # than propagate NaN into the executed action.
+            if not bool(torch.isfinite(addend).all()):
+                print("[planner] non-finite steering addend at this level; steering dropped",
+                      flush=True)
+                addend = torch.zeros_like(addend)
             score_numerator = score_numerator + beta * addend[:, :, :active_dims]
             score[:, :, :active_dims] = score_numerator / beta
 

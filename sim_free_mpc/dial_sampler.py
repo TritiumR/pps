@@ -19,6 +19,18 @@ class DIALSamplerConfig:
     action_dims: int = 8
     joint_limit_margin: float = 0.0
     logit_norm: str = "raw"  # "raw" | "std" (DIAL-style scale-free logits)
+    # How the weighted candidate cloud collapses to one chunk.
+    #   "mean" -- sum(w_i x_i). MBD/DIAL default. For a multimodal cost this lands BETWEEN modes,
+    #             returning a trajectory no mode endorses; measured ESS 421/512 says the base
+    #             averages ~421 proposals, so its x0_hat is a centroid, not a plan.
+    #   "draw" -- x_j with j ~ Categorical(w). Always returns a chunk that was actually proposed,
+    #             and makes reweighting change WHICH plan comes out, which is what steering a
+    #             distribution is supposed to mean.
+    # draw_below: draw only when the proposal std is under this (late, low-noise levels); average
+    # above it, where the chain is still coarse and the mean is the better estimate. inf = always
+    # draw, 0.0 = never.
+    estimator: str = "mean"          # "mean" | "draw"
+    draw_below: float = float("inf")
 
 
 @dataclass(frozen=True)
@@ -82,6 +94,15 @@ class DIALSampler:
         total = w.sum()
         # A window that admits no probability mass would divide by ~0; fall back rather than emit NaN.
         return w / total if float(total) > 1e-12 else weights
+
+    def _reduce(self, weights, samples, scale, generator):
+        """Collapse the weighted candidate cloud to a single chunk."""
+        if self.config.estimator != "draw":
+            return torch.sum(weights[:, None, None] * samples, dim=0)
+        if float(torch.as_tensor(scale).max()) >= self.config.draw_below:
+            return torch.sum(weights[:, None, None] * samples, dim=0)
+        idx = torch.multinomial(weights, 1, generator=generator)
+        return samples[int(idx)]
 
     def _weights_from_costs(self, costs: torch.Tensor, log_importance=None) -> torch.Tensor:
         """Softmax weights. logit_norm='std' divides by the batch cost std
@@ -147,7 +168,7 @@ class DIALSampler:
                 )
             weights = self._weights_from_costs(costs, log_importance)
             weights = self._mode_restrict(weights, costs)
-            mean = torch.sum(weights[:, None, None] * samples, dim=0)
+            mean = self._reduce(weights, samples, scale, generator)
 
             last_costs = costs
             last_weights = weights
@@ -231,7 +252,7 @@ class DIALSampler:
                 )
             weights = self._weights_from_costs(costs, log_importance)
             weights = self._mode_restrict(weights, costs)
-            mean = torch.sum(weights[:, None, None] * samples, dim=0)
+            mean = self._reduce(weights, samples, scale, generator)
 
             last_costs = costs
             last_weights = weights
