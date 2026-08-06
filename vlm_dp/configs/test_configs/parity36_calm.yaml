@@ -1,0 +1,108 @@
+# parity36_calm -- parity36_core with ONE axis changed: the smoothness regularizers are
+# raised 10x (smooth 5.04 -> 50.4, joint_delta 3.5 -> 35.0).
+#
+# Measured on parity36_core at N=10 (applediag2_t1600): the within-chunk joint delta sits at
+# EXACTLY the 0.15 rad clamp on the median step (per-seed range 0.1459-0.1500), i.e. the
+# planner continuously demands motion past the limit and the clamp saturates. 0.15 rad/step
+# at 15 Hz is 2.25 rad/s, near the Franka joint-velocity ceiling. The consequence is measured
+# directly: net object displacement per episode is pear 0.392 m, apple 0.264 m, cabbage
+# 0.174 m, and in one seed the scale fixture was dragged 0.655 m.
+#
+# smooth/joint_delta were 5.04/3.5 against place_reach 100, center_region 120, tip_z 80 --
+# 20-30x weaker than the task attractors, so calm candidates carry almost no ranking weight.
+# 10x puts them in the same order of magnitude without exceeding the attractors.
+
+cost:
+  terms:
+    # -- attractors
+    reach: 8.0                   # grasp_flow reach (grasp phase; gates off while a payload is ...
+    terminal_reach: 40.0         # grasp_flow terminal
+    # -- regularizers
+    smooth: 50.4                 # CHANGED from 5.04                 # = grasp_flow's 0.08 x 7 joints x (H-1)=9 (grasp_flow sums; ...
+    joint_delta: 35.0            # CHANGED from 3.5             # = grasp_flow's local 0.05 x 7 x H=10
+    # -- grasp / pinch
+    orientation: 8.0             # grasp_flow orient
+    straddle: 30.0
+    # -- keepout
+    clear: 0.1                   # grasp_flow clear (fixtures are never sphere obstacles)
+    floor: 40.0
+    # -- grasp / pinch
+    tip_z: 80.0
+    yaw: 5.0                     # mild world-axis default (round objects)
+    grasp_axis: 15.0             # close across the object's narrow axis when elongated ...
+    center_region: 120.0
+    aperture_region: 80.0
+    close_gripper: 2.0
+    # -- lift / carry
+    carry_hold: 40.0             # grasp_flow lift_gripper / place_gripper
+    # -- release / departure
+    release_gripper: 40.0        # reopen recovery (closed-empty at target)
+    # -- regularizers
+    gripper_smooth: 0.5
+    # -- lift / carry
+    lift_reach: 100.0            # consolidated lift attractor (was xy 80 + z 120 + terminal 80 ...
+    # -- place
+    place_reach: 100.0           # consolidated place attractor (was xy 120 + z 80 + ...
+    place_terminal: 60.0
+    # -- grasp / pinch
+    grasp_standoff: 40.0         # contact stack: hover until xy-aligned
+    # -- keepout
+    carry_clear: 40.0            # held payload keeps clear of placed objects
+    # -- release / departure
+    release_rise_first: 1.0      # no lateral travel while low over something already seated
+    # -- regularizers
+    not_hold: 8.0                # negate stasis: hold beat the demo at every stage (bench)
+  geometry:
+    ee_r: 0.035
+    coll_clear: 0.02
+    finger_r: 0.012
+    open_half: 0.04
+    tool_back: 0.06
+    tcp_to_tip: 0.0
+    center_scale: 0.40           # perception-scale dead-zone (grounding error ~17mm >> GT's 6mm ...
+    grasp_dead_zone: proportional  # CONTROL arm: the pre-unification dead-zone
+    close_z_scale: 0.025
+    preshape_z: 0.025            # close-while-descending: begin close in the cone above the ...
+    release_step_motion_cap: 0.004  # m per env step (~6cm/s): quasi-static release gate
+    retreat_margin: 0.02
+    retreat_clear: 0.04
+    rise_first_span: 0.05
+    rise_first_step: 0.01
+    not_hold_sigma: 0.05
+    carry_clear_include_placed: true
+    carry_clear_margin: 0.005    # < seat clearance 0.01 so the apple can reach its own seat
+    preshape_xy_tol: 0.02
+    corridor_margin: 0.01
+    grasp_approach_cap: 0.008
+    grasp_brake_slope: 0.25
+    grasp_descend_closing_only: true  # charge approach, not lateral/retreat (see header)
+    approach_hover: 0.08
+    approach_xy_tol: 0.02
+    close_xy_floor: 0.008        # gate wider than grounding wobble
+    aperture_margin: 0.006
+    release_xy: 0.06             # now the xy tolerance scale of the commitment potential, not a ...
+    release_z: 0.02              # release near the surface (with clearance 0.012 -> ~3cm max ...
+    place_approach_margin: 0.01  # payload underside clearance over the destination's top face
+    release_commit_aniso: true   # smooth per-axis commitment instead of the hard AND indicator
+    commit_measured_gate: true   # no opening reward until the payload is measurably near the ...
+    release_commit_band: 3.0     # measured-gate width, in tolerance units
+    place_descend_radius: 0.08   # grasp_flow's binary descend gate
+    place_release_clearance: 0.012  # gentle set-down near the surface (was 0.04 drop -> pear ...
+    clear_max_radius: 0.10       # wider objects are fixtures, not sphere obstacles
+
+# Ablation: no env flag ever touches the control loop (place advance = geometric done() only).
+advance:
+  flag_fallback: false
+  release_debug: true            # log the measured release gate each replan (xy/z, in tolerance ...
+  grasp_advance_on_hold: true    # a confirmed hold advances the grasp; do not re-gate on the ...
+  ground_error_debug: true       # per-replan drift of the grasp target vs sim pose (logging ...
+
+grounding:
+  rotate_grasp_offset: false     # keypoint->centre offset stored/read in the owning body's frame
+  support_extents: false         # half-height from the support plane, not the occluded visible ...
+  seat_from_plane: true          # place onto the destination's dominant flat plane, not its ...
+  lift_latch_xy: false           # latch the lift's xy anchor at stage entry, not the live held ...
+
+steering:
+  gate_stats: /workspace/pps/data/weight/gate_stats.json
+  dwell_k: 2.0
