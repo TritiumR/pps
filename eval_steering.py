@@ -1905,7 +1905,19 @@ def _infer_actions_eager(
         # diagnostics for this inference are only emitted from the LAST level, so the trace has to
         # start empty here or it would carry over from the previous inference.
         mpc_planner.begin_inference()
-    while denoise_time >= -dt / 2:
+    # --ddim_final_level: run the DDIM/score paths' last reverse transition.
+    # ddim_iteration_alphas accepts iteration in [0, num_iterations), and at the last one
+    # (iteration == num_steps) timestep is 0 and prev_timestep < 0, which is the only way to
+    # reach its set_alpha_to_one branch -- i.e. the final refinement level. The default bound
+    # (-dt/2) stops at iteration num_steps-1, so that level never runs and both the parameter
+    # and that branch are dead. Opt-in, because running it changes every MPC inference and so
+    # is not comparable to runs without it. The flow path integrates x_t from t=1 to t=0 in
+    # exactly num_steps steps and must NOT take an extra one, so the bound stays path-local.
+    _ddim_levels = bool(getattr(args, "ddim_final_level", False)) and use_vlm_mpc_base and (
+        disable_steering or score_steering_mode in ("full", "task")
+    )
+    denoise_stop = (dt / 2) if _ddim_levels else (-dt / 2)
+    while denoise_time >= denoise_stop:
         expanded_time = denoise_time.expand(bsize)
 
         if use_vlm_mpc_base and float(getattr(args, "inject_proxy", 0.0)) > 0.0:
@@ -3734,6 +3746,13 @@ def _write_experiment_results(path: str, payload: dict[str, Any]) -> None:
         "num_successes": successes,
         "success_rate": successes / len(scored) if scored else 0.0,
         "num_errored": len(episodes) - len(scored),
+        # Both readings, so neither has to be recomputed and the excluded-denominator choice
+        # cannot be mistaken for a hidden one: an ungroundable scene is not a policy failure,
+        # but a run with many of them did not attempt as many episodes as it requested.
+        "num_requested": len(episodes),
+        "success_rate_including_errored": (
+            successes / len(episodes) if episodes else 0.0
+        ),
     }
     tmp_path = f"{path}.tmp"
     with open(tmp_path, "w", encoding="utf-8") as handle:
@@ -4543,6 +4562,27 @@ def parse_args():
             "Set to 0 to disable the per-step delta clamp. Joint limits are still enforced."
         ),
     )
+    parser.add_argument(
+        "--ddim_final_level",
+        action="store_true",
+        help=(
+            "Run the final DDIM reverse transition on the score/MPC paths. num_iterations is "
+            "num_steps+1, but the loop stops one short, so iteration num_steps (timestep 0, "
+            "alpha_prev=1.0 -- the only level reaching ddim_iteration_alphas' set_alpha_to_one "
+            "branch) never executes. Changes every MPC inference, so it is not comparable to "
+            "runs without it. Does not affect the flow path, which correctly takes num_steps."
+        ),
+    )
+    parser.add_argument(
+        "--cost_executable_actions",
+        action="store_true",
+        help=(
+            "Score MPC candidates after the execution clamp (joint limits + per-step "
+            "joint delta) instead of before it. Without this the planner can select a "
+            "plan whose low cost depends on motion that is truncated before env.step. "
+            "Changes the optimisation landscape, so it is not comparable to runs without it."
+        ),
+    )
     parser.add_argument("--mpc_debug", action="store_true")
     parser.add_argument(
         "--mpc_debug_stdout",
@@ -5221,6 +5261,7 @@ if _uses_vlm_mpc_base(args):
                 prior_weight_high=args.prior_weight_high,
                 prior_weight_schedule=args.prior_weight_schedule,
                 feasibility_gate=args.feasibility_gate,
+                cost_executable_actions=args.cost_executable_actions,
             ),
         )
     print(

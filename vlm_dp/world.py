@@ -26,6 +26,17 @@ class GTWorld:
         st = self.env.scene[name].data.root_state_w[0, :7].detach().cpu().numpy()
         return st[:3].astype(np.float64), quat_wxyz_to_R(st[3:7])
 
+    @property
+    def _pos(self):
+        """Believed object positions, for the eval loop's belief logger.
+
+        Only SensedWorld defined this, and the logger guards on
+        getattr(world, "_pos", None) -- so every --vlm_state gt run silently logged no
+        object_beliefs at all, leaving GT target error unmeasurable and GT unusable as a
+        reference arm. GTWorld reads exact simulator state, so the belief IS the pose.
+        """
+        return {n: self.object_pose(n)[0] for n in self.names}
+
     def body_pose(self, asset, body):
         """Return the world pose of an articulation body."""
         data = self.env.scene[asset].data

@@ -187,7 +187,14 @@ def rekep_subgoal(I):
     subgoal = I.context.get("constraint")
     if subgoal is None:
         return _zeros(I)
-    v = _flat(subgoal(I.ee_pos, _rekep_keypoints(I)), I.geom)
+    v = subgoal(I.ee_pos, _rekep_keypoints(I))
+    # ReKep constraints are satisfied at f(x) <= 0, so only POSITIVE values are violations.
+    # Summing the raw signed output let a satisfied constraint cancel a violated one, which
+    # rekep_path (immediately below) already avoids with the same clamp.
+    v = torch.clamp(v, min=0)
+    # Clamp FIRST, then the optional shaping: _flat's max(0, err - tol) assumes a non-negative
+    # error, and _progress should charge increases in violation, not in signed constraint value.
+    v = _flat(v, I.geom)
     if getattr(I.geom, "potential_shaping", False):
         return _progress(v, I.geom)
     return v.mean(dim=1) if getattr(I.geom, "subgoal_mean", False) else v.sum(dim=1)

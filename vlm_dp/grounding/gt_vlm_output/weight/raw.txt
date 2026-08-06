@@ -1,0 +1,62 @@
+# weight -- deterministic stand-in for a GPT-4o ReKep response.
+# Format follows rekep/prompts/prompt_template.txt, so _render() parses it exactly as
+# rekep/constraint_generation.py parses a live response. Placeholders in braces are the values only
+# resolvable at runtime: keypoint indices from the live scene and offsets measured from the
+# observed point cloud.
+#
+# Task: "put pear and apple on the scale"
+#
+# The task involves four stages:
+# 1. Grasp the pear.
+# 2. Place the pear on the scale.
+# 3. Grasp the apple.
+# 4. Place the apple on the scale.
+
+num_stages = 4
+
+
+### stage 1 sub-goal constraints
+def stage1_subgoal_constraint1(end_effector, keypoints):
+    """Align the end-effector with the pear (keypoint {p})."""
+    return np.linalg.norm(end_effector - keypoints[{p}])
+
+### stage 1 path constraints
+# No path constraints needed for grasping.
+
+### stage 2 sub-goal constraints
+def stage2_subgoal_constraint1(end_effector, keypoints):
+    """The pear (keypoint {p}) rests at the scale-top placement point."""
+    offsetted_point = keypoints[{s}] + np.array({off_pear})
+    return np.linalg.norm(keypoints[{p}] - offsetted_point)
+
+### stage 2 path constraints
+# No path constraints.
+
+### stage 3 sub-goal constraints
+def stage3_subgoal_constraint1(end_effector, keypoints):
+    """Align the end-effector with the apple (keypoint {a})."""
+    return np.linalg.norm(end_effector - keypoints[{a}])
+
+### stage 3 path constraints
+# No path constraints needed for grasping.
+
+### stage 4 sub-goal constraints
+def stage4_subgoal_constraint1(end_effector, keypoints):
+    """The apple (keypoint {a}) rests at the scale-top placement point."""
+    offsetted_point = keypoints[{s}] + np.array({off_apple})
+    return np.linalg.norm(keypoints[{a}] - offsetted_point)
+
+### stage 4 path constraints
+# No path constraints.
+
+
+"""
+Summarize keypoints to be grasped in all grasping stages.
+For a grasping stage write the keypoint index; for a non-grasping stage write -1.
+"""
+grasp_keypoints = [{p}, -1, {a}, -1]
+
+"""
+Summarize at **the end of which stage** the robot should release each keypoint.
+"""
+release_keypoints = [-1, {p}, -1, {a}]

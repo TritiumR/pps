@@ -1,0 +1,72 @@
+# gripfix_commit -- parity13_rekep_legacy_deadzone with ONE change: the gripper channel
+# is driven by grasp_commit instead of close_gripper.
+#
+# Why: at --mpc_temperature 2.0 (needed to keep weight_ess off the floor; at 0.1 it is ~2 of
+# 4096) the gripper command collapses to a mush around 0.45-0.5 and never closes -- measured
+# range 0.395-0.600 vs 0.000-1.000 at temp 0.1. close_gripper is a QUADRATIC pull toward a
+# soft gate, so softmax averaging over ~2750 effective samples lands on the mean of "open"
+# and "closed". grasp_commit is LINEAR in the gripper action (grip * (1 - 2*prox)), so it
+# gives monotonic pressure that survives averaging. Its docstring names it the alternative
+# to close_gripper, so the two are swapped rather than stacked.
+#
+# Weight 10.0: grasp_commit contributes +/-10 x mean(grip); total episode cost sits near 2.2
+# with tip_z ~1.8 dominant, so 10 is decisive without swamping the placement terms.
+
+cost:
+  terms:
+    # -- attractors
+    reach: 8.0
+    terminal_reach: 40.0
+    # -- regularizers
+    smooth: 5.04
+    joint_delta: 3.5
+    # -- grasp / pinch
+    orientation: 8.0
+    straddle: 30.0
+    # -- keepout
+    clear: 0.1
+    floor: 40.0
+    # -- grasp / pinch
+    tip_z: 80.0
+    yaw: 5.0
+    grasp_axis: 15.0
+    center_region: 120.0
+    aperture_region: 80.0
+    grasp_commit: 10.0           # CHANGED: replaces close_gripper: 2.0
+    # -- lift / carry
+    carry_hold: 40.0
+    # -- release / departure
+    release_gripper: 40.0
+    # -- regularizers
+    gripper_smooth: 0.5
+    # -- lift / carry
+    lift_reach: 12.0
+    lift_xy: 80.0
+    lift_z: 120.0
+    lift_terminal: 80.0
+    # -- place
+    place_reach: 12.0
+    place_xy: 120.0
+    place_z: 80.0
+    place_carry_height: 80.0
+    place_terminal: 60.0
+  geometry:
+    ee_r: 0.035
+    coll_clear: 0.02
+    finger_r: 0.012
+    open_half: 0.04
+    tool_back: 0.06
+    tcp_to_tip: 0.0
+    center_scale: 0.40
+    grasp_dead_zone: proportional
+    close_z_scale: 0.025
+    close_xy_floor: 0.008
+    aperture_margin: 0.006
+    release_xy: 0.06
+    release_z: 0.02
+    place_descend_radius: 0.08
+    place_release_clearance: 0.012
+    clear_max_radius: 0.10
+
+advance:
+  flag_fallback: false

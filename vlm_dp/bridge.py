@@ -282,6 +282,10 @@ class VlmDpBridge:
     def _enter_stage(self):
         """Reset stage-local state and capture the initial grasp height."""
         self.stage_replans = 0
+        # The previous stage's (or a backtracked-away) plan must not survive into the new one:
+        # the `consistency` term penalises deviation from plan_ref, so a stale reference makes
+        # recovery pay for not repeating the plan that just failed.
+        self.plan_ref = None
         self._place_seen = None
         self._place_since = None
         self._reopen = False
