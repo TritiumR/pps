@@ -6,6 +6,67 @@ import numpy as np
 
 from vlm_dp.grounding.masks import _masked_points, _nearest_kp
 
+_TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gt_vlm_output")
+
+
+def _render(task_key, out_dir, **fields):
+    """Render a task's raw.txt plan into the per-stage files the loader reads.
+
+    gt_vlm_output/<task>/raw.txt is the single source of truth: the whole plan in one file,
+    in the same shape a real GPT-4o response takes. This splits it exactly as
+    rekep/constraint_generation.py splits a live response -- functions run from a column-0
+    `def ` to their `    return `, and group by the stage prefix (the trailing part of the
+    name is the constraint index).
+
+    {placeholders} carry the values only resolvable at runtime: keypoint indices resolved
+    against the live scene, and offsets measured from the observed point cloud.
+
+    Returns the parsed metadata (num_stages / grasp_keypoints / release_keypoints).
+    """
+    raw_path = os.path.join(_TEMPLATE_DIR, task_key, "raw.txt")
+    if not os.path.isfile(raw_path):
+        raise SystemExit(f"[fake-vlm] no raw.txt for task {task_key!r} at {raw_path}")
+    with open(raw_path, encoding="utf-8") as f:
+        output = f.read().format(**fields)
+
+    # --- split into function blocks (same convention as the real parser) ---
+    lines, functions, start, name = output.split("\n"), {}, None, None
+    for i, line in enumerate(lines):
+        if line.startswith("def "):
+            start, name = i, line.split("(")[0].split("def ")[1]
+        elif line.startswith("    return ") and name is not None:
+            functions[name] = lines[start:i + 1]
+            start, name = None, None
+
+    grouped = {}
+    for fn_name in functions:                      # stage3_subgoal_constraint2 -> stage3_subgoal
+        grouped.setdefault("_".join(fn_name.split("_")[:-1]), []).append(fn_name)
+
+    # --- metadata ---
+    def _line(key):
+        for line in lines:
+            if line.startswith(f"{key} = "):
+                return line.split(" = ", 1)[1].strip()
+        raise SystemExit(f"[fake-vlm] {key} not found in {raw_path}")
+
+    def _int_list(text):
+        return [int(x.strip()) for x in text.replace("[", "").replace("]", "").split(",")]
+
+    metadata = {"num_stages": int(_line("num_stages")),
+                "grasp_keypoints": _int_list(_line("grasp_keypoints")),
+                "release_keypoints": _int_list(_line("release_keypoints"))}
+
+    # --- write one file per (stage, kind), including the empty ones ---
+    # load_stage() reads every stage{N}_path_constraints.txt unconditionally, so a stage with
+    # no path constraint still needs the file to exist.
+    for idx in range(1, metadata["num_stages"] + 1):
+        for kind in ("subgoal", "path"):
+            key = f"stage{idx}_{kind}"
+            body = "\n\n".join("\n".join(functions[n]) for n in sorted(grouped.get(key, [])))
+            with open(os.path.join(out_dir, f"{key}_constraints.txt"), "w", encoding="utf-8") as f:
+                f.write(body + "\n" if body else "")
+    return metadata
+
 
 def _weight_roles(keypoints, grounded, env, clearance):
     """Resolve weight-task keypoints and placement offsets."""
@@ -29,35 +90,12 @@ def _weight(out_dir, keypoints, grounded, env, clearance):
     """Generate constraints for placing the pear and apple on the scale."""
     roles, off = _weight_roles(keypoints, grounded, env, clearance)
     p, a, s = roles["pear"], roles["apple"], roles["scale"]
-    metadata = {"num_stages": 4, "grasp_keypoints": [p, -1, a, -1], "release_keypoints": [-1, p, -1, a],
-
-
-                "steer_policies": ["on_failure", "on_failure", "on_failure", "on_failure"]}
+    metadata = _render("weight", out_dir, p=p, a=a, s=s,
+                       off_pear=off["pear"], off_apple=off["apple"])
+    # vlm_dp extension, not part of the ReKep response format the parser understands.
+    metadata["steer_policies"] = ["on_failure"] * metadata["num_stages"]
     with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
-
-    def write(stage, kind, body):
-        with open(os.path.join(out_dir, f"stage{stage}_{kind}_constraints.txt"), "w", encoding="utf-8") as f:
-            f.write(body)
-
-    write(1, "subgoal", f'''def stage1_subgoal_constraint1(end_effector, keypoints):
-    """Grasp the pear: align the end-effector with the pear keypoint."""
-    return np.linalg.norm(end_effector - keypoints[{p}])
-''')
-    write(2, "subgoal", f'''def stage2_subgoal_constraint1(end_effector, keypoints):
-    """Place the pear on the scale (pear keypoint at the scale-top placement point)."""
-    return np.linalg.norm(keypoints[{p}] - (keypoints[{s}] + np.array({off["pear"]})))
-''')
-    write(3, "subgoal", f'''def stage3_subgoal_constraint1(end_effector, keypoints):
-    """Grasp the apple: align the end-effector with the apple keypoint."""
-    return np.linalg.norm(end_effector - keypoints[{a}])
-''')
-    write(4, "subgoal", f'''def stage4_subgoal_constraint1(end_effector, keypoints):
-    """Place the apple on the scale (apple keypoint at the scale-top placement point)."""
-    return np.linalg.norm(keypoints[{a}] - (keypoints[{s}] + np.array({off["apple"]})))
-''')
-    for st in range(1, 5):
-        write(st, "path", "")
 
     print(f"[fake-vlm] weight roles pear=kp{p} apple=kp{a} scale=kp{s}", flush=True)
     return metadata, roles
@@ -66,41 +104,9 @@ def _weight(out_dir, keypoints, grounded, env, clearance):
 def _capsule(out_dir, keypoints, grounded, env, clearance):
     """Generate the fixed capsule-task constraint plan."""
     lip, open_goal, pod, bay = 0, 1, 2, 3
-    metadata = {"num_stages": 4, "grasp_keypoints": [lip, -1, pod, -1],
-                "release_keypoints": [-1, lip, -1, pod]}
+    metadata = _render("capsule", out_dir, lip=lip, open_goal=open_goal, pod=pod, bay=bay)
     with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
-
-    def write(stage, kind, body):
-        with open(os.path.join(out_dir, f"stage{stage}_{kind}_constraints.txt"), "w", encoding="utf-8") as f:
-            f.write(body)
-
-    write(1, "subgoal", f'''def stage1_subgoal_constraint1(end_effector, keypoints):
-    """Grasp the coffee-maker lid: align the end-effector with the lid lip."""
-    return np.linalg.norm(end_effector - keypoints[{lip}])
-''')
-    write(2, "subgoal", f'''def stage2_subgoal_constraint1(end_effector, keypoints):
-    """Open the lid: bring the lip to the open goal above it (rotates the lid up on its hinge)."""
-    return np.linalg.norm(keypoints[{lip}] - keypoints[{open_goal}])
-''')
-    write(2, "path", f'''def stage2_path_constraint1(end_effector, keypoints):
-    """Keep grasping the lid lip while opening."""
-    return get_grasping_cost_by_keypoint_idx({lip})
-''')
-    write(3, "subgoal", f'''def stage3_subgoal_constraint1(end_effector, keypoints):
-    """Grasp the pod: align the end-effector with the pod keypoint."""
-    return np.linalg.norm(end_effector - keypoints[{pod}])
-''')
-    write(4, "subgoal", f'''def stage4_subgoal_constraint1(end_effector, keypoints):
-    """Place the pod in the bay (pod keypoint resting at the bay opening, ~2cm above)."""
-    return np.linalg.norm(keypoints[{pod}] - (keypoints[{bay}] + np.array([0.0, 0.0, 0.02])))
-''')
-    write(4, "path", f'''def stage4_path_constraint1(end_effector, keypoints):
-    """Keep grasping the pod while placing."""
-    return get_grasping_cost_by_keypoint_idx({pod})
-''')
-    for st, kind in ((1, "path"), (3, "path")):
-        write(st, kind, "")
 
     print(f"[fake-vlm] capsule GT plan: grasp lid kp{lip} -> open to kp{open_goal} -> "
           f"grasp pod kp{pod} -> place at bay kp{bay}", flush=True)
@@ -165,40 +171,9 @@ def _tea(out_dir, keypoints, grounded, env, clearance):
     rest_dz = float(keypoints[m][2] - keypoints[h][2])
     pour_margin = rest_dz - max(0.03, 0.5 * lever)
 
-    metadata = {"num_stages": 3, "grasp_keypoints": [h, -1, -1],
-                "release_keypoints": [-1, -1, -1]}
+    metadata = _render("tea", out_dir, h=h, m=m, c=c, cup_off=cup_off, pour_margin=pour_margin)
     with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
-
-    def write(stage, kind, body):
-        with open(os.path.join(out_dir, f"stage{stage}_{kind}_constraints.txt"), "w", encoding="utf-8") as f:
-            f.write(body)
-
-    write(1, "subgoal", f'''def stage1_subgoal_constraint1(end_effector, keypoints):
-    """Grasp the teapot: align the end-effector with the teapot keypoint."""
-    return np.linalg.norm(end_effector - keypoints[{h}])
-''')
-    write(1, "path", "")
-    write(2, "subgoal", f'''def stage2_subgoal_constraint1(end_effector, keypoints):
-    """Carry the teapot mouth above the cup (10 cm over the rim)."""
-    return np.linalg.norm(keypoints[{m}] - (keypoints[{c}] + np.array({cup_off}) + np.array([0.0, 0.0, 0.10])))
-''')
-    write(2, "path", f'''def stage2_path_constraint1(end_effector, keypoints):
-    """Keep grasping the teapot while carrying."""
-    return get_grasping_cost_by_keypoint_idx({h})
-''')
-    write(3, "subgoal", f'''def stage3_subgoal_constraint1(end_effector, keypoints):
-    """Pour: bring the mouth just above the cup rim."""
-    return np.linalg.norm(keypoints[{m}] - (keypoints[{c}] + np.array({cup_off}) + np.array([0.0, 0.0, 0.04])))
-
-def stage3_subgoal_constraint2(end_effector, keypoints):
-    """Pour: drop the mouth below its rest offset by the pour-angle lever arm."""
-    return np.maximum(0.0, keypoints[{m}][..., 2] - keypoints[{h}][..., 2] - ({pour_margin}))
-''')
-    write(3, "path", f'''def stage3_path_constraint1(end_effector, keypoints):
-    """Keep grasping the teapot while pouring."""
-    return get_grasping_cost_by_keypoint_idx({h})
-''')
     print(f"[fake-vlm] tea roles teapot=kp{h} mouth=kp{m} teacup=kp{c}", flush=True)
     return metadata, roles
 
@@ -246,41 +221,9 @@ def _pot(out_dir, keypoints, grounded, env, clearance):
                         pts["pot"][:, 2].max()])
     egg_off = (rim_top + np.array([0.0, 0.0, 0.02]) - keypoints[pot]).tolist()
 
-    metadata = {"num_stages": 4, "grasp_keypoints": [lid, -1, egg, -1],
-                "release_keypoints": [-1, lid, -1, egg]}
+    metadata = _render("pot", out_dir, lid=lid, egg=egg, pot=pot, lid_off=lid_off, egg_off=egg_off)
     with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
-
-    def write(stage, kind, body):
-        with open(os.path.join(out_dir, f"stage{stage}_{kind}_constraints.txt"), "w", encoding="utf-8") as f:
-            f.write(body)
-
-    write(1, "subgoal", f'''def stage1_subgoal_constraint1(end_effector, keypoints):
-    """Grasp the pot lid: align the end-effector with the lid keypoint."""
-    return np.linalg.norm(end_effector - keypoints[{lid}])
-''')
-    write(1, "path", "")
-    write(2, "subgoal", f'''def stage2_subgoal_constraint1(end_effector, keypoints):
-    """Set the lid aside on the table, clear of the pot."""
-    return np.linalg.norm(keypoints[{lid}] - (keypoints[{pot}] + np.array({lid_off})))
-''')
-    write(2, "path", f'''def stage2_path_constraint1(end_effector, keypoints):
-    """Keep grasping the lid while carrying it aside."""
-    return get_grasping_cost_by_keypoint_idx({lid})
-''')
-    write(3, "subgoal", f'''def stage3_subgoal_constraint1(end_effector, keypoints):
-    """Grasp the egg: align the end-effector with the egg keypoint."""
-    return np.linalg.norm(end_effector - keypoints[{egg}])
-''')
-    write(3, "path", "")
-    write(4, "subgoal", f'''def stage4_subgoal_constraint1(end_effector, keypoints):
-    """Place the egg into the pot (egg keypoint just above the rim centre)."""
-    return np.linalg.norm(keypoints[{egg}] - (keypoints[{pot}] + np.array({egg_off})))
-''')
-    write(4, "path", f'''def stage4_path_constraint1(end_effector, keypoints):
-    """Keep grasping the egg while placing."""
-    return get_grasping_cost_by_keypoint_idx({egg})
-''')
     print(f"[fake-vlm] pot roles lid=kp{lid} egg=kp{egg} pot=kp{pot}", flush=True)
     return metadata, roles
 

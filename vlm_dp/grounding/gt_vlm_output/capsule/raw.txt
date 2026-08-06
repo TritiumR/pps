@@ -1,0 +1,65 @@
+# capsule -- deterministic stand-in for a GPT-4o ReKep response.
+# Format follows rekep/prompts/prompt_template.txt, so _render() parses it exactly as
+# rekep/constraint_generation.py parses a live response. Placeholders in braces are the values only
+# resolvable at runtime: keypoint indices from the live scene and offsets measured from the
+# observed point cloud.
+#
+# Task: "open the coffee maker lid and put the pod inside"
+#
+# The task involves four stages:
+# 1. Grasp the coffee-maker lid.
+# 2. Open the lid on its hinge.
+# 3. Grasp the pod.
+# 4. Place the pod in the bay.
+
+num_stages = 4
+
+
+### stage 1 sub-goal constraints
+def stage1_subgoal_constraint1(end_effector, keypoints):
+    """Align the end-effector with the lid lip (keypoint {lip})."""
+    return np.linalg.norm(end_effector - keypoints[{lip}])
+
+### stage 1 path constraints
+# No path constraints needed for grasping.
+
+### stage 2 sub-goal constraints
+def stage2_subgoal_constraint1(end_effector, keypoints):
+    """The lid lip (keypoint {lip}) reaches the open goal (keypoint {open_goal})."""
+    return np.linalg.norm(keypoints[{lip}] - keypoints[{open_goal}])
+
+### stage 2 path constraints
+def stage2_path_constraint1(end_effector, keypoints):
+    """The robot must still be grasping the lid lip (keypoint {lip})."""
+    return get_grasping_cost_by_keypoint_idx({lip})
+
+### stage 3 sub-goal constraints
+def stage3_subgoal_constraint1(end_effector, keypoints):
+    """Align the end-effector with the pod (keypoint {pod})."""
+    return np.linalg.norm(end_effector - keypoints[{pod}])
+
+### stage 3 path constraints
+# No path constraints needed for grasping.
+
+### stage 4 sub-goal constraints
+def stage4_subgoal_constraint1(end_effector, keypoints):
+    """The pod (keypoint {pod}) rests at the bay opening (keypoint {bay}), 2cm above."""
+    offsetted_point = keypoints[{bay}] + np.array([0.0, 0.0, 0.02])
+    return np.linalg.norm(keypoints[{pod}] - offsetted_point)
+
+### stage 4 path constraints
+def stage4_path_constraint1(end_effector, keypoints):
+    """The robot must still be grasping the pod (keypoint {pod})."""
+    return get_grasping_cost_by_keypoint_idx({pod})
+
+
+"""
+Summarize keypoints to be grasped in all grasping stages.
+For a grasping stage write the keypoint index; for a non-grasping stage write -1.
+"""
+grasp_keypoints = [{lip}, -1, {pod}, -1]
+
+"""
+Summarize at **the end of which stage** the robot should release each keypoint.
+"""
+release_keypoints = [-1, {lip}, -1, {pod}]
