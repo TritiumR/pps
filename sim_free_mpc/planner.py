@@ -82,6 +82,10 @@ class SimFreeMPCConfig:
     action_dims: int = 8
     flow_eps: float = 1e-3
     joint_delta_clip: float = 0.25
+    # Cost candidates as they would actually execute (joint limits + per-step delta
+    # clamp) instead of pre-clamp. Off by default: it changes the optimisation
+    # landscape, so arms with and without it are not comparable.
+    cost_executable_actions: bool = False
     ddim_num_train_timesteps: int = 100
     interpolate: bool = False
     control_frequency: float = 40.0
@@ -653,12 +657,28 @@ class SimFreeMPC:
     ) -> torch.Tensor:
         full = x_template.detach().repeat(samples.shape[0], 1, 1)
         full[:, :, :active_dims] = samples
-        decoded = decode_model_action_chunks(
-            self.policy,
-            policy_inputs,
-            full,
-            apply_clamp=False,
-        )
+        # Candidates are costed WITHOUT the execution clamp by default, so a plan can be scored
+        # on motion that is truncated before env.step -- measured: executed within-chunk joint
+        # deltas sit at the clamp value on the median step, so the clamp is saturating and the
+        # scored trajectory routinely is not the executed one. cost_executable_actions=True
+        # scores exactly what would be executed. Opt-in: it changes the optimisation landscape,
+        # so runs with and without it are not comparable.
+        if self.config.cost_executable_actions and self.config.joint_delta_clip > 0.0:
+            decoded = decode_model_action_chunks(
+                self.policy,
+                policy_inputs,
+                full,
+                apply_clamp=True,
+                current_joint_pos=context.get("joint_pos"),
+                max_joint_delta=self.config.joint_delta_clip,
+            )
+        else:
+            decoded = decode_model_action_chunks(
+                self.policy,
+                policy_inputs,
+                full,
+                apply_clamp=False,
+            )
         real = decoded.real_actions
         joints = real[..., :7]
         fk = self.fk.forward(joints)
