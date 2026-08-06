@@ -6,12 +6,17 @@
 #
 # Task: "pour the tea from the teapot into the cup"
 #
-# The task involves three stages:
+# The task involves four stages:
 # 1. Grasp the teapot.
-# 2. Carry the teapot mouth above the cup.
-# 3. Tilt the teapot to pour.
+# 2. Lift the teapot clear of the table.
+# 3. Carry the teapot mouth above the cup.
+# 4. Tilt the teapot to pour.
+#
+# Stage 2 is an explicit lift: it carries no grasp or release keypoint, so its sub-goal
+# constraint is what certifies the hold before any transport begins. Without it the plan
+# advances on grasp proximity alone and discovers mid-carry that the hand is empty.
 
-num_stages = 3
+num_stages = 4
 
 
 ### stage 1 sub-goal constraints
@@ -24,9 +29,9 @@ def stage1_subgoal_constraint1(end_effector, keypoints):
 
 ### stage 2 sub-goal constraints
 def stage2_subgoal_constraint1(end_effector, keypoints):
-    """The teapot mouth (keypoint {m}) is 10cm above the cup rim (keypoint {c})."""
-    offsetted_point = keypoints[{c}] + np.array({cup_off}) + np.array([0.0, 0.0, 0.10])
-    return np.linalg.norm(keypoints[{m}] - offsetted_point)
+    """The teapot handle (keypoint {h}) is raised to its carry height above the pick-up pose."""
+    offsetted_point = keypoints[{c}] + np.array({lift_teapot})
+    return np.linalg.norm(keypoints[{h}] - offsetted_point)
 
 ### stage 2 path constraints
 def stage2_path_constraint1(end_effector, keypoints):
@@ -35,16 +40,27 @@ def stage2_path_constraint1(end_effector, keypoints):
 
 ### stage 3 sub-goal constraints
 def stage3_subgoal_constraint1(end_effector, keypoints):
+    """The teapot mouth (keypoint {m}) is 10cm above the cup rim (keypoint {c})."""
+    offsetted_point = keypoints[{c}] + np.array({cup_off}) + np.array([0.0, 0.0, 0.10])
+    return np.linalg.norm(keypoints[{m}] - offsetted_point)
+
+### stage 3 path constraints
+def stage3_path_constraint1(end_effector, keypoints):
+    """The robot must still be grasping the teapot (keypoint {h})."""
+    return get_grasping_cost_by_keypoint_idx({h})
+
+### stage 4 sub-goal constraints
+def stage4_subgoal_constraint1(end_effector, keypoints):
     """The teapot mouth (keypoint {m}) is just above the cup rim (keypoint {c})."""
     offsetted_point = keypoints[{c}] + np.array({cup_off}) + np.array([0.0, 0.0, 0.04])
     return np.linalg.norm(keypoints[{m}] - offsetted_point)
 
-def stage3_subgoal_constraint2(end_effector, keypoints):
+def stage4_subgoal_constraint2(end_effector, keypoints):
     """The mouth (keypoint {m}) drops below the handle (keypoint {h}) by the pour lever arm."""
     return np.maximum(0.0, keypoints[{m}][..., 2] - keypoints[{h}][..., 2] - ({pour_margin}))
 
-### stage 3 path constraints
-def stage3_path_constraint1(end_effector, keypoints):
+### stage 4 path constraints
+def stage4_path_constraint1(end_effector, keypoints):
     """The robot must still be grasping the teapot (keypoint {h})."""
     return get_grasping_cost_by_keypoint_idx({h})
 
@@ -53,9 +69,9 @@ def stage3_path_constraint1(end_effector, keypoints):
 Summarize keypoints to be grasped in all grasping stages.
 For a grasping stage write the keypoint index; for a non-grasping stage write -1.
 """
-grasp_keypoints = [{h}, -1, -1]
+grasp_keypoints = [{h}, -1, -1, -1]
 
 """
 Summarize at **the end of which stage** the robot should release each keypoint.
 """
-release_keypoints = [-1, -1, -1]
+release_keypoints = [-1, -1, -1, -1]
