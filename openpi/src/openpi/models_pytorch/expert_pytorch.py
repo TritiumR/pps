@@ -16,7 +16,6 @@ class DINOExpertModel(nn.Module):
         use_adarms=None,
         precision: Literal["bfloat16", "float32"] = "float32",
         freeze_dino_encoder: bool = False,
-        language_vocab_size: int | None = None,
     ):
         if use_adarms is None:
             use_adarms = [False, False]
@@ -70,15 +69,8 @@ class DINOExpertModel(nn.Module):
         )
 
         self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
-        # Continuous image/state/action embeddings bypass Gemma's input table.
+        # Remove embedding layer since we use input embeddings directly.
         self.gemma_expert.model.embed_tokens = None  # type: ignore
-        self.language_embedding = (
-            nn.Embedding(language_vocab_size, action_expert_config.width)
-            if language_vocab_size is not None
-            else None
-        )
-        if self.language_embedding is not None:
-            nn.init.normal_(self.language_embedding.weight, mean=0.0, std=0.02)
         # The proxy consumes decoder hidden states directly and never calls the
         # language-modeling head. Keep it in the state dict for checkpoint
         # compatibility, but exclude it from gradient reduction under DDP.
@@ -157,11 +149,6 @@ class DINOExpertModel(nn.Module):
         # print(outputs.shape)
         # Return last_hidden_state which contains patch features
         return outputs
-
-    def embed_language_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
-        if self.language_embedding is None:
-            raise RuntimeError("Language embeddings are disabled for this DINO expert.")
-        return self.language_embedding(tokens)
 
     def forward(
         self,

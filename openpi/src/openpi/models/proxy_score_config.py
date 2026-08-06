@@ -23,8 +23,6 @@ class ProxyScoreConfig(_model.BaseModelConfig):
     prediction_type: Literal["score", "epsilon"] = "score"
     bidirectional_attention: bool = True
     legacy_gemma_input_scale: bool = False
-    use_language_tokens: bool = False
-    language_vocab_size: int = 257152
     compile_sample_actions: bool = False
 
     action_dim: int = 8

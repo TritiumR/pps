@@ -122,8 +122,7 @@ def _score_training_semantics(config, data_config, patch_info: dict[str, str]) -
         "prediction_type": str(model.prediction_type),
         "bidirectional_attention": bool(model.bidirectional_attention),
         "legacy_gemma_input_scale": bool(model.legacy_gemma_input_scale),
-        "use_language_tokens": bool(model.use_language_tokens),
-        "language_vocab_size": int(model.language_vocab_size),
+        "conditioning_inputs": ["images", "state"],
         **patch_info,
     }
 
@@ -143,9 +142,12 @@ def _validate_checkpoint_metadata(
     if saved_semantics != expected_semantics:
         saved_semantics = saved_semantics or {}
         mismatches = {
-            key: {"saved": saved_semantics.get(key), "current": value}
-            for key, value in expected_semantics.items()
-            if saved_semantics.get(key) != value
+            key: {
+                "saved": saved_semantics.get(key),
+                "current": expected_semantics.get(key),
+            }
+            for key in sorted(saved_semantics.keys() | expected_semantics.keys())
+            if saved_semantics.get(key) != expected_semantics.get(key)
         }
         raise ValueError(
             f"Checkpoint {checkpoint_dir} training semantics do not match the "

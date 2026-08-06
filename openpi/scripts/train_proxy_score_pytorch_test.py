@@ -109,8 +109,8 @@ def test_task_configs_use_clean_bidirectional_semantics(config_name, repo_id):
     assert config.model.prediction_type == "epsilon"
     assert config.model.bidirectional_attention is True
     assert config.model.legacy_gemma_input_scale is False
-    assert config.model.use_language_tokens is True
-    assert config.model.language_vocab_size == 257152
+    assert not hasattr(config.model, "use_language_tokens")
+    assert not hasattr(config.model, "language_vocab_size")
     assert config.data.repo_id == repo_id
     assert config.data.assets.asset_id == repo_id
 
@@ -127,6 +127,7 @@ def test_checkpoint_metadata_requires_exact_training_semantics(tmp_path):
         "bidirectional_attention": True,
         "legacy_gemma_input_scale": False,
         "gemma_patch_sha256": "clean",
+        "conditioning_inputs": ["images", "state"],
     }
     metadata = {
         "checkpoint_format_version": train_score.CHECKPOINT_FORMAT_VERSION,
@@ -151,6 +152,20 @@ def test_checkpoint_metadata_requires_exact_training_semantics(tmp_path):
     with pytest.raises(ValueError, match="legacy_gemma_input_scale"):
         train_score._validate_checkpoint_metadata(
             incompatible, expected, checkpoint_dir
+        )
+
+    language_checkpoint = {
+        **metadata,
+        "training_semantics": {
+            **expected,
+            "conditioning_inputs": ["images", "language", "state"],
+            "use_language_tokens": True,
+            "language_vocab_size": 257152,
+        },
+    }
+    with pytest.raises(ValueError, match="conditioning_inputs"):
+        train_score._validate_checkpoint_metadata(
+            language_checkpoint, expected, checkpoint_dir
         )
 
 

@@ -5156,7 +5156,6 @@ _CONFIGS = [
             prediction_type="epsilon",
             bidirectional_attention=True,
             legacy_gemma_input_scale=False,
-            use_language_tokens=True,
         ),
         data=ProxyLeRobotDROIDJointPosDataConfig(
             repo_id="cn356/isaaclab_pot",
@@ -5509,7 +5508,6 @@ _CONFIGS = [
             prediction_type="epsilon",
             bidirectional_attention=True,
             legacy_gemma_input_scale=False,
-            use_language_tokens=True,
         ),
         data=ProxyLeRobotDROIDJointPosDataConfig(
             repo_id="cn356/isaaclab_weight",
@@ -6340,7 +6338,6 @@ _CONFIGS = [
             prediction_type="epsilon",
             bidirectional_attention=True,
             legacy_gemma_input_scale=False,
-            use_language_tokens=True,
         ),
         data=ProxyLeRobotDROIDJointPosDataConfig(
             repo_id="cn356/isaaclab_tea",
@@ -7185,7 +7182,6 @@ _CONFIGS = [
             prediction_type="epsilon",
             bidirectional_attention=True,
             legacy_gemma_input_scale=False,
-            use_language_tokens=True,
         ),
         data=ProxyLeRobotDROIDJointPosDataConfig(
             repo_id="cn356/isaaclab_capsule",

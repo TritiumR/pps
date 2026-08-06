@@ -10,7 +10,7 @@ TASK_NAME=$1
 shift
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
-DEFAULT_EXP_NAME="task_eps_bidir_openpi"
+DEFAULT_EXP_NAME="task_eps_bidir_openpi_image_only"
 
 case "${TASK_NAME}" in
     weight)
@@ -133,7 +133,7 @@ fi
 
 printf '[score_task] task=%s config=%s exp=%s mode=%s\n' \
     "${TASK_NAME}" "${CONFIG_NAME}" "${EXP_NAME}" "${mode[0]}"
-echo "[score_task] semantics=epsilon,bidirectional,language,openpi-gemma,no-legacy-scale"
+echo "[score_task] semantics=epsilon,bidirectional,image-state-only,openpi-gemma,no-legacy-scale"
 echo "[score_task] shared training cache=${TASK_CACHE_DIR}"
 echo "[score_task] cache-build workers=${NUM_WORKERS}; mmap training workers/rank=0"
 PYTHONUNBUFFERED=1 conda run --no-capture-output -n "${CONDA_ENV}" \
