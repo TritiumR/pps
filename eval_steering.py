@@ -1336,13 +1336,17 @@ def _base_source_name(args) -> str:
 def _base_decode_only_blockers(args) -> list[str]:
     """Reasons --base_decode_only cannot be honored; empty when the base network is unused.
 
-    Only the geometric MBD base drives the chunk entirely from the planner.
+    Every MBD mode drives the chunk from the planner: the sole base forward pass is gated on
+    `use_vlm_mpc_base`, which is true for base, task and full score steering alike. Score
+    steering adds a proxy score, not a base forward pass, so it decodes without base weights
+    too -- only `base_model.config.*` and `sample_noise` are read, both of which the
+    decode-only stub provides.
     """
     blockers = []
-    if _base_source_name(args) != "mbd_base":
+    if not _uses_vlm_mpc_base(args):
         blockers.append(
             f"base_source={_base_source_name(args)} forward-passes the base network "
-            "(only mbd_base decodes without it)"
+            "(only the MBD planner bases decode without it)"
         )
     if getattr(args, "compare_difference", False):
         blockers.append("--compare_difference runs the base velocity field")
