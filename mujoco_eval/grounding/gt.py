@@ -219,8 +219,11 @@ TASKS = {
                   "movable": ["needle", "tripod"]},
     "coffee": {"grasp_objs": ["coffee_pod"], "place_obj": "coffee_pod_holder",
                "movable": ["coffee_pod"]},
+    # drawer/drawer_link are tracked so rollout telemetry records the articulated state: the
+    # open-drawer stage is the measured failure point (18/25 never leave stage 0) and it cannot be
+    # diagnosed from a log that only carries the mug's pose.
     "mug_cleanup": {"grasp_objs": ["mug"], "place_obj": "drawer",
-                    "movable": ["mug"]},
+                    "movable": ["mug", "drawer", "drawer_link"]},
     "three_piece_assembly": {"grasp_objs": ["piece_1", "piece_2"], "place_obj": "base",
                              "movable": ["base", "piece_1", "piece_2"]},
     "hammer_cleanup": {"grasp_objs": ["hammer"], "place_obj": "drawer",
@@ -327,6 +330,18 @@ class MGGroundingSource:
             d = pos("nut") - PEG_TOP
             return bool(np.linalg.norm(d[:2]) < _SQ_XY and pos("nut")[2] < _SQ_Z_TOP)
 
+        def place_subgoal(ee, kp):
+            # VLM-style sub-goal: the nut RING (kp[2], riding the gripper) xy-aligned over the
+            # peg top (kp[1]) and not far above it. Satisfied -> carry_hold's release_on_subgoal
+            # opens the gripper; this replaces the geometric at-the-seat release gate that E4
+            # measured as the failure (the seat is unreachable while the peg fills the hole).
+            import torch
+            del ee
+            ring, peg = kp[2], kp[1]
+            xy = torch.linalg.vector_norm(ring[..., :2] - peg[..., :2], dim=-1)
+            high = torch.clamp(ring[..., 2] - (peg[..., 2] + _PLACE_CLEARANCE), min=0.0)
+            return torch.maximum(xy, high)
+
         stages = [
             Stage(name="grasp nut handle", gripper="close", grasp_obj="nut", target=handle),
             Stage(name="lift nut", gripper="hold", grasp_obj="nut", payload="nut",
@@ -335,10 +350,11 @@ class MGGroundingSource:
                   target=(lambda: PEG_TOP + np.array([0.0, 0.0, _PLACE_CLEARANCE])),
                   place_point=(lambda: PEG_TOP.copy()), carry_z=(lambda: z0 + _LIFT["square"]),
                   done=threaded, place_mode="container",
+                  constraint=place_subgoal, held_idx=(0, 2),
                   insert=(lambda: _insert_cone(PEG_TOP.copy(), np.array([0.0, 0.0, 1.0]), PEG_FIT,
                                                PEG_MOUTH, PEG_CONE_H, PEG_CAPTURE))),
         ]
-        keypoints = lambda: np.stack([handle(), PEG_TOP]).astype(np.float32)
+        keypoints = lambda: np.stack([handle(), PEG_TOP, pos("nut")]).astype(np.float32)
         return Grounding(objects=objects, stages=stages,
                          manipulated=frozenset({"nut"}), keypoints=keypoints)
 

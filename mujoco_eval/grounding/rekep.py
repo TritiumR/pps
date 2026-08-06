@@ -9,10 +9,14 @@ import numpy as np
 import torch
 
 from rekep import grounding as rk_grounding
-from rekep.constraint_generation import ConstraintGenerator
-from rekep.keypoint_tracking import KeypointTracker
+# ConstraintGenerator (real-VLM codegen, needs `parse` + `openai`) and KeypointTracker are imported
+# lazily where used: the artifact path -- manually authored or previously generated constraints --
+# must load without the live-VLM and perception dependencies installed.
 from rekep.utils import get_callable_grasping_cost_fn, load_default_config
 from vlm_dp.grounding import Grounding, SceneObject, Stage, fake_vlm, masks
+
+from .. import paths
+from .gt import CP_EXTENTS, EXTENTS, HC_EXTENTS, MC_EXTENTS, TASKS
 
 
 from vlm_dp.grounding.gt import _LIFT_HEIGHT as _GT_LIFT, _shifted_seat
@@ -34,6 +38,118 @@ _MIN_LOCAL_PTS = 20
 _MIN_GRASP_EXT = 0.012
 _RESTS_ON_SUPPORT = 0.03
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+# Per-task extent tables: mug_cleanup's mug lives in MC_EXTENTS, coffee_prep's in CP_EXTENTS,
+# hammer_cleanup's in HC_EXTENTS. Reading only EXTENTS left those objects with no synthetic cloud,
+# so the template builder raised "no grasp centre for 'mug'".
+# gt.py names some parts by role while MuJoCo names them by hierarchy; without the alias the
+# object has no pose, hence no cloud, hence "perception found no cloud for it".
+_BODY_ALIASES = {
+    "coffee_pod_holder": ("coffee_machine_pod_holder_holder", "coffee_machine_pod_holder"),
+    "coffee_machine": ("coffee_machine_body",),
+}
+
+_ALL_EXTENTS = {**EXTENTS, **MC_EXTENTS, **HC_EXTENTS, **CP_EXTENTS,
+                # The drawer's sliding front. Tracked as a movable so rollout telemetry records
+                # the articulated state, so it also needs a box for the synthetic cloud.
+                "drawer_link": (0.12, 0.12, 0.04)}
+
+
+def _box_points_fn(world, per_axis=7):
+    """Return points_of(name) -> a box point cloud from the object's live pose and extents."""
+    if world is None:
+        return None
+    grid = np.linspace(-1.0, 1.0, per_axis)
+    unit = np.stack(np.meshgrid(grid, grid, grid, indexing="ij"), -1).reshape(-1, 3)
+
+    def points_of(name):
+        half = _ALL_EXTENTS.get(name)
+        if half is None:
+            return None
+        pos = rot = None
+        for candidate in (name,) + _BODY_ALIASES.get(name, ()):
+            try:
+                pos, rot = world.object_pose(candidate)[:2]
+                break
+            except Exception:
+                continue
+        if pos is None:
+            return None
+        local = unit * np.asarray(half, dtype=np.float64)
+        return np.asarray(pos, dtype=np.float64) + local @ np.asarray(rot, dtype=np.float64).T
+
+    return points_of
+
+
+def load_rekep_context(path, world=None):
+    """Load a written rekep_context.json into the dict `propose_keypoints` would have returned.
+
+    The artifact stores each keypoint as {owner, offset_local, world_at_capture} -- i.e. RIGIDLY
+    ATTACHED to a named body, not as a frozen world point. `world_at_capture` came from whatever
+    episode wrote the artifact, so replaying it verbatim would target where the objects USED to be;
+    with `world` supplied, each owned keypoint is recomputed as owner_pos + owner_rot @ offset_local
+    against the current scene. Unowned keypoints keep their captured position.
+
+    This is the standing keypoint assumption: rigid attachment to known objects, no visual
+    re-detection. Point tracking is deliberately out of scope.
+
+    Camera calibration (fovy, focal length, pose, near/far) rides along for later image-space work;
+    only `keypoints` and `projected` are consumed downstream.
+    """
+    if not path:
+        raise SystemExit("[rekep] kp_source=artifact needs --rekep_context <rekep_context.json>")
+    if not os.path.exists(path):
+        raise SystemExit(f"[rekep] no rekep context at {path}")
+    with open(path) as fh:
+        raw = json.load(fh)
+
+    entries = raw["keypoints"]
+    points, owners, rebased = [], [], 0
+    for entry in entries:
+        if not isinstance(entry, dict):                      # plain [x, y, z] form
+            points.append(np.asarray(entry, dtype=np.float64))
+            owners.append(None)
+            continue
+        owner = entry.get("owner")
+        captured = np.asarray(entry["world_at_capture"], dtype=np.float64)
+        offset = np.asarray(entry.get("offset_local", (0.0, 0.0, 0.0)), dtype=np.float64)
+        if owner and world is not None:
+            try:
+                pos, rot = world.object_pose(owner)[:2]
+                points.append(np.asarray(pos, dtype=np.float64) + np.asarray(rot) @ offset)
+                rebased += 1
+            except Exception:                                # owner absent from this scene
+                points.append(captured)
+        else:
+            points.append(captured)
+        owners.append(owner)
+
+    keypoints = np.stack(points) if points else np.zeros((0, 3))
+    if keypoints.ndim != 2 or keypoints.shape[1] != 3:
+        raise SystemExit(f"[rekep] context keypoints must resolve to [N, 3], got "
+                         f"{keypoints.shape} in {path}")
+    print(f"[rekep] loaded {len(keypoints)} keypoints from {path} "
+          f"({rebased} rebased onto live object poses, owners={owners})", flush=True)
+    return {
+        "keypoints": keypoints,
+        "owners": owners,
+        # masks._masked_points prefers this hook over IsaacLab's scene/prim lookup, which does not
+        # exist under MuJoCo. Synthesising the cloud from the live pose + known extents gives the
+        # seat/centroid/local-grasp geometry downstream something real to measure.
+        "points_of": _box_points_fn(world),
+        "projected": raw.get("projected"),
+        "names": raw.get("names"),
+        # The ladder the generator walks: stage -> target keypoint, plus intents and payloads.
+        "stage_keypoints": raw.get("stage_keypoints"),
+        "stage_names": raw.get("stage_names"),
+        "stage_gripper": raw.get("stage_gripper"),
+        "stage_payload": raw.get("stage_payload"),
+        "camera": raw.get("camera"),
+        "masks": None,
+        "points": None,
+        "id_to_prim": raw.get("id_to_prim"),
+    }
 
 
 def _annotate_object_names(img, name_masks):
@@ -109,7 +225,11 @@ class RekepGrounding:
                  local_grasp: bool = False, local_grasp_radius: float = 0.05,
                  kp_source: str = "perception", contact_criterion: str = "feasibility",
                  open_half: float = 0.04, rotate_grasp_offset: bool = False,
-                 lift_latch_xy: bool = False, seat_from_plane: bool = False):
+                 lift_latch_xy: bool = False, seat_from_plane: bool = False,
+                 context_path: str | None = None, constraints_path: str | None = None):
+        # kp_source="artifact" replays these instead of proposing from a live camera.
+        self.context_path = context_path
+        self.constraints_path = constraints_path
         self.vlm = vlm
         self.task_key = task_key
         self.place_obj = place_obj
@@ -147,9 +267,19 @@ class RekepGrounding:
         if self.stages != "vlm" and not self.place_obj:
             raise SystemExit("[rekep] the template path needs place_obj, pass it from the task entry, or use "
                              "a _vlm grounding, which derives the destination from the VLM sub-goal.")
-        dev = env.device
+        # MuJoCoEnv has no .device (an IsaacLab/torch attribute); everything here is CPU there.
+        self._env_for_vlm = env
+        dev = getattr(env, "device", "cpu")
         config = load_default_config()
-        grounded = rk_grounding.propose_keypoints(env.cam, env.env, config, perception=self.perception)
+        if self.kp_source == "artifact":
+            # Replay a previously written rekep_context.json instead of proposing keypoints from a
+            # live camera. propose_keypoints needs IsaacLab perception, which does not exist in the
+            # MuJoCo eval env, so this is the only path by which manually authored or
+            # previously generated ReKep artifacts can reach the planner here.
+            grounded = load_rekep_context(self.context_path, world)
+        else:
+            grounded = rk_grounding.propose_keypoints(
+                env.cam, env.env, config, perception=self.perception)
         keypoints = grounded["keypoints"]
         virtual_kps, gt_meta = set(), None
         if self.kp_source == "gt":
@@ -173,6 +303,20 @@ class RekepGrounding:
         if len(keypoints) == 0:
             raise SystemExit("[rekep-grounding] no keypoints proposed")
         scene_objects = list(world.names)
+        # world.names is the task's `movable` set, which often omits the destination (coffee tracks
+        # only the pod, not the holder). The seat/extent loop below then measures nothing for it and
+        # the template builder raises "perception found no cloud". Add the declared roles.
+        # Only roles we can LOCALIZE: a SceneObject must answer pos(), and that comes from the
+        # object's own keypoint, which only exists if it has a cloud. can's bin2_q3 has no body at
+        # all, so adding it unconditionally crashed context-build on the first replan.
+        _spec = TASKS.get(self.task_key, {})
+        for _role in list(_spec.get("grasp_objs", ())) + (
+                [_spec["place_obj"]] if _spec.get("place_obj") else []):
+            if _role and _role not in scene_objects:
+                if masks._masked_points(grounded, env.env, _role) is None:
+                    print(f"[rekep] role {_role!r} has no cloud; not a scene object", flush=True)
+                    continue
+                scene_objects.append(_role)
         if self.perception is not None:
 
             extents = {n: e for n in scene_objects if (e := self.perception.object_extents(n)) is not None}
@@ -186,6 +330,14 @@ class RekepGrounding:
                         print(f"[ext-diag] {_n}: {d}", flush=True)
         else:
             extents = usd_extents(env, scene_objects)
+        # usd_extents needs `omni` (Isaac only). Under MuJoCo it returns nothing and every object
+        # falls back to DEFAULT_EXTENT = 0.05 half-width, which exceeds open_half (0.04) -- so
+        # _contact_for typed EVERY grasp as a "press" and the arm pressed cubeA (true half-width
+        # 0.02) instead of pinching it. gt.EXTENTS carries the real numbers for these tasks.
+        for _n in scene_objects:
+            if _n in EXTENTS and _n not in extents:
+                extents[_n] = EXTENTS[_n]
+        from rekep.keypoint_tracking import KeypointTracker
         tracker = KeypointTracker(world, keypoints)
         if gt_meta is not None:
 
@@ -203,7 +355,11 @@ class RekepGrounding:
         shim = TorchNumpyShim(dev)
 
 
-        vlm_dir = os.path.join(_REPO, "results", "vlm_mpc", "vlm_base",
+        # Generated constraints are scratch. _REPO/results is root-owned in the container image,
+        # so honour MUJOCO_EVAL_RESULTS when set (the mujoco eval always sets it) and fall back to
+        # the repo only when it is not.
+        _vlm_root = os.environ.get("MUJOCO_EVAL_RESULTS") or os.path.join(_REPO, "results")
+        vlm_dir = os.path.join(_vlm_root, "vlm_mpc", "vlm_base",
                                f"vlm_query_{self.task_key}_p{os.getpid()}")
 
 
@@ -212,7 +368,13 @@ class RekepGrounding:
                 if _f.endswith("_constraints.txt") or _f == "metadata.json":
                     os.remove(os.path.join(vlm_dir, _f))
         if self.vlm == "fake":
-            metadata, _ = fake_vlm.generate(self.task_key, vlm_dir, keypoints, grounded, env.env, self.clearance)
+            # Route to whichever fake VLM knows this task: vlm_dp.fake_vlm covers the Isaac
+            # tasks, fake_rekep the mujoco ones. Both emit the same artifact layout, so the
+            # loader below does not care which produced it.
+            from . import fake_rekep
+            gen = fake_rekep if self.task_key in fake_rekep.supported_tasks() else fake_vlm
+            metadata, _ = gen.generate(self.task_key, vlm_dir, keypoints, grounded, env.env,
+                                       self.clearance)
         else:
             metadata = self._real_constraints(vlm_dir, grounded, config)
         bad = [i for i in metadata["grasp_keypoints"] + metadata["release_keypoints"] if not -1 <= i < len(keypoints)]
@@ -558,9 +720,15 @@ class RekepGrounding:
                 manipulated.add(name)
 
 
+                # The authored stage-N subgoal ("reach the grasp keypoint") was loaded and then
+                # dropped here, leaving the grasp stage with no constraint while the place stage
+                # below carried one -- so rekep_subgoal/rekep_path scored nothing until the final
+                # stage. `done` is deliberately NOT the subgoal: a grasp advances on the hold
+                # sensor, not on proximity, or it would advance before the gripper closes.
                 stages.append(Stage(name=f"{'press' if press else 'grasp'} {name}", gripper="close", steer_policy=_pol(i),
                                     grasp_obj=name, payload=None, held_idx=held,
                                     target=(kp_point(grasp_kp) if press else obj_center[name]),
+                                    constraint=subgoal, path_fns=path_fns,
                                     contact=("press" if press else "pinch")))
                 grasped_body = owner
                 pressed = press
@@ -621,12 +789,70 @@ class RekepGrounding:
         """Generate and load constraints with the real VLM."""
         with open(os.path.join(_REPO, "task_prompts.json"), encoding="utf-8") as f:
             instruction = json.load(f)[self.task_key]["prompt"]
-        img = grounded["projected"]
+        img = grounded.get("projected")
+        if img is None:
+            # Artifact path: no stored overlay. ReKep prompts with a NUMBERED-keypoint image, so
+            # render one from the live scene -- the same frame mujoco_eval.viz draws for debugging.
+            from .. import viz
+            img = viz.annotate_keypoints(self._env_for_vlm, grounded["keypoints"], hw=512)
         if self.perception is not None:
 
 
             img = _annotate_object_names(img, self.perception.masks)
             instruction += " (object names are written on the image)"
+        from rekep.constraint_generation import ConstraintGenerator
         ConstraintGenerator(config["constraint_generator"]).generate(img, instruction, {}, vlm_dir)
         with open(os.path.join(vlm_dir, "metadata.json"), encoding="utf-8") as f:
             return json.load(f)
+
+
+class MGRekepGroundingSource:
+    """ReKep grounding for mujoco_eval, replayed from written artifacts.
+
+    The `--ground rekep` source. Mirrors MGGroundingSource's interface (`movable`, `roles`,
+    `ground(env, world)`) so the runner, bridge, costs and steering modes need no branch: whichever
+    source is built, the planner receives the same Grounding object.
+
+    Keypoints and camera calibration come from `rekep_context.json`, constraints from a
+    `rekep_constraints/` directory. Nothing here touches a live camera, a segmenter or a VLM, so it
+    runs under the MuJoCo eval env where none of those are installed.
+
+    KEYPOINT ASSUMPTION: keypoints are loaded once per episode and then ride their owning bodies
+    through KeypointTracker. There is no visual re-detection -- point tracking is deliberately out
+    of scope for now.
+    """
+
+    _MODE = "template"
+
+    def __init__(self, task, context_path=None, constraints_path=None, vlm="fake"):
+        if task not in TASKS:
+            raise ValueError(f"unknown mg task {task!r} (have {sorted(TASKS)})")
+        spec = TASKS[task]
+        self.task = task
+        self.movable = list(spec["movable"])
+        self.roles = {"grasp_obj": spec["grasp_objs"][0], "grasp_objs": spec["grasp_objs"],
+                      "place_obj": spec["place_obj"]}
+        self.context_path = context_path or self._default(task, "rekep_context.json")
+        self.constraints_path = constraints_path or self._default(task, "rekep_constraints")
+        self._grounding = RekepGrounding(
+            task_key=task, place_obj=spec["place_obj"],
+            grasp_objs=spec["grasp_objs"], stages=self._MODE, kp_source="artifact", vlm=vlm,
+            context_path=self.context_path, constraints_path=self.constraints_path)
+
+    @staticmethod
+    def _default(task, leaf):
+        """Artifacts live beside the task's demos, as grounding/propose.py writes them."""
+        return str(paths.task_data(task, leaf))
+
+    def ground(self, env, world):
+        return self._grounding.ground(env, world)
+
+
+class MGRekepVlmGroundingSource(MGRekepGroundingSource):
+    """`--ground rekep_vlm`: stages emitted from the VLM metadata rather than the task ladder.
+
+    Same artifacts and the same interface; only the stage-construction mode differs, so the two
+    sources stay a one-word change rather than parallel implementations.
+    """
+
+    _MODE = "vlm"
