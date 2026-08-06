@@ -42,9 +42,14 @@ import openpi.training.config as _config
 import openpi.training.data_loader as _data
 
 
+CHECKPOINT_FORMAT_VERSION = 2
 TASK_CACHE_FORMAT_VERSION = 1
 TASK_CACHE_IMAGE_KEYS = ("base_0_rgb", "left_wrist_0_rgb")
 TASK_CACHE_ENV = "SCORE_TASK_CACHE_PATH"
+_GEMMA_REPLACEMENT_PATH = (
+    pathlib.Path(_OPENPI_SRC_DIR)
+    / "openpi/models_pytorch/transformers_replace/models/gemma/modeling_gemma.py"
+)
 
 
 def _norm_stats_fingerprint(norm_stats) -> str | None:
@@ -65,6 +70,88 @@ def _norm_stats_fingerprint(norm_stats) -> str | None:
             digest.update(str(array.dtype).encode("utf-8"))
             digest.update(np.ascontiguousarray(array).tobytes())
     return digest.hexdigest()
+
+
+def _sha256_file(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_openpi_gemma_patch() -> dict[str, str]:
+    """Fail before training if the active Gemma is not OpenPI's replacement."""
+    import transformers
+    from transformers.models.gemma import modeling_gemma
+
+    installed_path = pathlib.Path(modeling_gemma.__file__).resolve()
+    expected_path = _GEMMA_REPLACEMENT_PATH.resolve()
+    installed_sha256 = _sha256_file(installed_path)
+    expected_sha256 = _sha256_file(expected_path)
+    if installed_sha256 != expected_sha256:
+        raise RuntimeError(
+            "The active Transformers Gemma implementation is not the OpenPI "
+            "replacement required for clean score-proxy training. The stock "
+            "implementation rescales inputs_embeds by sqrt(hidden_size), which "
+            "changes checkpoint semantics. Install transformers==4.53.2 and copy "
+            "openpi/src/openpi/models_pytorch/transformers_replace/* into the "
+            "active transformers package before training. "
+            f"active={installed_path} expected={expected_path}"
+        )
+    return {
+        "transformers_version": transformers.__version__,
+        "gemma_patch_sha256": installed_sha256,
+    }
+
+
+def _score_training_semantics(config, data_config, patch_info: dict[str, str]) -> dict:
+    model = config.model
+    return {
+        "config_name": config.name,
+        "repo_id": data_config.repo_id,
+        "norm_stats_fingerprint": _norm_stats_fingerprint(data_config.norm_stats),
+        "use_quantile_norm": bool(data_config.use_quantile_norm),
+        "action_dim": int(model.action_dim),
+        "action_horizon": int(model.action_horizon),
+        "action_expert_variant": str(model.action_expert_variant),
+        "dino_model_name": str(model.dino_model_name),
+        "dtype": str(model.dtype),
+        "freeze_dino_encoder": bool(model.freeze_dino_encoder),
+        "ddim_num_train_timesteps": int(model.ddim_num_train_timesteps),
+        "prediction_type": str(model.prediction_type),
+        "bidirectional_attention": bool(model.bidirectional_attention),
+        "legacy_gemma_input_scale": bool(model.legacy_gemma_input_scale),
+        "use_language_tokens": bool(model.use_language_tokens),
+        "language_vocab_size": int(model.language_vocab_size),
+        **patch_info,
+    }
+
+
+def _validate_checkpoint_metadata(
+    metadata: dict,
+    expected_semantics: dict,
+    checkpoint_dir: pathlib.Path,
+) -> None:
+    if metadata.get("checkpoint_format_version") != CHECKPOINT_FORMAT_VERSION:
+        raise ValueError(
+            f"Checkpoint {checkpoint_dir} predates score-training semantic metadata "
+            "and cannot be resumed safely. Use a new EXP_NAME for clean training; "
+            "keep legacy checkpoints for evaluation only."
+        )
+    saved_semantics = metadata.get("training_semantics")
+    if saved_semantics != expected_semantics:
+        saved_semantics = saved_semantics or {}
+        mismatches = {
+            key: {"saved": saved_semantics.get(key), "current": value}
+            for key, value in expected_semantics.items()
+            if saved_semantics.get(key) != value
+        }
+        raise ValueError(
+            f"Checkpoint {checkpoint_dir} training semantics do not match the "
+            f"current run: {json.dumps(mismatches, sort_keys=True)}. Use a new "
+            "EXP_NAME instead of resuming incompatible weights."
+        )
 
 
 def _task_cache_metadata(config, data_config, *, num_samples: int) -> dict:
@@ -422,7 +509,15 @@ def get_model_parameters(model):
     )
 
 
-def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
+def save_checkpoint(
+    model,
+    optimizer,
+    global_step,
+    config,
+    is_main,
+    data_config,
+    training_semantics,
+):
     if not is_main:
         return
     if not (
@@ -444,7 +539,15 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
     )
     safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
     torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
-    torch.save({"global_step": global_step, "timestamp": time.time()}, tmp_ckpt_dir / "metadata.pt")
+    torch.save(
+        {
+            "checkpoint_format_version": CHECKPOINT_FORMAT_VERSION,
+            "global_step": global_step,
+            "timestamp": time.time(),
+            "training_semantics": training_semantics,
+        },
+        tmp_ckpt_dir / "metadata.pt",
+    )
 
     if data_config.norm_stats is not None and data_config.asset_id is not None:
         _normalize.save(tmp_ckpt_dir / "assets" / data_config.asset_id, data_config.norm_stats)
@@ -455,16 +558,33 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
     logging.info("Saved checkpoint at step %s -> %s", global_step, final_ckpt_dir)
 
 
-def load_checkpoint(model, optimizer, checkpoint_dir, device):
+def _validate_latest_checkpoint(checkpoint_dir, expected_semantics):
     checkpoint_steps = [
-        int(d.name)
-        for d in checkpoint_dir.iterdir()
-        if d.is_dir() and d.name.isdigit() and not d.name.startswith("tmp_")
+        int(path.name)
+        for path in checkpoint_dir.iterdir()
+        if path.is_dir() and path.name.isdigit() and not path.name.startswith("tmp_")
     ]
     if not checkpoint_steps:
         raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
     latest_step = max(checkpoint_steps)
     ckpt_dir = checkpoint_dir / f"{latest_step}"
+    metadata = torch.load(
+        ckpt_dir / "metadata.pt", map_location="cpu", weights_only=False
+    )
+    _validate_checkpoint_metadata(metadata, expected_semantics, ckpt_dir)
+    return latest_step, ckpt_dir
+
+
+def load_checkpoint(
+    model,
+    optimizer,
+    checkpoint_dir,
+    device,
+    expected_semantics,
+):
+    latest_step, ckpt_dir = _validate_latest_checkpoint(
+        checkpoint_dir, expected_semantics
+    )
     model_to_load = (
         model.module
         if isinstance(model, torch.nn.parallel.DistributedDataParallel)
@@ -503,6 +623,7 @@ def train_loop(config: _config.TrainConfig):
             "train_proxy_score_pytorch.py requires a ProxyScoreConfig. "
             f"Got {type(config.model).__name__} from config {config.name!r}."
         )
+    patch_info = _validate_openpi_gemma_patch()
 
     resuming = False
     if config.resume:
@@ -522,14 +643,16 @@ def train_loop(config: _config.TrainConfig):
     if use_ddp:
         torch.distributed.barrier()
 
-    if is_main:
-        config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
-    elif config.wandb_enabled:
-        wandb.init(mode="disabled")
-
     train_loader = build_loader(config)
     data_config = train_loader.data_config()
+
+    training_semantics = _score_training_semantics(config, data_config, patch_info)
+    logging.info(
+        "Score training semantics: %s",
+        json.dumps(training_semantics, sort_keys=True),
+    )
+    if resuming:
+        _validate_latest_checkpoint(config.checkpoint_dir, training_semantics)
 
     model = openpi.models_pytorch.proxy_score_pytorch.ProxyScorePytorch(config.model).to(device)
     if not resuming and config.pytorch_weight_path is not None:
@@ -558,7 +681,19 @@ def train_loop(config: _config.TrainConfig):
 
     global_step = 0
     if resuming:
-        global_step = load_checkpoint(model, optimizer, config.checkpoint_dir, device)
+        global_step = load_checkpoint(
+            model,
+            optimizer,
+            config.checkpoint_dir,
+            device,
+            training_semantics,
+        )
+
+    if is_main:
+        config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    elif config.wandb_enabled:
+        wandb.init(mode="disabled")
 
     def lr_schedule(step: int):
         warmup_steps = config.lr_schedule.warmup_steps
@@ -647,7 +782,15 @@ def train_loop(config: _config.TrainConfig):
             start_time = time.time()
 
         global_step = completed_step
-        save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
+        save_checkpoint(
+            model,
+            optimizer,
+            global_step,
+            config,
+            is_main,
+            data_config,
+            training_semantics,
+        )
         if pbar is not None:
             pbar.update(1)
             pbar.set_postfix(

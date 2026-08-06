@@ -144,6 +144,11 @@ class ProxyScorePytorch(nn.Module):
             use_adarms=[False, False],
             precision=config.dtype,
             freeze_dino_encoder=getattr(config, "freeze_dino_encoder", False),
+            language_vocab_size=(
+                config.language_vocab_size
+                if getattr(config, "use_language_tokens", False)
+                else None
+            ),
         )
         self.bidirectional_attention = getattr(config, "bidirectional_attention", True)
         self.legacy_gemma_input_scale = getattr(
@@ -187,6 +192,8 @@ class ProxyScorePytorch(nn.Module):
         return (
             list(observation.images.values()),
             list(observation.image_masks.values()),
+            observation.tokenized_prompt,
+            observation.tokenized_prompt_mask,
             observation.state,
         )
 
@@ -223,7 +230,7 @@ class ProxyScorePytorch(nn.Module):
         return alphas[idx]
 
     def embed_prefix(
-        self, images, img_masks
+        self, images, img_masks, lang_tokens=None, lang_masks=None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         embs = []
         pad_masks = []
@@ -234,6 +241,18 @@ class ProxyScorePytorch(nn.Module):
             embs.append(img_emb)
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
             att_masks += [0] * num_img_embs
+
+        if getattr(self.config, "use_language_tokens", False):
+            if lang_tokens is None or lang_masks is None:
+                raise ValueError(
+                    "tokenized_prompt and tokenized_prompt_mask are required when "
+                    "use_language_tokens=True."
+                )
+            lang_emb = self.expert_model.embed_language_tokens(lang_tokens)
+            lang_emb = lang_emb * math.sqrt(lang_emb.shape[-1])
+            embs.append(lang_emb)
+            pad_masks.append(lang_masks.to(torch.bool))
+            att_masks += [0] * lang_emb.shape[1]
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -432,7 +451,9 @@ class ProxyScorePytorch(nn.Module):
             raise ValueError("score_target and epsilon_target are mutually exclusive.")
 
         actions = actions[..., : self.config.action_dim]
-        images, img_masks, state = self._preprocess_observation(observation, train=True)
+        images, img_masks, lang_tokens, lang_masks, state = (
+            self._preprocess_observation(observation, train=True)
+        )
         loss_weight = None
         direct_score_target = score_target is not None
         direct_epsilon_target = epsilon_target is not None
@@ -479,7 +500,7 @@ class ProxyScorePytorch(nn.Module):
                 loss_weight = beta[:, None, None]
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks
+            images, img_masks, lang_tokens, lang_masks
         )
         grouped_labels = x_t.ndim == 4
         if grouped_labels:
@@ -540,11 +561,11 @@ class ProxyScorePytorch(nn.Module):
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        images, img_masks, state = self._preprocess_observation(
-            observation, train=False
+        images, img_masks, lang_tokens, lang_masks, state = (
+            self._preprocess_observation(observation, train=False)
         )
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks
+            images, img_masks, lang_tokens, lang_masks
         )
         x_t = noise
         for iteration in range(int(num_steps)):

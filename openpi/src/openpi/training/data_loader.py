@@ -28,6 +28,12 @@ def _patch_datasets_array_extension_to_pylist():
     except Exception:
         return
 
+    # Newer Hugging Face Datasets serializes fixed-size sequences as ``List``.
+    # datasets==2.21 (used by this LeRobot environment) calls the equivalent
+    # feature ``Sequence`` and otherwise crashes while reading parquet metadata.
+    if _hf_features._FEATURE_TYPES.get("List") is None:
+        _hf_features._FEATURE_TYPES["List"] = _hf_features.Sequence
+
     to_pylist = getattr(_hf_features.ArrayExtensionArray, "to_pylist", None)
     if to_pylist is None or getattr(to_pylist, "_openpi_accepts_pyarrow_kwargs", False):
         return

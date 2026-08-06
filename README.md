@@ -35,6 +35,26 @@ uv run scripts/train_pytorch.py <train-config> \
 # -> checkpoints/<train-config>/task/{8000,16000,24000}
 ```
 
+### Bidirectional score-task proxies
+
+Weight, tea, capsule, and pot use one shared clean score-training path. The task
+wrappers fix epsilon prediction, bidirectional attention, the OpenPI Gemma
+replacement, and no legacy input scaling:
+
+```bash
+tools/train_score_task_weight.sh  1 32 8
+tools/train_score_task_tea.sh     1 32 8
+tools/train_score_task_capsule.sh 1 32 8
+tools/train_score_task_pot.sh     1 32 8
+```
+
+The arguments are GPU count, global batch size, and cache-build workers. The
+default experiment name is `task_eps_bidir_openpi`; compatible checkpoints resume
+automatically. Set `EXP_NAME` for a separate run, `DATA_FILE` to override the task
+HDF5 path, or `TRAIN_MODE=--overwrite` to explicitly restart that experiment.
+Legacy `task_eps_bidir` checkpoints are evaluation-only and are rejected by the
+resume semantic check.
+
 ## Evaluation in simulation
 
 Run from the repo root. Steering combines a base policy with a `reference` and a

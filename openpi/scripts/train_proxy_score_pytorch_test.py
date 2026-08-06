@@ -94,6 +94,66 @@ def test_task_cache_reuses_preprocessed_tensors(monkeypatch, tmp_path):
     assert tuple(action_batch.shape) == (2, 3, 2)
 
 
+@pytest.mark.parametrize(
+    ("config_name", "repo_id"),
+    (
+        ("score_task_weight", "cn356/isaaclab_weight"),
+        ("score_task_tea", "cn356/isaaclab_tea"),
+        ("score_task_capsule", "cn356/isaaclab_capsule"),
+        ("score_task_pot", "cn356/isaaclab_pot"),
+    ),
+)
+def test_task_configs_use_clean_bidirectional_semantics(config_name, repo_id):
+    config = train_score._config.get_config(config_name)
+
+    assert config.model.prediction_type == "epsilon"
+    assert config.model.bidirectional_attention is True
+    assert config.model.legacy_gemma_input_scale is False
+    assert config.model.use_language_tokens is True
+    assert config.model.language_vocab_size == 257152
+    assert config.data.repo_id == repo_id
+    assert config.data.assets.asset_id == repo_id
+
+
+def test_active_gemma_matches_openpi_replacement():
+    patch_info = train_score._validate_openpi_gemma_patch()
+
+    assert patch_info["transformers_version"] == "4.53.2"
+    assert len(patch_info["gemma_patch_sha256"]) == 64
+
+
+def test_checkpoint_metadata_requires_exact_training_semantics(tmp_path):
+    expected = {
+        "bidirectional_attention": True,
+        "legacy_gemma_input_scale": False,
+        "gemma_patch_sha256": "clean",
+    }
+    metadata = {
+        "checkpoint_format_version": train_score.CHECKPOINT_FORMAT_VERSION,
+        "training_semantics": expected,
+    }
+    checkpoint_dir = tmp_path / "1000"
+
+    train_score._validate_checkpoint_metadata(metadata, expected, checkpoint_dir)
+
+    with pytest.raises(ValueError, match="predates score-training semantic metadata"):
+        train_score._validate_checkpoint_metadata(
+            {"global_step": 1000}, expected, checkpoint_dir
+        )
+
+    incompatible = {
+        **metadata,
+        "training_semantics": {
+            **expected,
+            "legacy_gemma_input_scale": True,
+        },
+    }
+    with pytest.raises(ValueError, match="legacy_gemma_input_scale"):
+        train_score._validate_checkpoint_metadata(
+            incompatible, expected, checkpoint_dir
+        )
+
+
 def test_ref_cache_defaults_match_eval_truncated_teacher():
     args = train_mpc.build_parser().parse_args(
         [

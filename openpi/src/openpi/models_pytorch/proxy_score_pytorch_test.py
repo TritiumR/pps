@@ -33,9 +33,10 @@ class _TinyProxyScore(ProxyScorePytorch):
         batch_size = observation.state.shape[0]
         images = [torch.ones(batch_size, 1, device=observation.state.device)]
         masks = [torch.ones(batch_size, dtype=torch.bool, device=observation.state.device)]
-        return images, masks, observation.state
+        return images, masks, None, None, observation.state
 
-    def embed_prefix(self, images, img_masks):
+    def embed_prefix(self, images, img_masks, lang_tokens=None, lang_masks=None):
+        del lang_tokens, lang_masks
         del img_masks
         batch_size = images[0].shape[0]
         self.prefix_batch_sizes.append(batch_size)
@@ -55,6 +56,49 @@ class _TinyProxyScore(ProxyScorePytorch):
         del prefix_pad_masks, prefix_att_masks
         condition = prefix_embs[:, :1, :1] + state[:, :1, None] + time_cond[:, None, None]
         return x_t + condition
+
+
+def test_language_tokens_join_the_bidirectional_prefix():
+    class FakeExpert(nn.Module):
+        def embed_image(self, image):
+            return image[:, None, :].expand(-1, 2, 4)
+
+        def embed_language_tokens(self, tokens):
+            return tokens.to(torch.float32)[..., None].expand(-1, -1, 4)
+
+    model = _TinyProxyScore()
+    model.config.use_language_tokens = True
+    model.expert_model = FakeExpert()
+    images = [torch.ones(1, 4)]
+    image_masks = [torch.ones(1, dtype=torch.bool)]
+    tokens = torch.tensor([[7, 8, 0]])
+    token_masks = torch.tensor([[True, True, False]])
+
+    prefix, pad_mask, block_mask = ProxyScorePytorch.embed_prefix(
+        model, images, image_masks, tokens, token_masks
+    )
+
+    assert tuple(prefix.shape) == (1, 5, 4)
+    torch.testing.assert_close(
+        prefix[:, 2:], tokens.to(torch.float32)[..., None].expand(-1, -1, 4) * 2.0
+    )
+    torch.testing.assert_close(
+        pad_mask, torch.tensor([[True, True, True, True, False]])
+    )
+    assert not block_mask.any()
+    suffix_pad = torch.ones(1, 4, dtype=torch.bool)
+    suffix_blocks = torch.tensor([[True, True, False, False]])
+    attention_mask, _ = model.build_expert_masks(
+        pad_mask, block_mask, suffix_pad, suffix_blocks
+    )
+    assert tuple(attention_mask.shape) == (1, 1, 9, 9)
+    torch.testing.assert_close(
+        attention_mask[:, 0] == 0,
+        make_att_2d_masks(
+            torch.cat([pad_mask, suffix_pad], dim=1),
+            torch.cat([block_mask, suffix_blocks], dim=1),
+        ),
+    )
 
 
 def test_grouped_score_labels_reuse_visual_prefix_and_match_flat_loss():
