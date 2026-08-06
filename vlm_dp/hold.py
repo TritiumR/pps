@@ -6,12 +6,16 @@ from __future__ import annotations
 class HoldLatch:
     """Maintain a latched hold across control steps."""
 
+    # Radian-scale default, from the Isaac gripper convention.
     _SLIP_MARGIN = 0.18
 
-    def __init__(self, sensor):
+    def __init__(self, sensor, slip_margin=None):
         self.sensor = sensor
         self._held = None
         self._grip_aperture = None
+        self._slip_margin = (
+            self._SLIP_MARGIN if slip_margin is None else float(slip_margin)
+        )
 
     def held(self):
         return self._held
@@ -23,7 +27,7 @@ class HoldLatch:
             and self._grip_aperture is not None
             and not self.sensor.hold_lost()
             and self.sensor.aperture()
-            < self._grip_aperture + self._SLIP_MARGIN
+            < self._grip_aperture + self._slip_margin
         ):
             held = self._held
         else:

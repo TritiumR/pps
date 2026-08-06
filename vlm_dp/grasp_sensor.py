@@ -32,6 +32,7 @@ class ApertureGraspSensor:
         legacy=False,
         stall_margin_enter=None,
         stall_margin_exit=None,
+        lost_on_free_close=None,
     ):
         # Restore the original continuous-close and dense-settling gates.
         self.legacy = bool(legacy)
@@ -55,6 +56,11 @@ class ApertureGraspSensor:
             if stall_margin_exit is None
             else float(stall_margin_exit)
         )
+
+        # Whether free-close counts as losing a latched hold. None keeps the historical
+        # coupling to `hysteresis`, which conflated "enter and exit margins differ" with
+        # "fingers meeting on air means the object is gone" -- two separate questions.
+        self.lost_on_free_close = lost_on_free_close
 
         self.q_touch = q_touch
         self.settle_steps = settle_steps
@@ -117,7 +123,12 @@ class ApertureGraspSensor:
 
     def hold_lost(self) -> bool:
         """Return whether a latched grasp has opened or reached free close."""
-        return self.is_open() or (self.hysteresis and self.closed_on_air())
+        free = (
+            self.hysteresis
+            if self.lost_on_free_close is None
+            else self.lost_on_free_close
+        )
+        return self.is_open() or (free and self.closed_on_air())
 
     def held_object(self, positions: dict, tcp) -> str | None:
         """Return the nearest object within reach when a grasp is detected."""

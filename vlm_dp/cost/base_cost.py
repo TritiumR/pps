@@ -15,6 +15,7 @@ TERM_ROLES = {
     "reach": "task",
     "terminal_reach": "task",
     "rekep_subgoal": "task",
+    "rekep_keypose": "task",
     "rekep_path": "task",
     "straddle": "task",
     "tip_z": "task",

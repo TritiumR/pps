@@ -67,6 +67,13 @@ class VlmDpBridge:
         # Optional hold hysteresis, grace, and backtrack limits.
         self.hold_enter = _opt_float(adv.get("hold_enter"))
         self.hold_exit = _opt_float(adv.get("hold_exit"))
+        # Ghost-hold guards. Free-close release is otherwise reachable only by also setting
+        # hold_enter/hold_exit; the slip margin is on the sensor's own scale, so the 0.18
+        # default exceeds the MuJoCo closure range (0-0.08) and never trips there.
+        self.hold_free_close = adv.get("hold_free_close")
+        self.hold_free_close = (None if self.hold_free_close is None
+                                else bool(self.hold_free_close))
+        self.slip_margin = _opt_float(adv.get("slip_margin"))
         self._hold_grace_replans = int(adv.get("hold_grace_replans", 0))
         self._backtrack_budget = int(adv.get("backtrack_budget", 0))  # 0 disables the limit
         self._backtrack_commit = int(adv.get("backtrack_commit_replans", 0))
@@ -195,7 +202,8 @@ class VlmDpBridge:
                                           close_steps=self.close_steps, settle_steps=self.settle_steps,
                                           legacy=self.legacy_sensor,
                                           stall_margin_enter=self.hold_enter,
-                                          stall_margin_exit=self.hold_exit)
+                                          stall_margin_exit=self.hold_exit,
+                                          lost_on_free_close=self.hold_free_close)
         # Real state shares perception between world tracking and grounding.
         percep = self._build_perception() if self.state == "real" else None
         src = get_source(self.ground_name, task_key=self.task_key, perception=percep,

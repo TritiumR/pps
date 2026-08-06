@@ -128,12 +128,49 @@ def _placing(ctx):
     return ctx.get("payload") is not None and ctx.get("place_target") is not None
 
 
+def _flat(err, geom):
+    """Clamp an error to zero inside a tolerance, so the term is FLAT over the acceptable set.
+
+    MBD weights candidates by softmax(-cost), which is shift-invariant -- subtracting a tolerance
+    does nothing. Only clamping makes every configuration inside the tolerance score identically,
+    which is what gives the sampler more than one optimum to hold mass on (measured ESS ~1 without
+    it). center_region and aperture_region already do this; the goal attractors and tip_z do not,
+    and an unclamped term re-selects a single point inside any region the others leave flat.
+
+    Feasibility terms (floor, clear, collision) are deliberately NOT clamped -- a dead zone on
+    collision would license penetration.
+    """
+    tol = float(getattr(geom, "flat_tol", 0.0) or 0.0)
+    return err if tol <= 0.0 else torch.clamp(err - tol, min=0.0)
+
+
+def _progress(values, geom):
+    """Reduce a per-row distance series to a cost.
+
+    Default sums the distance itself, which penalises ANY path that is not monotonically
+    approaching -- so going up before going across costs more than a straight line even when it
+    is the correct motion. That bias is why the config carries explicit permission-slip terms
+    (release_rise_first, grasp_standoff, approach_hover) whose only job is to license particular
+    detours.
+
+    `potential_shaping` costs the INCREASE in distance instead, max(0, d_t - d_{t-1}). Any
+    non-increasing path is then free, so detours need no licensing. This is potential-based
+    reward shaping (Ng et al. 1999): adding a potential difference leaves the optimal policy
+    unchanged, so it removes the bias without changing what "solved" means.
+    """
+    if not getattr(geom, "potential_shaping", False):
+        return values.mean(dim=1)
+    step = values[:, 1:] - values[:, :-1]
+    return torch.clamp(step, min=0.0).sum(dim=1)
+
+
 @register("reach")
 def reach(I):
     """Penalty: mean squared TCP-to-target distance."""
     if I.context.get("constraint") is not None or I.context.get("payload") is not None:
         return _zeros(I)
-    return ((I.ee_pos - _target(I).view(1, 1, 3)) ** 2).sum(dim=-1).mean(dim=1)
+    d = _flat(((I.ee_pos - _target(I).view(1, 1, 3)) ** 2).sum(dim=-1).sqrt(), I.geom) ** 2
+    return _progress(d, I.geom)
 
 
 @register("terminal_reach")
@@ -141,7 +178,7 @@ def terminal_reach(I):
     """Penalty: terminal squared TCP-to-target distance."""
     if I.context.get("constraint") is not None or I.context.get("payload") is not None:
         return _zeros(I)
-    return ((I.ee_pos - _target(I).view(1, 1, 3)) ** 2).sum(dim=-1)[:, -1]
+    return _flat(((I.ee_pos - _target(I).view(1, 1, 3)) ** 2).sum(dim=-1).sqrt(), I.geom)[:, -1] ** 2
 
 
 @register("rekep_subgoal")
@@ -150,8 +187,31 @@ def rekep_subgoal(I):
     subgoal = I.context.get("constraint")
     if subgoal is None:
         return _zeros(I)
-    v = subgoal(I.ee_pos, _rekep_keypoints(I))
+    v = _flat(subgoal(I.ee_pos, _rekep_keypoints(I)), I.geom)
+    if getattr(I.geom, "potential_shaping", False):
+        return _progress(v, I.geom)
     return v.mean(dim=1) if getattr(I.geom, "subgoal_mean", False) else v.sum(dim=1)
+
+
+@register("rekep_keypose")
+def rekep_keypose(I):
+    """Constraint: the ReKep subgoal evaluated on the LAST chunk row only.
+
+    The keypose-steering term. `rekep_subgoal` sums or means the subgoal over every row, so under
+    keypose steering -- where proposals perturb one row of sixteen -- its response to a proposal is
+    diluted ~16x (measured: 3.0% relative cost spread across 128 proposals, too flat for the
+    Feynman-Kac softmax to discriminate). This scores the keypose row alone, mirroring the terminal
+    keypose cost Cory's method weights at 30, and it reads the VLM/GT sub-goal rather than the
+    motion scaffold -- so it cannot inherit `carry_hold`'s measured inversion (E4: +22 at insert).
+
+    Requires a stage constraint; inert on stages without one, and on any config that does not
+    weight it.
+    """
+    subgoal = I.context.get("constraint")
+    if subgoal is None:
+        return _zeros(I)
+    v = subgoal(I.ee_pos, _rekep_keypoints(I))
+    return v[:, -1]
 
 
 @register("rekep_path")
@@ -262,7 +322,7 @@ def tip_z(I):
     if f is None:
         return _zeros(I)
     tip, _, _, _, center, _ = f
-    err = (tip[..., 2] - center[..., 2]).abs()
+    err = _flat((tip[..., 2] - center[..., 2]).abs(), I.geom)
     # Linear by default: squared metres vanish near contact.
     return (err.pow(2) if getattr(I.geom, "tip_z_shape", "linear") == "squared" else err).mean(dim=1)
 
