@@ -170,3 +170,9 @@ diary/
 # personal design notes + papers (kept local, not shared)
 VLMDP_DESIGN.md
 *.pdf
+
+# machine-local data symlinks and run junk
+mujoco_eval/setup/*_d0
+MUJOCO_LOG.TXT
+figures/
+pot_scene_fix.py
