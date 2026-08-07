@@ -32,6 +32,8 @@ _RING_PAD = 0.02
 _SUPPORT_MAX_HALF = 0.10
 _MIN_RING_PTS = 50
 _MASK_ESCAPE_TOL = 8.0
+# Fraction of a detection box whose depth must fall inside the workspace for it to be a candidate.
+_BOX_IN_WORKSPACE = 0.5
 _OBSTACLE_MIN_H = 0.01
 
 
@@ -189,8 +191,10 @@ class Perception:
 
     def calibrate(self, env):
         """Measure static fixture masks and points."""
-        if self.segment == "sam_vlm":
-            self._bounds = workspace_bounds_from_scene(env.env, margin=0.6)
+        self._bounds = workspace_bounds_from_scene(env.env, margin=0.6)
+        if self._bounds[0] is not None:
+            print(f"[perception] workspace bounds {np.round(self._bounds[0], 2)} .. "
+                  f"{np.round(self._bounds[1], 2)}", flush=True)
         if not self.fixtures:
             return
         _, points, m, id_to_prim = camera_to_rekep_inputs(env.cam, 0)
@@ -491,7 +495,7 @@ class Perception:
 
         _, image_torch = load_pil_image(Image.fromarray(rgb).convert("RGB"))
         H, W = rgb.shape[:2]
-        boxes = self._assign(self._detect(image_torch, W, H))
+        boxes = self._assign(self._in_workspace(self._detect(image_torch, W, H)))
         if not boxes:
             return {}
 
@@ -514,8 +518,36 @@ class Perception:
                 print(f"[perception] '{name}' mask escaped its detection box "
                       f"({escaped:.0f}px average bleed); rejected this frame", flush=True)
                 continue
+            inside = self._workspace_fraction(m)
+            if inside is not None and inside < _BOX_IN_WORKSPACE:
+                # The box survived the workspace test but the mask SAM grew inside it did not:
+                # the detector boxed a piece of the room, not a task object.
+                print(f"[perception] '{name}' mask lies {(1 - inside) * 100:.0f}% outside the "
+                      f"workspace; rejected this frame", flush=True)
+                continue
             out[name] = m
+        if os.environ.get("VLMDP_SEG_DEBUG"):
+            self._dump_segmentation(rgb, out, boxes)
         return out
+
+    def _dump_segmentation(self, rgb, masks, boxes):
+        """Write an annotated segmentation frame for offline inspection."""
+        img = np.ascontiguousarray(rgb.copy())
+        for i, (name, m) in enumerate(masks.items()):
+            colour = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255),
+                      (0, 255, 255)][i % 6]
+            cnts, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(img, cnts, -1, colour, 2)
+            x0, y0, x1, y1 = (int(round(float(v))) for v in boxes[name])
+            cv2.rectangle(img, (x0, y0), (x1, y1), colour, 1)
+            cv2.putText(img, name, (x0, max(y0 - 4, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        colour, 2, cv2.LINE_AA)
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "results", "vlm_mpc", "vlm_base",
+                            f"seg_debug_p{os.getpid()}_{len(self._sig)}.png")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        cv2.imwrite(path, img[..., ::-1])
+        print(f"[perception] segmentation debug frame -> {path}", flush=True)
 
     def _detect(self, image_torch, W, H) -> dict:
         """Return plausible detection boxes for each prompt."""
@@ -534,6 +566,56 @@ class Perception:
             xyxy = box_ops.box_cxcywh_to_xyxy(b) * torch.Tensor([W, H, W, H])
             dets[name] = [(xyxy[i].numpy(), float(logits[i])) for i in range(len(logits))]
         return dets
+
+    def _workspace_mask(self):
+        """Return the per-pixel in-workspace test, or None when there is no workspace box."""
+        if self._bounds is None or self._bounds[0] is None or self.points is None:
+            return None
+        lo, hi = self._bounds
+        pts = self.points
+        return (np.isfinite(pts).all(axis=-1)
+                & (pts[..., 0] >= lo[0]) & (pts[..., 0] <= hi[0])
+                & (pts[..., 1] >= lo[1]) & (pts[..., 1] <= hi[1])
+                & (pts[..., 2] >= lo[2]) & (pts[..., 2] <= hi[2]))
+
+    def _workspace_fraction(self, mask):
+        """Fraction of a mask's depth-carrying pixels that fall inside the workspace."""
+        within = self._workspace_mask()
+        if within is None:
+            return None
+        finite = mask & np.isfinite(self.points).all(axis=-1)
+        n = int(finite.sum())
+        return None if n < _MIN_PIXELS else float((finite & within).sum()) / n
+
+    def _in_workspace(self, dets) -> dict:
+        """Drop detections that mostly lie outside the task workspace.
+
+        An open-vocabulary detector asked for a "teapot" in a furnished room will happily return
+        the bookcase across the room at a respectable score, and the Hungarian assignment has no
+        way to prefer the real one. Depth does: the task's objects are, by construction, inside
+        the workspace box, and a box whose points mostly are not is not one of them.
+        """
+        within = self._workspace_mask()
+        if within is None:
+            return dets
+        h, w = within.shape
+        out = {}
+        for name, boxes in dets.items():
+            kept = []
+            for box, score in boxes:
+                x0, y0, x1, y1 = (int(round(float(v))) for v in box)
+                x0, y0 = max(x0, 0), max(y0, 0)
+                x1, y1 = min(max(x1, 0), w), min(max(y1, 0), h)
+                if x1 <= x0 or y1 <= y0:
+                    continue
+                patch = within[y0:y1, x0:x1]
+                if float(patch.mean()) >= _BOX_IN_WORKSPACE:
+                    kept.append((box, score))
+            if len(kept) != len(boxes):
+                print(f"[perception] '{name}': dropped {len(boxes) - len(kept)} of {len(boxes)} "
+                      f"detections lying outside the workspace", flush=True)
+            out[name] = kept
+        return out
 
     def _assign(self, dets) -> dict:
         """Assign one unique detection box to each label."""

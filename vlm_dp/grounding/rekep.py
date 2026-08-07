@@ -32,6 +32,14 @@ _REST_TOL = 0.10
 _SEAT_BAND = 0.005
 _MIN_LOCAL_PTS = 20
 _MIN_GRASP_EXT = 0.012
+
+# Radius of the cloud patch used to measure an object's width at its grasp keypoint.
+_GRASP_PROBE_R = 0.03
+# A segmentation sanity bound: how much wider than its own USD bounding box an object's observed
+# cloud may be before we call the mask wrong rather than the object big.
+_GROSS_EXT_FACTOR, _GROSS_EXT_PAD = 3.0, 0.05
+# How far a grasp keypoint may sit from the nearest point of the object it is supposed to be on.
+_KP_ON_OBJECT = 0.10
 _RESTS_ON_SUPPORT = 0.03
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -186,6 +194,7 @@ class RekepGrounding:
                         print(f"[ext-diag] {_n}: {d}", flush=True)
         else:
             extents = usd_extents(env, scene_objects)
+            usd = extents
         tracker = KeypointTracker(world, keypoints)
         if gt_meta is not None:
 
@@ -211,8 +220,30 @@ class RekepGrounding:
             for _f in os.listdir(vlm_dir):
                 if _f.endswith("_constraints.txt") or _f == "metadata.json":
                     os.remove(os.path.join(vlm_dir, _f))
+        roles, declared = {}, {}
         if self.vlm == "fake":
-            metadata, _ = fake_vlm.generate(self.task_key, vlm_dir, keypoints, grounded, env.env, self.clearance)
+            metadata, roles, extra_kps = fake_vlm.generate(self.task_key, vlm_dir, keypoints, grounded,
+                                                           env.env, self.clearance)
+            if extra_kps:
+                # Points the plan needs that no proposal stands for (a thin lid rim, a place in
+                # mid-air, a recess inside a fixture). Appended after the tracker exists, so they
+                # are registered here by hand rather than re-running the association.
+                first = len(keypoints)
+                keypoints = np.concatenate(
+                    [np.asarray(keypoints, dtype=np.float64),
+                     np.stack([np.asarray(p, dtype=np.float64) for p, _ in extra_kps])], axis=0)
+                grounded["keypoints"] = keypoints
+                for point, owner in extra_kps:
+                    point = np.asarray(point, dtype=np.float64)
+                    if owner is None:
+                        tracker.registrations.append((None, point))
+                    else:
+                        _p, _r = world.object_pose(owner)
+                        tracker.registrations.append((owner, _r.T @ (point - _p)))
+                    declared[len(tracker.owners)] = owner
+                    tracker.owners.append(owner)
+                print(f"[rekep] fake VLM declared keypoints {list(range(first, len(keypoints)))} "
+                      f"owners={[o for _, o in extra_kps]}", flush=True)
         else:
             metadata = self._real_constraints(vlm_dir, grounded, config)
         bad = [i for i in metadata["grasp_keypoints"] + metadata["release_keypoints"] if not -1 <= i < len(keypoints)]
@@ -248,11 +279,24 @@ class RekepGrounding:
 
         kp_of, centroid_off, grasp_axis, grasp_ext_of, seat_off = {}, {}, {}, {}, {}
         grasp_region_of = {}
+        clouds, probe_ext = {}, {}
         for name in scene_objects:
             pts = masks._masked_points(grounded, env.env, name)
             if pts is None:
                 continue
+            clouds[name] = pts
             gk = grasp_kp_of.get(name)
+
+            # What the gripper actually closes on: the object's width *at the grasp point*, not
+            # the width of the whole object. A teapot is 96mm across and its handle is not; a
+            # coffee machine is 166mm across and its lid rim is not. Measured unconditionally
+            # (it is a few hundred distance computations) but only consulted when the
+            # whole-object width would rule a graspable feature un-graspable.
+            if gk is not None:
+                near = pts[np.linalg.norm(pts - keypoints[gk], axis=1) <= _GRASP_PROBE_R]
+                if near.shape[0] >= _MIN_LOCAL_PTS:
+                    lo, hi = np.percentile(near[:, :2], [5, 95], axis=0)
+                    probe_ext[name] = max(float(np.min(hi - lo)) / 2.0, _MIN_GRASP_EXT)
 
 
             obj_support = support_top
@@ -312,6 +356,13 @@ class RekepGrounding:
                     print(f"[grasp-region] {name}: half_len={half_len:.3f}m along {np.round(long_axis, 2)}",
                           flush=True)
 
+        # A declared grasp keypoint IS the grasp point (a lid rim, not the machine's centroid), so
+        # it overrides the cloud-centroid estimate its owner would otherwise be grasped at. Same
+        # rule the gt_meta block below applies to privileged keypoints.
+        for k, owner in declared.items():
+            if owner is not None and k in metadata["grasp_keypoints"]:
+                kp_of[owner], centroid_off[owner] = k, np.zeros(3)
+
         if gt_meta is not None:
 
 
@@ -342,9 +393,17 @@ class RekepGrounding:
 
         for _n in scene_objects:
             if _n in kp_of:
-                err = np.linalg.norm(obj_pos(_n) - env.object_pose(_n)[0]) * 1000
+                try:
+                    _gt = env.object_pose(_n)[0]
+                except Exception:
+                    # A named distractor need not be a simulator entity (it exists only to give
+                    # the segmenter somewhere to put a competing mask). No truth to compare to.
+                    print(f"[rekep-dbg] {_n}: grasp_center={np.round(obj_pos(_n), 3)} "
+                          f"(no simulator pose, distractor only)", flush=True)
+                    continue
+                err = np.linalg.norm(obj_pos(_n) - _gt) * 1000
                 print(f"[rekep-dbg] {_n}: grasp_center={np.round(obj_pos(_n), 3)} "
-                      f"gt={np.round(env.object_pose(_n)[0], 3)} err={err:.1f}mm", flush=True)
+                      f"gt={np.round(_gt, 3)} err={err:.1f}mm", flush=True)
 
         objects = [SceneObject(name=n, pos=(lambda n=n: obj_pos(n)), extents=extents.get(n, _DEFAULT_EXTENT),
                                axis=grasp_axis.get(n), grasp_extent=grasp_ext_of.get(n),
@@ -400,7 +459,8 @@ class RekepGrounding:
 
         if self.stages == "vlm":
             stages, manipulated = self._vlm_stages(metadata, tracker, keypoints, name_for,
-                                                   load_stage, objects, env, dev, vlm_dir)
+                                                   load_stage, objects, env, dev, vlm_dir,
+                                                   probe_ext, clouds, usd, roles)
             return Grounding(objects=objects, stages=stages, manipulated=frozenset(manipulated),
                              keypoints=(lambda: tracker.get_positions()))
 
@@ -482,12 +542,99 @@ class RekepGrounding:
                 else float(extents.get(name, _DEFAULT_EXTENT)[0]))
         return ("pinch", grip) if grip <= self.open_half else ("press", grip)
 
-    def _vlm_stages(self, metadata, tracker, keypoints, name_for, load_stage, objects, env, dev, vlm_dir):
+    def _effective_contact(self, name, obj_ext, local_ext, probe_ext):
+        """Decide pinch vs press, falling back to the width at the grasp point."""
+        mode, grip = self._contact_for(name, obj_ext, local_grip=local_ext.get(name))
+        if mode == "press" and probe_ext.get(name) is not None:
+            alt_mode, alt_grip = self._contact_for(name, obj_ext, local_grip=probe_ext[name])
+            if alt_mode == "pinch":
+                return alt_mode, alt_grip, f"width at the grasp point, r={_GRASP_PROBE_R:g}m"
+        return mode, grip, "whole-object width"
+
+    def _preflight(self, metadata, keypoints, name_for, obj_ext, local_ext, probe_ext,
+                   usd_ext, clouds, roles):
+        """Refuse to roll out on grounding the plan cannot act on.
+
+        Every failure here used to be discovered ~50 minutes later as an inexplicably bad rollout.
+        The checks are all on quantities the compiler has already computed, so healthy grounding
+        pays nothing for them.
+        """
+        problems, claimed = [], {}
+        for role, kp in sorted((roles or {}).items()):
+            if not isinstance(kp, (int, np.integer)) or int(kp) < 0:
+                continue
+            kp = int(kp)
+            if kp in claimed:
+                problems.append(f"roles {claimed[kp]!r} and {role!r} both resolved to keypoint "
+                                f"{kp} -- the plan would drive two different things to one point")
+            claimed[kp] = role
+            # A role named after an object has to land on that object. Without this the plan can
+            # compile cleanly around a keypoint that belongs to something else entirely.
+            pts = clouds.get(role)
+            if pts is not None and 0 <= kp < len(keypoints):
+                off = float(np.linalg.norm(pts - keypoints[kp], axis=1).min())
+                if off > _KP_ON_OBJECT:
+                    problems.append(f"role {role!r} resolved to keypoint {kp}, which is "
+                                    f"{off * 1e3:.0f}mm off the nearest point of {role!r} itself")
+
+        # Segmentation sanity, for every object at once: a mask that has run off its object onto
+        # the scene shows up as a cloud far wider than the object's own bounding box.
+        for name, pts in sorted(clouds.items()):
+            usd = usd_ext.get(name)
+            if usd is None or pts.shape[0] < _MIN_LOCAL_PTS:
+                continue
+            grip = float(obj_ext.get(name, _DEFAULT_EXTENT)[0])
+            bound = max(_GROSS_EXT_FACTOR * float(usd[0]), float(usd[0]) + _GROSS_EXT_PAD)
+            if grip > bound:
+                problems.append(f"{name!r} segments {grip * 1e3:.0f}mm wide against a "
+                                f"{float(usd[0]) * 1e3:.0f}mm USD half-width: the mask has run off "
+                                f"the object onto the scene")
+
+        for i, gk in enumerate(metadata["grasp_keypoints"]):
+            if gk < 0:
+                continue
+            name = name_for(gk)
+            pts = clouds.get(name)
+            if name is None or pts is None or pts.shape[0] < _MIN_LOCAL_PTS:
+                problems.append(f"stage {i + 1} grasps keypoint {gk}, whose object "
+                                f"({name!r}) has no usable point cloud "
+                                f"({0 if pts is None else int(pts.shape[0])} points): the segmenter "
+                                f"did not find it, or the keypoint landed on nothing")
+                continue
+            span = float(np.max(pts.max(axis=0) - pts.min(axis=0)))
+            if span < 2 * _MIN_GRASP_EXT:
+                problems.append(f"{name!r} (grasped by stage {i + 1}) has a degenerate cloud: "
+                                f"largest span {span * 1e3:.0f}mm")
+                continue
+            off = float(np.linalg.norm(pts - keypoints[gk], axis=1).min())
+            if off > _KP_ON_OBJECT:
+                problems.append(f"stage {i + 1} grasp keypoint {gk} sits {off * 1e3:.0f}mm off the "
+                                f"nearest point of {name!r} -- the role did not land on its object")
+            if self.contact_criterion != "plan":
+                mode, width, src = self._effective_contact(name, obj_ext, local_ext, probe_ext)
+                if mode == "press":
+                    problems.append(
+                        f"{name!r} is grasped by stage {i + 1} but its grip half-width is "
+                        f"{width * 1e3:.0f}mm ({src}) against a {self.open_half * 1e3:.0f}mm "
+                        f"gripper aperture, so the stage would compile as a press: either the mask "
+                        f"is wrong or the role resolved to the wrong object")
+        if problems:
+            raise SystemExit("[rekep-preflight] grounding is not usable for this plan; refusing to "
+                             "roll out:\n  - " + "\n  - ".join(problems))
+        print(f"[rekep-preflight] OK: {len(claimed)} distinct roles, grasp objects "
+              f"{sorted({name_for(k) for k in metadata['grasp_keypoints'] if k >= 0})} all "
+              f"pinchable within the {self.open_half * 1e3:.0f}mm aperture", flush=True)
+
+    def _vlm_stages(self, metadata, tracker, keypoints, name_for, load_stage, objects, env, dev, vlm_dir,
+                    probe_ext=None, clouds=None, usd_ext=None, roles=None):
         """Build stages directly from VLM constraints."""
         obj_names = [o.name for o in objects]
         obj_center = {o.name: o.pos for o in objects}
         obj_ext = {o.name: o.extents for o in objects}
         local_ext = {o.name: o.grasp_extent for o in objects if o.grasp_extent is not None}
+        probe_ext, clouds, usd_ext = probe_ext or {}, clouds or {}, usd_ext or {}
+        self._preflight(metadata, keypoints, name_for, obj_ext, local_ext, probe_ext,
+                        usd_ext, clouds, roles)
 
         def kp_point(k):
             return lambda k=k: tracker.get_positions()[k]
@@ -551,10 +698,10 @@ class RekepGrounding:
                     print(f"[rekep-vlm] {name}: contact={'press' if press else 'pinch'} (plan structure)",
                           flush=True)
                 else:
-                    mode, grip = self._contact_for(name, obj_ext, local_grip=local_ext.get(name))
+                    mode, grip, src = self._effective_contact(name, obj_ext, local_ext, probe_ext)
                     press = mode == "press"
                     print(f"[rekep-vlm] {name}: contact={mode} (grip half-width {grip * 1e3:.0f}mm vs "
-                          f"{self.open_half * 1e3:.0f}mm aperture)", flush=True)
+                          f"{self.open_half * 1e3:.0f}mm aperture, {src})", flush=True)
                 manipulated.add(name)
 
 
