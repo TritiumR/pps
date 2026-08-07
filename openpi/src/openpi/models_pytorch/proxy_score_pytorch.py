@@ -9,6 +9,28 @@ import torch.nn.functional as F  # noqa: N812
 from transformers.cache_utils import DynamicCache
 
 
+def make_att_2d_masks(pad_masks: Tensor, att_masks: Tensor) -> Tensor:
+    """pi0 / big_vision block mask: token i sees j iff cumsum(att)[j] <= cumsum(att)[i].
+
+    att_masks is per token: 1 starts a new block, 0 continues the previous one. So a run of
+    zeros is one MUTUALLY VISIBLE block, and blocks are causal with respect to each other.
+    The model already declares this -- embed_prefix emits [0]*num_img_embs (the DINO patches are
+    one block) and embed_suffix emits [1] for the state then [1] + [0]*(H-1) for the action chunk
+    -- and both call sites were discarding it, which is what left the expert fully causal.
+    """
+    cumsum = torch.cumsum(att_masks.to(torch.int32), dim=1)
+    att_2d = cumsum[:, None, :] <= cumsum[:, :, None]
+    pad_2d = pad_masks[:, None, :] * pad_masks[:, :, None]
+    return att_2d & pad_2d.to(torch.bool)
+
+
+def _to_additive_4d(att_2d: Tensor, dtype: torch.dtype) -> Tensor:
+    """[B, Q, K] bool -> [B, 1, Q, K] additive mask (0 keep, -inf drop)."""
+    out = torch.zeros(att_2d.shape[0], 1, att_2d.shape[1], att_2d.shape[2],
+                      dtype=dtype, device=att_2d.device)
+    return out.masked_fill(~att_2d[:, None], torch.finfo(dtype).min)
+
+
 def _two_block_mask(pad_masks: Tensor, n_suffix: int, dtype: torch.dtype,
                     n_query: int | None = None) -> Tensor:
     """Build the [B, 1, Q, K] additive mask the diffusion head is supposed to use.
@@ -289,7 +311,27 @@ class ProxyScorePytorch(nn.Module):
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
         att_masks = att_masks[None, :].expand(pad_masks.shape[0], len(att_masks))
+        # Stashed because both call sites discard the returned value; _run_diffusion_head needs it
+        # to build the block mask, and threading it through three signatures would touch the
+        # serving path for no benefit.
+        self._last_prefix_att = att_masks
         return embs, pad_masks, att_masks
+
+    def build_attention_mask(self, pad_masks, att_masks, *, query_offset=0):
+        """Mask handed to the Gemma expert. Same contract as ProxyPytorch's.
+
+        Disabled -> return the 2-D pad mask and let HF build its causal mask (legacy).
+        Enabled  -> build the pi0 block mask ourselves and hand it over as a 4-D additive mask,
+        which HF forwards unchanged. query_offset is the number of cached prefix tokens when only
+        the suffix is being queried.
+        """
+        if not getattr(self, "bidirectional_suffix", False):
+            return pad_masks
+        att_2d = make_att_2d_masks(pad_masks, att_masks)
+        if query_offset:
+            att_2d = att_2d[:, query_offset:, :]
+        return _to_additive_4d(att_2d, pad_masks.dtype if pad_masks.is_floating_point()
+                               else torch.float32)
 
     def embed_suffix(self, state, noisy_actions, timestep, cond=None):
         embs = []
@@ -345,6 +387,7 @@ class ProxyScorePytorch(nn.Module):
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
+        self._last_suffix_att = att_masks
         return embs, pad_masks, att_masks, None
 
     @torch.no_grad()
@@ -406,9 +449,22 @@ class ProxyScorePytorch(nn.Module):
         # token sees every other diffusion token. self.bidirectional_suffix=False restores the old
         # behaviour exactly, for checkpoints trained under it.
         attn = pad_masks
-        if getattr(self, "bidirectional_suffix", True):
-            attn = _two_block_mask(pad_masks, suffix_embs.shape[1], embs.dtype,
-                                   n_query=embs.shape[1])
+        if getattr(self, "bidirectional_suffix", False):
+            pa = getattr(self, "_last_prefix_att", None)
+            sa = getattr(self, "_last_suffix_att", None)
+            if (pa is not None and sa is not None
+                    and pa.shape[1] + sa.shape[1] == pad_masks.shape[1]):
+                # The model's OWN declared block structure: DINO patches are one mutually visible
+                # block, the state its own, the action chunk another. Hardcoding a causal prefix
+                # (the previous _two_block_mask) left patch i unable to attend to patch j > i --
+                # the same defect proxy_pytorch's bidirectional_attention flag fixes.
+                att = torch.cat([pa.expand(pad_masks.shape[0], -1).to(torch.int32),
+                                 sa.expand(pad_masks.shape[0], -1).to(torch.int32)], dim=1)
+                attn = self.build_attention_mask(
+                    pad_masks, att, query_offset=pad_masks.shape[1] - embs.shape[1])
+            else:
+                attn = _two_block_mask(pad_masks, suffix_embs.shape[1], embs.dtype,
+                                       n_query=embs.shape[1])
         hidden_states, _ = self.expert_model.forward(
             attention_mask=attn,
             position_ids=position_ids,

@@ -2148,8 +2148,14 @@ def train(args: argparse.Namespace) -> None:
             # stores the raw JSON payload (flat, mean/std alongside the descriptors). Write it
             # directly rather than reshaping into a form only that helper wants.
             config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            # bidirectional_suffix must describe THIS training run, not the cache-generation run
+            # that produced the stats. The cache is built by a separate process whose environment
+            # says nothing about how the reference is trained, and a checkpoint that mis-declares
+            # its own mask gets served under the wrong attention pattern.
+            _stats_out = dict(_ref_norm_stats)
+            _stats_out["bidirectional_suffix"] = os.environ.get("MG_PROXY_BIDIR_SUFFIX", "0") == "1"
             (config.checkpoint_dir / ACTION_NORM_STATS_FILENAME).write_text(
-                json.dumps(_ref_norm_stats, indent=2, sort_keys=True))
+                json.dumps(_stats_out, indent=2, sort_keys=True))
             _copy_action_norm_stats(config, global_step)
         if pbar is not None:
             pbar.update(1)

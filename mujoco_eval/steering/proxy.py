@@ -615,6 +615,7 @@ class AdditiveScoreSteering:
             slope = slope[None, :]                 # one flat scale, broadcast over rows
         s_planner = s_proxy[:, : x.shape[1], :] * slope[None]
         addend = self.gamma * (w[:, None, None] * s_planner).sum(axis=0)
+        ref_field = None
         if self.ref == "proxy":
             # PPS Eq (4) proper: the reference is a proxy distilled from the base, so the
             # difference isolates the task increment while the shared prior cancels. Scored on
@@ -632,7 +633,8 @@ class AdditiveScoreSteering:
             r_planner = s_ref[:, :rows_ref, :] * slope[None, :rows_ref]
             if rows_ref < addend.shape[0]:
                 r_planner = np.pad(r_planner, ((0, 0), (0, addend.shape[0] - rows_ref), (0, 0)))
-            addend = addend - self.gamma * (w[:, None, None] * r_planner).sum(axis=0)
+            ref_field = (w[:, None, None] * r_planner).sum(axis=0)
+            addend = addend - self.gamma * ref_field
         elif self.ref == "base":
             # PPS Eq (4) with v_ref := v_base, i.e. Eq (3): (1-gamma)*base + gamma*task.
             # A convex interpolation, bounded at every gamma -- unlike base + gamma*task,
@@ -672,6 +674,17 @@ class AdditiveScoreSteering:
         task_dir = a_rows + b_rows if self.ref == "base" else a_rows
         denom = np.linalg.norm(task_dir) * np.linalg.norm(b_rows)
         cos = float(task_dir @ b_rows / denom) if denom > 1e-12 else float("nan")
+        # PPS Eq (4) assumes the reference is an on-policy distillation of the base, so that
+        # s_base - s_ref cancels and the residual is a pure task increment. That assumption is
+        # never checked; if s_ref points elsewhere the residual carries a spurious -s_ref drag.
+        _ref = {}
+        if ref_field is not None:
+            r_rows = np.asarray(ref_field, dtype=np.float64).reshape(-1)[: b_rows.size]
+            bb = b_rows[: r_rows.size]
+            dn = np.linalg.norm(r_rows) * np.linalg.norm(bb)
+            _ref = {"cos_ref_base": round(float(r_rows @ bb / dn), 4) if dn > 1e-12 else None,
+                    "ref_over_base": round(float(np.linalg.norm(r_rows)
+                                                 / max(np.linalg.norm(bb), 1e-9)), 4)}
         self.level_trace.append({
             "it": int(iteration),
             "n_scored": int(x.shape[0]),
@@ -680,6 +693,7 @@ class AdditiveScoreSteering:
             "task_norm": round(float(np.linalg.norm(task_dir)), 4),
             "cos_task_base": round(cos, 4),
             "ratio": round(add_norm / max(base_norm, 1e-9), 4),
+            **_ref,
             **_supp,
             "wall_s": round(wall_s, 3),
             "server_s": round(server_s, 3)})
