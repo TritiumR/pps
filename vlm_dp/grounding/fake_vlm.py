@@ -13,6 +13,18 @@ _TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gt_vlm
 # the templated one -- with the difference that every stage keeps its constraints under `_vlm`.
 _LIFT_HEIGHT = 0.15
 
+# Transport geometry the plan references: how high the hover point sits above the place
+# point, and how much slack the carry-height path rule allows below the lift height.
+_CARRY_HOVER, _CARRY_SLACK = 0.10, 0.03
+
+# Capsule geometry, in the machine-root frame. Same numbers vlm_dp/grounding/capsule.py and
+# vlm_dp/offline_context.py use: the pod bay sits on the machine's vertical axis, and the lid
+# travels roughly this far up when it swings open.
+_CAPSULE_BAY_LOCAL = np.array([0.0, 0.0, 0.27])
+_CAPSULE_LID_OPEN_LIFT = np.array([0.0, 0.0, 0.12])
+# Thickness of the "top slab" of the machine cloud the lid lip is searched in.
+_CAPSULE_LID_BAND = 0.04
+
 
 def _render(task_key, out_dir, **fields):
     """Render a task's raw.txt plan into the per-stage files the loader reads.
@@ -100,9 +112,18 @@ def _weight(out_dir, keypoints, grounded, env, clearance):
     # the carried object's own keypoint would be degenerate (the target would track the object).
     lift = {n: (keypoints[k] + np.array([0.0, 0.0, _LIFT_HEIGHT]) - keypoints[s]).tolist()
             for n, k in (("pear", p), ("apple", a))}
+    # Hover point for the transport stage: the place point raised by the carry clearance, so
+    # the descent in the following stage is straight down.
+    hover = {n: (np.array(off[n]) + np.array([0.0, 0.0, _CARRY_HOVER])).tolist()
+             for n in ("pear", "apple")}
+    # Absolute world height the plan's path rule forbids dropping below while carrying.
+    carry_z = {n: float(keypoints[k][2] + _LIFT_HEIGHT - _CARRY_SLACK)
+               for n, k in (("pear", p), ("apple", a))}
     metadata = _render("weight", out_dir, p=p, a=a, s=s,
                        off_pear=off["pear"], off_apple=off["apple"],
-                       lift_pear=lift["pear"], lift_apple=lift["apple"])
+                       lift_pear=lift["pear"], lift_apple=lift["apple"],
+                       hover_pear=hover["pear"], hover_apple=hover["apple"],
+                       carry_z_pear=carry_z["pear"], carry_z_apple=carry_z["apple"])
     # vlm_dp extension, not part of the ReKep response format the parser understands.
     metadata["steer_policies"] = ["on_failure"] * metadata["num_stages"]
     with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
@@ -113,17 +134,74 @@ def _weight(out_dir, keypoints, grounded, env, clearance):
 
 
 def _capsule(out_dir, keypoints, grounded, env, clearance):
-    """Generate the fixed capsule-task constraint plan."""
-    lip, open_goal, pod, bay = 0, 1, 2, 3
-    lift_pod = (keypoints[pod] + np.array([0.0, 0.0, _LIFT_HEIGHT]) - keypoints[bay]).tolist()
+    """Resolve the capsule roles against the live scene, then render the fixed plan.
+
+    Three of the four roles have no proposed keypoint to snap to: the lid lip is a thin rim the
+    proposer rarely samples, the open goal is a place in mid-air, and the bay is a recess inside
+    the machine. They are *declared* instead -- returned as extra keypoints the caller appends and
+    registers (the same trick `kp_source=gt` uses for its virtual points), so the plan can name
+    them without any of them being a keypoint index the proposer happened to hand us.
+
+    Only the pod is resolved by snapping, because the can is a real, segmented, movable object
+    and its keypoint has to travel with it.
+    """
+    pts = {}
+    for name in ("can", "capsule"):
+        p = _masked_points(grounded, env, name)
+        if p is None:
+            raise SystemExit(f"[fake-vlm] no masked points for {name}")
+        pts[name] = p
+
+    # The machine is a declared fixture: perception.calibrate() already reads its mask from the
+    # simulator rather than the segmenter, so reading its (static) root pose here grants no
+    # privilege the perception path did not already have. Everything below is measured from it or
+    # from the machine's own point cloud -- no keypoint is copied from vlm_dp.grounding.capsule.
+    data = env.scene["capsule"].data
+    root = data.root_pos_w[0].cpu().numpy().astype(np.float64)
+    quat = data.root_quat_w[0].cpu().numpy()
+    front = _quat_rotate_wxyz(quat, np.array([0.0, -1.0, 0.0]))
+
+    # Lid lip: the front-most point of the machine's top slab, from the observed cloud.
+    mach = pts["capsule"]
+    band = mach[mach[:, 2] >= float(np.percentile(mach[:, 2], 99)) - _CAPSULE_LID_BAND]
+    lip_world = band[int(np.argmax((band - root) @ front))].astype(np.float64)
+    open_world = lip_world + _CAPSULE_LID_OPEN_LIFT
+    bay_world = root + _quat_rotate_wxyz(quat, _CAPSULE_BAY_LOCAL)
+
+    pod = _nearest_kp_distinct(keypoints, pts["can"].mean(axis=0), set())
+    n = len(keypoints)
+    lip, open_goal, bay = n, n + 1, n + 2
+    extra = [(lip_world, "capsule"), (open_world, None), (bay_world, "capsule")]
+
+    kps = np.concatenate([np.asarray(keypoints, dtype=np.float64),
+                          np.stack([lip_world, open_world, bay_world])], axis=0)
+    lift_pod = (kps[pod] + np.array([0.0, 0.0, _LIFT_HEIGHT]) - kps[bay]).tolist()
     metadata = _render("capsule", out_dir, lip=lip, open_goal=open_goal, pod=pod, bay=bay,
                        lift_pod=lift_pod)
     with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
 
-    print(f"[fake-vlm] capsule GT plan: grasp lid kp{lip} -> open to kp{open_goal} -> "
-          f"grasp pod kp{pod} -> place at bay kp{bay}", flush=True)
-    return metadata, {"lid": lip, "pod": pod, "bay": bay}
+    print(f"[fake-vlm] capsule roles pod=kp{pod} (snapped, {np.round(kps[pod], 3)}) "
+          f"lip=kp{lip} (declared, {np.round(lip_world, 3)}) "
+          f"open_goal=kp{open_goal} (declared, {np.round(open_world, 3)}) "
+          f"bay=kp{bay} (declared, {np.round(bay_world, 3)})", flush=True)
+    _capsule_lip_diagnostic(env, lip_world)
+    return metadata, {"lid": lip, "open_goal": open_goal, "pod": pod, "bay": bay}, extra
+
+
+def _capsule_lip_diagnostic(env, lip_world):
+    """Report how far the measured lid lip sits from the privileged one (diagnostic only)."""
+    try:
+        from vlm_dp.grounding.capsule import gt_keypoints
+        from types import SimpleNamespace
+
+        gt_kps, _ = gt_keypoints(SimpleNamespace(env=env))
+        err = float(np.linalg.norm(np.asarray(gt_kps[0]) - lip_world)) * 1e3
+        print(f"[fake-vlm] capsule lip check: measured {np.round(lip_world, 3)} vs privileged "
+              f"{np.round(np.asarray(gt_kps[0]), 3)} ({err:.0f}mm) -- diagnostic only, "
+              f"the plan uses the measured point", flush=True)
+    except Exception as exc:                       # never let a diagnostic break grounding
+        print(f"[fake-vlm] capsule lip check unavailable ({exc})", flush=True)
 
 
 def _quat_rotate_wxyz(quat, vec):
@@ -247,9 +325,15 @@ _FAKE_VLMS = {"weight": _weight, "capsule": _capsule, "tea": _tea, "pot": _pot}
 
 
 def generate(task_key, out_dir, keypoints, grounded, env, clearance=0.015):
-    """Write fake VLM metadata and constraint files for a task."""
+    """Write fake VLM metadata and constraint files for a task.
+
+    Returns ``(metadata, roles, extra_keypoints)``. ``extra_keypoints`` is a list of
+    ``(world_point, owner_name_or_None)`` the task declared: points the plan needs that no
+    proposed keypoint stands for. The caller appends them and registers them for tracking.
+    """
     if task_key not in _FAKE_VLMS:
         raise SystemExit(f"[fake-vlm] no fake VLM for task {task_key!r}, register one in _FAKE_VLMS "
                          f"(have: {sorted(_FAKE_VLMS)})")
     os.makedirs(out_dir, exist_ok=True)
-    return _FAKE_VLMS[task_key](out_dir, keypoints, grounded, env, clearance)
+    out = _FAKE_VLMS[task_key](out_dir, keypoints, grounded, env, clearance)
+    return (out[0], out[1], out[2] if len(out) > 2 else ())
