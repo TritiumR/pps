@@ -52,7 +52,7 @@ def project_env(env, pts, camera="agentview", hw=512):
     return world_to_pixel(model, data, _camera_id(model, camera), np.asarray(pts), hw, hw)
 
 
-def draw_keypoints(frame, pixels, visible, labels=None, radius=7):
+def draw_keypoints(frame, pixels, visible, labels=None, radius=7, width=2):
     """Overlay numbered keypoint dots, ReKep style (the form the VLM prompt expects)."""
     from PIL import Image, ImageDraw
 
@@ -62,7 +62,7 @@ def draw_keypoints(frame, pixels, visible, labels=None, radius=7):
         if not ok:
             continue
         draw.ellipse([u - radius, v - radius, u + radius, v + radius],
-                     fill=_OBJ_COLOR, outline=_RING, width=2)
+                     fill=_OBJ_COLOR, outline=_RING, width=width)
         draw.text((u + radius + 2, v - radius - 2), str(i) if labels is None else str(labels[i]),
                   fill=_RING)
     return np.asarray(img)
@@ -77,6 +77,23 @@ def draw_path(frame, pixels, visible, color=_PATH, width=2):
     pts = [tuple(p) for p, ok in zip(pixels, visible) if ok]
     if len(pts) >= 2:
         draw.line(pts, fill=color, width=width)
+    return np.asarray(img)
+
+
+def draw_labels(frame, items, radius=3):
+    """Mark each (text, (x, y), colour) with a small dot and its label.
+
+    Ported from Cory's AWE waypoint renderer, which labels every ghost W1..Wn at the centroid of
+    its mask -- without it a stack of ghosts is one blob and no single waypoint is identifiable.
+    """
+    from PIL import Image, ImageDraw
+
+    img = Image.fromarray(np.ascontiguousarray(frame))
+    draw = ImageDraw.Draw(img)
+    for text, (x, y), color in items:
+        draw.ellipse([x - radius, y - radius, x + radius, y + radius],
+                     fill=color, outline=_RING, width=1)
+        draw.text((x + radius + 2, y - radius - 3), str(text), fill=color)
     return np.asarray(img)
 
 
@@ -145,18 +162,27 @@ def composite_ghost(base, ghost, mask, alpha):
 
 
 def annotate_rollout_frame(env, keypoints=None, subgoal_pt=None, ee_path=None,
-                           camera="agentview", hw=512, lines=(), ghosts=()):
-    """One debug frame: keypoints, the active subgoal target, and the executed EE path."""
+                           camera="agentview", hw=512, lines=(), ghosts=(), radius=None,
+                           ghost_labels=()):
+    """One debug frame: keypoints, the active subgoal target, and the executed EE path.
+
+    Dot size scales with the frame. The VLM prompt image (annotate_keypoints) keeps the fixed
+    ReKep radius; here a 7px dot that reads well at 512 hides the object outright at 256.
+    """
     frame = env.rgb(camera, hw=hw)
+    r = int(radius) if radius else max(3, round(hw / 64))
+    ring = 1 if r <= 5 else 2
     if keypoints is not None and len(keypoints):
         px, vis = project_env(env, keypoints, camera=camera, hw=hw)
-        frame = draw_keypoints(frame, px, vis)
+        frame = draw_keypoints(frame, px, vis, radius=r, width=ring)
     if ee_path is not None and len(ee_path) >= 2:
         px, vis = project_env(env, ee_path, camera=camera, hw=hw)
         frame = draw_path(frame, px, vis)
     if subgoal_pt is not None:
         px, vis = project_env(env, np.asarray(subgoal_pt).reshape(1, 3), camera=camera, hw=hw)
-        frame = draw_keypoints(frame, px, vis, labels=["goal"], radius=9)
+        frame = draw_keypoints(frame, px, vis, labels=["goal"], radius=r + 2, width=ring)
     for ghost, mask, alpha in ghosts:
         frame = composite_ghost(frame, ghost, mask, alpha)
+    if ghost_labels:                       # after compositing, so the marks sit on top
+        frame = draw_labels(frame, ghost_labels)
     return draw_text_lines(frame, lines) if lines else frame

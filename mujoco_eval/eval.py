@@ -75,6 +75,10 @@ def build_parser():
                    help="alpha interpolates prior_weight_high -> prior_weight as noise falls")
 
     g = p.add_argument_group("grounding")
+    g.add_argument("--ghost_style", default="ours", choices=("ours", "cory"),
+                   help="goal-row ghost renderer: 'ours' (cyan waypoints + magenta keypose, "
+                        "two-pass mask) or 'cory' (his single cyan, segmentation mask, "
+                        "normalised trail alpha) -- see mujoco_eval/ghost_cory.py")
     g.add_argument("--ground", default="gt", choices=("gt", "rekep", "rekep_vlm"),
                    help="rekep: artifact keypoints + constraint costs; rekep_vlm: stages "
                         "emitted from the VLM metadata alone")
