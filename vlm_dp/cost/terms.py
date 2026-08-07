@@ -723,6 +723,65 @@ def carry_hold(I):
     return (gripper - (1.0 - release)).pow(2).mean(dim=1)
 
 
+@register("carry_accel")
+def carry_accel(I):
+    """Penalty: end-effector acceleration above a cap while a payload is held.
+
+    Slip forensics (57 slips, Isaac-Weight, simple_grip_eps12 vs the hand-written baseline):
+    objects shear out of a still-closed gripper during high-acceleration motion, mostly in the
+    first ~0.4s after lift. P(fall within 5 steps) is <=7% below ~2.2 m/s^2 and 44-86% above
+    ~3.6 m/s^2; baseline carry |a| is median 1.10 / p90 3.09 m/s^2 against 2.26-2.59 / ~5.8 for
+    the VLM config. So: cap the magnitude, do not penalise motion below the cap.
+
+    Units: I.ee_pos is [N,H,3] over the executed action chunk, one row per env control step at
+    CONTROL_FREQUENCY = 15 Hz (eval_steering.py), so the step spacing is dt = 1/15 s. The second
+    finite difference is m/step^2; dividing by dt^2 puts the term in physical m/s^2 so that
+    carry_accel_max is directly readable as m/s^2 (unlike smooth/joint_delta, which are joint
+    space and unit-step by convention). Override dt via geometry carry_accel_dt if the control
+    rate changes.
+
+    Shear weighting: slips are xy(shear)-dominant, so the z component is down-weighted by
+    carry_accel_z_weight (0.5) rather than dropped -- vertical jerk still unloads the pinch.
+
+    Peak, not mean: friction fails at the INSTANT of peak shear, so this is a pointwise
+    constraint. The residual slips under the horizon-mean version were single-step spikes
+    (pre-slip 5-step max |a| median 4.87 m/s^2 against a 1.57 background) that a mean over
+    ~10 horizon rows diluted by an order of magnitude. The reduction is a hard amax: the
+    planner (mbd_score_action_prox) ranks sampled candidates through a softmax over their
+    costs and never differentiates the cost, so the non-differentiability of a max costs
+    nothing here, and max-of-continuous is still continuous in the candidate. Note that a
+    SUSTAINED violation scores the same under amax as under mean, so the pinned weight (40)
+    keeps its calibrated meaning; only isolated spikes stop being averaged away.
+
+    Chunk boundary: the first two rows of a replanned chunk have no acceleration defined
+    against the executed past, so a chunk could start with an arbitrarily large jerk for
+    free. When the bridge supplies context["eef_hist"] (the last measured TCP positions, one
+    control step apart, most recent last) those rows are prepended so row 0 is scored too.
+    They are measured while the chunk rows are commanded, so a standing tracking lag shows up
+    as boundary acceleration -- shared by all candidates, and still ranking the gentler ones
+    first. Absent (early episode, other configs) the term silently keeps the old behaviour.
+    """
+    if I.context.get("payload") is None:            # robot-knowledge only, self-gating
+        return _zeros(I)
+    pos = I.ee_pos
+    if pos is None or pos.ndim != 3:
+        return _zeros(I)
+    hist = I.context.get("eef_hist")
+    if hist is not None:
+        h = torch.as_tensor(hist, device=pos.device, dtype=pos.dtype).reshape(-1, 3)[-2:]
+        if h.shape[0]:
+            pos = torch.cat([h.unsqueeze(0).expand(pos.shape[0], -1, -1), pos], dim=1)
+    if pos.shape[1] < 3:                            # need >=3 samples for a 2nd difference
+        return _zeros(I)
+    dt = float(getattr(I.geom, "carry_accel_dt", 1.0 / 15.0))
+    a_max = float(getattr(I.geom, "carry_accel_max", 2.0))          # m/s^2
+    wz = float(getattr(I.geom, "carry_accel_z_weight", 0.5))
+    accel = (pos[:, 2:] - 2.0 * pos[:, 1:-1] + pos[:, :-2]) / max(dt * dt, 1e-12)  # [N,H-2,3]
+    scale = accel.new_tensor([1.0, 1.0, wz])
+    mag = torch.linalg.vector_norm(accel * scale.view(1, 1, 3), dim=-1)
+    return torch.clamp(mag - a_max, min=0.0).pow(2).amax(dim=1)     # one-sided hinge, squared
+
+
 def _carried_pos(I, payload_pos):
     """Carried payload per candidate: candidate TCP + (measured payload - measured TCP)."""
     tcp = torch.as_tensor(I.context["eef_pos"], device=I.ee_pos.device, dtype=I.ee_pos.dtype)

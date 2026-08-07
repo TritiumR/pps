@@ -120,6 +120,7 @@ class VlmDpBridge:
         self.seat_from_plane = bool(cost_cfg.get("grounding", {}).get("seat_from_plane", False))
         self.support_extents = bool(cost_cfg.get("grounding", {}).get("support_extents", False))
         self.kp_source = cost_cfg.get("grounding", {}).get("kp_source", "perception")
+        self.subgoal_eps = float(cost_cfg.get("grounding", {}).get("subgoal_eps", 0.06))
         # "feasibility" uses geometry; "plan" uses stage structure.
         self.contact_criterion = cost_cfg.get("grounding", {}).get("contact_criterion", "feasibility")
         if self.state == "real" and (self.flag_fallback or self.advance_mode == "env_flags"):
@@ -145,6 +146,11 @@ class VlmDpBridge:
         self._open_run = 0
         self._close_val = 1.0
         self._z_hist = []                    # Never stage-reset; contact detection spans stage changes.
+        # Measured TCP one control step back, for carry_accel's chunk-boundary rows. Sampled
+        # per applied step only when a config actually asks for the term, so every other
+        # config pays nothing and sees no new context key.
+        self._track_eef_hist = "carry_accel" in self.terms
+        self._eef_last = None
         self._contact_prev = False
         self._last_cmd_close = False
         self._reset_churn()
@@ -190,6 +196,7 @@ class VlmDpBridge:
                 self._settle(raw_env)
         except ImportError:
             pass
+        self._eef_last = None                # no cross-episode TCP history
         self.env = DroidEnv.attach(raw_env, device=self.device)
         self.sensor = ApertureGraspSensor(stall_margin=self.stall_margin, settle_eps=self.settle_eps,
                                           close_steps=self.close_steps, settle_steps=self.settle_steps,
@@ -201,7 +208,7 @@ class VlmDpBridge:
         src = get_source(self.ground_name, task_key=self.task_key, perception=percep,
                          seat_shift=self.seat_shift, local_grasp=self.local_grasp,
                          local_grasp_radius=self.local_grasp_radius, kp_source=self.kp_source,
-                         contact_criterion=self.contact_criterion,
+                         contact_criterion=self.contact_criterion, subgoal_eps=self.subgoal_eps,
                          rotate_grasp_offset=self.rotate_grasp_offset,
                          lift_latch_xy=self.lift_latch_xy, seat_from_plane=self.seat_from_plane,
                          open_half=float(self.geom.get("open_half", 0.04)), **self.roles)
@@ -378,6 +385,12 @@ class VlmDpBridge:
         if getattr(self, "_eef_prev", None) is not None and int(executed_steps) > 0:
             ctx["eef_step_motion"] = float(np.linalg.norm(eef_now - self._eef_prev)) / int(executed_steps)
         self._eef_prev = eef_now
+        # Chunk-boundary history for carry_accel: the TCP one control step ago and now, so
+        # the acceleration of the first planned row is defined against the executed past.
+        # Omitted before the first executed step of an episode -> the term keeps its old shape.
+        if self._track_eef_hist and self._eef_last is not None:
+            ctx["eef_hist"] = np.stack([self._eef_last,
+                                        eef_now.astype(np.float32)]).astype(np.float32)
         ctx["released"] = bool(self.sensor.released()) if self.sensor is not None else False
         ctx["hold_grace"] = self._hold_grace_value(st)
         auth = self._steer_authority(st)
@@ -454,11 +467,29 @@ class VlmDpBridge:
 
     def observe_step(self, action_step):
         """Record sensor evidence for one applied control step."""
+        self._sample_eef()
         if self.sensor_cadence == "replan":
             return                                   # observe_plan already sampled this chunk
         commanded_close = bool(float(torch.as_tensor(action_step).reshape(-1)[7]) > 0.5)
         self._last_cmd_close = commanded_close
         self._observe_sensors(commanded_close)
+
+    def _sample_eef(self):
+        """Record the measured TCP before this control step (carry_accel boundary rows only).
+
+        Called once per APPLIED step, so consecutive samples are exactly one control step
+        apart -- the spacing carry_accel's second difference assumes. The frame is the one
+        build_context reports as ctx["eef_pos"], which is the frame the planner optimizes in.
+        """
+        if not self._track_eef_hist or self.env is None:
+            return
+        try:
+            frame = self.env.env.scene["ee_frame"]
+            frame.update(0.0, force_recompute=True)
+            self._eef_last = np.asarray(
+                frame.data.target_pos_w[0, 0].detach().cpu(), dtype=np.float32)
+        except Exception:                            # never let bookkeeping break a rollout
+            self._eef_last = None
 
     def _observe_sensors(self, commanded_close: bool) -> None:
         """Record one shared world and aperture-sensor observation."""

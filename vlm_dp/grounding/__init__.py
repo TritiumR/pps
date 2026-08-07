@@ -124,6 +124,7 @@ def get_source(name: str, **kwargs) -> GroundingSource:
                               local_grasp_radius=kwargs.get("local_grasp_radius", 0.05),
                               kp_source=kwargs.get("kp_source", "perception"),
                               contact_criterion=kwargs.get("contact_criterion", "feasibility"),
+                              subgoal_eps=kwargs.get("subgoal_eps", 0.06),
                               open_half=kwargs.get("open_half", 0.04),
                               rotate_grasp_offset=kwargs.get("rotate_grasp_offset", False),
                               lift_latch_xy=kwargs.get("lift_latch_xy", False),

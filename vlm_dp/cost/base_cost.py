@@ -62,6 +62,7 @@ TERM_ROLES = {
     "grasp_descend_rate": "prior",
     "grasp_standoff": "prior",
     "place_approach_rate": "prior",
+    "carry_accel": "prior",
     "carry_liftoff": "prior",
     "carry_altitude": "prior",
     "descend_gate": "prior",
