@@ -314,7 +314,12 @@ def _pot(out_dir, keypoints, grounded, env, clearance):
                         pts["pot"][:, 2].max()])
     egg_off = (rim_top + np.array([0.0, 0.0, 0.02]) - keypoints[pot]).tolist()
 
-    metadata = _render("pot", out_dir, lid=lid, egg=egg, pot=pot, lid_off=lid_off, egg_off=egg_off)
+    # Lift targets: pick-up pose raised _LIFT_HEIGHT, anchored to the pot keypoint (the pot
+    # stays put; anchoring to the carried object's own keypoint would be degenerate).
+    lift_lid = (keypoints[lid] + np.array([0.0, 0.0, _LIFT_HEIGHT]) - keypoints[pot]).tolist()
+    lift_egg = (keypoints[egg] + np.array([0.0, 0.0, _LIFT_HEIGHT]) - keypoints[pot]).tolist()
+    metadata = _render("pot", out_dir, lid=lid, egg=egg, pot=pot, lid_off=lid_off, egg_off=egg_off,
+                       lift_lid=lift_lid, lift_egg=lift_egg)
     with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
     print(f"[fake-vlm] pot roles lid=kp{lid} egg=kp{egg} pot=kp{pot}", flush=True)

@@ -6,13 +6,20 @@
 #
 # Task: "remove the lid of the pot and put egg in it"
 #
-# The task involves four stages:
+# The task involves six stages:
 # 1. Grasp the pot lid.
-# 2. Set the lid aside on the table.
-# 3. Grasp the egg.
-# 4. Place the egg into the pot.
+# 2. Lift the lid clear of the pot.
+# 3. Set the lid aside on the table.
+# 4. Grasp the egg.
+# 5. Lift the egg clear of the table.
+# 6. Place the egg into the pot.
+#
+# Stages 2 and 5 are explicit lifts. They carry no grasp or release keypoint; their sub-goal
+# constraint certifies the hold before transport begins. Without them the plan advances to
+# transport on grasp proximity alone and discovers mid-carry that the hand is empty
+# (measured on weight: 21 of 23 recoveries were "empty hand").
 
-num_stages = 4
+num_stages = 6
 
 
 ### stage 1 sub-goal constraints
@@ -25,8 +32,8 @@ def stage1_subgoal_constraint1(end_effector, keypoints):
 
 ### stage 2 sub-goal constraints
 def stage2_subgoal_constraint1(end_effector, keypoints):
-    """The lid (keypoint {lid}) rests on the table, clear of the pot (keypoint {pot})."""
-    offsetted_point = keypoints[{pot}] + np.array({lid_off})
+    """The lid (keypoint {lid}) is raised to carry height above its pick-up pose."""
+    offsetted_point = keypoints[{pot}] + np.array({lift_lid})
     return np.linalg.norm(keypoints[{lid}] - offsetted_point)
 
 ### stage 2 path constraints
@@ -36,20 +43,42 @@ def stage2_path_constraint1(end_effector, keypoints):
 
 ### stage 3 sub-goal constraints
 def stage3_subgoal_constraint1(end_effector, keypoints):
-    """Align the end-effector with the egg (keypoint {egg})."""
-    return np.linalg.norm(end_effector - keypoints[{egg}])
+    """The lid (keypoint {lid}) rests on the table, clear of the pot (keypoint {pot})."""
+    offsetted_point = keypoints[{pot}] + np.array({lid_off})
+    return np.linalg.norm(keypoints[{lid}] - offsetted_point)
 
 ### stage 3 path constraints
-# No path constraints needed for grasping.
+def stage3_path_constraint1(end_effector, keypoints):
+    """The robot must still be grasping the lid (keypoint {lid})."""
+    return get_grasping_cost_by_keypoint_idx({lid})
 
 ### stage 4 sub-goal constraints
 def stage4_subgoal_constraint1(end_effector, keypoints):
+    """Align the end-effector with the egg (keypoint {egg})."""
+    return np.linalg.norm(end_effector - keypoints[{egg}])
+
+### stage 4 path constraints
+# No path constraints needed for grasping.
+
+### stage 5 sub-goal constraints
+def stage5_subgoal_constraint1(end_effector, keypoints):
+    """The egg (keypoint {egg}) is raised to carry height above its pick-up pose."""
+    offsetted_point = keypoints[{pot}] + np.array({lift_egg})
+    return np.linalg.norm(keypoints[{egg}] - offsetted_point)
+
+### stage 5 path constraints
+def stage5_path_constraint1(end_effector, keypoints):
+    """The robot must still be grasping the egg (keypoint {egg})."""
+    return get_grasping_cost_by_keypoint_idx({egg})
+
+### stage 6 sub-goal constraints
+def stage6_subgoal_constraint1(end_effector, keypoints):
     """The egg (keypoint {egg}) rests just above the pot rim (keypoint {pot})."""
     offsetted_point = keypoints[{pot}] + np.array({egg_off})
     return np.linalg.norm(keypoints[{egg}] - offsetted_point)
 
-### stage 4 path constraints
-def stage4_path_constraint1(end_effector, keypoints):
+### stage 6 path constraints
+def stage6_path_constraint1(end_effector, keypoints):
     """The robot must still be grasping the egg (keypoint {egg})."""
     return get_grasping_cost_by_keypoint_idx({egg})
 
@@ -58,9 +87,9 @@ def stage4_path_constraint1(end_effector, keypoints):
 Summarize keypoints to be grasped in all grasping stages.
 For a grasping stage write the keypoint index; for a non-grasping stage write -1.
 """
-grasp_keypoints = [{lid}, -1, {egg}, -1]
+grasp_keypoints = [{lid}, -1, -1, {egg}, -1, -1]
 
 """
 Summarize at **the end of which stage** the robot should release each keypoint.
 """
-release_keypoints = [-1, {lid}, -1, {egg}]
+release_keypoints = [-1, -1, {lid}, -1, -1, {egg}]
