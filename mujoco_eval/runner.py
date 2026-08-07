@@ -276,6 +276,10 @@ def infer_chunk(planner, env, ctx, args, stage_key=None, steer=None, x0_init=Non
 
     planner.begin_inference()
     stats = {}
+    # stats is reassigned every level, so only the last (tightest, least discriminating) cloud
+    # reaches the record. Whether the cost separates candidates is a question about the early
+    # levels, so keep the planner's own per-level softmax diagnostics.
+    base_levels = []
     for it in range(args.num_steps + 1):
         if steer is not None and steer.mode == "tilt":
             t = steer.tilt_for(it, args.num_steps + 1, planner.policy, args.tilt_lambda,
@@ -326,7 +330,17 @@ def infer_chunk(planner, env, ctx, args, stage_key=None, steer=None, x0_init=Non
         else:
             x_t, stats = planner.step_mbd_score_action_prox(
                 x_t, inputs, ctx, iteration=it, num_iterations=args.num_steps + 1)
+        if stats:
+            base_levels.append({
+                "it": int(it),
+                "ess": round(float(stats.get("weight_ess", float("nan"))), 2),
+                "cost_min": round(float(stats.get("cost_min", float("nan"))), 5),
+                "cost_std": round(float(stats.get("cost_std", float("nan"))), 5),
+                "weight_max": round(float(stats.get("weight_max", float("nan"))), 5)})
 
+    if base_levels:
+        stats = dict(stats)
+        stats["base_levels"] = base_levels
     if steer is not None:
         ctx.pop("inject", None)
         ctx.pop("score_addend", None)
@@ -338,7 +352,36 @@ def infer_chunk(planner, env, ctx, args, stage_key=None, steer=None, x0_init=Non
         out["x_final"] = x_t.detach().clone()
     dec = decode_model_action_chunks(planner.policy, inputs, x_t, apply_clamp=True,
                                      current_joint_pos=q0, max_joint_delta=args.delta_clip)
+    stats = _clamp_saturation(planner, inputs, x_t, q0, args, dec, stats)
     return dec.real_actions[0].detach().cpu().numpy(), stats, w_plan
+
+
+def _clamp_saturation(planner, inputs, x_t, q0, args, dec, stats):
+    """Measure how often the execution clamp rewrites the plan the optimiser chose.
+
+    Candidates are costed unclamped (planner.cost_executable_actions defaults False) while
+    execution clamps per-step joint delta, so a saturating clamp means the scored plan is not the
+    executed one. The tell is the median executed |dq| sitting exactly at delta_clip.
+    """
+    clip = float(args.delta_clip)
+    if clip <= 0.0:
+        return stats
+    try:
+        raw = decode_model_action_chunks(planner.policy, inputs, x_t, apply_clamp=False,
+                                         current_joint_pos=q0)
+        a_raw = raw.real_actions[0].detach().cpu().numpy()[:, :7]
+        a_exe = dec.real_actions[0].detach().cpu().numpy()[:, :7]
+        q = np.asarray(q0, dtype=np.float64).reshape(-1)[:7]
+        d_raw = np.abs(np.diff(np.vstack([q, a_raw]), axis=0)).max(axis=1)
+        d_exe = np.abs(np.diff(np.vstack([q, a_exe]), axis=0)).max(axis=1)
+        stats = dict(stats)
+        stats["exec_dq_median"] = float(np.median(d_exe))
+        stats["exec_dq_frac_at_clip"] = float((d_exe >= clip - 1e-6).mean())
+        stats["raw_dq_median"] = float(np.median(d_raw))
+        stats["raw_dq_over_clip_frac"] = float((d_raw > clip + 1e-6).mean())
+    except Exception:
+        pass                       # a diagnostic must never cost the rollout
+    return stats
 
 
 def keypose_fk_chunk(planner, env, ctx, args, stage_key, steer, out=None):
@@ -963,7 +1006,9 @@ def _handoff_due(args, s, step, fired):
 
 def rollout(args):
     out_dir = paths.results_dir(args.task, args.exp)
-    jsonl_path, video_path = out_dir / f"{args.seed}.jsonl", out_dir / f"{args.seed}.mp4"
+    # Success is only known at the end, so the trace streams to _pending/ and is filed under
+    # success/ or failure/ once the episode summary exists.
+    jsonl_path = paths.pending_path(out_dir, args.seed, "jsonl")
     s = _setup(args)
 
     t_ep = time.perf_counter()
@@ -1023,6 +1068,11 @@ def rollout(args):
                              handoff=handoff_step)
     log.episode(final)
     log.close()
+    trace_path = paths.episode_path(out_dir, args.seed, success, "trace", "jsonl")
+    jsonl_path.replace(trace_path)
+    jsonl_path = trace_path
+    paths.prune_pending(out_dir)
+    video_path = paths.episode_path(out_dir, args.seed, success, "videos", "mp4")
     if s.client is not None:
         s.client.close()
 
@@ -1037,6 +1087,7 @@ def rollout(args):
                    "subgoal": (_stage.target if callable(getattr(_stage, "target", None)) else None),
                    "ee_path": ee_trace,
                    "goals": goal_trace,
+                   "ghost_style": args.ghost_style,
                    "lines": lambda i: [f"{args.task} | {args.exp}",
                                        f"step {i}/{len(states) - 1}"]}
     record.save_video(s.env, states, video_path, overlay=overlay)

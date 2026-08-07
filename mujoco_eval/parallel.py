@@ -24,6 +24,19 @@ def parse_seeds(spec):
     return seeds
 
 
+def filed_outcome(out_dir, seed):
+    """Read the outcome back off the path the runner filed the trace under.
+
+    Returns None when the episode never produced a summary (crash or timeout), which is
+    distinct from a clean failure and leaves that seed's log in _pending/ for inspection.
+    """
+    for success in (True, False):
+        outcome = "success" if success else "failure"
+        if (out_dir / outcome / "trace" / f"{seed}_{outcome}.jsonl").exists():
+            return success
+    return None
+
+
 def episode_success(jsonl_path):
     """Return whether an episode log contains a successful result."""
     try:
@@ -85,6 +98,13 @@ def main():
         help="total thread budget across workers; default is the idle core count",
     )
     parser.add_argument(
+        "--wandb",
+        action="store_true",
+        help="publish the run summary to wandb; summary.json is written either way",
+    )
+    parser.add_argument("--wandb_project", default="mujoco-eval")
+    parser.add_argument("--wandb_entity", default=None)
+    parser.add_argument(
         "rest",
         nargs=argparse.REMAINDER,
         help="args after -- go to the eval CLI",
@@ -99,7 +119,9 @@ def main():
 
     seeds = parse_seeds(args.seeds)
     env = worker_env(args.workers, args.threads)
-    log_dir = paths.results_dir(args.task, args.exp)
+    # Pin the day once so a run crossing midnight does not split across two directories.
+    env["MUJOCO_EVAL_DAY"] = paths.run_day()
+    log_dir = paths.results_dir(args.task, args.exp, day=env["MUJOCO_EVAL_DAY"])
 
     print(
         f"[par] {len(seeds)} seeds, {args.workers} workers, "
@@ -121,7 +143,7 @@ def main():
             *passthrough,
         ]
         log = open(
-            log_dir / f"{seed}.log",
+            paths.pending_path(log_dir, seed, "log"),
             "w",
             encoding="utf-8",
         )
@@ -163,9 +185,13 @@ def main():
 
             if return_code is not None:
                 del running[seed]
-                success = episode_success(
-                    log_dir / f"{seed}.jsonl"
-                )
+                outcome = filed_outcome(log_dir, seed)
+                success = bool(outcome)
+                pending_log = paths.pending_path(log_dir, seed, "log")
+                if outcome is not None and pending_log.exists():
+                    pending_log.replace(
+                        paths.episode_path(log_dir, seed, success, "logs", "log")
+                    )
                 results[seed] = (return_code, success)
                 print(
                     f"[par] seed {seed} done "
@@ -173,6 +199,12 @@ def main():
                     flush=True,
                 )
 
+    paths.prune_pending(log_dir)
+    # Nothing recorded what a run actually was, so arms could not be compared after the fact.
+    (log_dir / "config.json").write_text(
+        json.dumps({"task": args.task, "exp": args.exp, "seeds": args.seeds,
+                    "workers": args.workers, "passthrough": list(passthrough)}, indent=2),
+        encoding="utf-8")
     successful = sum(
         1
         for _, success in results.values()
@@ -195,6 +227,15 @@ def main():
         f"({clean_exits} clean exits, {timeouts} timeouts)",
         flush=True,
     )
+
+    # Always write summary.json; publish only when asked. Aggregation reads the filed traces, so
+    # a failure here cannot lose a completed sweep.
+    from . import wandb_log
+    try:
+        wandb_log.publish(args.task, args.exp, project=args.wandb_project,
+                          entity=args.wandb_entity, use_wandb=args.wandb)
+    except Exception as exc:
+        print(f"[par] summary/publish failed: {exc}", flush=True)
 
 
 if __name__ == "__main__":
