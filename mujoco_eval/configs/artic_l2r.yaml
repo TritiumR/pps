@@ -1,0 +1,91 @@
+# artic_l2r -- the Language-to-Rewards ablation of artic.yaml, for the drawer tasks.
+#
+# L2R (CoRL 2023) specifies "open the drawer" with TWO reward terms -- palm close to the handle,
+# and the drawer joint to a target -- and lets MuJoCo MPC discover reach/grip/pull, because its
+# rollout simulates contact. Our planner scores joint trajectories through FK only
+# (sim_free_mpc/planner.py cost_from_positions: no mj_step, no contact), so the question is
+# whether that emergence is available to us at all.
+#
+# Task specification, mapped from their manipulator API (Table 4):
+#   reach        <- "manipulator's palm should move close to drawer_handle"
+#   hook_pull    <- "drawer needs to be open"  (move joint to target value)
+#   place_reach  <- "object1 should be close to object2"
+#
+# Kept because MJPC gets them free from physics and we must state them; they are not task spec:
+#   floor, clear
+# Kept as their always-on regularizers (Posture 0.01, act_dot 2e-5):
+#   smooth, joint_delta
+#
+# Everything else in artic.yaml is dropped -- 26 terms -> 7. In particular NO close_gripper /
+# carry_hold / grasp shaping: L2R never scripts the gripper, it emerges from contact. If the
+# drawer never opens here while artic.yaml opens it, the ceiling is the rollout model rather than
+# the cost, and no amount of cost simplification will move it.
+#
+# Derived from: artic.yaml (geometry/advance/grounding/planner blocks copied verbatim so the
+# only difference between the arms is the term set).
+
+cost:
+  terms:
+    reach: 8.0
+    hook_pull: 20.0
+    place_reach: 100.0
+    floor: 40.0
+    clear: 0.1
+    smooth: 5.04
+    joint_delta: 3.5
+  geometry:
+    ee_r: 0.035
+    coll_clear: 0.02
+    finger_r: 0.012
+    open_half: 0.04
+    tool_back: 0.06
+    tcp_to_tip: 0.0
+    center_scale: 0.4
+    grasp_dead_zone: proportional
+    close_z_scale: 0.025
+    preshape_z: 0.025
+    release_step_motion_cap: 0.008
+    retreat_margin: 0.02
+    retreat_clear: 0.04
+    rise_first_span: 0.05
+    rise_first_step: 0.02
+    not_hold_sigma: 0.05
+    carry_clear_include_placed: true
+    carry_clear_margin: 0.005
+    preshape_xy_tol: 0.02
+    corridor_margin: 0.01
+    grasp_approach_cap: 0.016
+    grasp_brake_slope: 0.5
+    place_approach_cap: 0.024
+    place_brake_slope: 0.5
+    grasp_descend_closing_only: true
+    approach_hover: 0.08
+    approach_xy_tol: 0.02
+    close_xy_floor: 0.008
+    aperture_margin: 0.006
+    release_xy: 0.06
+    release_z: 0.02
+    place_approach_margin: 0.01
+    release_commit_aniso: true
+    commit_measured_gate: true
+    release_commit_band: 3.0
+    place_descend_radius: 0.08
+    place_release_clearance: 0.012
+    clear_max_radius: 0.1
+advance:
+  flag_fallback: false
+  release_debug: true
+  grasp_advance_on_hold: true
+  ground_error_debug: true
+grounding:
+  rotate_grasp_offset: false
+  support_extents: false
+  seat_from_plane: true
+  lift_latch_xy: false
+steering:
+  dwell_k: 2.0
+planner:
+  interpolate: 'on'
+  interpolation_method: bspline
+  interpolate_frequency: 10.0
+  interpolate_high_frequency: 20.0
