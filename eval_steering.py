@@ -426,12 +426,43 @@ def _run_multi_worker_launcher(pre_args: argparse.Namespace, argv: list[str]) ->
         rollout_offset += worker_seed_end - worker_seed_start
 
     def terminate_workers() -> None:
+        # A worker that is blocked waiting on the start barrier is inside Isaac Sim, which
+        # installs its own SIGTERM handling and does not necessarily exit on it. Escalate to
+        # SIGKILL, otherwise the "wait for every worker to exit" loop below never returns and
+        # the whole job burns its wall clock with nothing running.
+        live = []
         for worker in workers:
             process = worker["process"]
             if process is not None and process.poll() is None:
                 process.terminate()
+                live.append(process)
+        deadline = time.time() + 30.0
+        for process in live:
+            try:
+                process.wait(timeout=max(deadline - time.time(), 0.1))
+            except subprocess.TimeoutExpired:
+                process.kill()
+
+    def report_worker_failure(worker, reason: str) -> None:
+        """Surface a dead worker's own last words; they are only in its log file."""
+        if worker["log_handle"] is not None:
+            worker["log_handle"].flush()
+        try:
+            with open(worker["log_path"], encoding="utf-8", errors="replace") as handle:
+                tail = [line.rstrip() for line in handle.readlines()[-40:]]
+        except OSError:
+            tail = []
+        print(
+            f"worker {worker['id']} (gpu {worker['gpu']}, seeds "
+            f"{worker['seed_start']}-{worker['seed_end'] - 1}) failed to initialize: {reason}. "
+            f"Tail of {worker['log_path']}:",
+            file=sys.stderr,
+        )
+        for line in tail:
+            print(f"  | {line}", file=sys.stderr)
 
     atexit.register(terminate_workers)
+    init_stall_s = float(os.environ.get("VLMDP_WORKER_INIT_STALL_S", 300.0))
     failed_to_initialize = False
     for wave_start in range(0, len(workers), len(gpu_ids)):
         wave = workers[wave_start : wave_start + len(gpu_ids)]
@@ -450,13 +481,40 @@ def _run_multi_worker_launcher(pre_args: argparse.Namespace, argv: list[str]) ->
                 stdout=worker["log_handle"],
                 stderr=subprocess.STDOUT,
             )
+        for worker in wave:
+            worker["progress_size"] = 0
+            worker["progress_time"] = time.time()
         while not all(worker["ready"] for worker in wave):
             for worker in workers:
                 _read_worker_progress(worker)
+            now = time.time()
             for worker in wave:
-                return_code = worker["process"].poll()
-                if return_code is not None and not worker["ready"]:
-                    failed_to_initialize = True
+                if worker["ready"]:
+                    continue
+                reason = None
+                if worker["process"].poll() is not None:
+                    reason = f"process exited with code {worker['process'].returncode}"
+                else:
+                    # A worker that aborts during grounding (e.g. the ReKep preflight refusing an
+                    # unusable mask) raises SystemExit, and Isaac Sim then wedges on shutdown --
+                    # the process never exits, so polling alone never notices. Treat a worker that
+                    # has stopped emitting init progress as failed, or the launcher waits forever.
+                    try:
+                        size = os.path.getsize(worker["progress_path"])
+                    except OSError:
+                        size = worker["progress_size"]
+                    if size != worker["progress_size"]:
+                        worker["progress_size"] = size
+                        worker["progress_time"] = now
+                    elif now - worker["progress_time"] > init_stall_s:
+                        reason = (f"no initialization progress for {init_stall_s:.0f}s while still "
+                                  f"running (hung, most likely after a fatal error)")
+                if reason is None:
+                    continue
+                if not worker.get("reported"):
+                    worker["reported"] = True
+                    report_worker_failure(worker, reason)
+                failed_to_initialize = True
             if failed_to_initialize:
                 break
             time.sleep(0.1)
