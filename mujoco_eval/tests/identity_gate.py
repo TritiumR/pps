@@ -18,6 +18,8 @@ import pathlib
 import subprocess
 import sys
 
+from mujoco_eval import paths
+
 WALL_FIELDS = {"wall_s", "episode_wall_s", "replan_wall_median_s", "replan_wall_mean_s",
                "proxy_wall_s", "proxy_server_s", "proxy_embed_s"}
 
@@ -70,10 +72,13 @@ def run_case(legacy, task, seed, config, legacy_config, extra, candidates, resul
          "--config", config, *common],
         cwd=str(pathlib.Path(__file__).resolve().parents[2]), env=env, check=True,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # The legacy side is an external checkout and keeps the flat layout; only the new side moved.
     old = pathlib.Path(legacy) / "results" / task / f"{tag}_old"
-    new = pathlib.Path(results) / task / f"{tag}_new"
-    return compare(old / f"{seed}.jsonl", new / f"{seed}.jsonl",
-                   old / f"{seed}.mp4", new / f"{seed}.mp4")
+    new = paths.find_run(task, f"{tag}_new") or pathlib.Path(results) / task / f"{tag}_new"
+    return compare(old / f"{seed}.jsonl",
+                   paths.seed_artifact(new, seed, "trace", "jsonl"),
+                   old / f"{seed}.mp4",
+                   paths.seed_artifact(new, seed, "videos", "mp4"))
 
 
 def main():

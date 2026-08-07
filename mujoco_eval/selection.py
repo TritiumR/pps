@@ -126,9 +126,10 @@ def score_arm(task, base_dir, seeds, m):
 
         for sampler_seed in range(m):
             episode = read_episode(
-                base_dir
-                / f"k{sampler_seed}"
-                / f"{seed}.jsonl"
+                paths.seed_artifact(
+                    base_dir / f"k{sampler_seed}", seed, "trace", "jsonl"
+                )
+                or base_dir / f"k{sampler_seed}" / f"{seed}.jsonl"
             )
             score = (
                 round(
@@ -190,7 +191,8 @@ def score_arm(task, base_dir, seeds, m):
 
 def run_pool(args, seeds, passthrough):
     """Run missing seed and sampler combinations with bounded parallelism."""
-    source_dir = paths.RESULTS / args.task / args.from_exp
+    source_dir = (paths.find_run(args.task, args.from_exp)
+                  or paths.RESULTS / args.task / args.from_exp)
 
     env = dict(os.environ)
     env.setdefault("MUJOCO_GL", "egl")
@@ -205,9 +207,10 @@ def run_pool(args, seeds, passthrough):
     for seed in seeds:
         for sampler_seed in range(args.m):
             episode_path = (
-                source_dir
-                / f"k{sampler_seed}"
-                / f"{seed}.jsonl"
+                paths.seed_artifact(
+                    source_dir / f"k{sampler_seed}", seed, "trace", "jsonl"
+                )
+                or source_dir / f"k{sampler_seed}" / f"{seed}.jsonl"
             )
             if read_episode(episode_path)["complete"]:
                 continue
@@ -348,7 +351,8 @@ def main():
 
     per_seed, summary = score_arm(
         args.task,
-        paths.RESULTS / args.task / args.from_exp,
+        (paths.find_run(args.task, args.from_exp)
+         or paths.RESULTS / args.task / args.from_exp),
         seeds,
         args.m,
     )
