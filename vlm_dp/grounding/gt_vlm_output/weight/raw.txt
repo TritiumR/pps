@@ -6,13 +6,21 @@
 #
 # Task: "put pear and apple on the scale"
 #
-# The task involves four stages:
+# The task involves six stages:
 # 1. Grasp the pear.
-# 2. Place the pear on the scale.
-# 3. Grasp the apple.
-# 4. Place the apple on the scale.
+# 2. Lift the pear clear of the board.
+# 3. Place the pear on the scale.
+# 4. Grasp the apple.
+# 5. Lift the apple clear of the board.
+# 6. Place the apple on the scale.
+#
+# Stages 2 and 5 are explicit lifts. They carry no grasp or release keypoint, so the `template`
+# compiler would drop them and inject its own hand-coded lift instead; under the `_vlm` compiler
+# they become `move` stages whose sub-goal constraint gates advancement. Without them the plan
+# advances to transport on grasp proximity alone and discovers mid-carry that the hand is empty
+# (measured: 21 of 23 backtracks were "empty hand").
 
-num_stages = 4
+num_stages = 6
 
 
 ### stage 1 sub-goal constraints
@@ -25,38 +33,64 @@ def stage1_subgoal_constraint1(end_effector, keypoints):
 
 ### stage 2 sub-goal constraints
 def stage2_subgoal_constraint1(end_effector, keypoints):
+    """The pear (keypoint {p}) is raised to its carry height above the pick-up pose."""
+    offsetted_point = keypoints[{s}] + np.array({lift_pear})
+    return np.linalg.norm(keypoints[{p}] - offsetted_point)
+
+### stage 2 path constraints
+def stage2_path_constraint1(end_effector, keypoints):
+    """The robot must still be holding the pear (keypoint {p})."""
+    return get_grasping_cost_by_keypoint_idx({p})
+
+### stage 3 sub-goal constraints
+def stage3_subgoal_constraint1(end_effector, keypoints):
     """The pear (keypoint {p}) rests at the scale-top placement point."""
     offsetted_point = keypoints[{s}] + np.array({off_pear})
     return np.linalg.norm(keypoints[{p}] - offsetted_point)
 
-### stage 2 path constraints
-# No path constraints.
-
-### stage 3 sub-goal constraints
-def stage3_subgoal_constraint1(end_effector, keypoints):
-    """Align the end-effector with the apple (keypoint {a})."""
-    return np.linalg.norm(end_effector - keypoints[{a}])
-
 ### stage 3 path constraints
-# No path constraints needed for grasping.
+def stage3_path_constraint1(end_effector, keypoints):
+    """The robot must still be holding the pear (keypoint {p})."""
+    return get_grasping_cost_by_keypoint_idx({p})
 
 ### stage 4 sub-goal constraints
 def stage4_subgoal_constraint1(end_effector, keypoints):
+    """Align the end-effector with the apple (keypoint {a})."""
+    return np.linalg.norm(end_effector - keypoints[{a}])
+
+### stage 4 path constraints
+# No path constraints needed for grasping.
+
+### stage 5 sub-goal constraints
+def stage5_subgoal_constraint1(end_effector, keypoints):
+    """The apple (keypoint {a}) is raised to its carry height above the pick-up pose."""
+    offsetted_point = keypoints[{s}] + np.array({lift_apple})
+    return np.linalg.norm(keypoints[{a}] - offsetted_point)
+
+### stage 5 path constraints
+def stage5_path_constraint1(end_effector, keypoints):
+    """The robot must still be holding the apple (keypoint {a})."""
+    return get_grasping_cost_by_keypoint_idx({a})
+
+### stage 6 sub-goal constraints
+def stage6_subgoal_constraint1(end_effector, keypoints):
     """The apple (keypoint {a}) rests at the scale-top placement point."""
     offsetted_point = keypoints[{s}] + np.array({off_apple})
     return np.linalg.norm(keypoints[{a}] - offsetted_point)
 
-### stage 4 path constraints
-# No path constraints.
+### stage 6 path constraints
+def stage6_path_constraint1(end_effector, keypoints):
+    """The robot must still be holding the apple (keypoint {a})."""
+    return get_grasping_cost_by_keypoint_idx({a})
 
 
 """
 Summarize keypoints to be grasped in all grasping stages.
 For a grasping stage write the keypoint index; for a non-grasping stage write -1.
 """
-grasp_keypoints = [{p}, -1, {a}, -1]
+grasp_keypoints = [{p}, -1, -1, {a}, -1, -1]
 
 """
 Summarize at **the end of which stage** the robot should release each keypoint.
 """
-release_keypoints = [-1, {p}, -1, {a}]
+release_keypoints = [-1, -1, {p}, -1, -1, {a}]

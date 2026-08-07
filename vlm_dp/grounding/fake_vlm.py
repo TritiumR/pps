@@ -8,6 +8,11 @@ from vlm_dp.grounding.masks import _masked_points, _nearest_kp
 
 _TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gt_vlm_output")
 
+# Height an object is raised before transport. Matches the lift the `template` compiler injects
+# (rekep._LIFT_HEIGHT), so a plan carrying its own explicit lift stage is structurally equal to
+# the templated one -- with the difference that every stage keeps its constraints under `_vlm`.
+_LIFT_HEIGHT = 0.15
+
 
 def _render(task_key, out_dir, **fields):
     """Render a task's raw.txt plan into the per-stage files the loader reads.
@@ -90,8 +95,14 @@ def _weight(out_dir, keypoints, grounded, env, clearance):
     """Generate constraints for placing the pear and apple on the scale."""
     roles, off = _weight_roles(keypoints, grounded, env, clearance)
     p, a, s = roles["pear"], roles["apple"], roles["scale"]
+    # Lift targets: the object's pick-up position raised _LIFT_HEIGHT, expressed as an offset
+    # from the scale keypoint because that one is on a fixture and does not move. Anchoring to
+    # the carried object's own keypoint would be degenerate (the target would track the object).
+    lift = {n: (keypoints[k] + np.array([0.0, 0.0, _LIFT_HEIGHT]) - keypoints[s]).tolist()
+            for n, k in (("pear", p), ("apple", a))}
     metadata = _render("weight", out_dir, p=p, a=a, s=s,
-                       off_pear=off["pear"], off_apple=off["apple"])
+                       off_pear=off["pear"], off_apple=off["apple"],
+                       lift_pear=lift["pear"], lift_apple=lift["apple"])
     # vlm_dp extension, not part of the ReKep response format the parser understands.
     metadata["steer_policies"] = ["on_failure"] * metadata["num_stages"]
     with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
@@ -104,7 +115,9 @@ def _weight(out_dir, keypoints, grounded, env, clearance):
 def _capsule(out_dir, keypoints, grounded, env, clearance):
     """Generate the fixed capsule-task constraint plan."""
     lip, open_goal, pod, bay = 0, 1, 2, 3
-    metadata = _render("capsule", out_dir, lip=lip, open_goal=open_goal, pod=pod, bay=bay)
+    lift_pod = (keypoints[pod] + np.array([0.0, 0.0, _LIFT_HEIGHT]) - keypoints[bay]).tolist()
+    metadata = _render("capsule", out_dir, lip=lip, open_goal=open_goal, pod=pod, bay=bay,
+                       lift_pod=lift_pod)
     with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
 
@@ -171,7 +184,9 @@ def _tea(out_dir, keypoints, grounded, env, clearance):
     rest_dz = float(keypoints[m][2] - keypoints[h][2])
     pour_margin = rest_dz - max(0.03, 0.5 * lever)
 
-    metadata = _render("tea", out_dir, h=h, m=m, c=c, cup_off=cup_off, pour_margin=pour_margin)
+    lift_teapot = (keypoints[h] + np.array([0.0, 0.0, _LIFT_HEIGHT]) - keypoints[c]).tolist()
+    metadata = _render("tea", out_dir, h=h, m=m, c=c, cup_off=cup_off, pour_margin=pour_margin,
+                       lift_teapot=lift_teapot)
     with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
     print(f"[fake-vlm] tea roles teapot=kp{h} mouth=kp{m} teacup=kp{c}", flush=True)

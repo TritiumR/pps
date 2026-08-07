@@ -10,9 +10,13 @@
 # 1. Grasp the coffee-maker lid.
 # 2. Open the lid on its hinge.
 # 3. Grasp the pod.
-# 4. Place the pod in the bay.
+# 4. Lift the pod clear of the tray.
+# 5. Place the pod in the bay.
+#
+# Stage 4 is an explicit lift, carrying no grasp or release keypoint: its sub-goal constraint
+# certifies the pod is actually held before transport to the bay begins.
 
-num_stages = 4
+num_stages = 5
 
 
 ### stage 1 sub-goal constraints
@@ -43,12 +47,23 @@ def stage3_subgoal_constraint1(end_effector, keypoints):
 
 ### stage 4 sub-goal constraints
 def stage4_subgoal_constraint1(end_effector, keypoints):
-    """The pod (keypoint {pod}) rests at the bay opening (keypoint {bay}), 2cm above."""
-    offsetted_point = keypoints[{bay}] + np.array([0.0, 0.0, 0.02])
+    """The pod (keypoint {pod}) is raised to its carry height above the pick-up pose."""
+    offsetted_point = keypoints[{bay}] + np.array({lift_pod})
     return np.linalg.norm(keypoints[{pod}] - offsetted_point)
 
 ### stage 4 path constraints
 def stage4_path_constraint1(end_effector, keypoints):
+    """The robot must still be holding the pod (keypoint {pod})."""
+    return get_grasping_cost_by_keypoint_idx({pod})
+
+### stage 5 sub-goal constraints
+def stage5_subgoal_constraint1(end_effector, keypoints):
+    """The pod (keypoint {pod}) rests at the bay opening (keypoint {bay}), 2cm above."""
+    offsetted_point = keypoints[{bay}] + np.array([0.0, 0.0, 0.02])
+    return np.linalg.norm(keypoints[{pod}] - offsetted_point)
+
+### stage 5 path constraints
+def stage5_path_constraint1(end_effector, keypoints):
     """The robot must still be grasping the pod (keypoint {pod})."""
     return get_grasping_cost_by_keypoint_idx({pod})
 
@@ -57,9 +72,9 @@ def stage4_path_constraint1(end_effector, keypoints):
 Summarize keypoints to be grasped in all grasping stages.
 For a grasping stage write the keypoint index; for a non-grasping stage write -1.
 """
-grasp_keypoints = [{lip}, -1, {pod}, -1]
+grasp_keypoints = [{lip}, -1, {pod}, -1, -1]
 
 """
 Summarize at **the end of which stage** the robot should release each keypoint.
 """
-release_keypoints = [-1, {lip}, -1, {pod}]
+release_keypoints = [-1, {lip}, -1, -1, {pod}]
