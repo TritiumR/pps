@@ -1,5 +1,6 @@
 import argparse
 import atexit
+import dataclasses
 import json
 import os
 import random
@@ -998,12 +999,15 @@ def _prepare_proxy_steering(model, observation):
 
     if model_type in (_model.ModelType.PROXY, _model.ModelType.PROXY_SCORE):
         images, img_masks, state = model._preprocess_observation(observation, train=False)
-        prefix_embs, prefix_pad_masks, _ = model.embed_prefix(images, img_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = model.embed_prefix(
+            images, img_masks
+        )
         return {
             "kind": "sequence",
             "state": state,
             "prefix_embs": prefix_embs,
             "prefix_pad_masks": prefix_pad_masks,
+            "prefix_att_masks": prefix_att_masks,
         }
 
     if model_type == _model.ModelType.PROXY_SOUND:
@@ -1128,6 +1132,7 @@ def _predict_proxy_score(prepared_proxy, model, x_t_path, time_cond):
         prepared_proxy["prefix_pad_masks"],
         x_t_model,
         time_cond,
+        prefix_att_masks=prepared_proxy.get("prefix_att_masks"),
     )
 
 
@@ -4148,6 +4153,16 @@ def parse_args():
         help="Task proxy checkpoint directory. Defaults to the matching task_prompts.json entry.",
     )
     parser.add_argument(
+        "--task_attention",
+        "--task-attention",
+        choices=("config", "causal", "bidirectional"),
+        default="config",
+        help=(
+            "Attention mask used by the task score proxy. 'config' uses the model config; "
+            "the explicit modes are checkpoint-compatibility/ablation overrides."
+        ),
+    )
+    parser.add_argument(
         "--ref_checkpoint_dir",
         type=str,
         default=None,
@@ -5234,7 +5249,30 @@ if "base" in required_policy_roles:
 if "task" in required_policy_roles:
     task_config_name = _config_name_from_checkpoint_dir(task_checkpoint_dir)
     task_config = _config.get_config(task_config_name)
-    _report_initialization_stage(args, "loading task policy", config=task_config_name)
+    if args.task_attention != "config":
+        if not hasattr(task_config.model, "bidirectional_attention"):
+            raise ValueError(
+                "--task_attention is only supported for ProxyScore task models; "
+                f"config {task_config_name!r} uses {type(task_config.model).__name__}."
+            )
+        task_config = dataclasses.replace(
+            task_config,
+            model=dataclasses.replace(
+                task_config.model,
+                bidirectional_attention=args.task_attention == "bidirectional",
+            ),
+        )
+    task_attention = (
+        "bidirectional"
+        if getattr(task_config.model, "bidirectional_attention", False)
+        else "causal"
+    )
+    _report_initialization_stage(
+        args,
+        "loading task policy",
+        config=task_config_name,
+        attention=task_attention,
+    )
     task_policy = policy_config.create_trained_policy(
         task_config,
         task_checkpoint_dir,
