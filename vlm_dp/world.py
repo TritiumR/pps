@@ -103,6 +103,7 @@ class SensedWorld:
         self.reperceive_every = reperceive_every
         self.visual = tracker
         self._step = 0
+        self.static_names = set()
 
 
         self._last_correct = {}
@@ -163,8 +164,9 @@ class SensedWorld:
     def _reprime_tracker(self, env):
         """Reinitialize visual tracking after a displaced re-perception."""
         from vlm_dp.visual_tracker import VisualTracker
-        self.visual = VisualTracker(env.cam, self.names,
-                                    {n: self._pos[n] for n in self.names},
+        trackable = [n for n in self.names if n not in self.static_names]
+        self.visual = VisualTracker(env.cam, trackable,
+                                    {n: self._pos[n] for n in trackable},
                                     device=self.visual.device)
         print("[world:visual] tracker re-primed after displaced re-perception", flush=True)
 

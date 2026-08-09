@@ -743,12 +743,26 @@ class RekepGrounding:
         def approach_for(stage_idx):
             return (metadata.get("approach_axes") or {}).get(str(stage_idx))
 
+        def approach_x_for(stage_idx):
+            return (metadata.get("approach_x_axes") or {}).get(str(stage_idx))
+
         def orientation_scale_for(stage_idx):
             return float((metadata.get("approach_axis_scales") or {}).get(str(stage_idx), 1.0))
 
         def contact_slack_for(stage_idx):
             value = (metadata.get("contact_slack") or {}).get(str(stage_idx))
             return None if value is None else float(value)
+
+        def grasp_transit_offsets_for(stage_idx):
+            value = (metadata.get("grasp_transit_offsets") or {}).get(str(stage_idx))
+            if value is None:
+                return None
+            offsets = np.asarray(value, dtype=np.float64)
+            if offsets.shape == (3,):
+                offsets = offsets[None, :]
+            if offsets.ndim != 2 or offsets.shape[1] != 3 or not np.all(np.isfinite(offsets)):
+                raise ValueError(f"invalid grasp transit offsets for stage {stage_idx + 1}: {value}")
+            return tuple(tuple(float(v) for v in offset) for offset in offsets)
 
         def rise_confirm_for(name):
             value = (metadata.get("rise_confirm") or {}).get(name)
@@ -770,6 +784,12 @@ class RekepGrounding:
         }
         release_done_targets = {int(idx) for idx in metadata.get("release_done_targets", [])}
         move_done_targets = {int(idx) for idx in metadata.get("move_done_targets", [])}
+        force_gripper_targets = {
+            int(idx) for idx in metadata.get("force_gripper_at_target", [])
+        }
+        visual_rise_grasp_targets = {
+            int(idx) for idx in metadata.get("grasp_advance_on_visual_rise", [])
+        }
         for i in range(metadata["num_stages"]):
             grasp_kp, release_kp = metadata["grasp_keypoints"][i], metadata["release_keypoints"][i]
             held = tuple(j for j, o in enumerate(tracker.owners) if grasped_body is not None and o == grasped_body)
@@ -806,8 +826,13 @@ class RekepGrounding:
                                             (metadata.get("grasp_targets") or {}).get(str(i)) == "keypoint"
                                             else obj_center[name]),
                                     orient=orient_for(i), approach_axis=approach_for(i),
+                                    approach_x_axis=approach_x_for(i),
                                     orientation_scale=orientation_scale_for(i),
                                     grasp_slack=contact_slack_for(i),
+                                    force_gripper_at_target=(i in force_gripper_targets),
+                                    grasp_advance_on_visual_rise=(i in visual_rise_grasp_targets),
+                                    rise_confirm=rise_confirm_for(name),
+                                    grasp_transit_offsets=grasp_transit_offsets_for(i),
                                     contact=("press" if press else "pinch")))
                 grasped_body = owner
                 pressed = press

@@ -48,9 +48,20 @@ class Stage:
     # Optional desired world-frame tool (+z) axis. Used when orient="axis"; a callable
     # keeps fixture-relative axes live without exposing simulator state to the cost.
     approach_axis: Optional[object] = None
+    # Optional tool (+x) axis fixes gripper roll when finger direction matters.
+    approach_x_axis: Optional[object] = None
     orient: str = "down"
     orientation_scale: float = 1.0
     grasp_slack: Optional[float] = None
+    # Stay fully open in transit and close only once the measured TCP reaches
+    # the grasp neighbourhood. Opt-in for plans whose sampled gripper channel
+    # otherwise dithers around half-close.
+    force_gripper_at_target: bool = False
+    # Allow an opt-in grasp to advance after a latched close when raw visual
+    # tracking confirms that the object rose with the hand.
+    grasp_advance_on_visual_rise: bool = False
+    # Optional object-relative waypoints used before approaching the ordinary target.
+    grasp_transit_offsets: Optional[tuple] = None
     rise_confirm: Optional[float] = None
     place_point: Optional[Callable[[], np.ndarray]] = None    # calibrated top-surface seat point
     carry_z: Optional[Callable[[], float]] = None             # carry altitude for the place transit

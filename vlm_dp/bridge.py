@@ -144,7 +144,10 @@ class VlmDpBridge:
         self._place_seen = None
         self._place_since = None
         self._reopen = False
+        self._grasp_transit_idx = None
+        self._grasp_close_latched = False
         self._pot_drop_lid = False
+        self._carry_release_latched = False
         self._grasp_probe = np.zeros(3)
         self._grasp_target0 = None
         self._grasp_visual_z0 = None
@@ -255,6 +258,10 @@ class VlmDpBridge:
         world = SensedWorld(percep, self.sensor, place_obj=self.roles.get("place_obj"),
                             tcp_offset=ROBOTIQ_GRASP_OFFSET, track=self.track,
                             reperceive_every=self.reperceive_every)
+        world.static_names = set(self.fixtures)
+        if self.task_key == "pot":
+            world.static_names.add(self.roles.get("place_obj"))
+        world.static_names.discard(None)
         world.relax_identity_when_stale = self._relax_identity_when_stale
         if self.jump_rate is not None:
             world.set_jump_rate(self.jump_rate)
@@ -277,7 +284,7 @@ class VlmDpBridge:
         if self.track == "visual":
             from vlm_dp.visual_tracker import VisualTracker
             # Do not track fixed calibration fixtures.
-            trackable = [n for n in world.names if n not in self.fixtures]
+            trackable = [n for n in world.names if n not in world.static_names]
             init = {n: world.object_pose(n)[0] for n in trackable}
             world.visual = VisualTracker(self.env.cam, trackable, init)
         print(f"[vlm_dp] sensed world: {world.names} (track={self.track})", flush=True)
@@ -289,6 +296,7 @@ class VlmDpBridge:
     def _enter_stage(self):
         """Reset stage-local state and capture the initial grasp height."""
         self.stage_replans = 0
+        carry_close_latched = self._grasp_close_latched
         # The previous stage's (or a backtracked-away) plan must not survive into the new one:
         # the `consistency` term penalises deviation from plan_ref, so a stale reference makes
         # recovery pay for not repeating the plan that just failed.
@@ -298,6 +306,7 @@ class VlmDpBridge:
         self._reopen = False
         self._contact_seen = False
         self._released_latch = False
+        self._carry_release_latched = False
         self._grasp_probe = np.zeros(3)
         self._grasp_target0 = None
         self._grasp_visual_z0 = None
@@ -307,6 +316,10 @@ class VlmDpBridge:
         self.gate_events = {"closed_empty": 0, "backtracks": 0}
         self._stage_env_steps = 0
         st = self.stage()
+        self._grasp_close_latched = (
+            carry_close_latched if st.gripper in ("hold", "place") else False)
+        transit_offsets = getattr(st, "grasp_transit_offsets", None)
+        self._grasp_transit_idx = 0 if transit_offsets else None
         self._configure_grasp_sensor(st)
         if st.on_enter is not None:
             st.on_enter()
@@ -369,6 +382,22 @@ class VlmDpBridge:
                             placed=placed)
         ctx["destination"] = self.roles.get("place_obj")
         st = self.stage()
+        base_target = np.asarray(ctx["target"], dtype=np.float64)
+        tcp = np.asarray(self.env.tcp(), dtype=np.float64)
+        transit_offsets = getattr(st, "grasp_transit_offsets", None)
+        if self._grasp_transit_idx is not None and transit_offsets and st.gripper == "close":
+            transit_offset = np.asarray(transit_offsets[self._grasp_transit_idx], dtype=np.float64)
+            transit_target = base_target + transit_offset
+            if float(np.linalg.norm(tcp - transit_target)) <= self._closed_empty_radius:
+                print(f"[vlm_dp] grasp transit {self._grasp_transit_idx + 1}/{len(transit_offsets)} "
+                      f"reached stage={self.stage_idx} "
+                      f"offset={np.round(transit_offset, 3)}", flush=True)
+                self._grasp_transit_idx += 1
+                if self._grasp_transit_idx >= len(transit_offsets):
+                    self._grasp_transit_idx = None
+            if self._grasp_transit_idx is not None:
+                transit_offset = np.asarray(transit_offsets[self._grasp_transit_idx], dtype=np.float64)
+                ctx["target"] = base_target + transit_offset
         # The successful capsule task policy approaches the lid with open fingers,
         # then closes while seating and levering it along the hinge arc.
         if getattr(st, "contact", "pinch") == "press":
@@ -392,6 +421,7 @@ class VlmDpBridge:
                 if not self._reopen:
                     self._closed_empty += 1
                     self.gate_events["closed_empty"] += 1
+                    self._grasp_close_latched = False
                     print("[vlm_dp] closed-empty at grasp target: commanding reopen", flush=True)
                     if self._grasp_recovery == "search":
                         self._grasp_probe_idx += 1
@@ -419,15 +449,12 @@ class VlmDpBridge:
         # Verify a thin pinch by lifting slightly while the aperture still reports a hold.
         if (getattr(self, "_thin_verify_lift", 0.0) > 0.0 and st.gripper == "close"
                 and self.sensor is not None and self.sensor.holding() and not self._reopen):
-            if self._grasp_target0 is None:
-                base_target = np.asarray(ctx["target"], dtype=np.float32)
-            else:
-                base_target = (self._grasp_target0.copy()
-                               + self._grasp_probe.astype(np.float32))
+            base_target = self._active_grasp_target(st, latched=True).astype(np.float32)
             lift_reached = float(np.asarray(self.env.tcp())[2]) >= (
                 float(base_target[2]) + 0.75 * self._thin_verify_lift
             )
-            if lift_reached and not self._thin_visual_rose(st.grasp_obj):
+            if (lift_reached and not self._thin_visual_rose(st.grasp_obj)
+                    and not getattr(st, "grasp_advance_on_visual_rise", False)):
                 print("[vlm_dp] thin-grasp micro-lift moved FK belief but not visual object; reopening",
                       flush=True)
                 self._grasp_probe_idx += 1
@@ -548,11 +575,50 @@ class VlmDpBridge:
             return 1.0
         return 0.0
 
+    def _active_grasp_target(self, stage, *, latched=False):
+        """Return the live or stage-entry grasp target with transit and probe offsets."""
+        if latched and self._grasp_target0 is not None:
+            target = np.asarray(self._grasp_target0, dtype=np.float64).copy()
+        else:
+            target = np.asarray(stage.target(), dtype=np.float64).copy()
+        transit_offsets = getattr(stage, "grasp_transit_offsets", None)
+        if self._grasp_transit_idx is not None and transit_offsets:
+            transit = transit_offsets[self._grasp_transit_idx]
+            target += np.asarray(transit, dtype=np.float64)
+        return target + self._grasp_probe
+
     def filter_plan(self, actions, execute_steps):
-        """Suppress brief open commands while a payload is held."""
+        """Apply executable gripper schedules and suppress unsafe open blips."""
+        st = self.stage()
+        if self._grasp_close_latched and st.gripper in ("hold", "place"):
+            if st.gripper == "place" and bool(st.done()):
+                self._carry_release_latched = True
+            close = not self._carry_release_latched
+            if torch.is_tensor(actions):
+                actions = actions.clone()
+            else:
+                actions = np.array(actions, copy=True)
+            actions[:execute_steps, 7] = 1.0 if close else 0.0
+            print(f"[vlm_dp] carry gripper stage={self.stage_idx} "
+                  f"command={'close' if close else 'open'}", flush=True)
+        if (getattr(st, "force_gripper_at_target", False)
+                and st.gripper == "close" and st.grasp_obj is not None):
+            tgt = self._active_grasp_target(st)
+            dist = float(np.linalg.norm(np.asarray(self.env.tcp(), dtype=np.float64) - tgt))
+            if not self._reopen and dist <= self.grasp_eps:
+                self._grasp_close_latched = True
+            held = self.sensor is not None and self.sensor.holding()
+            close = bool(not self._reopen and (held or self._grasp_close_latched))
+            if torch.is_tensor(actions):
+                actions = actions.clone()
+            else:
+                actions = np.array(actions, copy=True)
+            actions[:execute_steps, 7] = 1.0 if close else 0.0
+            print(f"[vlm_dp] target-gated gripper stage={self.stage_idx} "
+                  f"dist={dist * 1e3:.1f}mm command={'close' if close else 'open'}",
+                  flush=True)
         if self._grip_debounce <= 0:
             return actions, []
-        st = self.stage()
         name = st.payload or st.grasp_obj
         held = bool(name) and self._payload_held(name)
         suppressed, self._open_run, self._close_val = debounce_gripper(
@@ -692,15 +758,24 @@ class VlmDpBridge:
             pass
 
     def _thin_visual_rose(self, payload, rise=0.005):
-        """Confirm a micro-lift from raw vision rather than the held-object FK belief."""
+        """Confirm a micro-lift from raw or visually corrected tracking."""
         visual_position = getattr(self.world, "visual_position", None)
-        if not callable(visual_position):
-            return True
-        pos = visual_position(payload)
+        pos = visual_position(payload) if callable(visual_position) else None
         z0 = self._grasp_visual_z0
         if z0 is None:
             z0 = self.grasp_z0.get(payload)
-        return pos is not None and z0 is not None and float(pos[2]) >= float(z0) + float(rise)
+        raw_rose = (
+            pos is not None and z0 is not None
+            and float(pos[2]) >= float(z0) + float(rise)
+        )
+        if raw_rose:
+            return True
+        if self.track == "visual":
+            belief_pos = self._pos(payload)
+            belief_z0 = self.grasp_z0.get(payload)
+            return (belief_pos is not None and belief_z0 is not None
+                    and float(belief_pos[2]) >= float(belief_z0) + float(rise))
+        return False
 
     def _payload_held(self, payload):
         """Return whether the configured hold authority reports the payload held."""
@@ -884,11 +959,8 @@ class VlmDpBridge:
             if self.advance_mode == "env_flags":
                 return bool(flags.get(f"grasp_{stage.grasp_obj}", False))
             # Measure proximity against the probe-shifted target.
-            if (getattr(self, "_thin_verify_lift", 0.0) > 0.0
-                    and self._grasp_target0 is not None):
-                tgt = self._grasp_target0 + self._grasp_probe
-            else:
-                tgt = np.asarray(stage.target()) + self._grasp_probe
+            tgt = self._active_grasp_target(
+                stage, latched=getattr(self, "_thin_verify_lift", 0.0) > 0.0)
             slack = (self._grasp_slack(stage.grasp_obj) if getattr(stage, "grasp_slack", None) is None
                      else float(stage.grasp_slack))
             near = float(np.linalg.norm(np.asarray(self.env.tcp()) - tgt)) < slack
@@ -897,6 +969,13 @@ class VlmDpBridge:
                 # sensor to report a fully closed hand can deadlock articulated contacts: the
                 # lid itself may stop the fingers, and levering does not require a pinch hold.
                 return near
+            if getattr(stage, "grasp_advance_on_visual_rise", False):
+                rise = (self.rise_confirm if getattr(stage, "rise_confirm", None) is None
+                        else float(stage.rise_confirm))
+                visual_rise = self._thin_visual_rose(stage.grasp_obj, rise=rise)
+                sensor_hold = self.sensor is not None and self.sensor.holding()
+                return visual_rise and (self._grasp_close_latched or sensor_hold)
+
             held = self._payload_held(stage.grasp_obj)
             if self._grasp_advance_on_hold:
                 # Thin contacts first perform a sensor-only micro-lift: surface contact closes

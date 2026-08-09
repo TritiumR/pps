@@ -85,6 +85,11 @@ def build_context(
     if approach_axis is not None:
         axis = approach_axis() if callable(approach_axis) else approach_axis
         ctx["approach_axis"] = np.asarray(axis, dtype=np.float32)
+    approach_x_axis = getattr(stage, "approach_x_axis", None)
+    if approach_x_axis is not None:
+        axis = approach_x_axis() if callable(approach_x_axis) else approach_x_axis
+        ctx["approach_x_axis"] = np.asarray(axis, dtype=np.float32)
+
 
     place_point = getattr(stage, "place_point", None)
     if place_point is not None:

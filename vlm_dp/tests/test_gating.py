@@ -379,6 +379,25 @@ def test_declared_orientation_axis_has_stage_local_authority():
     assert abs(strong - 6.0 * base) < 1e-5
 
 
+def test_declared_gripper_x_axis_penalizes_wrong_roll():
+    """A second tool axis may constrain finger direction without changing approach."""
+    q = (_Q / _Q.norm()).numpy()
+    w, x, y, z = q
+    z_axis = np.array([
+        2 * (x * z + w * y),
+        2 * (y * z - w * x),
+        1 - 2 * (x * x + y * y),
+    ], np.float32)
+    x_axis = np.array([
+        1 - 2 * (y * y + z * z),
+        2 * (x * y + w * z),
+        2 * (x * z - w * y),
+    ], np.float32)
+    matched = _ctx(orient="axis", approach_axis=z_axis, approach_x_axis=x_axis)
+    wrong_roll = dict(matched, approach_x_axis=np.array([1.0, 0.0, 0.0], np.float32))
+    assert _evaluate(_Scenario("matched", "", matched, set()))["orientation"] < 1e-6
+    assert _evaluate(_Scenario("rolled", "", wrong_roll, set()))["orientation"] > 0.0
+
 # ------------------------------------------------------------------- the pinch/press contact criterion
 # Narrow horizontal half-extents from each object's own perceived cloud, on clean-mask looks. The
 # criterion compares them against the gripper's 40 mm aperture half-width.

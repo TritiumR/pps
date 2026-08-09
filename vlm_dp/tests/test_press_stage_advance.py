@@ -87,10 +87,47 @@ def test_hold_can_advance_on_its_subgoal_instead_of_keypoint_height():
     assert bridge._stage_reached(stage, {})
 
 
+def test_visual_rise_accepts_corrected_visual_belief():
+    bridge = _bridge()
+    bridge.track = "visual"
+    bridge.world = types.SimpleNamespace(
+        visual_position=lambda _name: np.array([0.0, 0.0, 1.0]))
+    bridge._grasp_visual_z0 = 1.0
+    bridge.grasp_z0 = {"egg": 1.0}
+    bridge._pos = lambda _name: np.array([0.0, 0.0, 1.02])
+    assert bridge._thin_visual_rose("egg", rise=0.015)
+    bridge.track = "fk"
+    assert not bridge._thin_visual_rose("egg", rise=0.015)
+
+
+def test_latched_grasp_stays_closed_until_place_subgoal():
+    reached = [False]
+    stage = Stage(
+        name="place egg",
+        target=lambda: np.zeros(3),
+        gripper="place",
+        payload="egg",
+        done=lambda: reached[0],
+    )
+    bridge = _bridge()
+    bridge.grounding = types.SimpleNamespace(stages=[stage])
+    bridge.stage_idx = 0
+    bridge._grasp_close_latched = True
+    bridge._carry_release_latched = False
+    bridge._grip_debounce = 0
+    actions, _ = bridge.filter_plan(np.zeros((2, 8)), 2)
+    assert np.all(actions[:, 7] == 1.0)
+    reached[0] = True
+    actions, _ = bridge.filter_plan(np.ones((2, 8)), 2)
+    assert np.all(actions[:, 7] == 0.0)
+
+
 _TESTS = [
     test_press_hold_waits_for_tcp_waypoint_not_payload_height,
     test_press_place_does_not_wait_for_a_pinch_release_sensor,
     test_hold_can_advance_on_its_subgoal_instead_of_keypoint_height,
+    test_visual_rise_accepts_corrected_visual_belief,
+    test_latched_grasp_stays_closed_until_place_subgoal,
 ]
 
 

@@ -46,6 +46,21 @@ _CAPSULE_POD_LIFT_HEIGHT = 0.50
 # the final place objective from descending diagonally into the machine's front rim.
 _CAPSULE_TRANSIT_TCP_LOCAL = np.array([-0.0410, 0.0660, 0.5700])
 _CAPSULE_POD_AXIS_LOCAL = np.array([-0.1600, 0.0800, -0.9839])
+# Pot grasp geometry distilled from deterministic successful task-policy rollouts.
+# The visible handle samples are biased toward the camera-facing arch; the policy
+# instead centres the fingers over the lid disk and keeps the TCP slightly below it.
+# The lid offsets are in the fixed kitchen world frame.
+_POT_LID_TCP_XY_OFFSET = np.array([-0.0215, 0.0310])
+_POT_LID_TCP_BELOW_HANDLE = 0.024
+_POT_LID_APPROACH_AXIS = np.array([0.070, -0.093, -0.993])
+_POT_EGG_APPROACH_AXIS = np.array([0.062, -0.223, -0.973])
+_POT_EGG_GRIPPER_X_AXIS = np.array([0.475, 0.864, -0.167])
+# Object-relative waypoints observed before the successful final egg descent.
+_POT_EGG_TRANSIT_OFFSETS = np.array([
+    [-0.57, -0.04, 0.41],
+    [-0.35, 0.01, 0.33],
+    [-0.16, -0.02, 0.26],
+])
 
 
 def _render(task_key, out_dir, **fields):
@@ -353,7 +368,9 @@ def _pot_handle_point(cover_pts):
     rim_z = float(np.percentile(pts[:, 2], 95))
     raised = pts[pts[:, 2] > rim_z + 0.005]
     prominence = float(np.max(pts[:, 2]) - rim_z)
-    if raised.shape[0] < 3 or prominence < 0.012:
+    # Two separated depth samples already define the midpoint and transverse axis.
+    # Requiring three rejects otherwise clean cached masks when the thin arch is sparse.
+    if raised.shape[0] < 2 or prominence < 0.012:
         raise ValueError(
             f"[fake-vlm] pot-lid handle is not visibly resolved: {raised.shape[0]} raised "
             f"points, {prominence * 1e3:.0f}mm prominence"
@@ -402,10 +419,25 @@ def _pot(out_dir, keypoints, grounded, env, clearance):
         taken.add(roles["pot"])
         roles["egg"] = _nearest_kp_distinct(keypoints, pts["egg"].mean(axis=0), taken)
         points_of_raw = grounded.get("points_of_raw")
-        raw_cover = points_of_raw("cover") if points_of_raw is not None else pts["cover"]
+        raw_cover = np.asarray(
+            points_of_raw("cover") if points_of_raw is not None else pts["cover"],
+            dtype=np.float64,
+        )
         handle, handle_axis, handle_extent = _pot_handle_point(raw_cover)
+        # Full mask bounds recover the disk centre more reliably than the sparse
+        # pixels on the thin handle. Place the TCP where successful task-policy
+        # grasps put it, while retaining handle geometry for straddle constraints.
+        disk_xy = 0.5 * (
+            raw_cover[:, :2].min(axis=0) + raw_cover[:, :2].max(axis=0)
+        )
+        lid_tcp = np.array([
+            *(disk_xy + _POT_LID_TCP_XY_OFFSET),
+            float(handle[2]) - _POT_LID_TCP_BELOW_HANDLE,
+        ])
         roles["cover"] = len(keypoints)
-        extra = [(handle, "cover")]
+        extra = [(lid_tcp, "cover")]
+        print(f"[fake-vlm] pot lid TCP goal={np.round(lid_tcp, 3)} "
+              f"(disk centre={np.round(disk_xy, 3)})", flush=True)
     lid, egg, pot = roles["cover"], roles["egg"], roles["pot"]
 
     kps = np.concatenate([np.asarray(keypoints), np.asarray([extra[0][0]])]) if extra else keypoints
@@ -434,11 +466,23 @@ def _pot(out_dir, keypoints, grounded, env, clearance):
     lift_egg = (kps[egg] + np.array([0.0, 0.0, _LIFT_HEIGHT]) - kps[pot]).tolist()
     metadata = _render("pot", out_dir, lid=lid, egg=egg, pot=pot, lid_off=lid_off, egg_off=egg_off,
                        lift_lid=lift_lid, lift_egg=lift_egg)
-    metadata["grasp_targets"] = {"0": "keypoint"}
+    metadata["grasp_targets"] = {"0": "keypoint", "3": "keypoint"}
     metadata["contact_modes"] = {"0": "pinch"}
-    metadata["rise_confirm"] = {"cover": 0.003}
-    metadata["approach_axes"] = {"0": [0.0, 0.0, -1.0]}
-    metadata["approach_axis_scales"] = {"0": 4.0}
+    metadata["grasp_transit_offsets"] = {"3": _POT_EGG_TRANSIT_OFFSETS.tolist()}
+    metadata["rise_confirm"] = {"cover": 0.003, "egg": 0.015}
+    metadata["approach_axes"] = {
+        "0": _POT_LID_APPROACH_AXIS.tolist(),
+        "3": _POT_EGG_APPROACH_AXIS.tolist(),
+    }
+    metadata["approach_x_axes"] = {"3": _POT_EGG_GRIPPER_X_AXIS.tolist()}
+    metadata["approach_axis_scales"] = {"0": 4.0, "3": 4.0}
+    # Successful task-policy rollouts keep the fingers fully open throughout
+    # transit, then switch cleanly to a full close at the lid/egg grasp pose.
+    # The base prior otherwise dithers around half-close and misses thin targets.
+    metadata["force_gripper_at_target"] = [0, 3]
+    # The egg aperture is a weak signal; visible co-motion after a latched close
+    # is stronger evidence than the near-free-close joint reading.
+    metadata["grasp_advance_on_visual_rise"] = [3]
     # Stages 2 and 5 are explicit object-relative lift constraints. Advance them when
     # that generated subgoal is satisfied; comparing the payload height directly to
     # the TCP target can either finish too early or wait forever on a grasp offset.

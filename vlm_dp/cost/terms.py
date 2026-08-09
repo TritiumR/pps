@@ -218,10 +218,18 @@ def orientation(I):
         return _zeros(I)
     target = torch.as_tensor(target, device=I.ee_quat.device, dtype=I.ee_quat.dtype)
     target = target / torch.clamp(torch.linalg.vector_norm(target), min=1e-8)
-    scale = float(I.context.get("orientation_scale", 1.0))
-    return scale * (
+    penalty = (
         1.0 - (_axis(I.ee_quat, 2) * target.view(1, 1, 3)).sum(dim=-1)
-    ).mean(dim=1)
+    )
+    x_target = I.context.get("approach_x_axis")
+    if x_target is not None:
+        x_target = torch.as_tensor(x_target, device=I.ee_quat.device, dtype=I.ee_quat.dtype)
+        x_target = x_target / torch.clamp(torch.linalg.vector_norm(x_target), min=1e-8)
+        penalty = penalty + (
+            1.0 - (_axis(I.ee_quat, 0) * x_target.view(1, 1, 3)).sum(dim=-1)
+        )
+    scale = float(I.context.get("orientation_scale", 1.0))
+    return scale * penalty.mean(dim=1)
 
 
 @register("consistency")
