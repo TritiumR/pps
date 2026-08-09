@@ -4,6 +4,7 @@ import os
 
 import numpy as np
 
+from vlm_dp.grounding import predicates
 from vlm_dp.grounding.masks import _masked_points, _nearest_kp
 
 _TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gt_vlm_output")
@@ -103,6 +104,22 @@ def _render(task_key, out_dir, **fields):
             body = "\n\n".join("\n".join(functions[n]) for n in sorted(grouped.get(key, [])))
             with open(os.path.join(out_dir, f"{key}_constraints.txt"), "w", encoding="utf-8") as f:
                 f.write(body + "\n" if body else "")
+
+    # --- completion predicates (vlm_dp extension; absent from most plans) ---
+    # Same split, different question: a stage<N>_completion block says whether the EVENT the
+    # stage names has happened, instead of how far its sub-goal scalar is from zero. Written
+    # out per stage so the loader reads them exactly like the constraint files.
+    # The resolved {placeholder} values, so the rendered plan can be reproduced exactly offline.
+    # A rollout log records what each predicate DECIDED; without these it does not record what
+    # the predicate was deciding about, and no re-evaluation against the same episode is possible.
+    with open(os.path.join(out_dir, "render_fields.json"), "w", encoding="utf-8") as f:
+        json.dump({k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in fields.items()},
+                  f, indent=2)
+
+    n_pred = predicates.write_files(output, out_dir, metadata["num_stages"])
+    if n_pred:
+        print(f"[fake-vlm] {task_key}: {n_pred}/{metadata['num_stages']} stages carry a "
+              f"completion predicate", flush=True)
     return metadata
 
 

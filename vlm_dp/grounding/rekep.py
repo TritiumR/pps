@@ -1,6 +1,7 @@
 """Build ReKep grounding from tracked keypoints and stage constraints."""
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -12,7 +13,7 @@ from rekep import grounding as rk_grounding
 from rekep.constraint_generation import ConstraintGenerator
 from rekep.keypoint_tracking import KeypointTracker
 from rekep.utils import get_callable_grasping_cost_fn, load_default_config
-from vlm_dp.grounding import Grounding, SceneObject, Stage, fake_vlm, masks
+from vlm_dp.grounding import Grounding, SceneObject, Stage, fake_vlm, masks, predicates
 
 
 from vlm_dp.grounding.gt import _LIFT_HEIGHT as _GT_LIFT, _shifted_seat
@@ -97,6 +98,122 @@ def keypoint_claims(text, names):
                 claims[int(match.group(1))] = hit[1]
             cursor = match.end()
     return claims
+
+
+@contextlib.contextmanager
+def _installed(obj, name, fn):
+    """Temporarily shadow ``obj.name`` with ``fn``, restoring the original binding after."""
+    had = name in vars(obj)
+    old = vars(obj).get(name)
+    setattr(obj, name, fn)
+    try:
+        yield
+    finally:
+        if had:
+            setattr(obj, name, old)
+        else:
+            delattr(obj, name)
+
+
+def _satisfying_state(stage, kps0, ee0, owned, refs, dev, eps, steps=400, lr=0.02):
+    """Place the stage's movable keypoints where its own sub-goal constraint is satisfied.
+
+    Returns ``(keypoints, tcp, moved, value)``. The constraint is a differentiable torch callable,
+    so the satisfying state is found by descending the constraint itself rather than by any
+    hand-written idea of what the stage means -- the whole point being that the runtime must not
+    have such an idea. Only the keypoints of the object the stage manipulates move (plus the TCP);
+    if that is not enough to satisfy the constraint, every keypoint the constraint text references
+    is freed as a second attempt. A stage with no constraint (a grasp stage) is satisfied by
+    putting the TCP on its target.
+    """
+    kp0 = torch.as_tensor(np.asarray(kps0), device=dev, dtype=torch.float32)
+    if stage.constraint is None:
+        try:
+            ee = np.asarray(stage.target(), dtype=np.float64).reshape(3)
+        except Exception:
+            ee = np.asarray(ee0, dtype=np.float64).reshape(3)
+        return np.asarray(kps0, dtype=np.float64), ee, tuple(owned), 0.0
+
+    best = (np.asarray(kps0, dtype=np.float64), np.asarray(ee0, dtype=np.float64).reshape(3),
+            tuple(owned), float("inf"))
+    for movable in ([tuple(owned)] if owned else []) + [tuple(sorted(set(owned) | set(refs)))]:
+        if not movable:
+            continue
+        delta = torch.zeros(len(movable), 3, device=dev, dtype=torch.float32, requires_grad=True)
+        dee = torch.zeros(1, 1, 3, device=dev, dtype=torch.float32, requires_grad=True)
+        ee_t = torch.as_tensor(np.asarray(ee0), device=dev, dtype=torch.float32).reshape(1, 1, 3)
+        idx = list(movable)
+        opt = torch.optim.Adam([delta, dee], lr=lr)
+        value = float("inf")
+        for _ in range(int(steps)):
+            opt.zero_grad()
+            shift = torch.zeros_like(kp0)
+            shift[idx] = delta
+            kk = (kp0 + shift)[:, None, None, :]
+            val = torch.as_tensor(stage.constraint(ee_t + dee, kk)).reshape(-1)[0]
+            value = float(val.detach())
+            if value <= 0.25 * eps:
+                break
+            val.backward()
+            opt.step()
+        kp_out = kp0.detach().clone()
+        kp_out[idx] = kp0[idx] + delta.detach()
+        cand = (kp_out.cpu().numpy().astype(np.float64),
+                (ee_t + dee).detach().reshape(3).cpu().numpy().astype(np.float64),
+                tuple(movable), value)
+        if cand[3] < best[3]:
+            best = cand
+        if value <= 0.25 * eps:
+            break
+    return best
+
+
+def advance_preflight(probe, stages, plan_kps, tracker, env, dev, eps):
+    """Refuse to roll out on a plan whose stages cannot advance even when they are satisfied.
+
+    For every stage: synthesize a state in which the stage genuinely happened (:func:`_satisfying_state`
+    for the geometry, the caller's ``probe`` for the sensed evidence), install it in the tracker and
+    the env so every accessor the runtime reads sees it, and run THE ACTIVE advance test through
+    ``probe``. ``probe(stage_idx, stage, synth) -> (fired, test_name)`` is the bridge's
+    ``preflight_probe``, i.e. the real ``_stage_reached`` -- not a re-implementation of it, which
+    could agree with a copy of the rule while disagreeing with the rule.
+
+    A stage whose completion cannot fire in its own satisfying state is a permanent stall: the
+    episode would sit there until the step budget ran out. That is the failure this refuses, in the
+    same loud style as the grounding preflight above -- it is exactly the defect that cost the
+    motion_pred_go run 8 of 10 seeds (380+ replans in the lift stage while the plan's own sub-goal
+    read 0.000 satisfied).
+    """
+    problems, lines = [], []
+    kps0 = np.asarray(tracker.get_positions(), dtype=np.float64)
+    ee0 = np.asarray(env.tcp(), dtype=np.float64).reshape(3)
+    for i, st in enumerate(stages):
+        spec = plan_kps[i] if i < len(plan_kps) else {}
+        kp, ee, moved, value = _satisfying_state(st, kps0, ee0, spec.get("owned", ()),
+                                                 spec.get("refs", ()), dev, eps)
+        if st.constraint is not None and not value <= eps:
+            problems.append(f"stage {i + 1} {st.name!r}: no state satisfying its own sub-goal could "
+                            f"be synthesized (best {value:.3f} vs eps {eps:.3f}) -- the constraint "
+                            f"cannot be driven to zero by moving the object the stage manipulates")
+            continue
+        with _installed(tracker, "get_positions", lambda kp=kp: kp), \
+                _installed(env, "tcp", lambda ee=ee: ee):
+            fired, test = probe(i, st, {"kp": kp, "eef": ee, "moved": moved})
+        lines.append(f"stage {i + 1} {st.name!r}: {test} -> {'fires' if fired else 'NEVER FIRES'}"
+                     + (f" (sub-goal {value:.3f} < eps {eps:.3f})" if st.constraint is not None else ""))
+        if not fired:
+            problems.append(f"stage {i + 1} {st.name!r}: the active advance test ({test}) cannot "
+                            f"return True even in a state where the stage is satisfied"
+                            + (f" (its own sub-goal reads {value:.3f} against eps {eps:.3f})"
+                               if st.constraint is not None else "")
+                            + " -- the stage would stall here for the rest of the episode")
+    for line in lines:
+        print(f"[rekep-preflight] {line}", flush=True)
+    if problems:
+        raise SystemExit("[rekep-preflight] the plan's stages cannot advance; refusing to roll "
+                         "out:\n  - " + "\n  - ".join(problems))
+    print(f"[rekep-preflight] advanceability OK: all {len(stages)} stages complete in their own "
+          f"satisfying state", flush=True)
 
 
 def _constrains_orientation(txt_path):
@@ -513,12 +630,48 @@ class RekepGrounding:
 
 
         if self.stages == "vlm":
-            stages, manipulated = self._vlm_stages(metadata, tracker, keypoints, name_for,
-                                                   load_stage, objects, env, dev, vlm_dir,
-                                                   probe_ext, clouds, usd, roles,
-                                                   declared_grasp)
+            stages, manipulated, plan_kps = self._vlm_stages(metadata, tracker, keypoints, name_for,
+                                                             load_stage, objects, env, dev, vlm_dir,
+                                                             probe_ext, clouds, usd, roles,
+                                                             declared_grasp)
+            # Completion predicates, when the plan authored them. Read by the advance path only
+            # under the opt-in keys (predicate_place_transitions / plan_authoritative); otherwise
+            # they are carried on the Grounding for logging alone.
+            comp = predicates.CompletionPredicates.from_dir(vlm_dir, metadata["num_stages"])
+            if len(comp):
+                # Bind the primitive runtime BEFORE the advanceability preflight runs, so the
+                # preflight exercises the same bound primitives the rollout will -- an unbound
+                # predicate would fail on a NameError and be diagnosed as an unreachable stage.
+                _owner_cache = {}
+
+                def _owner_of(kp_idx):
+                    if kp_idx not in _owner_cache:
+                        try:
+                            _owner_cache[kp_idx] = name_for(kp_idx)
+                        except Exception:
+                            _owner_cache[kp_idx] = None
+                    return _owner_cache[kp_idx]
+
+                carried = {n for n in (_owner_of(k) for k in metadata["grasp_keypoints"] if k >= 0)
+                           if n}
+                runtime = predicates.PredicateRuntime(
+                    owner_of=_owner_of, grasp_ext_of=grasp_ext_of, extents=extents,
+                    carried=carried, declared=set(declared), open_half=self.open_half,
+                    geom=self.geom, sensor=self.sensor_cfg)
+                comp.bind(runtime)
+                print(f"[rekep-vlm] loaded completion predicates for stages "
+                      f"{[i + 1 for i in comp.stages]}; primitives bound: {runtime.describe()}",
+                      flush=True)
+            plan_fields = None
+            _fields_path = os.path.join(vlm_dir, "render_fields.json")
+            if os.path.isfile(_fields_path):
+                with open(_fields_path, encoding="utf-8") as _f:
+                    plan_fields = json.load(_f)
             return Grounding(objects=objects, stages=stages, manipulated=frozenset(manipulated),
-                             keypoints=(lambda: tracker.get_positions()))
+                             keypoints=(lambda: tracker.get_positions()),
+                             completion=comp if len(comp) else None, plan_fields=plan_fields,
+                             advance_preflight=(lambda probe: advance_preflight(
+                                 probe, stages, plan_kps, tracker, env, dev, self.subgoal_eps)))
 
         stages, manipulated, grasped_body = [], {self.place_obj}, None
         placed_names, last_z0 = [], None
@@ -816,6 +969,10 @@ class RekepGrounding:
             return metadata["release_keypoints"][j] >= 0 and place_target_for(j, owner) is None
 
         stages, manipulated, grasped_body, pressed = [], set(), None, False
+        # Per-stage keypoint bookkeeping for the advanceability preflight: which keypoints the
+        # stage's own object owns (the ones a satisfying state may move), and which ones its
+        # constraint text references at all (the fallback set).
+        plan_kps = []
         steer_policies = metadata.get("steer_policies") or []
         def _pol(idx):
             return steer_policies[idx] if idx < len(steer_policies) else None
@@ -860,12 +1017,24 @@ class RekepGrounding:
                 refs = _referenced_kps(os.path.join(vlm_dir, f"stage{i + 1}_subgoal_constraints.txt"))
 
 
+                # COST TARGET ONLY. This is a text-order heuristic -- the first keypoint the
+                # constraint's source text happens to mention -- so it is a reference point for the
+                # cost terms and nothing more. It must never feed a stage-advance decision: under
+                # advance.plan_authoritative the stage advances on its own sub-goal (stage.done()),
+                # because a target read out of prose cannot be compared against a belief the way an
+                # advance test needs (a surface keypoint against an object centre never closes).
                 stages.append(Stage(name=f"move {i}", gripper=("hold" if grasped_body else "open"), steer_policy=_pol(i),
                                     grasp_obj=None, payload=grasped_body,
                                     target=kp_point(refs[0] if refs else 0), held_idx=held,
                                     constraint=subgoal, path_fns=path_fns, done=subgoal_done(subgoal),
                                     orient=orient_for(i),
                                     contact=("press" if pressed else "pinch")))
+            owner = stages[-1].payload or stages[-1].grasp_obj
+            plan_kps.append({
+                "owned": tuple(j for j, o in enumerate(tracker.owners) if owner and o == owner),
+                "refs": tuple(_referenced_kps(
+                    os.path.join(vlm_dir, f"stage{i + 1}_subgoal_constraints.txt"))),
+            })
 
         tcp_probe = torch.as_tensor(keypoints, device=dev, dtype=torch.float32)[:1].reshape(1, 1, 3)
         kps_probe = torch.as_tensor(keypoints, device=dev, dtype=torch.float32)
@@ -878,7 +1047,7 @@ class RekepGrounding:
         self._check_keypoint_identity(metadata["num_stages"], vlm_dir, tracker, obj_names)
         print(f"[rekep-vlm] emitted {len(stages)} VLM-driven stages: "
               f"{[s.name for s in stages]}", flush=True)
-        return stages, manipulated
+        return stages, manipulated, plan_kps
 
     def _check_keypoint_identity(self, num_stages, vlm_dir, tracker, obj_names):
         """Compare VLM keypoint claims with tracker ownership."""

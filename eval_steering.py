@@ -5843,6 +5843,12 @@ for rollout_idx, seed in enumerate(eval_seeds):
         step=0,
         phase=current_phase,
         subtasks=current_subtasks,
+        # The {placeholder} values THIS episode's plan was rendered with. With the per-step
+        # grounded keypoints below, the log carries everything an offline re-evaluation of any
+        # completion predicate against this exact episode needs.
+        **({"plan_fields": _pf} if (_pf := (getattr(getattr(vlm_bridge, "grounding", None),
+                                                    "plan_fields", None)
+                                            if vlm_bridge is not None else None)) else {}),
     )
     _emit_worker_progress(
         args,
@@ -5998,6 +6004,10 @@ for rollout_idx, seed in enumerate(eval_seeds):
                         _mpc_logged = dict(_mpc_debug_stats(_LAST_INFERENCE_RUNTIME.get("mpc_last")) or {})
                         _mpc_logged.update({k: compare_stats[k] for k in _gate_keys
                                             if isinstance(compare_stats, dict) and k in compare_stats})
+                        # Shadow completion-predicate decision beside the scalar sub-goal one.
+                        # Read off the bridge, never off mpc_context: the planner never saw it.
+                        _pred = (getattr(vlm_bridge, "pred_shadow", None)
+                                 if args.vlm_cost != "none" else None)
                         _write_mpc_debug_log(
                             mpc_debug_log_file,
                             "inference",
@@ -6007,6 +6017,7 @@ for rollout_idx, seed in enumerate(eval_seeds):
                             subtasks=current_subtasks,
                             elapsed_s=infer_elapsed,
                             mpc=_mpc_logged,
+                            **({"pred_shadow": _pred} if _pred is not None else {}),
                             mpc_trace=_LAST_INFERENCE_RUNTIME.get("mpc_trace", []),
                         )
                     episode_inference_time_s += infer_elapsed
@@ -6122,6 +6133,17 @@ for rollout_idx, seed in enumerate(eval_seeds):
                     step_trace["object_beliefs"] = {
                         _n: np.asarray(_p, dtype=np.float64) for _n, _p in _bel._pos.items()
                     }
+                except Exception:      # diagnostics must never take down a rollout
+                    pass
+            # The GROUNDED KEYPOINT ARRAY, plus the TCP and aperture pushed alongside it. This is
+            # the exact frame the completion predicates saw this step, so a log alone is enough to
+            # re-evaluate any predicate offline against the run that produced it.
+            _ph = getattr(vlm_bridge, "_pred_hist", None) if "vlm_bridge" in dir() else None
+            if _ph is not None and len(_ph):
+                try:
+                    step_trace["grounding_kp"] = np.round(_ph.kp[-1], 4)
+                    step_trace["grounding_tcp"] = np.round(_ph.eef[-1], 4)
+                    step_trace["grounding_aperture"] = round(float(_ph.gripper_aperture[-1]), 4)
                 except Exception:      # diagnostics must never take down a rollout
                     pass
             _write_mpc_debug_log(
