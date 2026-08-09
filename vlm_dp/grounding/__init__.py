@@ -128,5 +128,7 @@ def get_source(name: str, **kwargs) -> GroundingSource:
                               open_half=kwargs.get("open_half", 0.04),
                               rotate_grasp_offset=kwargs.get("rotate_grasp_offset", False),
                               lift_latch_xy=kwargs.get("lift_latch_xy", False),
-                              seat_from_plane=kwargs.get("seat_from_plane", False))
+                              seat_from_plane=kwargs.get("seat_from_plane", False),
+                              geom=kwargs.get("geom"),
+                              sensor_cfg=kwargs.get("sensor_cfg"))
     raise ValueError(f"unknown grounding source: {name!r}")

@@ -22,8 +22,29 @@ _CARRY_HOVER, _CARRY_SLACK = 0.10, 0.03
 # travels roughly this far up when it swings open.
 _CAPSULE_BAY_LOCAL = np.array([0.0, 0.0, 0.27])
 _CAPSULE_LID_OPEN_LIFT = np.array([0.0, 0.0, 0.12])
-# Thickness of the "top slab" of the machine cloud the lid lip is searched in.
-_CAPSULE_LID_BAND = 0.04
+# Where the pod comes to rest relative to the bay keypoint. Was a literal np.array([0, 0, 0.02])
+# inside the plan's place stage; it is a field now because the descent gate and the stage's
+# completion predicate have to name the SAME seat, and two copies of a literal drift apart.
+_CAPSULE_BAY_SEAT = np.array([0.0, 0.0, 0.02])
+# The closed lid's graspable rim, in the same machine-root frame as the bay. Calibrated from
+# the asset (see _capsule_lip_diagnostic, which re-derives and prints it every run); it is the
+# lid-body offset vlm_dp/grounding/capsule.py carries as _LID_LIP_LOCAL, resolved through the
+# lid body's rest transform so it can be applied to the machine root directly.
+_CAPSULE_LIP_LOCAL = np.array([-0.0784, -0.2392, 0.3924])
+# The rim is the machine's topmost, far-side corner: a grazing surface the depth camera samples
+# thinly, and the width-at-grasp-point probe downstream needs a real neighbourhood to measure a
+# pinch in. These mirror rekep's probe (_GRASP_PROBE_R / _MIN_LOCAL_PTS): if the declared rim is
+# seen by fewer than this many points, the plan names the nearest point that IS seen instead, so
+# it never asks the robot to close on geometry nothing observed.
+_CAPSULE_LIP_PROBE_R, _CAPSULE_LIP_MIN_PTS = 0.03, 20
+# Half-width of the rim the plan asks the fingers to close on, declared with the point in the same
+# way and from the same asset calibration as _CAPSULE_LIP_LOCAL (it is the number
+# vlm_dp/grounding/capsule.py carries as _LID_EXTENTS[0]). It travels with the declaration because
+# a declared grasp FEATURE and its owner's body are different geometries: without it, every grasp
+# term downstream sizes itself to the machine's ~320mm keepout extent instead of a 10mm lip, which
+# floors aperture_region, opens the centre dead zone and the close gate to 127mm, and puts a 33cm
+# straddle repulsion around the very point the gripper is told to stand on.
+_CAPSULE_LIP_HALF_W = 0.010
 
 
 def _render(task_key, out_dir, **fields):
@@ -170,25 +191,44 @@ def _capsule(out_dir, keypoints, grounded, env, clearance):
     data = env.scene["capsule"].data
     root = data.root_pos_w[0].cpu().numpy().astype(np.float64)
     quat = data.root_quat_w[0].cpu().numpy()
-    front = _quat_rotate_wxyz(quat, np.array([0.0, -1.0, 0.0]))
 
-    # Lid lip: the front-most point of the machine's top slab, from the observed cloud.
-    mach = pts["capsule"]
-    band = mach[mach[:, 2] >= float(np.percentile(mach[:, 2], 99)) - _CAPSULE_LID_BAND]
-    lip_world = band[int(np.argmax((band - root) @ front))].astype(np.float64)
+    # Lid lip: declared from the machine root frame, exactly the way the bay already is. The
+    # rim is a few millimetres of near-tangential surface, so a single depth view samples it
+    # sparsely and the front-most point of the top slab lands ~90mm inboard and to the side of
+    # the real rim -- far enough that stage 1 never grasped it. The machine is a *calibrated
+    # fixture*: the plan already reads its root pose to place the bay and the mid-air open goal,
+    # so one more fixed offset in that frame is the same class of information, and unlike the
+    # cloud search it does not depend on which facets the camera happened to see this episode.
+    lip_world = _observable(root + _quat_rotate_wxyz(quat, _CAPSULE_LIP_LOCAL), pts["capsule"])
     open_world = lip_world + _CAPSULE_LID_OPEN_LIFT
     bay_world = root + _quat_rotate_wxyz(quat, _CAPSULE_BAY_LOCAL)
 
     pod = _nearest_kp_distinct(keypoints, pts["can"].mean(axis=0), set())
     n = len(keypoints)
     lip, open_goal, bay = n, n + 1, n + 2
-    extra = [(lip_world, "capsule"), (open_world, None), (bay_world, "capsule")]
+    extra = [(lip_world, "capsule", _CAPSULE_LIP_HALF_W), (open_world, None), (bay_world, "capsule")]
 
     kps = np.concatenate([np.asarray(keypoints, dtype=np.float64),
                           np.stack([lip_world, open_world, bay_world])], axis=0)
+    # Lift target: the pod's pick-up position raised _LIFT_HEIGHT, expressed as an offset from the
+    # BAY keypoint because that one is on the machine and does not move. Anchoring to the carried
+    # pod's own keypoint would be degenerate (the target would track the pod).
     lift_pod = (kps[pod] + np.array([0.0, 0.0, _LIFT_HEIGHT]) - kps[bay]).tolist()
+    # Seat and hover offsets from the bay keypoint: the hover point for the transport stage is the
+    # seat raised by the carry clearance, so the following stage's descent is straight down.
+    off_pod = _CAPSULE_BAY_SEAT.tolist()
+    hover_pod = (_CAPSULE_BAY_SEAT + np.array([0.0, 0.0, _CARRY_HOVER])).tolist()
+    # Absolute world heights the plan's scalar rules measure against: the LIFT stage's one-sided
+    # vertical sub-goal, the transport stage's carry-height floor, and the descent gate's hover
+    # height. `lift_pod` is still supplied for any plan wanting the full 3-D lift point.
+    lift_z_pod = float(kps[pod][2] + _LIFT_HEIGHT)
+    carry_z_pod = float(kps[pod][2] + _LIFT_HEIGHT - _CARRY_SLACK)
+    hover_z_pod = float(kps[bay][2] + hover_pod[2])
     metadata = _render("capsule", out_dir, lip=lip, open_goal=open_goal, pod=pod, bay=bay,
-                       lift_pod=lift_pod)
+                       lift_pod=lift_pod, off_pod=off_pod, hover_pod=hover_pod,
+                       lift_z_pod=lift_z_pod, carry_z_pod=carry_z_pod, hover_z_pod=hover_z_pod)
+    # vlm_dp extension, not part of the ReKep response format the parser understands.
+    metadata["steer_policies"] = ["on_failure"] * metadata["num_stages"]
     with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
 
@@ -196,21 +236,31 @@ def _capsule(out_dir, keypoints, grounded, env, clearance):
           f"lip=kp{lip} (declared, {np.round(lip_world, 3)}) "
           f"open_goal=kp{open_goal} (declared, {np.round(open_world, 3)}) "
           f"bay=kp{bay} (declared, {np.round(bay_world, 3)})", flush=True)
-    _capsule_lip_diagnostic(env, lip_world)
+    _capsule_lip_diagnostic(env, lip_world, root, quat)
     return metadata, {"lid": lip, "open_goal": open_goal, "pod": pod, "bay": bay}, extra
 
 
-def _capsule_lip_diagnostic(env, lip_world):
-    """Report how far the measured lid lip sits from the privileged one (diagnostic only)."""
+def _capsule_lip_diagnostic(env, lip_world, root, quat):
+    """Report how far the declared lid lip sits from the privileged one (diagnostic only).
+
+    Also prints the privileged lip re-expressed in the machine-root frame: that is the number
+    _CAPSULE_LIP_LOCAL is calibrated from, and printing it every run is how a change to the
+    asset would be caught rather than silently drifting the grasp point.
+    """
     try:
         from vlm_dp.grounding.capsule import gt_keypoints
         from types import SimpleNamespace
 
         gt_kps, _ = gt_keypoints(SimpleNamespace(env=env))
-        err = float(np.linalg.norm(np.asarray(gt_kps[0]) - lip_world)) * 1e3
-        print(f"[fake-vlm] capsule lip check: measured {np.round(lip_world, 3)} vs privileged "
-              f"{np.round(np.asarray(gt_kps[0]), 3)} ({err:.0f}mm) -- diagnostic only, "
-              f"the plan uses the measured point", flush=True)
+        gt_lip = np.asarray(gt_kps[0], dtype=np.float64)
+        err = float(np.linalg.norm(gt_lip - lip_world)) * 1e3
+        local = _quat_rotate_wxyz(_quat_conj_wxyz(quat), gt_lip - root)
+        print(f"[fake-vlm] capsule lip check: declared {np.round(lip_world, 3)} vs privileged "
+              f"{np.round(gt_lip, 3)} ({err:.0f}mm) -- diagnostic only, "
+              f"the plan uses the declared point", flush=True)
+        print(f"[fake-vlm] capsule lip calibration: privileged lip in the machine-root frame is "
+              f"{np.round(local, 4).tolist()} (constant _CAPSULE_LIP_LOCAL = "
+              f"{np.round(_CAPSULE_LIP_LOCAL, 4).tolist()})", flush=True)
     except Exception as exc:                       # never let a diagnostic break grounding
         print(f"[fake-vlm] capsule lip check unavailable ({exc})", flush=True)
 
@@ -219,6 +269,48 @@ def _quat_rotate_wxyz(quat, vec):
     w, x, y, z = [float(v) for v in quat]
     q = np.array([x, y, z])
     return vec + 2.0 * np.cross(q, np.cross(q, vec) + w * vec)
+
+
+def _observable(point, pts):
+    """Return the declared point, moved the least distance that makes it observable.
+
+    A declared point is only useful if perception can certify what is at it: the compiler
+    measures the grip width from the cloud in a small ball around the grasp point, and a point
+    nothing was sampled near falls back to the whole object's width and compiles as a press.
+    The machine's lid rim is its topmost far-side edge -- grazing geometry a single depth view
+    barely samples -- so the plan walks the declared point toward the cloud only until the
+    probe has enough support, keeping the grasp as close to the true rim as evidence allows.
+    """
+    point = np.asarray(point, dtype=np.float64)
+    pts = np.asarray(pts, dtype=np.float64)
+    d = np.linalg.norm(pts - point[None], axis=1)
+    seen = int((d <= _CAPSULE_LIP_PROBE_R).sum())
+    if seen >= _CAPSULE_LIP_MIN_PTS:
+        print(f"[fake-vlm] capsule lip observability: {seen} cloud points within "
+              f"{_CAPSULE_LIP_PROBE_R * 1e3:.0f}mm -- declared rim kept", flush=True)
+        return point
+    step = 0.0025
+    direction = pts[int(np.argmin(d))] - point
+    direction = direction / max(float(np.linalg.norm(direction)), 1e-9)
+    for i in range(1, int((float(d.min()) + _CAPSULE_LIP_PROBE_R) / step) + 1):
+        moved = point + direction * (i * step)
+        n = int((np.linalg.norm(pts - moved[None], axis=1) <= _CAPSULE_LIP_PROBE_R).sum())
+        if n >= _CAPSULE_LIP_MIN_PTS:
+            print(f"[fake-vlm] capsule lip observability: {seen} cloud points within "
+                  f"{_CAPSULE_LIP_PROBE_R * 1e3:.0f}mm of the declared rim (nearest "
+                  f"{float(d.min()) * 1e3:.0f}mm); moved {i * step * 1e3:.0f}mm inboard to "
+                  f"{np.round(moved, 3)}, where {n} points support the grip probe", flush=True)
+            return moved
+    snapped = pts[int(np.argmin(d))]
+    print(f"[fake-vlm] capsule lip observability: the rim is unobservable ({seen} points within "
+          f"{_CAPSULE_LIP_PROBE_R * 1e3:.0f}mm and no inboard point does better); snapping "
+          f"{float(d.min()) * 1e3:.0f}mm to {np.round(snapped, 3)}", flush=True)
+    return snapped
+
+
+def _quat_conj_wxyz(quat):
+    w, x, y, z = [float(v) for v in quat]
+    return np.array([w, -x, -y, -z])
 
 
 def _nearest_kp_distinct(keypoints, point, taken):
@@ -377,8 +469,11 @@ def generate(task_key, out_dir, keypoints, grounded, env, clearance=0.015):
     """Write fake VLM metadata and constraint files for a task.
 
     Returns ``(metadata, roles, extra_keypoints)``. ``extra_keypoints`` is a list of
-    ``(world_point, owner_name_or_None)`` the task declared: points the plan needs that no
-    proposed keypoint stands for. The caller appends them and registers them for tracking.
+    ``(world_point, owner_name_or_None)``, or ``(world_point, owner_name_or_None,
+    grasp_half_width)``, the task declared: points the plan needs that no proposed keypoint stands
+    for. The caller appends them and registers them for tracking. A declaration that names a GRASP
+    feature carries its half-width, which is the geometry every downstream grasp term uses for it
+    (rekep.ground propagates it); the owner's whole-body extent describes a different thing.
     """
     if task_key not in _FAKE_VLMS:
         raise SystemExit(f"[fake-vlm] no fake VLM for task {task_key!r}, register one in _FAKE_VLMS "

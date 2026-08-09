@@ -60,12 +60,13 @@ class GTWorld:
         """Return the latched held object, if available."""
         return self._latch.held() if self._latch is not None else None
 
-    def observe(self, env, commanded_close, candidates=None):
+    def observe(self, env, commanded_close, candidates=None, points=None):
         """Update the GT hold latch for one control step."""
         if self._latch is None:
             return
         self._latch.sensor.observe(env, commanded_close)
         positions = {n: self.object_pose(n)[0] for n in self.names}
+        positions.update(points or {})   # grasp points, not centroids: see SensedWorld.observe
         self._latch.update(positions, env.tcp(), candidates)
 
     def sync_fk(self, env):
@@ -159,8 +160,17 @@ class SensedWorld:
                                     device=self.visual.device)
         print("[world:visual] tracker re-primed after displaced re-perception", flush=True)
 
-    def observe(self, env, commanded_close, candidates=None):
-        """Update the GT hold latch for one control step."""
+    def observe(self, env, commanded_close, candidates=None, points=None):
+        """Update the hold latch for one control step.
+
+        ``points`` overrides, for the hold test only, where an object is considered to BE. The
+        hold test asks "is the thing the fingers stalled on within reach of the TCP", and the
+        answer has to be measured at the point the stage actually grasps: a declared lid rim is
+        0.25-0.30m from its machine's centroid, so resolving the hold against centroids made a
+        physically perfect grasp (TCP 1.2mm from the rim, fingers stalled on it) unrecognisable and
+        the stage unadvanceable by construction. Object TRACKING keeps using the centroid belief --
+        that is what _fk_held carries and what _placed measures -- so only this dictionary changes.
+        """
         self.sensor.observe(env, commanded_close)
 
 
@@ -175,8 +185,9 @@ class SensedWorld:
                 and self.sensor.aperture() < self._grip_aperture + self._SLIP_MARGIN):
             held = self._held
         else:
-            near = ({n: p for n, p in self._pos.items() if n in candidates} if candidates
-                    else self._pos)
+            at = dict(self._pos)
+            at.update(points or {})
+            near = ({n: p for n, p in at.items() if n in candidates} if candidates else at)
             held = self.sensor.held_object(near, env.tcp())
 
         if held != self._held:

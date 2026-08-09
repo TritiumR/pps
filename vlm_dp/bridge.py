@@ -63,6 +63,13 @@ class VlmDpBridge:
         # Search recovery probes nearby poses after a closed-empty grasp.
         self._grasp_recovery = adv.get("grasp_recovery", "reopen")
         self._probe_pts = probe_pattern(float(adv.get("grasp_search_radius", 0.045)))
+        # Bounds on the reopen recovery, so it cannot hold the gripper open for an entire episode
+        # when the fingers physically cannot reach the open threshold (see _reopen_escape).
+        self._reopen_max = int(adv.get("reopen_max_replans", 12))
+        self._reopen_stall = int(adv.get("reopen_stall_replans", 4))
+        self._reopen_stall_eps = float(adv.get("reopen_stall_eps", 0.01))
+        self._reopen_travel = float(adv.get("reopen_min_travel", 0.02))
+        self._reopen_cooldown = int(adv.get("reopen_cooldown_replans", 8))
         self.stall_margin = float(adv.get("stall_margin", 0.15))
         # Optional hold hysteresis, grace, and backtrack limits.
         self.hold_enter = _opt_float(adv.get("hold_enter"))
@@ -140,6 +147,9 @@ class VlmDpBridge:
         self._place_seen = None
         self._place_since = None
         self._reopen = False
+        self._reopen_ap = []
+        self._reopen_cooldown_left = 0
+        self._hold_world = None
         self._grasp_probe = np.zeros(3)
         self._grasp_probe_idx = 0
         self._closed_empty = 0
@@ -220,7 +230,14 @@ class VlmDpBridge:
                          contact_criterion=self.contact_criterion, subgoal_eps=self.subgoal_eps,
                          rotate_grasp_offset=self.rotate_grasp_offset,
                          lift_latch_xy=self.lift_latch_xy, seat_from_plane=self.seat_from_plane,
-                         open_half=float(self.geom.get("open_half", 0.04)), **self.roles)
+                         open_half=float(self.geom.get("open_half", 0.04)), geom=self.geom,
+                         # The live aperture sensor's own thresholds, so the completion
+                         # predicates' contact band is auditable against the band the hold
+                         # latch actually uses instead of being compared from memory.
+                         sensor_cfg={"q_free": float(self.sensor.q_free),
+                                     "stall_margin": float(self.sensor.stall_margin),
+                                     "q_touch": float(self.sensor.q_touch)},
+                         **self.roles)
         self.world = self._build_world(raw_env, percep, src)
         self.grounding = src.ground(self.env, self.world)
         # Advance checks use grounding estimates rather than simulator poses.
@@ -297,6 +314,8 @@ class VlmDpBridge:
         self._place_seen = None
         self._place_since = None
         self._reopen = False
+        self._reopen_ap = []
+        self._reopen_cooldown_left = 0
         self._contact_seen = False
         self._released_latch = False
         self._grasp_probe = np.zeros(3)
@@ -332,8 +351,14 @@ class VlmDpBridge:
         st = self.stage()
         # Press stages may close without certifying a pinch hold.
         if st.gripper == "close" and self.sensor is not None and getattr(st, "contact", "pinch") != "press":
-            if self.sensor.closed_on_air():
+            if self._reopen_cooldown_left > 0:
+                # Escaped a reopen recently: let the gripper close again before re-arming, or the
+                # recovery re-latches on the same evidence and the escape buys nothing.
+                self._reopen_cooldown_left -= 1
+                self._reopen = False
+            elif self.sensor.closed_on_air():
                 if not self._reopen:
+                    self._reopen_ap = []
                     self._closed_empty += 1
                     self.gate_events["closed_empty"] += 1
                     print("[vlm_dp] closed-empty at grasp target: commanding reopen", flush=True)
@@ -352,6 +377,13 @@ class VlmDpBridge:
                 self._reopen = True
             elif self.sensor.is_open():
                 self._reopen = False
+            if self._reopen:
+                escape = self._reopen_escape()
+                if escape is not None:
+                    self._reopen = False
+                    self._reopen_cooldown_left = self._reopen_cooldown
+                    print(f"[vlm_dp] reopen abandoned ({escape}); commanding close again for "
+                          f"{self._reopen_cooldown} replans", flush=True)
         else:
             self._reopen = False
         if self._reopen:
@@ -425,6 +457,36 @@ class VlmDpBridge:
         ctx["steer_events"] = dict(self.gate_events)
         ctx["stage_env_steps"] = int(self._stage_env_steps)
         return ctx
+
+    def _reopen_escape(self):
+        """Return why the reopen recovery must be abandoned this replan, or None to continue.
+
+        The recovery latches on ``closed_on_air`` and, as shipped, cleared on ``is_open()`` alone
+        (aperture <= q_touch). Fingers that close on the EDGE of something wedge part-way -- 0.23
+        to 0.38 rad, neither open nor free-closed -- and neither exit condition can ever be met, so
+        the open command is held for the rest of the episode and the stage cannot be retried. Both
+        escapes below are bounded and preserve the normal path: an ordinary reopen travels from the
+        free-close angle to open in a few replans, so it never sits still long enough to stall out
+        and never reaches the timeout.
+        """
+        ap = float(self.sensor.aperture())
+        self._reopen_ap.append(ap)
+        n = len(self._reopen_ap)
+        if n >= self._reopen_max:
+            return (f"timeout: {n} replans commanding open, aperture still {ap:.3f} rad "
+                    f"(open needs <= {self.sensor.q_touch:.3f})")
+        k = self._reopen_stall
+        if n >= k and not self.sensor.closed_on_air():
+            # WEDGED means part-way: neither open nor free-closed. While the fingers are still in
+            # the free-close range this is just an ordinary reopen in progress -- which is allowed
+            # to be slow, and is bounded by the timeout above -- so the stall test stands down and
+            # normal closed-on-air recovery is preserved.
+            window = self._reopen_ap[-k:]
+            moved = self._reopen_ap[0] - ap
+            if max(window) - min(window) <= self._reopen_stall_eps and moved >= self._reopen_travel:
+                return (f"fingers wedged at {ap:.3f} rad: {k} replans within "
+                        f"{self._reopen_stall_eps:.3f} rad after opening {moved:.3f} rad")
+        return None
 
     def _hold_grace_value(self, stage):
         """Return whether the post-grasp hold-grace window is active."""
@@ -520,9 +582,32 @@ class VlmDpBridge:
         cand = {n for n in (st.grasp_obj, st.payload) if n}
         observe = getattr(self.world, "observe", None)
         if callable(observe):
-            observe(self.env, commanded_close, candidates=cand or None)
+            observe(self.env, commanded_close, candidates=cand or None,
+                    points=self._hold_points(cand))
         else:
             self.sensor.observe(self.env, commanded_close)
+
+    def _hold_points(self, names):
+        """Return where the hold test should look for each object: its GROUNDED grasp point.
+
+        The grounding's own accessor (``self._obj_pos``, i.e. the tracked keypoint the stage
+        grasps, with its registered offset) rather than the world's centroid belief. For an object
+        whose grasp point IS its centre the two are the same reading; for a stage that grasps a
+        declared feature -- a lid rim on a coffee machine -- they are 0.25-0.30m apart, and the
+        centroid reading makes the correct grasp invisible to ApertureGraspSensor.held_object,
+        whose proximity gate is 0.10m. The stage's grasp point is what the cost drove the TCP to,
+        so it is the point the hold has to be judged against.
+        """
+        out = {}
+        for name in names or ():
+            fn = self._obj_pos.get(name)
+            if fn is None:
+                continue
+            try:
+                out[name] = np.asarray(fn(), dtype=np.float64)[:3]
+            except Exception:
+                continue                      # an un-grounded name simply keeps the world's belief
+        return out or None
 
     def _pos(self, name):
         """Return the estimated object position, with a world-state fallback."""
@@ -567,6 +652,36 @@ class VlmDpBridge:
                       f"gt=({gt[0]:.3f},{gt[1]:.3f},{gt[2]:.3f})", flush=True)
             except Exception:
                 pass
+
+    def _log_grasp_state(self, stage):
+        """Log the grasp evidence a close stage advances on, once per replan.
+
+        One line carrying all four quantities that decide a grasp: where the TCP is relative to the
+        point the stage actually grasps, the feasibility radius every grasp term is sized by (and
+        the dead zone it implies), the gripper channel's state including the reopen recovery, and
+        what the hold latch resolves to.
+        """
+        if stage.gripper != "close" or stage.grasp_obj is None or self.sensor is None:
+            return
+        name = stage.grasp_obj
+        obj = next((o for o in self.grounding.objects if o.name == name), None)
+        ge = getattr(obj, "grasp_extent", None) if obj is not None else None
+        ext = self._extents.get(name)
+        radius = float(ge) if ge is not None else (float(ext[1]) if ext is not None else float("nan"))
+        try:
+            tgt = np.asarray(stage.target(), dtype=np.float64)[:3] + self._grasp_probe
+            d = float(np.linalg.norm(np.asarray(self.env.tcp(), dtype=np.float64)[:3] - tgt))
+        except Exception:
+            d = float("nan")
+        latched = getattr(self.world, "held", None)
+        print(f"[vlm_dp] grasp_dbg stage={self.stage_idx} replan={self.stage_replans} obj={name} "
+              f"r={radius:.4f}{'' if ge is not None else '(whole-object)'} "
+              f"dead={self._grasp_slack(name):.4f} d_tcp={d:.4f} ap={self.sensor.aperture():.3f} "
+              f"open={int(self.sensor.is_open())} air={int(self.sensor.closed_on_air())} "
+              f"holding={int(self.sensor.holding())} reopen={int(self._reopen)} "
+              f"cool={self._reopen_cooldown_left} "
+              f"latch={latched() if callable(latched) else None} "
+              f"held={int(self._payload_held(name))}", flush=True)
 
     def _log_release_gate(self, stage):
         """Log placement release errors and simulator-only diagnostics."""
@@ -671,6 +786,7 @@ class VlmDpBridge:
             self._log_release_gate(stage)
         if self._ground_err_debug:
             self._log_ground_error()
+            self._log_grasp_state(stage)
         violated = self._invariant_violated(stage, flags) if self.backtrack_enabled else None
         if violated and self._backtrack_blocked():
             violated = None  # Commit to the current grip.

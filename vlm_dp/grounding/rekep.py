@@ -117,7 +117,8 @@ class RekepGrounding:
                  local_grasp: bool = False, local_grasp_radius: float = 0.05,
                  kp_source: str = "perception", contact_criterion: str = "feasibility",
                  open_half: float = 0.04, rotate_grasp_offset: bool = False,
-                 lift_latch_xy: bool = False, seat_from_plane: bool = False):
+                 lift_latch_xy: bool = False, seat_from_plane: bool = False, geom=None,
+                 sensor_cfg=None):
         self.vlm = vlm
         self.task_key = task_key
         self.place_obj = place_obj
@@ -141,6 +142,14 @@ class RekepGrounding:
 
         self.contact_criterion = contact_criterion
         self.open_half = float(open_half)
+        # The COST geometry block, verbatim. Read only by the grasp-geometry preflight, which must
+        # report the radii the cost terms will actually compute rather than a re-derivation.
+        self.geom = dict(geom) if geom else {}
+        # The APERTURE SENSOR's own thresholds, verbatim. Carried to the predicate runtime so the
+        # aperture band the completion predicates test against is auditable against the band the
+        # hold sensor uses -- the two are stated independently today, and the log line the runtime
+        # prints is what a later change that unifies them has to work from.
+        self.sensor_cfg = dict(sensor_cfg) if sensor_cfg else {}
 
 
         self.rotate_grasp_offset = bool(rotate_grasp_offset)
@@ -237,7 +246,7 @@ class RekepGrounding:
             for _f in os.listdir(vlm_dir):
                 if _f.endswith("_constraints.txt") or _f == "metadata.json":
                     os.remove(os.path.join(vlm_dir, _f))
-        roles, declared = {}, {}
+        roles, declared, declared_ext = {}, {}, {}
         if self.vlm == "fake":
             metadata, roles, extra_kps = fake_vlm.generate(self.task_key, vlm_dir, keypoints, grounded,
                                                            env.env, self.clearance)
@@ -245,12 +254,17 @@ class RekepGrounding:
                 # Points the plan needs that no proposal stands for (a thin lid rim, a place in
                 # mid-air, a recess inside a fixture). Appended after the tracker exists, so they
                 # are registered here by hand rather than re-running the association.
+                # A declaration is ``(point, owner)`` or ``(point, owner, grasp_half_width)``: a
+                # declared GRASP feature carries its own local geometry, because the feature is
+                # exactly what the owner's whole-body extent is not (a 10mm lid rim on a 300mm
+                # machine). See the propagation below.
                 first = len(keypoints)
+                extra_kps = [tuple(e) + (None,) * (3 - len(e)) for e in extra_kps]
                 keypoints = np.concatenate(
                     [np.asarray(keypoints, dtype=np.float64),
-                     np.stack([np.asarray(p, dtype=np.float64) for p, _ in extra_kps])], axis=0)
+                     np.stack([np.asarray(p, dtype=np.float64) for p, _, _ in extra_kps])], axis=0)
                 grounded["keypoints"] = keypoints
-                for point, owner in extra_kps:
+                for point, owner, ext in extra_kps:
                     point = np.asarray(point, dtype=np.float64)
                     if owner is None:
                         tracker.registrations.append((None, point))
@@ -258,9 +272,12 @@ class RekepGrounding:
                         _p, _r = world.object_pose(owner)
                         tracker.registrations.append((owner, _r.T @ (point - _p)))
                     declared[len(tracker.owners)] = owner
+                    if ext is not None:
+                        declared_ext[len(tracker.owners)] = float(ext)
                     tracker.owners.append(owner)
                 print(f"[rekep] fake VLM declared keypoints {list(range(first, len(keypoints)))} "
-                      f"owners={[o for _, o in extra_kps]}", flush=True)
+                      f"owners={[o for _, o, _ in extra_kps]} "
+                      f"grasp_extents={ {k: round(v, 4) for k, v in declared_ext.items()} }", flush=True)
         else:
             metadata = self._real_constraints(vlm_dir, grounded, config)
         bad = [i for i in metadata["grasp_keypoints"] + metadata["release_keypoints"] if not -1 <= i < len(keypoints)]
@@ -375,9 +392,31 @@ class RekepGrounding:
         # A declared grasp keypoint IS the grasp point (a lid rim, not the machine's centroid), so
         # it overrides the cloud-centroid estimate its owner would otherwise be grasped at. Same
         # rule the gt_meta block below applies to privileged keypoints.
+        #
+        # It must also override the grasp EXTENT, for the same reason and by the same rule: if the
+        # plan declares a grasp feature, every downstream grasp geometry (terms._grasp_frame's
+        # feasibility radius, and through grasp_slack the centre dead zone, the close gate, the
+        # straddle keepout and the aperture floor) is the geometry of THAT FEATURE, never the
+        # owner's centroid-scale extent. Propagating the point without the extent is what made the
+        # capsule lid rim a 0.32m "object" to close on: aperture_region floored at 6.4 weighted,
+        # straddle pushed the fingers 33cm off the rim it was standing on, and the centre dead zone
+        # and close gate opened to 12.7cm. Explicit declaration first (the plan measured the
+        # feature), then the width the cloud shows AT the declared point; never the whole body.
+        declared_grasp = {}
         for k, owner in declared.items():
             if owner is not None and k in metadata["grasp_keypoints"]:
                 kp_of[owner], centroid_off[owner] = k, np.zeros(3)
+                declared_grasp[owner] = k
+                ext = declared_ext.get(k, probe_ext.get(owner))
+                if ext is not None:
+                    grasp_ext_of[owner] = float(ext)
+                print(f"[rekep] declared grasp kp{k} -> {owner}: grasp point "
+                      f"{np.round(keypoints[k], 3)}, grasp half-width "
+                      + (f"{grasp_ext_of[owner] * 1e3:.1f}mm "
+                         f"({'declared by the plan' if k in declared_ext else 'measured at the point'})"
+                         if ext is not None else "UNRESOLVED")
+                      + f" (owner extents={tuple(round(x, 3) for x in extents.get(owner, _DEFAULT_EXTENT))})",
+                      flush=True)
 
         if gt_meta is not None:
 
@@ -476,7 +515,8 @@ class RekepGrounding:
         if self.stages == "vlm":
             stages, manipulated = self._vlm_stages(metadata, tracker, keypoints, name_for,
                                                    load_stage, objects, env, dev, vlm_dir,
-                                                   probe_ext, clouds, usd, roles)
+                                                   probe_ext, clouds, usd, roles,
+                                                   declared_grasp)
             return Grounding(objects=objects, stages=stages, manipulated=frozenset(manipulated),
                              keypoints=(lambda: tracker.get_positions()))
 
@@ -567,8 +607,44 @@ class RekepGrounding:
                 return alt_mode, alt_grip, f"width at the grasp point, r={_GRASP_PROBE_R:g}m"
         return mode, grip, "whole-object width"
 
+    def _grasp_geometry(self, name, obj_ext, local_ext):
+        """Return the EXACT feasibility radius the cost terms will use, and where it came from.
+
+        This is a transcription of :func:`vlm_dp.cost.terms._grasp_frame`, deliberately, so the
+        preflight reports the number the run will actually use rather than a second opinion about
+        it. Any edit there must be mirrored here (the unit test pins the two together).
+        """
+        radius = local_ext.get(name)
+        if radius is not None:
+            return float(radius), "local grasp extent"
+        ext = obj_ext.get(name, _DEFAULT_EXTENT)
+        return float(ext[1]), "WHOLE-OBJECT keepout extent (fallback)"
+
+    def _grasp_radii(self, radius):
+        """Return the derived grasp radii the cost terms compute from one feasibility radius."""
+        import types as _types
+
+        from vlm_dp.cost.terms import grasp_slack
+        geom = _types.SimpleNamespace(**(self.geom or {}))
+        geom.open_half = float(getattr(geom, "open_half", self.open_half))
+        dead = float(grasp_slack(geom, float(radius)))
+        return {
+            "dead_zone": dead,
+            "close_gate_xy": max(dead, float(getattr(geom, "close_xy_floor", 1e-3))),
+            "straddle_keepout": float(radius) + float(getattr(geom, "finger_r", 0.0)),
+            "aperture_floor": max(float(radius) + float(getattr(geom, "aperture_margin", 0.0))
+                                  - geom.open_half, 0.0),
+        }
+
+    # A grasp geometry is "physically sensible" when the fingers can actually close around the
+    # feature: it fits inside the aperture (so aperture_region can reach zero rather than paying a
+    # constant floor everywhere), and the centre dead zone is no wider than the aperture itself
+    # (a dead zone wider than the hand means "anywhere near this object" counts as at the grasp
+    # pose, which is how a 12.7cm dead zone let the run park on a hover shell and call it done).
+    _DEAD_ZONE_MAX_FRAC = 1.0
+
     def _preflight(self, metadata, keypoints, name_for, obj_ext, local_ext, probe_ext,
-                   usd_ext, clouds, roles):
+                   usd_ext, clouds, roles, declared_grasp=None):
         """Refuse to roll out on grounding the plan cannot act on.
 
         Every failure here used to be discovered ~50 minutes later as an inexplicably bad rollout.
@@ -634,6 +710,47 @@ class RekepGrounding:
                         f"{width * 1e3:.0f}mm ({src}) against a {self.open_half * 1e3:.0f}mm "
                         f"gripper aperture, so the stage would compile as a press: either the mask "
                         f"is wrong or the role resolved to the wrong object")
+            # GRASP GEOMETRY. The pinch/press check above reads the width probe; the COST reads a
+            # different quantity (terms._grasp_frame's feasibility radius), and it was the gap
+            # between those two that hid the capsule defect: the plan was certified pinchable on a
+            # 10mm rim while every grasp term was sized for a 320mm machine. So assert the exact
+            # radius the terms will use, and the radii they derive from it.
+            radius, rsrc = self._grasp_geometry(name, obj_ext, local_ext)
+            rad = self._grasp_radii(radius)
+            declared_kp = (declared_grasp or {}).get(name)
+            print(f"[rekep-preflight] grasp-geometry stage {i + 1} {name!r}: radius="
+                  f"{radius * 1e3:.1f}mm ({rsrc}"
+                  + (f", declared kp{declared_kp}" if declared_kp is not None else "")
+                  + f") -> dead_zone={rad['dead_zone'] * 1e3:.1f}mm "
+                  f"close_gate_xy={rad['close_gate_xy'] * 1e3:.1f}mm "
+                  f"straddle_keepout={rad['straddle_keepout'] * 1e3:.1f}mm "
+                  f"aperture_floor={rad['aperture_floor'] * 1e3:.1f}mm", flush=True)
+            unfit = rad["aperture_floor"] > 0.0
+            wide_dead = rad["dead_zone"] > self._DEAD_ZONE_MAX_FRAC * self.open_half
+            if declared_kp is not None and local_ext.get(name) is None:
+                problems.append(
+                    f"stage {i + 1} grasps DECLARED keypoint {declared_kp} on {name!r}, but no local "
+                    f"grasp extent reached the runtime, so every grasp term would size itself to "
+                    f"{name!r}'s whole-object keepout ({radius * 1e3:.0f}mm): declare the feature's "
+                    f"half-width alongside the point, or leave enough cloud at it to measure one")
+            elif declared_kp is not None and (unfit or wide_dead):
+                problems.append(
+                    f"stage {i + 1} grasp geometry for {name!r} is not physically sensible: radius "
+                    f"{radius * 1e3:.0f}mm ({rsrc}) against a {self.open_half * 1e3:.0f}mm aperture "
+                    f"gives dead_zone {rad['dead_zone'] * 1e3:.0f}mm, close gate "
+                    f"{rad['close_gate_xy'] * 1e3:.0f}mm, straddle keepout "
+                    f"{rad['straddle_keepout'] * 1e3:.0f}mm and an irreducible aperture_region floor "
+                    f"of {rad['aperture_floor'] * 1e3:.0f}mm -- the fingers cannot close on it")
+            elif unfit or wide_dead:
+                # A SNAPPED grasp keypoint carries no declared geometry, so there is nothing to
+                # propagate and refusing would only ground a task the runtime can still attempt.
+                # Loud, with the numbers, because it is the same defect one declaration short.
+                print(f"[rekep-preflight] WARNING: {name!r} (stage {i + 1}, snapped grasp keypoint) "
+                      f"grasps at a {radius * 1e3:.0f}mm radius from its {rsrc}: dead zone "
+                      f"{rad['dead_zone'] * 1e3:.0f}mm, straddle keepout "
+                      f"{rad['straddle_keepout'] * 1e3:.0f}mm, irreducible aperture_region floor "
+                      f"{rad['aperture_floor'] * 1e3:.0f}mm. The grasp terms are sized for the whole "
+                      f"object, not for the feature the plan grasps.", flush=True)
         if problems:
             raise SystemExit("[rekep-preflight] grounding is not usable for this plan; refusing to "
                              "roll out:\n  - " + "\n  - ".join(problems))
@@ -642,7 +759,7 @@ class RekepGrounding:
               f"pinchable within the {self.open_half * 1e3:.0f}mm aperture", flush=True)
 
     def _vlm_stages(self, metadata, tracker, keypoints, name_for, load_stage, objects, env, dev, vlm_dir,
-                    probe_ext=None, clouds=None, usd_ext=None, roles=None):
+                    probe_ext=None, clouds=None, usd_ext=None, roles=None, declared_grasp=None):
         """Build stages directly from VLM constraints."""
         obj_names = [o.name for o in objects]
         obj_center = {o.name: o.pos for o in objects}
@@ -650,7 +767,7 @@ class RekepGrounding:
         local_ext = {o.name: o.grasp_extent for o in objects if o.grasp_extent is not None}
         probe_ext, clouds, usd_ext = probe_ext or {}, clouds or {}, usd_ext or {}
         self._preflight(metadata, keypoints, name_for, obj_ext, local_ext, probe_ext,
-                        usd_ext, clouds, roles)
+                        usd_ext, clouds, roles, declared_grasp or {})
 
         def kp_point(k):
             return lambda k=k: tracker.get_positions()[k]
