@@ -486,7 +486,9 @@ def _pot(out_dir, keypoints, grounded, env, clearance):
     # Stages 2 and 5 are explicit object-relative lift constraints. Advance them when
     # that generated subgoal is satisfied; comparing the payload height directly to
     # the TCP target can either finish too early or wait forever on a grasp offset.
-    metadata["move_advance_on_done_targets"] = [1, 4]
+    metadata["move_advance_on_done_targets"] = [1]
+    metadata["move_advance_on_payload_rise_targets"] = [4]
+    metadata["stage_rise_confirm"] = {"4": 0.08}
     if handle_axis is not None:
         metadata["grasp_geometry"] = {
             "cover": {"axis": list(handle_axis), "extent": float(handle_extent)}

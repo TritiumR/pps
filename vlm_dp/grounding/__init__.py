@@ -65,6 +65,7 @@ class Stage:
     rise_confirm: Optional[float] = None
     place_point: Optional[Callable[[], np.ndarray]] = None    # calibrated top-surface seat point
     carry_z: Optional[Callable[[], float]] = None             # carry altitude for the place transit
+    advance_on_payload_rise: bool = False     # hold stages: advance after the sensed payload rises
     advance_on_done: bool = False             # hold stages: advance on done() instead of the height gate
     # Called by the bridge on every entry (advance or backtrack) to this stage. Lets a stage latch a
     # world anchor at the moment it begins, rather than tracking a live estimate that its own motion moves.

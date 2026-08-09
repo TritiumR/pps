@@ -85,6 +85,25 @@ def test_hold_can_advance_on_its_subgoal_instead_of_keypoint_height():
     assert not bridge._stage_reached(stage, {})
     reached[0] = True
     assert bridge._stage_reached(stage, {})
+def test_hold_can_advance_on_payload_rise():
+    stage = Stage(
+        name="lift egg",
+        target=lambda: np.array([0.0, 0.0, 1.3]),
+        gripper="hold",
+        payload="egg",
+        advance_on_payload_rise=True,
+        rise_confirm=0.08,
+    )
+    bridge = _bridge()
+    bridge.grasp_z0 = {"egg": 1.0}
+
+    bridge._pos = lambda _name: np.array([0.0, 0.0, 1.07])
+    assert not bridge._stage_reached(stage, {})
+    bridge._pos = lambda _name: np.array([0.0, 0.0, 1.081])
+    assert bridge._stage_reached(stage, {})
+
+
+
 
 
 def test_visual_rise_accepts_corrected_visual_belief():
@@ -127,6 +146,7 @@ _TESTS = [
     test_press_place_does_not_wait_for_a_pinch_release_sensor,
     test_hold_can_advance_on_its_subgoal_instead_of_keypoint_height,
     test_visual_rise_accepts_corrected_visual_belief,
+    test_hold_can_advance_on_payload_rise,
     test_latched_grasp_stays_closed_until_place_subgoal,
 ]
 

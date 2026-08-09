@@ -767,6 +767,10 @@ class RekepGrounding:
         def rise_confirm_for(name):
             value = (metadata.get("rise_confirm") or {}).get(name)
             return None if value is None else float(value)
+        def stage_rise_confirm_for(stage_idx, name):
+            value = (metadata.get("stage_rise_confirm") or {}).get(str(stage_idx))
+            return rise_confirm_for(name) if value is None else float(value)
+
 
         def self_displace_next(grasp_i, owner):
             """Return whether the next stage displaces the grasped object's keypoint."""
@@ -781,6 +785,9 @@ class RekepGrounding:
             return steer_policies[idx] if idx < len(steer_policies) else None
         move_advance_on_done_targets = {
             int(idx) for idx in metadata.get("move_advance_on_done_targets", [])
+        }
+        move_advance_on_payload_rise_targets = {
+            int(idx) for idx in metadata.get("move_advance_on_payload_rise_targets", [])
         }
         release_done_targets = {int(idx) for idx in metadata.get("release_done_targets", [])}
         move_done_targets = {int(idx) for idx in metadata.get("move_done_targets", [])}
@@ -831,7 +838,7 @@ class RekepGrounding:
                                     grasp_slack=contact_slack_for(i),
                                     force_gripper_at_target=(i in force_gripper_targets),
                                     grasp_advance_on_visual_rise=(i in visual_rise_grasp_targets),
-                                    rise_confirm=rise_confirm_for(name),
+                                    rise_confirm=stage_rise_confirm_for(i, name),
                                     grasp_transit_offsets=grasp_transit_offsets_for(i),
                                     contact=("press" if press else "pinch")))
                 grasped_body = owner
@@ -851,7 +858,7 @@ class RekepGrounding:
                                           if i in release_done_targets else subgoal_done(subgoal)),
                                     orient=orient_for(i), approach_axis=approach_for(i),
                                     orientation_scale=orientation_scale_for(i),
-                                    rise_confirm=rise_confirm_for(name),
+                                    rise_confirm=stage_rise_confirm_for(i, name),
                                     place_mode=place_mode_for(i, place_target),
                                     contact=("press" if pressed else "pinch")))
                 grasped_body = None
@@ -867,8 +874,9 @@ class RekepGrounding:
                                     constraint=subgoal, path_fns=path_fns, done=done,
                                     advance_on_done=(i in move_advance_on_done_targets),
                                     orient=orient_for(i), approach_axis=approach_for(i),
+                                    advance_on_payload_rise=(i in move_advance_on_payload_rise_targets),
                                     orientation_scale=orientation_scale_for(i),
-                                    rise_confirm=rise_confirm_for(grasped_body),
+                                    rise_confirm=stage_rise_confirm_for(i, grasped_body),
                                     contact=("press" if pressed else "pinch")))
 
         tcp_probe = torch.as_tensor(keypoints, device=dev, dtype=torch.float32)[:1].reshape(1, 1, 3)

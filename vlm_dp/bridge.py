@@ -992,6 +992,12 @@ class VlmDpBridge:
                 # The payload may start above a downward/seat target, which would
                 # otherwise advance this stage before contact is established.
                 return bool(stage.done())
+            if getattr(stage, "advance_on_payload_rise", False):
+                z0 = self.grasp_z0.get(stage.payload)
+                rise = (self.rise_confirm if getattr(stage, "rise_confirm", None) is None
+                        else float(stage.rise_confirm))
+                return (z0 is not None
+                        and float(self._pos(stage.payload)[2]) >= float(z0) + rise)
             if getattr(stage, "advance_on_done", False):  # Task-state completion.
                 return bool(stage.done())
             if self.advance_mode == "subgoal":  # Subgoal predicate.
