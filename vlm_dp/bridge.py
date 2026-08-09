@@ -149,6 +149,8 @@ class VlmDpBridge:
         self._grasp_trigger_latched = False
         self._grasp_trigger_start = None
         self._grasp_rise_count = 0
+        self._grasp_visual_prev = None
+        self._grasp_visual_sample_id = None
         self._pot_drop_lid = False
         self._carry_release_latched = False
         self._grasp_probe = np.zeros(3)
@@ -312,6 +314,8 @@ class VlmDpBridge:
         self._grasp_trigger_latched = False
         self._grasp_trigger_start = None
         self._grasp_rise_count = 0
+        self._grasp_visual_prev = None
+        self._grasp_visual_sample_id = None
         self._carry_release_latched = False
         self._grasp_probe = np.zeros(3)
         self._grasp_target0 = None
@@ -332,11 +336,21 @@ class VlmDpBridge:
         if st.gripper == "close" and st.grasp_obj is not None:
             self.grasp_z0[st.grasp_obj] = float(self._pos(st.grasp_obj)[2])
             self._grasp_target0 = np.asarray(st.target(), dtype=np.float32).copy()
+            self._grasp_visual_prev = np.asarray(
+                self._pos(st.grasp_obj), dtype=np.float64).copy()
+            visual_pos = None
             visual_position = getattr(self.world, "visual_position", None)
             if callable(visual_position):
                 visual_pos = visual_position(st.grasp_obj)
                 if visual_pos is not None:
                     self._grasp_visual_z0 = float(visual_pos[2])
+            if self._ground_err_debug:
+                raw = "none" if visual_pos is None else np.array2string(
+                    np.asarray(visual_pos), precision=3, separator=",")
+                print(f"[vlm_dp] grasp baseline {st.grasp_obj}: "
+                      f"belief_z={self.grasp_z0[st.grasp_obj]:.3f} raw={raw}",
+                      flush=True)
+
 
     def _configure_grasp_sensor(self, stage):
         """Adapt hold detection to a declared thin local grasp geometry."""
@@ -792,6 +806,36 @@ class VlmDpBridge:
         return payload_held(payload, self.hold_authority, self.world, self.sensor,
                             self.env.tcp(), self._pos(payload))
 
+    def _new_plausible_visual_rise(
+            self, payload, rise, max_jump=0.06, max_jump_per_step=0.02):
+        """Evaluate sparse raw tracker samples once with a rate-aware jump gate."""
+        visual_sample = getattr(self.world, "visual_sample", None)
+        if not callable(visual_sample):
+            return None
+        sample = visual_sample(payload)
+        if sample is None or sample[1] == self._grasp_visual_sample_id:
+            return None
+        pos, sample_id = sample
+        pos = np.asarray(pos, dtype=np.float64)
+        previous = self._grasp_visual_prev
+        previous_id = self._grasp_visual_sample_id
+        elapsed = max(1, int(sample_id) - int(previous_id)) if previous_id is not None else 1
+        allowed_jump = max(float(max_jump), float(max_jump_per_step) * elapsed)
+        jump = 0.0 if previous is None else float(np.linalg.norm(pos - previous))
+        self._grasp_visual_sample_id = int(sample_id)
+        self._grasp_visual_prev = pos.copy()
+        if jump > allowed_jump:
+            if self._ground_err_debug:
+                print(
+                    f"[vlm_dp] rejected visual grasp jump for {payload}: "
+                    f"{jump * 1e3:.0f}mm > {allowed_jump * 1e3:.0f}mm",
+                    flush=True)
+            return False
+        z0 = self.grasp_z0.get(payload)
+        if z0 is None:
+            return False
+        return float(pos[2]) >= float(z0) + float(rise)
+
     def _grip_half_width(self, payload):
         """Return the half-width used to predict the payload stall angle."""
         obj = next((o for o in self.grounding.objects if o.name == payload), None)
@@ -835,7 +879,10 @@ class VlmDpBridge:
         if half_w is None:
             return True
         predicted = self.sensor.q_free - self._AP_SLOPE * (2.0 * half_w)
-        return abs(self.sensor.aperture() - predicted) <= self._AP_BAND
+        delta = self.sensor.aperture() - predicted
+        if self.task_key == "capsule" and payload == "can":
+            return delta <= self._AP_BAND
+        return abs(delta) <= self._AP_BAND
 
     def advance(self, flags):
         """Backtrack on invariant failure or advance when the stage is reached."""
@@ -858,7 +905,7 @@ class VlmDpBridge:
                 and self.stage_replans - self._grasp_trigger_start >= 8):
             rise = (self.rise_confirm if getattr(stage, "rise_confirm", None) is None
                     else float(stage.rise_confirm))
-            if not self._thin_visual_rose(stage.grasp_obj, rise=rise, raw_only=True):
+            if not self._thin_visual_rose(stage.grasp_obj, rise=rise, raw_only=False):
                 self._grasp_trigger_latched = False
                 self._grasp_trigger_start = None
                 self._grasp_close_latched = False
@@ -959,6 +1006,11 @@ class VlmDpBridge:
         if self.advance_mode == "env_flags":
             # Privileged-signal ablation.
             return None if flags.get(f"grasp_{stage.payload}", False) else "flag dropped"
+        # The pod is thinner than the aperture sensor's calibrated range. While
+        # the task contact remains asserted, prefer that latched contact over a
+        # spurious closed-on-air reading; a dropped flag still backtracks.
+        if self.task_key == "capsule" and stage.payload == "can" and flags.get("grasp_pod", False):
+            return None
         if self.sensor.closed_on_air():
             self._log_grip("empty hand", stage.payload)
             return "empty hand"
@@ -1009,11 +1061,13 @@ class VlmDpBridge:
             if getattr(stage, "grasp_advance_on_visual_rise", False):
                 rise = (self.rise_confirm if getattr(stage, "rise_confirm", None) is None
                         else float(stage.rise_confirm))
-                visual_rise = self._thin_visual_rose(
-                    stage.grasp_obj, rise=rise, raw_only=True)
+                visual_rise = self._new_plausible_visual_rise(
+                    stage.grasp_obj, rise=rise)
                 sensor_hold = self.sensor is not None and self.sensor.holding()
-                self._grasp_rise_count = self._grasp_rise_count + 1 if visual_rise else 0
-                return (self._grasp_rise_count >= 2
+                if visual_rise is not None:
+                    self._grasp_rise_count = (
+                        self._grasp_rise_count + 1 if visual_rise else 0)
+                return (self._grasp_rise_count >= 1
                         and (self._grasp_close_latched or sensor_hold))
 
             held = self._payload_held(stage.grasp_obj)

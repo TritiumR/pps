@@ -137,7 +137,7 @@ def test_visual_rise_accepts_corrected_visual_belief():
     assert not bridge._thin_visual_rose("egg", rise=0.015)
 
 
-def test_visual_grasp_requires_two_consecutive_raw_rise_observations():
+def test_visual_grasp_ignores_repeated_sparse_observation():
     stage = Stage(
         name="grasp can",
         target=lambda: np.zeros(3),
@@ -152,11 +152,26 @@ def test_visual_grasp_requires_two_consecutive_raw_rise_observations():
     bridge._thin_verify_lift = 0.0
     bridge._active_grasp_target = lambda _stage, latched=False: np.zeros(3)
     bridge._grasp_slack = lambda _name: 0.1
-    bridge._thin_visual_rose = lambda _name, rise, raw_only: True
+    samples = iter([None, True])
+    bridge._new_plausible_visual_rise = lambda _name, rise: next(samples)
     bridge.sensor = types.SimpleNamespace(holding=lambda: False)
 
     assert not bridge._stage_reached(stage, {})
     assert bridge._stage_reached(stage, {})
+
+
+def test_capsule_grip_accepts_narrow_rim_but_not_open_hand():
+    bridge = _bridge()
+    bridge.task_key = "capsule"
+    bridge._grip_half_width = lambda _name: 0.015
+    aperture = [0.285]
+    bridge.sensor = types.SimpleNamespace(
+        q_free=0.782, aperture=lambda: aperture[0])
+
+    assert bridge._grip_ok("can")
+    aperture[0] = 0.785
+    assert not bridge._grip_ok("can")
+
 
 
 
@@ -188,7 +203,8 @@ _TESTS = [
     test_done_flag_advances_before_stale_geometric_goal,
     test_hold_can_advance_on_its_subgoal_instead_of_keypoint_height,
     test_visual_rise_accepts_corrected_visual_belief,
-    test_visual_grasp_requires_two_consecutive_raw_rise_observations,
+    test_visual_grasp_ignores_repeated_sparse_observation,
+    test_capsule_grip_accepts_narrow_rim_but_not_open_hand,
     test_hold_can_advance_on_payload_rise,
     test_latched_grasp_stays_closed_until_place_subgoal,
 ]

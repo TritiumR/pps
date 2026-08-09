@@ -108,6 +108,8 @@ class SensedWorld:
 
         self._last_correct = {}
         self._last_visual = {}
+        self._visual_latest = {}
+        self._visual_seen_step = {}
         self.names = []
         self._pos = {}
         self._rot = {}
@@ -152,6 +154,7 @@ class SensedWorld:
             accepted[name] = pos
         self.names = list(self._pos)
         self._last_visual = dict(accepted)
+        self._record_visual(accepted)
 
 
         if self.visual is not None and accepted:
@@ -225,16 +228,33 @@ class SensedWorld:
             if self._step % self.reperceive_every == 0:
                 seen = self.perception.observe(env)
                 self._last_visual = dict(seen or {})
+                self._record_visual(seen)
                 self._vision_correct(env, seen)
         elif self.track == "visual" and self.visual is not None:
             seen = self.visual.step(env)
             self._last_visual = dict(seen or {})
+            self._record_visual(seen)
             self._vision_correct(env, seen)
 
     def visual_position(self, name):
         """Return the latest raw visual position, including objects temporarily held by FK."""
         pos = self._last_visual.get(name)
         return None if pos is None else np.asarray(pos, dtype=np.float64).copy()
+
+    def _record_visual(self, seen):
+        """Persist sparse tracker samples and their observation steps."""
+        for name, pos in (seen or {}).items():
+            self._visual_latest[name] = np.asarray(pos, dtype=np.float64).copy()
+            self._visual_seen_step[name] = int(self._step)
+
+    def visual_sample(self, name):
+        """Return the latest raw visual sample and a monotonic sample id."""
+        pos = self._visual_latest.get(name)
+        sample_id = self._visual_seen_step.get(name)
+        if pos is None or sample_id is None:
+            return None
+        return np.asarray(pos, dtype=np.float64).copy(), int(sample_id)
+
 
     def set_jump_rate(self, rate: float) -> None:
         """Set the maximum accepted visual correction per control step."""
