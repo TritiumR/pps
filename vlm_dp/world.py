@@ -10,6 +10,7 @@ from vlm_dp.sim_helpers import quat_wxyz_to_R
 _PLACE_MARGIN = 0.02
 _PLACE_FOOT_FALLBACK = 0.10
 _REST_TOL = 0.10
+_REPERCEPTION_MAX_JUMP = 0.15
 
 
 class GTWorld:
@@ -129,27 +130,33 @@ class SensedWorld:
         if getattr(self, "relax_identity_when_stale", False):
             self.perception.distrust = set(self._stale)
         seen = self.perception.observe(env)
-        self._last_visual = dict(seen or {})
+        accepted = {}
         displaced = False
         for name, pos in seen.items():
             if name == self._held:
                 continue
             pos = np.asarray(pos, dtype=np.float64)
-            if name in self._stale and name in self._pos \
-                    and float(np.linalg.norm(pos - self._pos[name])) > 0.03:
-                displaced = True
+            if name in self._stale and name in self._pos:
+                jump = float(np.linalg.norm(pos - self._pos[name]))
+                if jump > _REPERCEPTION_MAX_JUMP:
+                    print(f"[world:visual] rejected stale {name!r} re-perception jump "
+                          f"{jump * 1e3:.0f}mm > {_REPERCEPTION_MAX_JUMP * 1e3:.0f}mm",
+                          flush=True)
+                    continue
+                if jump > 0.03:
+                    displaced = True
             self._pos[name] = pos
-
-
             self._rot[name] = np.eye(3)
             self._stale.discard(name)
+            accepted[name] = pos
         self.names = list(self._pos)
+        self._last_visual = dict(accepted)
 
 
-        if self.visual is not None and seen:
+        if self.visual is not None and accepted:
             rebase = getattr(self.visual, "rebase", None)
             if callable(rebase):
-                rebase({n: self._pos[n] for n in seen if n in self._pos})
+                rebase({n: self._pos[n] for n in accepted})
         if displaced and self.visual is not None:
             self._reprime_tracker(env)
 
