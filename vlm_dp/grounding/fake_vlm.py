@@ -17,12 +17,24 @@ _LIFT_HEIGHT = 0.15
 # Transport geometry the plan references: how high the hover point sits above the place
 # point, and how much slack the carry-height path rule allows below the lift height.
 _CARRY_HOVER, _CARRY_SLACK = 0.10, 0.03
+# Tea: the band separating "mouth still clear above the cup" from "mouth descended onto it".
+# Same 5cm the other plans' place predicates use; authored here because the mouth is not a
+# body the plan carries as far as the runtime's ownership rule is concerned (see _tea).
+_TEA_MOUTH_CLEAR = 0.05
 
 # Capsule geometry, in the machine-root frame. Same numbers vlm_dp/grounding/capsule.py and
 # vlm_dp/offline_context.py use: the pod bay sits on the machine's vertical axis, and the lid
 # travels roughly this far up when it swings open.
 _CAPSULE_BAY_LOCAL = np.array([0.0, 0.0, 0.27])
 _CAPSULE_LID_OPEN_LIFT = np.array([0.0, 0.0, 0.12])
+# How far short of that open lift the lip may stop and still count as OPENED. Authored here,
+# beside the lift it is a band on, and rendered into the plan as {open_clear}: the lid's rise
+# tolerance is the plan's own geometry and must not be laundered through a runtime primitive.
+# clearance_margin() would REFUSE it and rightly so -- the lip is a DECLARED feature on a body
+# the robot never carries, so no clearance of it can be derived from that body's extents. 0.05
+# of the 0.12 lift means the lip has to reach ~58% of the commanded travel; it is a 5cm band and
+# not a 5mm one because a hinge arc does not stop on a millimetre.
+_CAPSULE_OPEN_CLEAR = 0.05
 # Where the pod comes to rest relative to the bay keypoint. Was a literal np.array([0, 0, 0.02])
 # inside the plan's place stage; it is a field now because the descent gate and the stage's
 # completion predicate have to name the SAME seat, and two copies of a literal drift apart.
@@ -243,7 +255,8 @@ def _capsule(out_dir, keypoints, grounded, env, clearance):
     hover_z_pod = float(kps[bay][2] + hover_pod[2])
     metadata = _render("capsule", out_dir, lip=lip, open_goal=open_goal, pod=pod, bay=bay,
                        lift_pod=lift_pod, off_pod=off_pod, hover_pod=hover_pod,
-                       lift_z_pod=lift_z_pod, carry_z_pod=carry_z_pod, hover_z_pod=hover_z_pod)
+                       lift_z_pod=lift_z_pod, carry_z_pod=carry_z_pod, hover_z_pod=hover_z_pod,
+                       open_clear=float(_CAPSULE_OPEN_CLEAR))
     # vlm_dp extension, not part of the ReKep response format the parser understands.
     metadata["steer_policies"] = ["on_failure"] * metadata["num_stages"]
     with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
@@ -396,9 +409,17 @@ def _tea(out_dir, keypoints, grounded, env, clearance):
     # Absolute world height of the pour hover point (the cup rim raised by the carry clearance
     # the stage-3 sub-goal already adds), for stage 3's completion predicate.
     hover_z_mouth = float(keypoints[c][2] + cup_off[2] + _CARRY_HOVER)
+    # How far below that hover height the mouth may sit and still count as "clear above the cup".
+    # Authored HERE and rendered into the plan as {mouth_clear} rather than resolved by
+    # clearance_margin({m}), because clearance_margin is defined only for a keypoint on a body
+    # the plan CARRIES and the mouth's owner is decided at runtime by keypoint registration --
+    # the spout tip is a snapped proposed keypoint, and whether it registers to the teapot or to
+    # the table under it is a fact about this episode's segmentation, not about the plan. A
+    # clearance the plan cannot be sure the primitive may answer is the plan's own to state.
     metadata = _render("tea", out_dir, h=h, m=m, c=c, cup_off=cup_off, pour_margin=pour_margin,
                        lift_teapot=lift_teapot, lift_z_teapot=lift_z_teapot,
-                       carry_z_teapot=carry_z_teapot, hover_z_mouth=hover_z_mouth)
+                       carry_z_teapot=carry_z_teapot, hover_z_mouth=hover_z_mouth,
+                       mouth_clear=float(_TEA_MOUTH_CLEAR))
     # vlm_dp extension, not part of the ReKep response format the parser understands.
     metadata["steer_policies"] = ["on_failure"] * metadata["num_stages"]
     with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:

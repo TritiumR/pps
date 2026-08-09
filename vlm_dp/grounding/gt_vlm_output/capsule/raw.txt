@@ -140,17 +140,68 @@ release_keypoints = [-1, {lip}, -1, -1, -1, {pod}]
 # ---------------------------------------------------------------------------
 # Completion predicates (vlm_dp extension to the ReKep response format).
 #
-# Same vocabulary and same interface as the weight plan documents: CONTACT (the finger joint
-# angle stalled in the band (0.08, 0.60) for a whole window, which a close on empty air can
-# never satisfy), CO-MOTION as a dimensionless RATIO (slip / hand_disp < 0.5, evaluated only
-# when the hand actually moved), SUSTAIN (five frames, not one instant), QUIESCENCE (< 0.015
-# m/s -- "it is resting in the bay" is a statement about speed, which a distance cannot see),
-# and REGION + ONE-SIDED VERTICAL rather than a 3-D ball. None of them re-expresses
-# `subgoal < eps`: no predicate here measures a distance to its stage's sub-goal point.
+# Written in the PRIMITIVE VOCABULARY the runtime provides (vlm_dp/grounding/predicates.py ::
+# PredicateRuntime), exactly as the weight and pot plans are. This plan states WHICH event each
+# stage names; the primitive states HOW that event is sensed. Nothing here re-derives a window,
+# a sensor threshold or a contact band.
+#
+#   EVENTS, each of which also fills `components` with its named boolean and the margin_*
+#   floats behind it:
+#     grasped(kp, name, "acquire")   the pick-up event: fingers stalled on something for a
+#                                    whole window, POSITIVE co-motion with a hand that actually
+#                                    travelled, and the object within reach.
+#     grasped(kp, name, "maintain")  still holding: fingers stalled and no slip relative to a
+#                                    hand that moved.
+#     released(kp, name)             the hand let go: it departed while the object stayed, or
+#                                    the fingers opened.
+#     stationary(kp, name)           the object stopped moving.
+#     sustained(cost_fn, name)       this plan's OWN geometry, in the ReKep cost convention
+#                                    (<= 0 satisfied), held over the last few belief frames
+#                                    rather than at one instant.
+#
+#   TOLERANCES. Only two of them are the runtime's to answer here, and WHICH two is the point:
+#     target_region_radius({bay})   the placement region around the bay anchor.
+#     clearance_margin({pod})       the vertical band separating "clear above the bay" from
+#                                   "descended into it". The POD is a body this plan carries,
+#                                   which is exactly the condition the primitive is defined for.
+#
+#   AND ONE THAT IS NOT. The lid's rise tolerance is `{open_clear}`, a RENDERED FIELD authored
+#   in fake_vlm beside _CAPSULE_LID_OPEN_LIFT, the lift it is a band on. It is emphatically NOT
+#   clearance_margin({lip}): the lip is a DECLARED feature on the machine, a body the robot
+#   never carries, and its geometry was declared precisely because the machine's own extents do
+#   not describe it. Asking the primitive for it is refused, and correctly so -- a 10mm rim on a
+#   320mm machine has no clearance the machine's extents could imply. The same holds for the
+#   bay: `{off_pod}` states where the pod seats, and the plan states it, because the bay is a
+#   declared recess and not a body anyone carries.
+#
+#   NOTE ON grasp_tolerance. Stage 1 does not need it -- grasped() is a statement about contact
+#   and co-motion, not about width -- but if it did, grasp_tolerance({lip}) is well defined and
+#   resolves to the DECLARED lip half-width (10mm), never to the machine's whole-body extent.
+#   That declared extent is the same number every grasp cost term is sized by, so the predicate
+#   and the cost would be reading one geometry rather than two.
+#
+#   DIAGNOSTIC KEYS. Every boolean these stages used to publish keeps its name and its meaning:
+#   closed_on_object, rides_with_hand, at_hand, lip_risen, hand_let_go, lid_quiescent,
+#   still_held, at_carry_height, inside_place_region, still_clear_of_bay, descended,
+#   object_quiescent, and the margins margin_aperture / margin_slip_ratio / margin_hand_disp_m /
+#   margin_reach_m / margin_open_frac / margin_speed_mps. Stages 1 and 3 additionally publish an
+#   overall lip_in_hand / pod_in_hand, which is the conjunction they used to return unnamed.
+#   Four margins are RENAMED because sustained() reports one uniform quantity -- the worst COST
+#   in the window, negative when satisfied -- where the old blocks reported differently-signed
+#   ad-hoc numbers:
+#     margin_rise_m             -> margin_lip_risen             (now negated: cost, not rise)
+#     margin_height_shortfall_m -> margin_at_carry_height       (same value)
+#     margin_xy_off_m           -> margin_inside_place_region   (now offset MINUS the radius)
+#     margin_clearance_m        -> margin_still_clear_of_bay    (now negated: cost, not clearance)
+#     margin_descent_m          -> margin_descended             (now negated: cost, not clearance)
 #
 # The capsule-specific event is LID-OPENED (stage 2): the lip has RISEN by the open lift and
-# held that height, while the fingers are still stalled on it. Height, not arc position: the
-# hinge chooses where the lip ends up in xy, so only the rise is evidence the robot produced.
+# held that height, while the hand has let go and the lid has stopped swinging. Height, not arc
+# position: the hinge chooses where the lip ends up in xy, so only the rise is evidence the
+# robot produced. Stage 2 is a RELEASE stage, so the runtime classifies it as a place stage and,
+# under advance.predicate_place_transitions, advances it on this predicate -- which is why it is
+# stated in the place vocabulary (risen, let go, quiescent). No new primitive is required for
+# it: "risen and held" is a sustained() over the plan's own one-sided vertical.
 #
 # Interface: stage<N>_completion(history, end_effector, keypoints, robot_state, components)
 # -> bool, filling `components` with named booleans plus margin_* floats. See
@@ -161,152 +212,52 @@ release_keypoints = [-1, {lip}, -1, -1, -1, {pod}]
 ### stage 1 completion predicate
 def stage1_completion(history, end_effector, keypoints, robot_state, components):
     """Lid lip grasped: the fingers are stalled on something, and the lip rides with the hand."""
-    ap = np.asarray(history["gripper_aperture"], dtype=np.float64)
-    eef = np.asarray(history["eef"], dtype=np.float64)
-    obj = np.asarray([f[{lip}] for f in history["kp"]], dtype=np.float64)
-    w = int(min(len(ap), len(eef), len(obj), 8))
-    closed = bool(w >= 8 and np.all(ap[-w:] > 0.08) and np.all(ap[-w:] < 0.60))
-    hand = float(np.linalg.norm(eef[-1] - eef[-w])) if w > 1 else 0.0
-    slip = float(np.linalg.norm((obj[-1] - eef[-1]) - (obj[-w] - eef[-w]))) if w > 1 else 9.9
-    ratio = slip / hand if hand > 1e-9 else 9.9
-    carried = bool(w >= 8 and hand > 0.02 and ratio < 0.5)
-    reach = float(np.linalg.norm(obj[-1] - eef[-1]))
-    components["closed_on_object"] = closed
-    components["rides_with_hand"] = carried
-    components["at_hand"] = bool(reach < 0.10)
-    components["margin_aperture"] = float(ap[-1])
-    components["margin_slip_ratio"] = ratio
-    components["margin_hand_disp_m"] = hand
-    components["margin_reach_m"] = reach
-    return bool(closed and carried and reach < 0.10)
+    lip_in_hand = grasped({lip}, "lip_in_hand", "acquire")
+    return bool(lip_in_hand)
 
 ### stage 2 completion predicate
 def stage2_completion(history, end_effector, keypoints, robot_state, components):
     """Lid opened: the lip has risen by the open lift and stayed there, the hand let go, nothing moving."""
-    ap = np.asarray(history["gripper_aperture"], dtype=np.float64)
-    eef = np.asarray(history["eef"], dtype=np.float64)
-    obj = np.asarray([f[{lip}] for f in history["kp"]], dtype=np.float64)
-    dt = max(float(history["dt"]), 1e-6)
-    w = int(min(len(ap), len(eef), len(obj), 8))
-    k = int(min(len(obj), 5))
-    rise = float(np.min(obj[-k:][..., 2]) - (keypoints[{open_goal}][..., 2] - 0.05))
-    risen = bool(k >= 5 and rise >= 0.0)
-    hand = float(np.linalg.norm(eef[-1] - eef[-w])) if w > 1 else 0.0
-    slip = float(np.linalg.norm((obj[-1] - eef[-1]) - (obj[-w] - eef[-w]))) if w > 1 else 0.0
-    ratio = slip / hand if hand > 0.02 else 0.0
-    departed = bool(w >= 8 and hand > 0.03 and ratio > 0.7)
-    open_frac = float(np.mean(ap[-w:] <= 0.06)) if w >= 4 else 0.0
-    released = bool(departed or open_frac >= 0.25)
-    speed = float(np.linalg.norm(obj[-1] - obj[-w]) / ((w - 1) * dt)) if w > 1 else 9.9
-    still = bool(w >= 8 and speed < 0.015)
-    components["lip_risen"] = risen
-    components["hand_let_go"] = released
-    components["lid_quiescent"] = still
-    components["margin_rise_m"] = rise
-    components["margin_slip_ratio"] = ratio
-    components["margin_open_frac"] = open_frac
-    components["margin_speed_mps"] = speed
-    return bool(risen and released and still)
+    lip_risen = sustained(
+        lambda ee, kp: (kp[{open_goal}][..., 2] - ({open_clear})) - kp[{lip}][..., 2], "lip_risen")
+    hand_let_go = released({lip}, "hand_let_go")
+    lid_quiescent = stationary({lip}, "lid_quiescent")
+    return bool(lip_risen and hand_let_go and lid_quiescent)
 
 ### stage 3 completion predicate
 def stage3_completion(history, end_effector, keypoints, robot_state, components):
     """Pod grasped: the fingers are stalled on something, and the pod rides with the hand."""
-    ap = np.asarray(history["gripper_aperture"], dtype=np.float64)
-    eef = np.asarray(history["eef"], dtype=np.float64)
-    obj = np.asarray([f[{pod}] for f in history["kp"]], dtype=np.float64)
-    w = int(min(len(ap), len(eef), len(obj), 8))
-    closed = bool(w >= 8 and np.all(ap[-w:] > 0.08) and np.all(ap[-w:] < 0.60))
-    hand = float(np.linalg.norm(eef[-1] - eef[-w])) if w > 1 else 0.0
-    slip = float(np.linalg.norm((obj[-1] - eef[-1]) - (obj[-w] - eef[-w]))) if w > 1 else 9.9
-    ratio = slip / hand if hand > 1e-9 else 9.9
-    carried = bool(w >= 8 and hand > 0.02 and ratio < 0.5)
-    reach = float(np.linalg.norm(obj[-1] - eef[-1]))
-    components["closed_on_object"] = closed
-    components["rides_with_hand"] = carried
-    components["at_hand"] = bool(reach < 0.10)
-    components["margin_aperture"] = float(ap[-1])
-    components["margin_slip_ratio"] = ratio
-    components["margin_hand_disp_m"] = hand
-    components["margin_reach_m"] = reach
-    return bool(closed and carried and reach < 0.10)
+    pod_in_hand = grasped({pod}, "pod_in_hand", "acquire")
+    return bool(pod_in_hand)
 
 ### stage 4 completion predicate
 def stage4_completion(history, end_effector, keypoints, robot_state, components):
     """Pod lifted: still owned by the hand, and it has held carry height for the last third of a second."""
-    ap = np.asarray(history["gripper_aperture"], dtype=np.float64)
-    eef = np.asarray(history["eef"], dtype=np.float64)
-    obj = np.asarray([f[{pod}] for f in history["kp"]], dtype=np.float64)
-    w = int(min(len(ap), len(eef), len(obj), 8))
-    closed = bool(w >= 8 and np.all(ap[-w:] > 0.08) and np.all(ap[-w:] < 0.60))
-    hand = float(np.linalg.norm(eef[-1] - eef[-w])) if w > 1 else 0.0
-    slip = float(np.linalg.norm((obj[-1] - eef[-1]) - (obj[-w] - eef[-w]))) if w > 1 else 9.9
-    ratio = slip / hand if hand > 0.02 else 0.0
-    held = bool(closed and ratio < 0.5)
-    k = int(min(len(obj), 5))
-    shortfall = float(np.max(({lift_z_pod}) - obj[-k:][..., 2]))
-    high = bool(k >= 5 and shortfall <= 0.005)
-    components["still_held"] = held
-    components["at_carry_height"] = high
-    components["margin_aperture"] = float(ap[-1])
-    components["margin_slip_ratio"] = ratio
-    components["margin_height_shortfall_m"] = shortfall
-    return bool(held and high)
+    still_held = grasped({pod}, "still_held", "maintain")
+    at_carry_height = sustained(
+        lambda ee, kp: ({lift_z_pod}) - kp[{pod}][..., 2], "at_carry_height")
+    return bool(still_held and at_carry_height)
 
 ### stage 5 completion predicate
 def stage5_completion(history, end_effector, keypoints, robot_state, components):
     """Pod over the bay: still owned by the hand, inside the bay region in xy, still clear above it."""
-    ap = np.asarray(history["gripper_aperture"], dtype=np.float64)
-    eef = np.asarray(history["eef"], dtype=np.float64)
-    obj = np.asarray([f[{pod}] for f in history["kp"]], dtype=np.float64)
-    w = int(min(len(ap), len(eef), len(obj), 8))
-    closed = bool(w >= 8 and np.all(ap[-w:] > 0.08) and np.all(ap[-w:] < 0.60))
-    hand = float(np.linalg.norm(eef[-1] - eef[-w])) if w > 1 else 0.0
-    slip = float(np.linalg.norm((obj[-1] - eef[-1]) - (obj[-w] - eef[-w]))) if w > 1 else 9.9
-    ratio = slip / hand if hand > 0.02 else 0.0
-    held = bool(closed and ratio < 0.5)
-    place_xy = keypoints[{bay}][..., :2] + np.array({off_pod})[:2]
-    k = int(min(len(obj), 5))
-    xy_off = float(np.max(np.linalg.norm(obj[-k:][..., :2] - place_xy, axis=-1)))
-    over = bool(k >= 5 and xy_off < 0.08)
-    clear = float(np.min(obj[-k:][..., 2]) - (({hover_z_pod}) - 0.05))
-    above = bool(clear >= 0.0)
-    components["still_held"] = held
-    components["inside_place_region"] = over
-    components["still_clear_of_bay"] = above
-    components["margin_slip_ratio"] = ratio
-    components["margin_xy_off_m"] = xy_off
-    components["margin_clearance_m"] = clear
-    return bool(held and over and above)
+    still_held = grasped({pod}, "still_held", "maintain")
+    inside_place_region = sustained(
+        lambda ee, kp: np.linalg.norm(kp[{pod}][..., :2] - (kp[{bay}][..., :2] + np.array({off_pod})[:2]),
+                                      axis=-1) - target_region_radius({bay}), "inside_place_region")
+    still_clear_of_bay = sustained(
+        lambda ee, kp: (({hover_z_pod}) - clearance_margin({pod})) - kp[{pod}][..., 2],
+        "still_clear_of_bay")
+    return bool(still_held and inside_place_region and still_clear_of_bay)
 
 ### stage 6 completion predicate
 def stage6_completion(history, end_effector, keypoints, robot_state, components):
     """Pod placed: down in the bay region, no longer owned by the hand, and no longer moving."""
-    ap = np.asarray(history["gripper_aperture"], dtype=np.float64)
-    eef = np.asarray(history["eef"], dtype=np.float64)
-    obj = np.asarray([f[{pod}] for f in history["kp"]], dtype=np.float64)
-    dt = max(float(history["dt"]), 1e-6)
-    w = int(min(len(ap), len(eef), len(obj), 8))
-    place_xy = keypoints[{bay}][..., :2] + np.array({off_pod})[:2]
-    k = int(min(len(obj), 5))
-    xy_off = float(np.max(np.linalg.norm(obj[-k:][..., :2] - place_xy, axis=-1)))
-    seated = bool(k >= 5 and xy_off < 0.08)
-    hand = float(np.linalg.norm(eef[-1] - eef[-w])) if w > 1 else 0.0
-    slip = float(np.linalg.norm((obj[-1] - eef[-1]) - (obj[-w] - eef[-w]))) if w > 1 else 0.0
-    ratio = slip / hand if hand > 0.02 else 0.0
-    departed = bool(w >= 8 and hand > 0.03 and ratio > 0.7)
-    open_frac = float(np.mean(ap[-w:] <= 0.06)) if w >= 4 else 0.0
-    released = bool(departed or open_frac >= 0.25)
-    speed = float(np.linalg.norm(obj[-1] - obj[-w]) / ((w - 1) * dt)) if w > 1 else 9.9
-    still = bool(w >= 8 and speed < 0.015)
-    descend = float((({hover_z_pod}) - 0.05) - np.max(obj[-k:][..., 2]))
-    down = bool(descend >= 0.0)
-    components["inside_place_region"] = seated
-    components["hand_let_go"] = released
-    components["object_quiescent"] = still
-    components["descended"] = down
-    components["margin_xy_off_m"] = xy_off
-    components["margin_slip_ratio"] = ratio
-    components["margin_open_frac"] = open_frac
-    components["margin_speed_mps"] = speed
-    components["margin_descent_m"] = descend
-    return bool(seated and released and still and down)
+    hand_let_go = released({pod}, "hand_let_go")
+    inside_place_region = sustained(
+        lambda ee, kp: np.linalg.norm(kp[{pod}][..., :2] - (kp[{bay}][..., :2] + np.array({off_pod})[:2]),
+                                      axis=-1) - target_region_radius({bay}), "inside_place_region")
+    object_quiescent = stationary({pod}, "object_quiescent")
+    descended = sustained(
+        lambda ee, kp: kp[{pod}][..., 2] - (({hover_z_pod}) - clearance_margin({pod})), "descended")
+    return bool(hand_let_go and inside_place_region and object_quiescent and descended)
