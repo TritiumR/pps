@@ -4604,6 +4604,14 @@ def parse_args():
         help="Stop each seed immediately after writing its pre-ReKep perception cache.",
     )
     parser.add_argument(
+        "--vlm_preflight_only",
+        action="store_true",
+        help=(
+            "Load each deterministic perception cache, compile ReKep grounding, record whether "
+            "preflight passed, and skip policy rollout. Intended for curating reusable seed sets."
+        ),
+    )
+    parser.add_argument(
         "--vlm_vocab",
         default=None,
         help="Comma-separated object names to restrict the perception vocabulary to (detector text kept "
@@ -4939,6 +4947,15 @@ if args.vlm_perception_cache_only:
         parser.error("--vlm_perception_cache_only cannot be combined with cache reading.")
     if args.vlm_cost == "none" or args.vlm_state != "real":
         parser.error("--vlm_perception_cache_only requires a real-state --vlm_cost configuration.")
+if args.vlm_preflight_only:
+    if not args.vlm_perception_cache_read_dir:
+        parser.error("--vlm_preflight_only requires --percept_cache.")
+    if not args.determine:
+        parser.error("--vlm_preflight_only requires --determine.")
+    if args.vlm_perception_cache_only or args.vlm_perception_cache_dir:
+        parser.error("--vlm_preflight_only reads existing caches and cannot write caches.")
+    if args.vlm_cost == "none" or args.vlm_state != "real":
+        parser.error("--vlm_preflight_only requires a real-state --vlm_cost configuration.")
 if args.vlm_perception_cache_read_dir and not args.determine:
     parser.error("--vlm_perception_cache_read_dir requires --determine.")
 try:
@@ -5554,8 +5571,8 @@ if args.determine:
     # Decouple policy/MPC randomness from random draws consumed by env.reset().
     _seed_runtime(args.seed_start)
 warmup_actions = None
-if args.vlm_perception_cache_only:
-    _report_initialization_stage(args, "cache-only mode; policy/VLM warmup skipped")
+if args.vlm_perception_cache_only or args.vlm_preflight_only:
+    _report_initialization_stage(args, "cache/preflight-only mode; policy/VLM warmup skipped")
 else:
     if args.vlm_cost != "none":
         warmup_read_path = None
@@ -5829,6 +5846,17 @@ for rollout_idx, seed in enumerate(eval_seeds):
             os.environ.pop("VLMDP_PERCEPTION_CACHE_PATH", None)
             os.environ.pop("VLMDP_PERCEPTION_CACHE_READ_PATH", None)
             os.environ.pop("VLMDP_PERCEPTION_CACHE_ONLY", None)
+
+        if args.vlm_preflight_only:
+            print(f"[eval] seed {seed}: ReKep preflight passed; rollout skipped", flush=True)
+            experiment_results["episodes"].append({
+                "rollout_index": rollout_idx,
+                "seed": seed,
+                "preflight_ok": True,
+                "cache_path": cache_read_path,
+            })
+            _write_experiment_results(experiment_results_path, experiment_results)
+            continue
 
     current_subtasks = _debug_subtasks(env_obs_dict)
     current_phase = _debug_phase_from_subtasks(args.task, current_subtasks)

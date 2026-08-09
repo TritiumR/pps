@@ -618,8 +618,27 @@ class RekepGrounding:
                         f"{width * 1e3:.0f}mm ({src}) against a {self.open_half * 1e3:.0f}mm "
                         f"gripper aperture, so the stage would compile as a press: either the mask "
                         f"is wrong or the role resolved to the wrong object")
+        if self.task_key == "pot":
+            pot_pts, cover_pts = clouds.get("pot"), clouds.get("cover")
+            if pot_pts is None or cover_pts is None:
+                problems.append("pot preflight requires both 'pot' and 'cover' point clouds")
+            else:
+                pot_xy = np.median(pot_pts[:, :2], axis=0)
+                cover_xy = np.median(cover_pts[:, :2], axis=0)
+                lid_dxy = float(np.linalg.norm(cover_xy - pot_xy))
+                pot_rim_z = float(np.percentile(pot_pts[:, 2], 95))
+                cover_z = float(np.median(cover_pts[:, 2]))
+                lid_dz = cover_z - pot_rim_z
+                if lid_dxy > 0.10:
+                    problems.append(
+                        f"pot cover cloud is {lid_dxy * 1e3:.0f}mm from the pot centre; "
+                        "the cover detector likely selected the robot or background")
+                if not -0.05 <= lid_dz <= 0.08:
+                    problems.append(
+                        f"pot cover median is {lid_dz * 1e3:.0f}mm relative to the observed rim; "
+                        "the pot/cover masks are geometrically inconsistent")
         if problems:
-            raise SystemExit("[rekep-preflight] grounding is not usable for this plan; refusing to "
+            raise ValueError("[rekep-preflight] grounding is not usable for this plan; refusing to "
                              "roll out:\n  - " + "\n  - ".join(problems))
         print(f"[rekep-preflight] OK: {len(claimed)} distinct roles, grasp objects "
               f"{sorted({name_for(k) for k in metadata['grasp_keypoints'] if k >= 0})} all "
