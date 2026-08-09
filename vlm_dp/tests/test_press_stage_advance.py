@@ -82,6 +82,34 @@ def test_done_flag_advances_before_stale_geometric_goal():
     assert not bridge._stage_reached(stage, {"open_coffee_lid": False})
     assert bridge._stage_reached(stage, {"open_coffee_lid": True})
 
+def test_capsule_lid_retries_when_arc_finishes_without_task_confirmation():
+    reached = [True]
+    stage = Stage(
+        name="open capsule lid",
+        target=lambda: np.zeros(3),
+        gripper="place",
+        payload="capsule",
+        contact="press",
+        done_flag="open_coffee_lid",
+        done=lambda: reached[0],
+    )
+    bridge = _bridge()
+    bridge.task_key = "capsule"
+    bridge._press_target_since = None
+    bridge.stage_replans = 10
+
+    pending, retry = bridge._capsule_lid_retry_state(
+        stage, {"open_coffee_lid": False})
+    assert pending and not retry
+    bridge.stage_replans = 12
+    pending, retry = bridge._capsule_lid_retry_state(
+        stage, {"open_coffee_lid": False})
+    assert pending and retry
+    pending, retry = bridge._capsule_lid_retry_state(
+        stage, {"open_coffee_lid": True})
+    assert not pending and not retry
+
+
 
 
 
@@ -201,6 +229,7 @@ _TESTS = [
     test_press_hold_waits_for_tcp_waypoint_not_payload_height,
     test_press_place_does_not_wait_for_a_pinch_release_sensor,
     test_done_flag_advances_before_stale_geometric_goal,
+    test_capsule_lid_retries_when_arc_finishes_without_task_confirmation,
     test_hold_can_advance_on_its_subgoal_instead_of_keypoint_height,
     test_visual_rise_accepts_corrected_visual_belief,
     test_visual_grasp_ignores_repeated_sparse_observation,

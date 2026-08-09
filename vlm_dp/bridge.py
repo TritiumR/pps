@@ -152,6 +152,8 @@ class VlmDpBridge:
         self._grasp_visual_prev = None
         self._grasp_visual_sample_id = None
         self._pot_drop_lid = False
+        self._press_target_since = None
+        self._capsule_lid_retry_count = 0
         self._carry_release_latched = False
         self._grasp_probe = np.zeros(3)
         self._grasp_target0 = None
@@ -243,6 +245,7 @@ class VlmDpBridge:
         self._contact_prev = False
         self._last_cmd_close = False
         self._pot_drop_lid = False
+        self._capsule_lid_retry_count = 0
         self._reset_churn()
         self._enter_stage()
 
@@ -308,6 +311,7 @@ class VlmDpBridge:
         self.plan_ref = None
         self._place_seen = None
         self._place_since = None
+        self._press_target_since = None
         self._reopen = False
         self._contact_seen = False
         self._released_latch = False
@@ -884,6 +888,25 @@ class VlmDpBridge:
             return delta <= self._AP_BAND
         return abs(delta) <= self._AP_BAND
 
+    def _capsule_lid_retry_state(self, stage, flags):
+        """Return (pending, retry_ready) for an unconfirmed lid-opening arc."""
+        is_lid_release = (
+            self.task_key == "capsule"
+            and stage.gripper == "place"
+            and getattr(stage, "contact", "pinch") == "press"
+            and stage.done_flag == "open_coffee_lid"
+        )
+        confirmed = bool(flags.get("open_coffee_lid", False))
+        if not is_lid_release or confirmed or not bool(stage.done()):
+            self._press_target_since = None
+            return False, False
+        if self._press_target_since is None:
+            self._press_target_since = self.stage_replans
+        # Give the articulated task flag two replans to settle after the TCP
+        # reaches the end of the hinge arc before declaring the contact missed.
+        return True, self.stage_replans - self._press_target_since >= 2
+
+
     def advance(self, flags):
         """Backtrack on invariant failure or advance when the stage is reached."""
         stage = self.stage()
@@ -901,6 +924,19 @@ class VlmDpBridge:
             self._commit_left -= 1
         # Sync FK before reading held-object state.
         self.world.sync_fk(self.env)
+        lid_pending, lid_retry = self._capsule_lid_retry_state(stage, flags)
+        if lid_pending:
+            if lid_retry:
+                self._capsule_lid_retry_count += 1
+                self.stage_idx = max(0, self.stage_idx - 2)
+                self.held_offset = _capture_held(
+                    self.env, self.grounding, self.stage().held_idx
+                )
+                self._enter_stage()
+                print(f"[vlm_dp] capsule lid arc unconfirmed -> retry "
+                      f"{self._capsule_lid_retry_count} from contact", flush=True)
+            return
+
         if (self._grasp_trigger_latched and self._grasp_trigger_start is not None
                 and self.stage_replans - self._grasp_trigger_start >= 8):
             rise = (self.rise_confirm if getattr(stage, "rise_confirm", None) is None
