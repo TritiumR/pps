@@ -38,14 +38,26 @@ _CAPSULE_RETREAT_TCP_LOCAL = np.array([0.1547, -0.2612, 0.4833])
 # The policy TCP is offset from the segmented pod centre at acquisition; aiming at the
 # centre directly pushed the pod across the counter instead of straddling it.
 _CAPSULE_POD_TCP_OFFSET_LOCAL = np.array([0.0430, 0.0440, -0.0060])
-# The successful task policy raises the pod root to roughly 0.75 m before crossing
-# the coffee-maker rim. The generic 0.15 m lift started lateral transit at 0.45 m
-# and collided with the fixture, so Capsule uses its observed carry clearance.
-_CAPSULE_POD_LIFT_HEIGHT = 0.50
+# The successful task policy first raises the pod around the front of the
+# coffee-maker rather than vertically through the lid. This is the observed pod
+# root at that safe waypoint, in the machine frame.
+_CAPSULE_POD_LIFT_LOCAL = np.array([0.2856, -0.1260, 0.3791])
 # High transit TCP from that rollout. Keeping this as its own waypoint prevents
 # the final place objective from descending diagonally into the machine's front rim.
-_CAPSULE_TRANSIT_TCP_LOCAL = np.array([-0.0410, 0.0660, 0.5700])
-_CAPSULE_POD_AXIS_LOCAL = np.array([-0.1600, 0.0800, -0.9839])
+_CAPSULE_TRANSIT_TCP_LOCAL = np.array([0.0218, -0.0273, 0.4539])
+_CAPSULE_POD_AXIS_LOCAL = np.array([-0.1400, 0.0453, -0.9891])
+# Tool +x at pod acquisition in the successful deterministic seed-4 task-policy
+# rollout, expressed in the coffee-machine frame. Together with the approach
+# (+z) axis this fixes the otherwise-free gripper yaw around the thin pod. The
+# remaining frames preserve that grip while reproducing the task policy's smooth
+# wrist rotation through lift, transit, and insertion.
+_CAPSULE_POD_GRIPPER_X_AXIS_LOCAL = np.array([-0.0515, 0.9973, 0.0530])
+_CAPSULE_POD_LIFT_AXIS_LOCAL = np.array([-0.0540, 0.0620, -0.9970])
+_CAPSULE_POD_LIFT_X_AXIS_LOCAL = np.array([-0.2080, 0.9750, 0.0710])
+_CAPSULE_POD_TRANSIT_AXIS_LOCAL = np.array([-0.1500, 0.1340, -0.9800])
+_CAPSULE_POD_TRANSIT_X_AXIS_LOCAL = np.array([-0.5090, 0.8390, 0.1920])
+_CAPSULE_POD_PLACE_AXIS_LOCAL = np.array([-0.1970, 0.1450, -0.9700])
+_CAPSULE_POD_PLACE_X_AXIS_LOCAL = np.array([-0.6770, 0.6950, 0.2420])
 # Pot grasp geometry distilled from deterministic successful task-policy rollouts.
 # The visible handle samples are biased toward the camera-facing arch; the policy
 # instead centres the fingers over the lid disk and keeps the TCP slightly below it.
@@ -203,6 +215,13 @@ def _capsule(out_dir, keypoints, grounded, env, clearance):
     seat_axis = _quat_rotate_wxyz(quat, _CAPSULE_SEAT_AXIS_LOCAL)
     lift_axis = _quat_rotate_wxyz(quat, _CAPSULE_OPEN_AXIS_LOCAL)
     pod_axis = _quat_rotate_wxyz(quat, _CAPSULE_POD_AXIS_LOCAL)
+    pod_x_axis = _quat_rotate_wxyz(quat, _CAPSULE_POD_GRIPPER_X_AXIS_LOCAL)
+    pod_lift_axis = _quat_rotate_wxyz(quat, _CAPSULE_POD_LIFT_AXIS_LOCAL)
+    pod_lift_x_axis = _quat_rotate_wxyz(quat, _CAPSULE_POD_LIFT_X_AXIS_LOCAL)
+    pod_transit_axis = _quat_rotate_wxyz(quat, _CAPSULE_POD_TRANSIT_AXIS_LOCAL)
+    pod_transit_x_axis = _quat_rotate_wxyz(quat, _CAPSULE_POD_TRANSIT_X_AXIS_LOCAL)
+    pod_place_axis = _quat_rotate_wxyz(quat, _CAPSULE_POD_PLACE_AXIS_LOCAL)
+    pod_place_x_axis = _quat_rotate_wxyz(quat, _CAPSULE_POD_PLACE_X_AXIS_LOCAL)
     bay_world = root + _quat_rotate_wxyz(quat, _CAPSULE_BAY_LOCAL)
 
     pod = _nearest_kp_distinct(keypoints, pts["can"].mean(axis=0), set())
@@ -222,7 +241,8 @@ def _capsule(out_dir, keypoints, grounded, env, clearance):
         np.stack([lid_lip_world, contact_world, seat_world, open_world,
                   retreat_world, pod_goal_world, transit_world, bay_world]),
     ], axis=0)
-    lift_pod = (kps[pod] + np.array([0.0, 0.0, _CAPSULE_POD_LIFT_HEIGHT]) - kps[bay]).tolist()
+    lift_pod = _quat_rotate_wxyz(
+        quat, _CAPSULE_POD_LIFT_LOCAL - _CAPSULE_BAY_LOCAL).tolist()
     metadata = _render(
         "capsule", out_dir, lip=lip, contact_goal=contact_goal, seat_goal=seat_goal,
         open_goal=open_goal, retreat_goal=retreat_goal, pod=pod, pod_goal=pod_goal,
@@ -231,9 +251,7 @@ def _capsule(out_dir, keypoints, grounded, env, clearance):
     metadata["contact_modes"] = {"0": "press"}
     metadata["grasp_target_keypoints"] = {"0": contact_goal, "4": pod_goal}
     metadata["move_done_targets"] = [3]
-    metadata["move_advance_on_done_targets"] = [6]
-    metadata["move_advance_on_payload_rise_targets"] = [5]
-    metadata["stage_rise_confirm"] = {"5": 0.40}
+    metadata["move_advance_on_done_targets"] = [5, 6]
     # Once the simulator confirms physical task progress, stop chasing a stale
     # geometric waypoint and let the next manipulation stage take over.
     metadata["done_flags"] = {"2": "open_coffee_lid"}
@@ -250,10 +268,15 @@ def _capsule(out_dir, keypoints, grounded, env, clearance):
     metadata["release_done_targets"] = [2]
     metadata["approach_axes"] = {
         "0": approach_axis.tolist(), "1": seat_axis.tolist(), "2": lift_axis.tolist(),
-        "4": pod_axis.tolist(),
+        "4": pod_axis.tolist(), "5": pod_lift_axis.tolist(),
+        "6": pod_transit_axis.tolist(), "7": pod_place_axis.tolist(),
+    }
+    metadata["approach_x_axes"] = {
+        "4": pod_x_axis.tolist(), "5": pod_lift_x_axis.tolist(),
+        "6": pod_transit_x_axis.tolist(), "7": pod_place_x_axis.tolist(),
     }
     metadata["approach_axis_scales"] = {
-        "0": 4.0, "1": 5.0, "2": 6.0, "4": 4.0,
+        "0": 4.0, "1": 5.0, "2": 6.0, "4": 4.0, "5": 4.0, "6": 4.0, "7": 4.0,
     }
     metadata["static_keypoints"] = [
         lip, contact_goal, seat_goal, open_goal, retreat_goal, transit_goal, bay,
