@@ -151,6 +151,12 @@ class VlmDpBridge:
         # config pays nothing and sees no new context key.
         self._track_eef_hist = "carry_accel" in self.terms
         self._eef_last = None
+        # Payload age for carry_accel's settle window (same gating as eef_hist: configs that
+        # do not ask for the term see no new context key). Counts env steps since the CURRENT
+        # payload was acquired, i.e. since the stage that first names it took over.
+        self._env_steps = 0
+        self._payload_name = None
+        self._payload_acq = None
         self._contact_prev = False
         self._last_cmd_close = False
         self._reset_churn()
@@ -197,6 +203,9 @@ class VlmDpBridge:
         except ImportError:
             pass
         self._eef_last = None                # no cross-episode TCP history
+        self._env_steps = 0                  # no cross-episode payload age
+        self._payload_name = None
+        self._payload_acq = None
         self.env = DroidEnv.attach(raw_env, device=self.device)
         self.sensor = ApertureGraspSensor(stall_margin=self.stall_margin, settle_eps=self.settle_eps,
                                           close_steps=self.close_steps, settle_steps=self.settle_steps,
@@ -380,6 +389,19 @@ class VlmDpBridge:
                       f"z={self._z_hist[-1]:.4f} cmd_close={self._last_cmd_close}", flush=True)
                 self._contact_prev = contact
         self._stage_env_steps += max(int(executed_steps), 0)
+        # Payload age, in seconds since acquisition, for carry_accel's settle window. The
+        # dose-response that set carry_accel_max was measured on the first ~0.4-0.5s after
+        # lift (an unsettled pinch); past the settle window the cap is a transport speed
+        # limit rather than a slip guard, so the term reads this and stands down.
+        # A payload change (None->name or name->other) restarts the clock; releasing clears it.
+        if self._track_eef_hist:
+            self._env_steps += max(int(executed_steps), 0)
+            pay = ctx.get("payload")
+            if pay != self._payload_name:
+                self._payload_name = pay
+                self._payload_acq = self._env_steps if pay is not None else None
+            if pay is not None and self._payload_acq is not None:
+                ctx["payload_age_s"] = (self._env_steps - self._payload_acq) / 15.0
         # Record TCP motion and release state for retreat terms.
         eef_now = np.asarray(ctx["eef_pos"], dtype=np.float64)[:3]
         if getattr(self, "_eef_prev", None) is not None and int(executed_steps) > 0:

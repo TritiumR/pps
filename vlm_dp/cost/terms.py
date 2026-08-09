@@ -763,6 +763,15 @@ def carry_accel(I):
     """
     if I.context.get("payload") is None:            # robot-knowledge only, self-gating
         return _zeros(I)
+    # Settle window: the dose-response above was measured on the first ~0.4-0.5s after lift,
+    # when the pinch has not yet settled; baseline slips peak at a median 1.0-1.3s. Past
+    # carry_accel_settle_s the cap stops being a slip guard and becomes a global transport
+    # speed limit (loaded EE speed p90 0.096 vs 0.232 m/s unrestricted), so the term stands
+    # down. context["payload_age_s"] comes from the bridge; absent, the term stays active
+    # for every step a payload is held (the pre-settle-window behaviour).
+    age = I.context.get("payload_age_s")
+    if age is not None and float(age) > float(getattr(I.geom, "carry_accel_settle_s", 1.0)):
+        return _zeros(I)
     pos = I.ee_pos
     if pos is None or pos.ndim != 3:
         return _zeros(I)
