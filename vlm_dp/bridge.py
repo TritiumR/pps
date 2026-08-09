@@ -368,8 +368,13 @@ class VlmDpBridge:
                             plan_ref=ref, held_offset=self.held_offset,
                             placed=placed)
         ctx["destination"] = self.roles.get("place_obj")
-        # Reopen after a closed-empty grasp before retrying.
         st = self.stage()
+        # A press-release stage first drives an articulated contact to its explicit
+        # release target. Keep the fingers closed during that motion, then open at
+        # the target so the normal place settling logic can advance.
+        if st.gripper == "place" and getattr(st, "contact", "pinch") == "press" and not st.done():
+            ctx["gripper_intent"] = "close"
+        # Reopen after a closed-empty grasp before retrying.
         # Press stages may close without certifying a pinch hold.
         if st.gripper == "close" and self.sensor is not None and getattr(st, "contact", "pinch") != "press":
             grasp_target = np.asarray(ctx["target"], dtype=np.float64)

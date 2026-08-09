@@ -695,6 +695,17 @@ class RekepGrounding:
                 return float(torch.as_tensor(subgoal(ee, kp)).reshape(-1)[0]) < eps
             return _d
 
+        def target_done(target):
+            """Return a sensed completion predicate for an explicit end-effector target."""
+            eps = self.subgoal_eps
+
+            def _d():
+                return float(np.linalg.norm(
+                    np.asarray(env.tcp(), dtype=np.float64)
+                    - np.asarray(target(), dtype=np.float64)
+                )) < eps
+            return _d
+
         def place_target_for(stage_idx, payload_owner):
             """Return the non-payload object referenced by a place subgoal."""
             refs = _referenced_kps(os.path.join(vlm_dir, f"stage{stage_idx + 1}_subgoal_constraints.txt"))
@@ -754,6 +765,7 @@ class RekepGrounding:
         steer_policies = metadata.get("steer_policies") or []
         def _pol(idx):
             return steer_policies[idx] if idx < len(steer_policies) else None
+        release_done_targets = {int(idx) for idx in metadata.get("release_done_targets", [])}
         for i in range(metadata["num_stages"]):
             grasp_kp, release_kp = metadata["grasp_keypoints"][i], metadata["release_keypoints"][i]
             held = tuple(j for j, o in enumerate(tracker.owners) if grasped_body is not None and o == grasped_body)
@@ -790,11 +802,16 @@ class RekepGrounding:
                 pressed = press
             elif release_kp >= 0:
                 name = name_for(release_kp)
+                target_kp = int((metadata.get("release_targets") or {}).get(str(i), release_kp))
+                if not 0 <= target_kp < len(tracker.owners):
+                    raise ValueError(f"stage {i + 1} release target keypoint {target_kp} is invalid")
+                target = kp_point(target_kp)
                 place_target = place_target_for(i, grasped_body)
                 manipulated.update({name} | ({place_target} if place_target else set()))
                 stages.append(Stage(name=f"place {name}", gripper="place", grasp_obj=None, payload=name, steer_policy=_pol(i),
-                                    place_target=place_target, target=kp_point(release_kp), held_idx=held,
-                                    constraint=subgoal, path_fns=path_fns, done=subgoal_done(subgoal),
+                                    place_target=place_target, target=target, held_idx=held,
+                                    constraint=subgoal, path_fns=path_fns,
+                                    done=(target_done(target) if i in release_done_targets else subgoal_done(subgoal)),
                                     orient=orient_for(i), approach_axis=approach_for(i),
                                     orientation_scale=orientation_scale_for(i),
                                     rise_confirm=rise_confirm_for(name),

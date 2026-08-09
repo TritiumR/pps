@@ -176,6 +176,10 @@ def _capsule(out_dir, keypoints, grounded, env, clearance):
                        lift_pod=lift_pod)
     metadata["contact_modes"] = {"0": "press"}
     metadata["contact_slack"] = {"0": 0.012}
+    # Stage 2 is the release stage syntactically, but physically it must keep contact
+    # while lifting the lid lip to the open goal and release only after arriving.
+    metadata["release_targets"] = {"1": open_goal}
+    metadata["release_done_targets"] = [1]
     metadata["approach_axes"] = {
         "0": approach_axis.tolist(), "1": approach_axis.tolist()
     }
