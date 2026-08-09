@@ -166,6 +166,7 @@ def _capsule(out_dir, keypoints, grounded, env, clearance):
     hinge_shift = _quat_rotate_wxyz(quat, np.array([0.0, 0.08, 0.0]))
     open_world = lip_world + hinge_shift + np.array([0.0, 0.0, 0.12])
     approach_axis = np.array([0.0, 0.0, -1.0])
+    lift_axis = np.array([-0.406, -0.765, -0.5])
     bay_world = root + _quat_rotate_wxyz(quat, _CAPSULE_BAY_LOCAL)
 
     pod = _nearest_kp_distinct(keypoints, pts["can"].mean(axis=0), set())
@@ -185,7 +186,7 @@ def _capsule(out_dir, keypoints, grounded, env, clearance):
     metadata["release_targets"] = {"1": open_goal}
     metadata["release_done_targets"] = [1]
     metadata["approach_axes"] = {
-        "0": approach_axis.tolist(), "1": approach_axis.tolist()
+        "0": approach_axis.tolist(), "1": lift_axis.tolist()
     }
     metadata["approach_axis_scales"] = {"0": 4.0, "1": 6.0}
     metadata["static_keypoints"] = [lip, bay]
@@ -196,7 +197,8 @@ def _capsule(out_dir, keypoints, grounded, env, clearance):
           f"lip=kp{lip} (declared, {np.round(lip_world, 3)}) "
           f"open_goal=kp{open_goal} (declared, {np.round(open_world, 3)}) "
           f"bay=kp{bay} (declared, {np.round(bay_world, 3)})", flush=True)
-    print(f"[fake-vlm] capsule approach axis={np.round(approach_axis, 3)}", flush=True)
+    print(f"[fake-vlm] capsule approach axis={np.round(approach_axis, 3)} "
+          f"lift axis={np.round(lift_axis, 3)}", flush=True)
     _capsule_lip_diagnostic(env, lid_lip_world)
     return metadata, {"lid": lip, "open_goal": open_goal, "pod": pod, "bay": bay}, extra
 
