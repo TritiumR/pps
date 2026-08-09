@@ -424,18 +424,23 @@ class RekepGrounding:
                 print(f"[rekep-dbg] {_n}: grasp_center={np.round(obj_pos(_n), 3)} "
                       f"gt={np.round(_gt, 3)} err={err:.1f}mm", flush=True)
 
+        tracked_scene_objects = [n for n in scene_objects if n in kp_of]
+        missing_geometry = [n for n in scene_objects if n not in kp_of]
+        if missing_geometry:
+            print(f"[rekep] ignoring perceived distractors without usable point geometry: "
+                  f"{missing_geometry}", flush=True)
         objects = [SceneObject(name=n, pos=(lambda n=n: obj_pos(n)), extents=extents.get(n, _DEFAULT_EXTENT),
                                axis=grasp_axis.get(n), grasp_extent=grasp_ext_of.get(n),
                                grasp_region=grasp_region_of.get(n))
-                   for n in scene_objects]
+                   for n in tracked_scene_objects]
 
 
         if self.perception is not None:
             for i, (centre, ext) in enumerate(self.perception.unexplained_obstacles(support_top)):
                 objects.append(SceneObject(name=f"_obstacle{i}", pos=(lambda p=centre: p), extents=ext,
                                            axis=None, grasp_extent=None, grasp_region=None))
-            if len(objects) > len(scene_objects):
-                print(f"[rekep] {len(objects) - len(scene_objects)} unnamed obstacles from scene geometry",
+            if len(objects) > len(tracked_scene_objects):
+                print(f"[rekep] {len(objects) - len(tracked_scene_objects)} unnamed obstacles from scene geometry",
                       flush=True)
 
         def load_stage(idx, held):
