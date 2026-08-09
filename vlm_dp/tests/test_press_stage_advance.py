@@ -7,6 +7,7 @@ import types
 
 import numpy as np
 
+import torch
 # bridge only needs this name for annotations in these CPU-only tests. Stub it
 # before import so Isaac Sim's pxr runtime is not required.
 _droid = types.ModuleType("sim_common.envs.droid")
@@ -225,6 +226,111 @@ def test_latched_grasp_stays_closed_until_place_subgoal():
     assert np.all(actions[:, 7] == 0.0)
 
 
+def test_capsule_press_arc_forces_close_until_done():
+    done = [False]
+    stage = Stage(
+        name="tilt lid",
+        target=lambda: np.zeros(3),
+        gripper="hold",
+        payload="capsule",
+        contact="press",
+        done=lambda: done[0],
+    )
+    bridge = _bridge()
+    bridge.task_key = "capsule"
+    bridge.grounding = types.SimpleNamespace(stages=[stage])
+    bridge.stage_idx = 0
+    bridge._grasp_close_latched = False
+    bridge._carry_release_latched = False
+    bridge._grip_debounce = 0
+    actions, _ = bridge.filter_plan(np.zeros((2, 8)), 2)
+    assert np.all(actions[:, 7] == 1.0)
+
+    stage = Stage(
+        name="open lid",
+        target=lambda: np.zeros(3),
+        gripper="place",
+        payload="capsule",
+        contact="press",
+        done=lambda: done[0],
+    )
+    bridge.grounding = types.SimpleNamespace(stages=[stage])
+    actions, _ = bridge.filter_plan(np.zeros((2, 8)), 2)
+    assert np.all(actions[:, 7] == 1.0)
+    done[0] = True
+    actions, _ = bridge.filter_plan(np.ones((2, 8)), 2)
+    assert np.all(actions[:, 7] == 0.0)
+
+
+
+def test_grasp_trigger_advances_into_explicit_lift():
+    stage = Stage(
+        name="grasp pod",
+        target=lambda: np.zeros(3),
+        gripper="close",
+        grasp_obj="can",
+        grasp_trigger_flag="grasp_pod",
+        grasp_advance_on_trigger=True,
+    )
+    bridge = _bridge()
+    assert bridge._stage_reached(stage, {"grasp_pod": True})
+
+
+
+def test_carry_transition_preserves_latched_payload_offset():
+    previous = Stage(
+        name="lift can",
+        target=lambda: np.zeros(3),
+        gripper="hold",
+        payload="can",
+        held_idx=(2,),
+    )
+    following = Stage(
+        name="place can",
+        target=lambda: np.zeros(3),
+        gripper="place",
+        payload="can",
+        held_idx=(2,),
+    )
+    bridge = _bridge()
+    bridge.grounding = types.SimpleNamespace(stages=[previous, following])
+    bridge.stage_idx = 1
+    latched = np.array([[0.01, -0.02, 0.03]])
+    bridge.held_offset = latched
+    assert bridge._transition_held_offset(previous) is latched
+
+
+def test_place_constraint_uses_latched_rigid_payload_not_live_tracker():
+    stage = Stage(
+        name="place can",
+        target=lambda: np.zeros(3),
+        gripper="place",
+        payload="can",
+        held_idx=(0,),
+        constraint=lambda _ee, kp: torch.linalg.vector_norm(
+            kp[0] - torch.tensor([0.1, 0.0, 0.0]), dim=-1
+        ),
+        done=lambda: False,
+    )
+    bridge = _bridge()
+    bridge.device = "cpu"
+    bridge.subgoal_eps = 0.01
+    bridge.held_offset = np.array([[0.1, 0.0, 0.0]])
+    bridge.grounding = types.SimpleNamespace(
+        keypoints=lambda: np.array([[9.0, 9.0, 9.0]])
+    )
+    bridge.env = types.SimpleNamespace(
+        q0=lambda: torch.zeros(1),
+        fk=types.SimpleNamespace(
+            grasp_point=lambda _q, _offset: (
+                torch.zeros((1, 3)), torch.eye(3).unsqueeze(0)
+            )
+        ),
+    )
+    assert bridge._stage_done(stage)
+    bridge.held_offset = np.array([[0.2, 0.0, 0.0]])
+    assert not bridge._stage_done(stage)
+
 _TESTS = [
     test_press_hold_waits_for_tcp_waypoint_not_payload_height,
     test_press_place_does_not_wait_for_a_pinch_release_sensor,
@@ -236,6 +342,10 @@ _TESTS = [
     test_capsule_grip_accepts_narrow_rim_but_not_open_hand,
     test_hold_can_advance_on_payload_rise,
     test_latched_grasp_stays_closed_until_place_subgoal,
+    test_capsule_press_arc_forces_close_until_done,
+    test_carry_transition_preserves_latched_payload_offset,
+    test_place_constraint_uses_latched_rigid_payload_not_live_tracker,
+    test_grasp_trigger_advances_into_explicit_lift,
 ]
 
 

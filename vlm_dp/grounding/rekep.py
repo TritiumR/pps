@@ -799,6 +799,9 @@ class RekepGrounding:
         visual_rise_grasp_targets = {
             int(idx) for idx in metadata.get("grasp_advance_on_visual_rise", [])
         }
+        trigger_advance_grasp_targets = {
+            int(idx) for idx in metadata.get("grasp_advance_on_trigger", [])
+        }
         for i in range(metadata["num_stages"]):
             grasp_kp, release_kp = metadata["grasp_keypoints"][i], metadata["release_keypoints"][i]
             held = tuple(j for j, o in enumerate(tracker.owners) if grasped_body is not None and o == grasped_body)
@@ -842,6 +845,7 @@ class RekepGrounding:
                                     force_gripper_at_target=(i in force_gripper_targets),
                                     grasp_advance_on_visual_rise=(i in visual_rise_grasp_targets),
                                     grasp_trigger_flag=grasp_trigger_flags.get(str(i)),
+                                    grasp_advance_on_trigger=(i in trigger_advance_grasp_targets),
                                     rise_confirm=stage_rise_confirm_for(i, name),
                                     grasp_transit_offsets=grasp_transit_offsets_for(i),
                                     contact=("press" if press else "pinch")))

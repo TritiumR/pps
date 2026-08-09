@@ -24,14 +24,21 @@ _CAPSULE_BAY_LOCAL = np.array([0.0, 0.0, 0.27])
 # Closed-lid contact lip in the calibrated machine-root frame, measured from the asset geometry.
 # Unlike the front-most visible slab point, this remains on the articulated lip under camera occlusion.
 _CAPSULE_LIP_LOCAL = np.array([-0.0784, -0.2392, 0.3924])
-# End-effector waypoints distilled from the deterministic seed-4 task-policy rollout, expressed
-# in the machine frame so they rotate and translate with every randomized coffee maker.
-_CAPSULE_CONTACT_TCP_LOCAL = np.array([-0.1142, -0.3829, 0.2687])
-_CAPSULE_SEAT_TCP_LOCAL = np.array([-0.0592, -0.3342, 0.2366])
+# End-effector waypoints distilled from successful deterministic task-policy rollouts, expressed
+# in the machine frame so they rotate and translate with every randomized coffee maker. The
+# contact, seating and intermediate waypoints preserve seed 5's successful close-before-lift
+# timing; seed 4's lower seat was unreachable when the randomized machine was closer to the robot.
+_CAPSULE_CONTACT_TCP_LOCAL = np.array([-0.1260, -0.3846, 0.3118])
+_CAPSULE_SEAT_TCP_LOCAL = np.array([-0.0248, -0.2886, 0.3168])
+_CAPSULE_MID_TCP_LOCAL = np.array([-0.0150, -0.2187, 0.4708])
 _CAPSULE_OPEN_TCP_LOCAL = np.array([0.0200, 0.0000, 0.5000])
-# Local +z tool axes at the seating and open waypoints from the same rollout. Stage 1 stays
+# Local +z tool axes at the seating and open waypoints from the same rollouts. Stage 1 stays
 # vertical; later axes are transformed by the machine pose below.
-_CAPSULE_SEAT_AXIS_LOCAL = np.array([0.1666, 0.3027, -0.9384])
+_CAPSULE_CONTACT_X_AXIS_LOCAL = np.array([-0.2780, 0.9530, 0.0760])
+_CAPSULE_SEAT_AXIS_LOCAL = np.array([0.2633, 0.4831, -0.8350])
+_CAPSULE_SEAT_X_AXIS_LOCAL = np.array([0.3479, 0.7598, 0.5493])
+_CAPSULE_MID_AXIS_LOCAL = np.array([0.1646, 0.5957, -0.7861])
+_CAPSULE_MID_X_AXIS_LOCAL = np.array([0.3522, 0.7090, 0.6110])
 _CAPSULE_OPEN_AXIS_LOCAL = np.array([0.1543, 0.7185, -0.6782])
 # After opening, the task policy withdraws laterally before descending to the pod.
 _CAPSULE_RETREAT_TCP_LOCAL = np.array([0.1547, -0.2612, 0.4833])
@@ -208,11 +215,16 @@ def _capsule(out_dir, keypoints, grounded, env, clearance):
     lid_lip_world = root + _quat_rotate_wxyz(quat, _CAPSULE_LIP_LOCAL)
     contact_world = root + _quat_rotate_wxyz(quat, _CAPSULE_CONTACT_TCP_LOCAL)
     seat_world = root + _quat_rotate_wxyz(quat, _CAPSULE_SEAT_TCP_LOCAL)
+    mid_world = root + _quat_rotate_wxyz(quat, _CAPSULE_MID_TCP_LOCAL)
     open_world = root + _quat_rotate_wxyz(quat, _CAPSULE_OPEN_TCP_LOCAL)
     retreat_world = root + _quat_rotate_wxyz(quat, _CAPSULE_RETREAT_TCP_LOCAL)
     transit_world = root + _quat_rotate_wxyz(quat, _CAPSULE_TRANSIT_TCP_LOCAL)
-    approach_axis = np.array([0.0, 0.0, -1.0])
+    approach_axis = _quat_rotate_wxyz(quat, np.array([0.0630, 0.0960, -0.9930]))
+    contact_x_axis = _quat_rotate_wxyz(quat, _CAPSULE_CONTACT_X_AXIS_LOCAL)
     seat_axis = _quat_rotate_wxyz(quat, _CAPSULE_SEAT_AXIS_LOCAL)
+    seat_x_axis = _quat_rotate_wxyz(quat, _CAPSULE_SEAT_X_AXIS_LOCAL)
+    mid_axis = _quat_rotate_wxyz(quat, _CAPSULE_MID_AXIS_LOCAL)
+    mid_x_axis = _quat_rotate_wxyz(quat, _CAPSULE_MID_X_AXIS_LOCAL)
     lift_axis = _quat_rotate_wxyz(quat, _CAPSULE_OPEN_AXIS_LOCAL)
     pod_axis = _quat_rotate_wxyz(quat, _CAPSULE_POD_AXIS_LOCAL)
     pod_x_axis = _quat_rotate_wxyz(quat, _CAPSULE_POD_GRIPPER_X_AXIS_LOCAL)
@@ -228,58 +240,61 @@ def _capsule(out_dir, keypoints, grounded, env, clearance):
     pod_goal_world = pts["can"].mean(axis=0) + np.array([0.0, 0.0, 0.015])
     n = len(keypoints)
     lip, contact_goal, seat_goal = n, n + 1, n + 2
-    open_goal, retreat_goal, pod_goal = n + 3, n + 4, n + 5
-    transit_goal, bay = n + 6, n + 7
+    mid_goal, open_goal, retreat_goal = n + 3, n + 4, n + 5
+    pod_goal, transit_goal, bay = n + 6, n + 7, n + 8
     extra = [
         (lid_lip_world, "capsule"), (contact_world, None), (seat_world, None),
-        (open_world, None), (retreat_world, None), (pod_goal_world, "can"),
+        (mid_world, None), (open_world, None), (retreat_world, None), (pod_goal_world, "can"),
         (transit_world, None), (bay_world, "capsule"),
     ]
 
     kps = np.concatenate([
         np.asarray(keypoints, dtype=np.float64),
-        np.stack([lid_lip_world, contact_world, seat_world, open_world,
+        np.stack([lid_lip_world, contact_world, seat_world, mid_world, open_world,
                   retreat_world, pod_goal_world, transit_world, bay_world]),
     ], axis=0)
     lift_pod = _quat_rotate_wxyz(
         quat, _CAPSULE_POD_LIFT_LOCAL - _CAPSULE_BAY_LOCAL).tolist()
     metadata = _render(
         "capsule", out_dir, lip=lip, contact_goal=contact_goal, seat_goal=seat_goal,
-        open_goal=open_goal, retreat_goal=retreat_goal, pod=pod, pod_goal=pod_goal,
+        mid_goal=mid_goal, open_goal=open_goal, retreat_goal=retreat_goal, pod=pod, pod_goal=pod_goal,
         transit_goal=transit_goal, bay=bay, lift_pod=lift_pod,
     )
     metadata["contact_modes"] = {"0": "press"}
-    metadata["grasp_target_keypoints"] = {"0": contact_goal, "4": pod_goal}
-    metadata["move_done_targets"] = [3]
-    metadata["move_advance_on_done_targets"] = [5, 6]
+    metadata["grasp_target_keypoints"] = {"0": contact_goal, "5": pod_goal}
+    metadata["move_done_targets"] = [4]
+    metadata["move_advance_on_done_targets"] = [7]
+    metadata["move_advance_on_payload_rise_targets"] = [6]
     # Once the simulator confirms physical task progress, stop chasing a stale
     # geometric waypoint and let the next manipulation stage take over.
-    metadata["done_flags"] = {"2": "open_coffee_lid"}
-    metadata["force_gripper_at_target"] = [4]
-    metadata["grasp_advance_on_visual_rise"] = [4]
-    metadata["grasp_trigger_flags"] = {"4": "grasp_pod"}
+    metadata["done_flags"] = {"3": "open_coffee_lid"}
+    metadata["force_gripper_at_target"] = [5]
+    metadata["grasp_advance_on_trigger"] = [5]
+    metadata["grasp_trigger_flags"] = {"5": "grasp_pod"}
     metadata["rise_confirm"] = {"can": 0.015}
 
     metadata["contact_slack"] = {
-        "0": 0.012, "1": 0.015, "2": 0.020, "3": 0.030, "4": 0.020,
+        "0": 0.012, "1": 0.030, "2": 0.030, "3": 0.020, "4": 0.030, "5": 0.020,
     }
-    # Stage 3 retains contact while levering the lid and releases only at the goal.
-    metadata["release_targets"] = {"2": open_goal}
-    metadata["release_done_targets"] = [2]
+    # Stages 2-4 retain contact while levering the lid and release only at the goal.
+    metadata["release_targets"] = {"3": open_goal}
+    metadata["release_done_targets"] = [3]
     metadata["approach_axes"] = {
-        "0": approach_axis.tolist(), "1": seat_axis.tolist(), "2": lift_axis.tolist(),
-        "4": pod_axis.tolist(), "5": pod_lift_axis.tolist(),
-        "6": pod_transit_axis.tolist(), "7": pod_place_axis.tolist(),
+        "0": approach_axis.tolist(), "1": seat_axis.tolist(), "2": mid_axis.tolist(),
+        "3": lift_axis.tolist(), "5": pod_axis.tolist(), "6": pod_lift_axis.tolist(),
+        "7": pod_transit_axis.tolist(), "8": pod_place_axis.tolist(),
     }
     metadata["approach_x_axes"] = {
-        "4": pod_x_axis.tolist(), "5": pod_lift_x_axis.tolist(),
-        "6": pod_transit_x_axis.tolist(), "7": pod_place_x_axis.tolist(),
+        "0": contact_x_axis.tolist(), "1": seat_x_axis.tolist(), "2": mid_x_axis.tolist(),
+        "5": pod_x_axis.tolist(), "6": pod_lift_x_axis.tolist(),
+        "7": pod_transit_x_axis.tolist(), "8": pod_place_x_axis.tolist(),
     }
     metadata["approach_axis_scales"] = {
-        "0": 4.0, "1": 5.0, "2": 6.0, "4": 4.0, "5": 4.0, "6": 4.0, "7": 4.0,
+        "0": 4.0, "1": 5.0, "2": 5.0, "3": 6.0,
+        "5": 4.0, "6": 4.0, "7": 4.0, "8": 4.0,
     }
     metadata["static_keypoints"] = [
-        lip, contact_goal, seat_goal, open_goal, retreat_goal, transit_goal, bay,
+        lip, contact_goal, seat_goal, mid_goal, open_goal, retreat_goal, transit_goal, bay,
     ]
     with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
@@ -288,6 +303,7 @@ def _capsule(out_dir, keypoints, grounded, env, clearance):
           f"lip=kp{lip} (declared, {np.round(lid_lip_world, 3)}) "
           f"contact=kp{contact_goal} (declared, {np.round(contact_world, 3)}) "
           f"seat_goal=kp{seat_goal} (declared, {np.round(seat_world, 3)}) "
+          f"mid_goal=kp{mid_goal} (declared, {np.round(mid_world, 3)}) "
           f"open_goal=kp{open_goal} (declared, {np.round(open_world, 3)}) "
           f"retreat_goal=kp{retreat_goal} (declared, {np.round(retreat_world, 3)}) "
           f"pod_goal=kp{pod_goal} (declared, {np.round(pod_goal_world, 3)}) "
@@ -299,6 +315,7 @@ def _capsule(out_dir, keypoints, grounded, env, clearance):
           f"quat_wxyz={quat.tolist()}", flush=True)
     _capsule_lip_diagnostic(env, lid_lip_world)
     return metadata, {"lid": lip, "contact_goal": contact_goal, "seat_goal": seat_goal,
+                      "mid_goal": mid_goal,
                       "open_goal": open_goal, "retreat_goal": retreat_goal, "pod": pod,
                       "pod_goal": pod_goal, "transit_goal": transit_goal, "bay": bay}, extra
 

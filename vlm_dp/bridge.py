@@ -612,12 +612,75 @@ class VlmDpBridge:
             transit = transit_offsets[self._grasp_transit_idx]
             target += np.asarray(transit, dtype=np.float64)
         return target + self._grasp_probe
+    def _transition_held_offset(self, previous_stage):
+        """Preserve the rigid payload transform across consecutive carry stages."""
+        next_stage = self.stage()
+        same_payload_points = (
+            bool(previous_stage.held_idx)
+            and tuple(previous_stage.held_idx) == tuple(next_stage.held_idx)
+        )
+        if (
+            self.held_offset is not None
+            and same_payload_points
+            and previous_stage.payload is not None
+            and getattr(previous_stage, "contact", "pinch") != "press"
+        ):
+            return self.held_offset
+        return _capture_held(self.env, self.grounding, next_stage.held_idx)
+
+    def _stage_done(self, stage):
+        """Evaluate a carried-object constraint from the latched rigid grasp."""
+        use_latched_payload = (
+            stage.gripper == "place"
+            and getattr(stage, "contact", "pinch") != "press"
+            and stage.constraint is not None
+            and bool(stage.held_idx)
+            and self.held_offset is not None
+        )
+        if not use_latched_payload:
+            return bool(stage.done())
+        try:
+            offsets = np.asarray(self.held_offset, dtype=np.float64)
+            if len(offsets) != len(stage.held_idx):
+                return bool(stage.done())
+            keypoints = np.asarray(self.grounding.keypoints(), dtype=np.float64).copy()
+            pos, rot = self.env.fk.grasp_point(
+                self.env.q0().unsqueeze(0), ROBOTIQ_GRASP_OFFSET
+            )
+            tcp = pos[0].detach().cpu().numpy()
+            rmat = rot[0].detach().cpu().numpy()
+            for held_slot, keypoint_idx in enumerate(stage.held_idx):
+                keypoints[keypoint_idx] = tcp + rmat @ offsets[held_slot]
+            ee = torch.as_tensor(
+                tcp, device=self.device, dtype=torch.float32
+            ).reshape(1, 1, 3)
+            kp = torch.as_tensor(
+                keypoints, device=self.device, dtype=torch.float32
+            )[:, None, None, :]
+            value = torch.as_tensor(stage.constraint(ee, kp)).reshape(-1)
+            return float(value.max()) < self.subgoal_eps
+        except Exception:
+            return bool(stage.done())
 
     def filter_plan(self, actions, execute_steps):
         """Apply executable gripper schedules and suppress unsafe open blips."""
         st = self.stage()
+        if (getattr(self, "task_key", None) == "capsule"
+                and getattr(st, "contact", "pinch") == "press"
+                and st.gripper in ("hold", "place")):
+            # The diffusion prior can emit a half-close while following the lid arc. The
+            # successful task policy closes fully after contact and keeps that command through
+            # the lever motion, releasing only at the terminal waypoint.
+            close = st.gripper == "hold" or not bool(st.done())
+            if torch.is_tensor(actions):
+                actions = actions.clone()
+            else:
+                actions = np.array(actions, copy=True)
+            actions[:execute_steps, 7] = 1.0 if close else 0.0
+            print(f"[vlm_dp] capsule lid gripper stage={self.stage_idx} "
+                  f"command={'close' if close else 'open'}", flush=True)
         if self._grasp_close_latched and st.gripper in ("hold", "place"):
-            if st.gripper == "place" and bool(st.done()):
+            if st.gripper == "place" and self._stage_done(st):
                 self._carry_release_latched = True
             close = not self._carry_release_latched
             if torch.is_tensor(actions):
@@ -928,10 +991,15 @@ class VlmDpBridge:
         if lid_pending:
             if lid_retry:
                 self._capsule_lid_retry_count += 1
-                self.stage_idx = max(0, self.stage_idx - 2)
-                self.held_offset = _capture_held(
-                    self.env, self.grounding, self.stage().held_idx
-                )
+                retry_idx = max(0, self.stage_idx - 1)
+                while retry_idx > 0:
+                    candidate = self.grounding.stages[retry_idx]
+                    if (candidate.gripper == "close"
+                            and getattr(candidate, "contact", "pinch") == "press"):
+                        break
+                    retry_idx -= 1
+                self.stage_idx = retry_idx
+                self.held_offset = self._transition_held_offset(stage)
                 self._enter_stage()
                 print(f"[vlm_dp] capsule lid arc unconfirmed -> retry "
                       f"{self._capsule_lid_retry_count} from contact", flush=True)
@@ -975,9 +1043,7 @@ class VlmDpBridge:
                     return
                 self._pot_drop_lid = False
                 self.stage_idx = egg_stage
-                self.held_offset = _capture_held(
-                    self.env, self.grounding, self.stage().held_idx
-                )
+                self.held_offset = self._transition_held_offset(stage)
                 self._enter_stage()
                 self._stage_high = max(self._stage_high, self.stage_idx)
                 print(f"[vlm_dp] lid clear -> {self.stage_idx}: {self.stage().name}", flush=True)
@@ -988,7 +1054,7 @@ class VlmDpBridge:
         if violated:
             if self.stage_idx > 0:
                 self.stage_idx -= 1
-                self.held_offset = _capture_held(self.env, self.grounding, self.stage().held_idx)
+                self.held_offset = self._transition_held_offset(stage)
                 self._enter_stage()
                 self.gate_events["backtracks"] += 1  # Preserve failure evidence.
                 self._backtracks_run += 1
@@ -997,7 +1063,7 @@ class VlmDpBridge:
             return
         if self._stage_reached(stage, flags) and self.stage_idx + 1 < len(self.grounding.stages):
             self.stage_idx += 1
-            self.held_offset = _capture_held(self.env, self.grounding, self.stage().held_idx)
+            self.held_offset = self._transition_held_offset(stage)
             self._enter_stage()
             if self.stage_idx > self._stage_high:
                 # Only new maximum stage depth refunds the backtrack budget.
@@ -1027,7 +1093,7 @@ class VlmDpBridge:
             # Press contacts do not certify pinch holds.
             return None
         placed_now = stage.gripper == "place" and (
-            bool(stage.done())
+            self._stage_done(stage)
             or (self.flag_fallback and stage.done_flag is not None
                 and bool(flags.get(stage.done_flag, False))))
         # Allow a brief seat-check flicker after deliberate release.
@@ -1083,6 +1149,11 @@ class VlmDpBridge:
                 return bool(stage.done())
             if self.advance_mode == "env_flags":
                 return bool(flags.get(f"grasp_{stage.grasp_obj}", False))
+            if getattr(stage, "grasp_advance_on_trigger", False):
+                trigger_flag = getattr(stage, "grasp_trigger_flag", None)
+                if trigger_flag is not None and bool(flags.get(trigger_flag, False)):
+                    return True
+
             # Measure proximity against the probe-shifted target.
             tgt = self._active_grasp_target(
                 stage, latched=getattr(self, "_thin_verify_lift", 0.0) > 0.0)
@@ -1144,7 +1215,7 @@ class VlmDpBridge:
                 return bool(self.sensor.released()) and self._place_seen is not None
             if self.advance_mode == "env_flags" and stage.done_flag is not None and stage.done_flag in flags:
                 return bool(flags.get(stage.done_flag, False))
-            seated = (bool(stage.done())
+            seated = (self._stage_done(stage)
                       or (self.flag_fallback and stage.done_flag is not None
                           and bool(flags.get(stage.done_flag, False))))
             # Require a stable seat before advancing to the next object.
