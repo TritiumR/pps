@@ -369,11 +369,15 @@ class VlmDpBridge:
                             placed=placed)
         ctx["destination"] = self.roles.get("place_obj")
         st = self.stage()
-        # Press contacts use the fingertips as a pusher/lever. Keeping the fingers
-        # open matches the successful task-policy posture and avoids pinching or
-        # sliding off a thin articulated lid.
+        # The successful capsule task policy approaches the lid with open fingers,
+        # then closes while seating and levering it along the hinge arc.
         if getattr(st, "contact", "pinch") == "press":
-            ctx["gripper_intent"] = "open"
+            if st.name.startswith("press "):
+                ctx["gripper_intent"] = "open"
+            elif not st.done():
+                ctx["gripper_intent"] = "close"
+            else:
+                ctx["gripper_intent"] = "open"
         # Reopen after a closed-empty grasp before retrying.
         # Press stages may close without certifying a pinch hold.
         if st.gripper == "close" and self.sensor is not None and getattr(st, "contact", "pinch") != "press":
@@ -904,12 +908,22 @@ class VlmDpBridge:
                 return held
             return near and held
         if stage.gripper == "hold" and stage.payload is not None:
+            if getattr(stage, "contact", "pinch") == "press":
+                # Articulated press plans track a TCP waypoint, not payload height.
+                # The payload may start above a downward/seat target, which would
+                # otherwise advance this stage before contact is established.
+                return bool(stage.done())
             if getattr(stage, "advance_on_done", False):  # Task-state completion.
                 return bool(stage.done())
             if self.advance_mode == "subgoal":  # Subgoal predicate.
                 return bool(stage.done())
             return float(self._pos(stage.payload)[2]) >= float(stage.target()[2]) - self.lift_tol
         if stage.gripper == "place":
+            if getattr(stage, "contact", "pinch") == "press":
+                # A press contact carries no pinched payload. Once its articulated
+                # TCP target is reached, advance so the next stage can withdraw with
+                # open fingers; aperture/release settling is not meaningful here.
+                return bool(stage.done())
             if self.advance_mode == "subgoal":
                 # A released payload may no longer satisfy a hover-based subgoal.
                 return bool(self.sensor.released()) and self._place_seen is not None

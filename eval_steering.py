@@ -6132,6 +6132,8 @@ for rollout_idx, seed in enumerate(eval_seeds):
                 step_trace["action_gripper_raw"] = _latch_g
             if "eef_pos" in policy_step_obs:
                 step_trace["eef_pos"] = _to_numpy_unbatched(policy_step_obs["eef_pos"])
+            if "eef_quat" in policy_step_obs:
+                step_trace["eef_quat"] = _to_numpy_unbatched(policy_step_obs["eef_quat"])
             # Object poses per step: without these a rollout log cannot rebuild the cost context
             # offline, so executed plans cannot be re-scored against demonstrations.
             _rigid = getattr(env.scene, "rigid_objects", None) or {}

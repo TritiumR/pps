@@ -695,9 +695,9 @@ class RekepGrounding:
                 return float(torch.as_tensor(subgoal(ee, kp)).reshape(-1)[0]) < eps
             return _d
 
-        def target_done(target):
+        def target_done(target, tolerance=None):
             """Return a sensed completion predicate for an explicit end-effector target."""
-            eps = self.subgoal_eps
+            eps = self.subgoal_eps if tolerance is None else float(tolerance)
 
             def _d():
                 return float(np.linalg.norm(
@@ -765,7 +765,11 @@ class RekepGrounding:
         steer_policies = metadata.get("steer_policies") or []
         def _pol(idx):
             return steer_policies[idx] if idx < len(steer_policies) else None
+        move_advance_on_done_targets = {
+            int(idx) for idx in metadata.get("move_advance_on_done_targets", [])
+        }
         release_done_targets = {int(idx) for idx in metadata.get("release_done_targets", [])}
+        move_done_targets = {int(idx) for idx in metadata.get("move_done_targets", [])}
         for i in range(metadata["num_stages"]):
             grasp_kp, release_kp = metadata["grasp_keypoints"][i], metadata["release_keypoints"][i]
             held = tuple(j for j, o in enumerate(tracker.owners) if grasped_body is not None and o == grasped_body)
@@ -789,9 +793,16 @@ class RekepGrounding:
                 manipulated.add(name)
 
 
+                grasp_target_kp = int(
+                    (metadata.get("grasp_target_keypoints") or {}).get(str(i), grasp_kp)
+                )
+                if not 0 <= grasp_target_kp < len(tracker.owners):
+                    raise ValueError(
+                        f"stage {i + 1} grasp target keypoint {grasp_target_kp} is invalid"
+                    )
                 stages.append(Stage(name=f"{'press' if press else 'grasp'} {name}", gripper="close", steer_policy=_pol(i),
                                     grasp_obj=name, payload=None, held_idx=held,
-                                    target=(kp_point(grasp_kp) if press or
+                                    target=(kp_point(grasp_target_kp) if press or
                                             (metadata.get("grasp_targets") or {}).get(str(i)) == "keypoint"
                                             else obj_center[name]),
                                     orient=orient_for(i), approach_axis=approach_for(i),
@@ -811,7 +822,8 @@ class RekepGrounding:
                 stages.append(Stage(name=f"place {name}", gripper="place", grasp_obj=None, payload=name, steer_policy=_pol(i),
                                     place_target=place_target, target=target, held_idx=held,
                                     constraint=subgoal, path_fns=path_fns,
-                                    done=(target_done(target) if i in release_done_targets else subgoal_done(subgoal)),
+                                    done=(target_done(target, contact_slack_for(i))
+                                          if i in release_done_targets else subgoal_done(subgoal)),
                                     orient=orient_for(i), approach_axis=approach_for(i),
                                     orientation_scale=orientation_scale_for(i),
                                     rise_confirm=rise_confirm_for(name),
@@ -821,12 +833,14 @@ class RekepGrounding:
                 pressed = False
             else:
                 refs = _referenced_kps(os.path.join(vlm_dir, f"stage{i + 1}_subgoal_constraints.txt"))
-
-
+                target = kp_point(refs[0] if refs else 0)
+                done = (target_done(target, contact_slack_for(i))
+                        if pressed or i in move_done_targets else subgoal_done(subgoal))
                 stages.append(Stage(name=f"move {i}", gripper=("hold" if grasped_body else "open"), steer_policy=_pol(i),
                                     grasp_obj=None, payload=grasped_body,
-                                    target=kp_point(refs[0] if refs else 0), held_idx=held,
-                                    constraint=subgoal, path_fns=path_fns, done=subgoal_done(subgoal),
+                                    target=target, held_idx=held,
+                                    constraint=subgoal, path_fns=path_fns, done=done,
+                                    advance_on_done=(i in move_advance_on_done_targets),
                                     orient=orient_for(i), approach_axis=approach_for(i),
                                     orientation_scale=orientation_scale_for(i),
                                     rise_confirm=rise_confirm_for(grasped_body),

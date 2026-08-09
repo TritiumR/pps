@@ -24,6 +24,28 @@ _CAPSULE_BAY_LOCAL = np.array([0.0, 0.0, 0.27])
 # Closed-lid contact lip in the calibrated machine-root frame, measured from the asset geometry.
 # Unlike the front-most visible slab point, this remains on the articulated lip under camera occlusion.
 _CAPSULE_LIP_LOCAL = np.array([-0.0784, -0.2392, 0.3924])
+# End-effector waypoints distilled from the deterministic seed-4 task-policy rollout, expressed
+# in the machine frame so they rotate and translate with every randomized coffee maker.
+_CAPSULE_CONTACT_TCP_LOCAL = np.array([-0.1142, -0.3829, 0.2687])
+_CAPSULE_SEAT_TCP_LOCAL = np.array([-0.0592, -0.3342, 0.2366])
+_CAPSULE_OPEN_TCP_LOCAL = np.array([0.0200, 0.0000, 0.5000])
+# Local +z tool axes at the seating and open waypoints from the same rollout. Stage 1 stays
+# vertical; later axes are transformed by the machine pose below.
+_CAPSULE_SEAT_AXIS_LOCAL = np.array([0.1666, 0.3027, -0.9384])
+_CAPSULE_OPEN_AXIS_LOCAL = np.array([0.1543, 0.7185, -0.6782])
+# After opening, the task policy withdraws laterally before descending to the pod.
+_CAPSULE_RETREAT_TCP_LOCAL = np.array([0.1547, -0.2612, 0.4833])
+# The policy TCP is offset from the segmented pod centre at acquisition; aiming at the
+# centre directly pushed the pod across the counter instead of straddling it.
+_CAPSULE_POD_TCP_OFFSET_LOCAL = np.array([0.0430, 0.0440, -0.0060])
+# The successful task policy raises the pod root to roughly 0.75 m before crossing
+# the coffee-maker rim. The generic 0.15 m lift started lateral transit at 0.45 m
+# and collided with the fixture, so Capsule uses its observed carry clearance.
+_CAPSULE_POD_LIFT_HEIGHT = 0.50
+# High transit TCP from that rollout. Keeping this as its own waypoint prevents
+# the final place objective from descending diagonally into the machine's front rim.
+_CAPSULE_TRANSIT_TCP_LOCAL = np.array([-0.0410, 0.0660, 0.5700])
+_CAPSULE_POD_AXIS_LOCAL = np.array([-0.1600, 0.0800, -0.9839])
 
 
 def _render(task_key, out_dir, **fields):
@@ -157,50 +179,84 @@ def _capsule(out_dir, keypoints, grounded, env, clearance):
     root = data.root_pos_w[0].cpu().numpy().astype(np.float64)
     quat = data.root_quat_w[0].cpu().numpy()
     lid_lip_world = root + _quat_rotate_wxyz(quat, _CAPSULE_LIP_LOCAL)
-    # Match the successful task-policy posture: descend vertically around the front
-    # lip, close the fingers, then lift the lip while retaining the vertical tool axis.
-    lip_world = lid_lip_world + np.array([0.0, 0.0, -0.012])
-    # A hinged lid follows an arc rather than a vertical rail. Move the contact
-    # toward the hinge in the machine's local +y direction while lifting, so the
-    # fingers keep pushing underneath the lip instead of sliding off it.
-    hinge_shift = _quat_rotate_wxyz(quat, np.array([0.0, 0.08, 0.0]))
-    open_world = lip_world + hinge_shift + np.array([0.0, 0.0, 0.12])
+    contact_world = root + _quat_rotate_wxyz(quat, _CAPSULE_CONTACT_TCP_LOCAL)
+    seat_world = root + _quat_rotate_wxyz(quat, _CAPSULE_SEAT_TCP_LOCAL)
+    open_world = root + _quat_rotate_wxyz(quat, _CAPSULE_OPEN_TCP_LOCAL)
+    retreat_world = root + _quat_rotate_wxyz(quat, _CAPSULE_RETREAT_TCP_LOCAL)
+    transit_world = root + _quat_rotate_wxyz(quat, _CAPSULE_TRANSIT_TCP_LOCAL)
     approach_axis = np.array([0.0, 0.0, -1.0])
-    lift_axis = np.array([-0.406, -0.765, -0.5])
+    seat_axis = _quat_rotate_wxyz(quat, _CAPSULE_SEAT_AXIS_LOCAL)
+    lift_axis = _quat_rotate_wxyz(quat, _CAPSULE_OPEN_AXIS_LOCAL)
+    pod_axis = _quat_rotate_wxyz(quat, _CAPSULE_POD_AXIS_LOCAL)
     bay_world = root + _quat_rotate_wxyz(quat, _CAPSULE_BAY_LOCAL)
 
     pod = _nearest_kp_distinct(keypoints, pts["can"].mean(axis=0), set())
+    pod_goal_world = (
+        np.asarray(keypoints[pod], dtype=np.float64)
+        + _quat_rotate_wxyz(quat, _CAPSULE_POD_TCP_OFFSET_LOCAL)
+    )
     n = len(keypoints)
-    lip, open_goal, bay = n, n + 1, n + 2
-    extra = [(lip_world, "capsule"), (open_world, None), (bay_world, "capsule")]
+    lip, contact_goal, seat_goal = n, n + 1, n + 2
+    open_goal, retreat_goal, pod_goal = n + 3, n + 4, n + 5
+    transit_goal, bay = n + 6, n + 7
+    extra = [
+        (lid_lip_world, "capsule"), (contact_world, None), (seat_world, None),
+        (open_world, None), (retreat_world, None), (pod_goal_world, "can"),
+        (transit_world, None), (bay_world, "capsule"),
+    ]
 
-    kps = np.concatenate([np.asarray(keypoints, dtype=np.float64),
-                          np.stack([lip_world, open_world, bay_world])], axis=0)
-    lift_pod = (kps[pod] + np.array([0.0, 0.0, _LIFT_HEIGHT]) - kps[bay]).tolist()
-    metadata = _render("capsule", out_dir, lip=lip, open_goal=open_goal, pod=pod, bay=bay,
-                       lift_pod=lift_pod)
+    kps = np.concatenate([
+        np.asarray(keypoints, dtype=np.float64),
+        np.stack([lid_lip_world, contact_world, seat_world, open_world,
+                  retreat_world, pod_goal_world, transit_world, bay_world]),
+    ], axis=0)
+    lift_pod = (kps[pod] + np.array([0.0, 0.0, _CAPSULE_POD_LIFT_HEIGHT]) - kps[bay]).tolist()
+    metadata = _render(
+        "capsule", out_dir, lip=lip, contact_goal=contact_goal, seat_goal=seat_goal,
+        open_goal=open_goal, retreat_goal=retreat_goal, pod=pod, pod_goal=pod_goal,
+        transit_goal=transit_goal, bay=bay, lift_pod=lift_pod,
+    )
     metadata["contact_modes"] = {"0": "press"}
-    metadata["contact_slack"] = {"0": 0.012}
-    # Stage 2 is the release stage syntactically, but physically it must keep contact
-    # while lifting the lid lip to the open goal and release only after arriving.
-    metadata["release_targets"] = {"1": open_goal}
-    metadata["release_done_targets"] = [1]
-    metadata["approach_axes"] = {
-        "0": approach_axis.tolist(), "1": lift_axis.tolist()
+    metadata["grasp_target_keypoints"] = {"0": contact_goal, "4": pod_goal}
+    metadata["grasp_targets"] = {"4": "keypoint"}
+    metadata["move_done_targets"] = [3]
+    metadata["move_advance_on_done_targets"] = [5, 6]
+    metadata["contact_slack"] = {
+        "0": 0.012, "1": 0.015, "2": 0.020, "3": 0.030, "4": 0.020,
     }
-    metadata["approach_axis_scales"] = {"0": 4.0, "1": 6.0}
-    metadata["static_keypoints"] = [lip, bay]
+    # Stage 3 retains contact while levering the lid and releases only at the goal.
+    metadata["release_targets"] = {"2": open_goal}
+    metadata["release_done_targets"] = [2]
+    metadata["approach_axes"] = {
+        "0": approach_axis.tolist(), "1": seat_axis.tolist(), "2": lift_axis.tolist(),
+        "4": pod_axis.tolist(),
+    }
+    metadata["approach_axis_scales"] = {
+        "0": 4.0, "1": 5.0, "2": 6.0, "4": 4.0,
+    }
+    metadata["static_keypoints"] = [
+        lip, contact_goal, seat_goal, open_goal, retreat_goal, transit_goal, bay,
+    ]
     with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
 
     print(f"[fake-vlm] capsule roles pod=kp{pod} (snapped, {np.round(kps[pod], 3)}) "
-          f"lip=kp{lip} (declared, {np.round(lip_world, 3)}) "
+          f"lip=kp{lip} (declared, {np.round(lid_lip_world, 3)}) "
+          f"contact=kp{contact_goal} (declared, {np.round(contact_world, 3)}) "
+          f"seat_goal=kp{seat_goal} (declared, {np.round(seat_world, 3)}) "
           f"open_goal=kp{open_goal} (declared, {np.round(open_world, 3)}) "
+          f"retreat_goal=kp{retreat_goal} (declared, {np.round(retreat_world, 3)}) "
+          f"pod_goal=kp{pod_goal} (declared, {np.round(pod_goal_world, 3)}) "
+          f"transit_goal=kp{transit_goal} (declared, {np.round(transit_world, 3)}) "
           f"bay=kp{bay} (declared, {np.round(bay_world, 3)})", flush=True)
     print(f"[fake-vlm] capsule approach axis={np.round(approach_axis, 3)} "
-          f"lift axis={np.round(lift_axis, 3)}", flush=True)
+          f"seat axis={np.round(seat_axis, 3)} lift axis={np.round(lift_axis, 3)}", flush=True)
+    print(f"[fake-vlm] capsule machine root={root.tolist()} "
+          f"quat_wxyz={quat.tolist()}", flush=True)
     _capsule_lip_diagnostic(env, lid_lip_world)
-    return metadata, {"lid": lip, "open_goal": open_goal, "pod": pod, "bay": bay}, extra
+    return metadata, {"lid": lip, "contact_goal": contact_goal, "seat_goal": seat_goal,
+                      "open_goal": open_goal, "retreat_goal": retreat_goal, "pod": pod,
+                      "pod_goal": pod_goal, "transit_goal": transit_goal, "bay": bay}, extra
 
 
 def _capsule_lip_diagnostic(env, lip_world):
@@ -383,6 +439,10 @@ def _pot(out_dir, keypoints, grounded, env, clearance):
     metadata["rise_confirm"] = {"cover": 0.003}
     metadata["approach_axes"] = {"0": [0.0, 0.0, -1.0]}
     metadata["approach_axis_scales"] = {"0": 4.0}
+    # Stages 2 and 5 are explicit object-relative lift constraints. Advance them when
+    # that generated subgoal is satisfied; comparing the payload height directly to
+    # the TCP target can either finish too early or wait forever on a grasp offset.
+    metadata["move_advance_on_done_targets"] = [1, 4]
     if handle_axis is not None:
         metadata["grasp_geometry"] = {
             "cover": {"axis": list(handle_axis), "extent": float(handle_extent)}
