@@ -15,7 +15,7 @@ from PIL import Image
 from scipy.optimize import linear_sum_assignment
 
 from rekep.isaaclab_helpers import camera_to_rekep_inputs, workspace_bounds_from_scene
-from vlm_dp.sim_helpers import center_from_points
+from vlm_dp.sim_helpers import center_from_points, usd_extents
 
 _SIG_TOL = 60.0
 
@@ -35,6 +35,28 @@ _MASK_ESCAPE_TOL = 8.0
 # Fraction of a detection box whose depth must fall inside the workspace for it to be a candidate.
 _BOX_IN_WORKSPACE = 0.5
 _OBSTACLE_MIN_H = 0.01
+
+# --- size prior on the mask -> object assignment -------------------------------------------
+# A caption alone cannot tell two objects of the same colour apart: on the tea scene both the
+# teapot and the teacup are pale-green jade, and GroundingDINO happily reads the (larger,
+# nearer) teapot as a "teacup". Depth can tell them apart -- the task declares how big each
+# object is, and a candidate mask's cloud says how big the thing under it actually is.
+#
+# What ranks candidates is ONE-SIDED: only growth counts against a pairing. A cloud wider than
+# the object it is named for is a mask that has left the object, and there is no innocent
+# reading of it. Shrinkage has several: a single depth view sees one side, the mask is eroded,
+# grazing pixels drop out, and a half-occluded mango reads 18mm against a 47mm USD half-width
+# while being perfectly correct. Penalising shrinkage symmetrically is not merely
+# over-cautious, it actively misassigns -- it moved the mango's label onto the cabbage next to
+# it, because the cabbage's fuller cloud "fitted" the mango's declared size better than the
+# mango's own occluded one did.
+_SIZE_OVER = 0.45
+# Shrinkage still means something when there is no caption at all to go on, so the rescue path
+# (and only the rescue path) reads a two-sided agreement, and demands a strong one.
+_SIZE_UNDER = 1.10
+_SIZE_ACCEPT = 0.60
+# Upper bound on candidate boxes carried into the (batched) mask pass, for cost.
+_MAX_CANDIDATES = 40
 
 
 def _backends():
@@ -104,6 +126,38 @@ def _mask_escape(mask, box) -> float:
     outside = total - int(mask[y0:y1, x0:x1].sum())
     perimeter = 2.0 * ((x1 - x0) + (y1 - y0))
     return outside / max(perimeter, 1.0)
+
+
+def _log_ratio(ext, ref):
+    """Per-axis log size ratio of a measured half-extent triple against a declared one."""
+    if ext is None or ref is None:
+        return None
+    e = np.maximum(np.asarray(ext, dtype=float), 1e-3)
+    r = np.maximum(np.asarray(ref, dtype=float), 1e-3)
+    return np.log(e / r)
+
+
+def _size_penalty(ext, ref) -> float:
+    """Discount in (0, 1] for a candidate that is too BIG to be the named object.
+
+    Scale-free: it works on log ratios, so it carries no task-specific length. Returns 1.0 --
+    no opinion -- when either side is missing, or whenever the candidate is no larger than
+    declared, so an occluded object is never punished for the half of it the camera cannot see.
+    """
+    ratio = _log_ratio(ext, ref)
+    if ratio is None:
+        return 1.0
+    d = float(np.mean(np.maximum(ratio, 0.0))) / _SIZE_OVER
+    return float(np.exp(-d * d))
+
+
+def _size_agreement(ext, ref) -> float:
+    """Two-sided score in (0, 1] of how well a measured extent matches a declared one."""
+    ratio = _log_ratio(ext, ref)
+    if ratio is None:
+        return 0.0
+    d = float(np.mean(np.maximum(ratio, 0.0) / _SIZE_OVER + np.maximum(-ratio, 0.0) / _SIZE_UNDER))
+    return float(np.exp(-d * d))
 
 
 def _cluster_blobs(pts, voxel=0.02, limit=12, min_pts=_MIN_RING_PTS):
@@ -183,6 +237,13 @@ class Perception:
         self._id_centroids: dict = {}
         self._fixture_masks: dict = {}
         self._fixture_points: dict = {}
+        # Declared half-extents per object, filled by calibrate() from whatever the task's
+        # assets say. Empty (no size prior at all) until then, and for any object the task
+        # does not describe.
+        self.expected_extents: dict = {}
+        # Per-frame memo for object_points(), whose dominant-component reduction is the one
+        # genuinely non-trivial computation on a path several callers hit repeatedly.
+        self._cloud_cache: dict = {}
 
     def warmup(self):
         """Load detector and segmenter models."""
@@ -195,6 +256,15 @@ class Perception:
         if self._bounds[0] is not None:
             print(f"[perception] workspace bounds {np.round(self._bounds[0], 2)} .. "
                   f"{np.round(self._bounds[1], 2)}", flush=True)
+        # The size prior's reference side. usd_extents() is the same reader rekep grounding uses
+        # one layer up for its gross-extent preflight, so the prior is measured against exactly
+        # the quantity that would later refuse the plan. Objects with no USD body (a table that
+        # is part of the room, a distractor absent from this scene) simply get no prior.
+        self.expected_extents = {n: e for n, e in usd_extents(env, self.names).items()}
+        if self.expected_extents:
+            print(f"[perception] size prior over {sorted(self.expected_extents)} "
+                  f"(no declared extent for {sorted(set(self.names) - set(self.expected_extents))})",
+                  flush=True)
         if not self.fixtures:
             return
         _, points, m, id_to_prim = camera_to_rekep_inputs(env.cam, 0)
@@ -217,6 +287,7 @@ class Perception:
         """Segment a frame and return detected object positions."""
         self.rgb, self.points = rgb, points
         self.masks = dict(self._segment(rgb), **self._fixture_masks)
+        self._cloud_cache = {}
         self._verify_identities()
         out = {}
         for name in self.masks:
@@ -338,16 +409,33 @@ class Perception:
                 + f" | clusters: frac={frac:.2f} n_main={int(keep.sum())} main={_r(main)}")
 
     def object_points(self, name) -> np.ndarray | None:
-        """Return valid world points inside an object's eroded mask."""
+        """Return valid world points inside an object's eroded mask.
+
+        Reduced to the cloud's dominant connected component. A mask that is correct to the eye
+        still leaks a handful of pixels at its border onto whatever lies behind the object --
+        the far wall, the floor -- and depth turns each of those into a point metres away. One
+        such point is enough to report a 96mm teapot as 770mm wide, which is how a perfectly
+        centred mask (centre error 43mm) came to be refused as "run off the object". The
+        component the mask is actually sitting on is what every caller means by the object.
+        """
         if name in self._fixture_points:
             return self._fixture_points[name]
         mask = self.masks.get(name)
         if mask is None or self.points is None:
             return None
-        mask = self._erode(mask)
-        sel = mask & np.isfinite(self.points).all(axis=-1)
+        if name in self._cloud_cache:
+            return self._cloud_cache[name]
+        sel = self._erode(mask) & np.isfinite(self.points).all(axis=-1)
         pts = self.points[sel]
-        return pts if pts.shape[0] >= 20 else None
+        if pts.shape[0] < 20:
+            return None
+        keep, frac, _ = _dominant_cluster(pts)
+        if int(keep.sum()) >= 20 and frac < 1.0:
+            print(f"[perception] '{name}': dropped {int((~keep).sum())} of {pts.shape[0]} "
+                  f"cloud points outside the dominant component", flush=True)
+            pts = pts[keep]
+        self._cloud_cache[name] = pts
+        return pts
 
     def label_image(self):
         """Return integer labels and their object-name mapping."""
@@ -489,28 +577,31 @@ class Perception:
         return reply.choices[0].message.content
 
     def _segment_groundedsam(self, rgb) -> dict:
-        """Segment named objects with GroundingDINO and SAM."""
+        """Segment named objects with GroundingDINO and SAM.
+
+        The mask pass runs over *every* candidate box, not only the ones the caption scores
+        would have picked, so the assignment can be decided on what is actually under each box
+        (its depth-cloud size) rather than on the caption alone. SAM's per-box prediction is
+        independent given the image embedding, so the masks of the boxes that would have been
+        chosen anyway are bit-for-bit what the single-pass version produced.
+        """
 
         from vlm_dp.vision_backends import load_pil_image
 
         _, image_torch = load_pil_image(Image.fromarray(rgb).convert("RGB"))
         H, W = rgb.shape[:2]
-        boxes = self._assign(self._in_workspace(self._detect(image_torch, W, H)))
-        if not boxes:
+        cands, score = self._candidates(self._in_workspace(self._detect(image_torch, W, H)))
+        if not cands:
             return {}
+        cand_masks = self._masks_for(rgb, cands)
+        chosen = self._assign(cands, score, cand_masks)
+        if not chosen:
+            return {}
+        boxes = {name: cands[j] for name, j in chosen.items()}
 
-        order = list(boxes)
-        sam = _sam(self.device)
-        sam.set_image(rgb)
-        b = torch.as_tensor(np.stack([boxes[n] for n in order]), dtype=torch.float32)
-        with torch.no_grad():
-            masks, _, _ = sam.predict_torch(
-                point_coords=None, point_labels=None,
-                boxes=sam.transform.apply_boxes_torch(b, (H, W)).to(self.device),
-                multimask_output=False)
         out = {}
-        for i, name in enumerate(order):
-            m = masks[i, 0].cpu().numpy()
+        for name, j in chosen.items():
+            m = cand_masks[j]
             if int(m.sum()) < _MIN_PIXELS:
                 continue
             escaped = _mask_escape(m, boxes[name])
@@ -617,20 +708,99 @@ class Perception:
             out[name] = kept
         return out
 
-    def _assign(self, dets) -> dict:
-        """Assign one unique detection box to each label."""
+    def _candidates(self, dets):
+        """Merge every caption's detections into unique boxes and score them by caption."""
         cands = []
         for name in self.names:
             for box, _ in dets.get(name, []):
                 if not any(_iou(box, c) > _IOU_MERGE for c in cands):
                     cands.append(box)
-        if not cands:
-            return {}
+        cands = cands[:_MAX_CANDIDATES]
         score = np.zeros((len(self.names), len(cands)))
         for i, name in enumerate(self.names):
             for box, s in dets.get(name, []):
                 for j, c in enumerate(cands):
                     if _iou(box, c) > _IOU_MERGE:
                         score[i, j] = max(score[i, j], s)
+        return cands, score
+
+    def _masks_for(self, rgb, boxes) -> list:
+        """Run one batched SAM pass over candidate boxes."""
+        H, W = rgb.shape[:2]
+        sam = _sam(self.device)
+        sam.set_image(rgb)
+        b = torch.as_tensor(np.stack(boxes), dtype=torch.float32)
+        with torch.no_grad():
+            masks, _, _ = sam.predict_torch(
+                point_coords=None, point_labels=None,
+                boxes=sam.transform.apply_boxes_torch(b, (H, W)).to(self.device),
+                multimask_output=False)
+        return [masks[i, 0].cpu().numpy() for i in range(len(boxes))]
+
+    def _extent_under(self, mask, valid) -> tuple | None:
+        """Half-extents of the depth cloud under a mask, ordered like the declared extents.
+
+        Trimmed at the 1st/99th percentile rather than taken raw: border pixels that leaked
+        onto the background would otherwise make every candidate look enormous, which is the
+        one error the prior must not make -- it reads growth as evidence of a bad mask. This
+        is the cheap stand-in for the dominant-component reduction object_points() does, which
+        would be too costly to run on every candidate of every frame.
+        """
+        pts = self.points[self._erode(mask) & valid]
+        if pts.shape[0] < 20:
+            return None
+        lo, hi = np.percentile(pts, [1, 99], axis=0)
+        half = (hi - lo) / 2.0
+        return (float(min(half[0], half[1])), float(max(half[0], half[1])), float(half[2]))
+
+    def _assign(self, cands, score, masks) -> dict:
+        """Assign one unique candidate mask to each label, on caption score and size prior."""
+        if not cands:
+            return {}
+        weight, agree = np.array(score, dtype=float), None
+        if self.expected_extents and self.points is not None:
+            valid = np.isfinite(self.points).all(axis=-1)
+            within = self._workspace_mask()
+            if within is not None:
+                valid = valid & within
+            ext = [self._extent_under(m, valid) for m in masks]
+            ref = [self.expected_extents.get(name) for name in self.names]
+            weight = weight * np.array([[_size_penalty(e, r) for e in ext] for r in ref])
+            agree = np.array([[_size_agreement(e, r) for e in ext] for r in ref])
+        rows, cols = linear_sum_assignment(-weight)
+        out = {self.names[i]: int(j) for i, j in zip(rows, cols) if weight[i, j] > 0}
+        if agree is not None:
+            self._rescue(out, agree)
+            self._report_prior(score, out)
+        return out
+
+    def _rescue(self, out, agree):
+        """Give a name no caption placed a candidate the size prior is confident about.
+
+        Kept strictly separate from the scored assignment above rather than folded in as a
+        floor score. A size-only pairing that competes on the same scale can outbid a real
+        detection -- it did, moving a distractor's label onto its neighbour's mask -- and no
+        prior should ever take a candidate away from the caption that actually fired on it.
+        This only fills names the scored pass left empty, from candidates it left unused.
+        """
+        used = set(out.values())
+        for i, name in enumerate(self.names):
+            if name in out:
+                continue
+            free = [j for j in range(agree.shape[1])
+                    if j not in used and agree[i, j] >= _SIZE_ACCEPT]
+            if not free:
+                continue
+            j = max(free, key=lambda j: agree[i, j])
+            print(f"[perception] '{name}': no caption placed it; taking unclaimed candidate {j} "
+                  f"on size alone (agreement {agree[i, j]:.2f})", flush=True)
+            out[name] = j
+            used.add(j)
+
+    def _report_prior(self, score, chosen):
+        """Log when the size prior overrules the caption-only assignment."""
         rows, cols = linear_sum_assignment(-score)
-        return {self.names[i]: cands[j] for i, j in zip(rows, cols) if score[i, j] > 0}
+        plain = {self.names[i]: int(j) for i, j in zip(rows, cols) if score[i, j] > 0}
+        if plain != chosen:
+            print(f"[perception] size prior changed the assignment: caption-only {plain} -> "
+                  f"{dict(sorted(chosen.items()))}", flush=True)
