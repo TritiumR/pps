@@ -1,0 +1,99 @@
+# simple_pred -- simple_grip_eps12 plus the two halves of a certified RELEASE. Nothing else
+# changes (same terms, same weights, same subgoal_eps 0.12).
+#
+# Evidence (motion_pred_shadow, dd_gate + shadow completion predicates, 10 seeds): on ALL 139
+# place-stage replans the stage4/8 completion component hand_let_go read 0.00 -- the gripper
+# NEVER opens on a place stage -- while the scalar test (stage sub-goal < subgoal_eps 0.12)
+# read "done" with the object still pinched on the scale. Two independent defects:
+#
+#  1. NO RELEASE COMMAND. carry_hold's shipped release gate here is release_commit_aniso: it
+#     compares the MEASURED payload belief against a computed seat inside a 6cm/2cm ellipsoid
+#     and then damps by release_step_motion_cap. Apple belief error is 25-75mm (median-p75),
+#     so the ellipsoid test is inside the noise and effectively never certifies; the gripper
+#     target stays 1.0 and carry_hold (weight 40) pins it shut. Switch to the opt-in
+#     release_on_subgoal branch, which asks the VLM's OWN stage constraint instead:
+#     ||payload_kp - (scale_kp + offset)||, a DIFFERENCE of two keypoints read from the same
+#     perception frame, so a common-mode belief bias cancels and only relative error survives.
+#     It is also evaluated per candidate (the payload keypoint rides the candidate gripper
+#     pose), so it commands opening rather than merely permitting it.
+#     subgoal_release_eps 0.10, pinned, chosen ONCE and not iterated: the apple belief error is
+#     median 25mm / p75 75mm, so 0.10 = p75 error + ~25mm of seat/extent slack, and it sits
+#     strictly BELOW grounding.subgoal_eps 0.12 so the open is commanded before the stage could
+#     be considered finished. Setting this makes release_commit_aniso / release_step_motion_cap
+#     inert for carry_hold (the subgoal branch returns first); they are kept for the record.
+#
+#  2. NO COMPLETION EVIDENCE. advance.predicate_place_transitions makes a PLACE stage advance
+#     on the plan's stage<N>_completion predicate (hand let go AND object inside the place
+#     region AND quiescent AND descended) instead of the scalar sub-goal dip, which a still-
+#     gripped object satisfies. Place stages only; every other stage type keeps its rule, and
+#     the shadow logging stays on for all stages as the evidence trail.
+cost:
+  terms:
+    rekep_subgoal: 100.0
+    rekep_path: 100.0
+    center_region: 120.0
+    aperture_region: 80.0
+    tip_z: 80.0
+    grasp_standoff: 40.0
+    close_gripper: 2.0
+    carry_hold: 40.0
+    release_gripper: 40.0
+    smooth: 50.4
+    joint_delta: 35.0
+    floor: 40.0
+    straddle: 30.0
+    orientation: 8.0
+    yaw: 5.0
+    grasp_axis: 15.0
+  geometry:
+    ee_r: 0.035
+    coll_clear: 0.02
+    finger_r: 0.012
+    open_half: 0.04
+    tool_back: 0.06
+    tcp_to_tip: 0.0
+    center_scale: 0.4
+    grasp_dead_zone: proportional
+    close_z_scale: 0.025
+    preshape_z: 0.025
+    release_step_motion_cap: 0.004
+    retreat_margin: 0.02
+    retreat_clear: 0.04
+    rise_first_span: 0.05
+    rise_first_step: 0.01
+    not_hold_sigma: 0.05
+    carry_clear_include_placed: true
+    carry_clear_margin: 0.005
+    preshape_xy_tol: 0.02
+    corridor_margin: 0.01
+    grasp_approach_cap: 0.008
+    grasp_brake_slope: 0.25
+    grasp_descend_closing_only: true
+    approach_hover: 0.08
+    approach_xy_tol: 0.02
+    close_xy_floor: 0.008
+    aperture_margin: 0.006
+    release_xy: 0.06
+    release_z: 0.02
+    place_approach_margin: 0.01
+    release_on_subgoal: true     # carry_hold releases on the VLM stage constraint (see header)
+    subgoal_release_eps: 0.10    # p75 apple belief error (75mm) + ~25mm slack, < subgoal_eps 0.12
+    release_commit_aniso: true   # superseded by release_on_subgoal above (kept for the record)
+    commit_measured_gate: true
+    release_commit_band: 3.0
+    place_descend_radius: 0.08
+    place_release_clearance: 0.012
+    clear_max_radius: 0.1
+    subgoal_mean: true
+advance:
+  flag_fallback: false
+  release_debug: true
+  grasp_advance_on_hold: true
+  ground_error_debug: true
+  predicate_place_transitions: true   # place stages advance on the completion predicate
+grounding:
+  rotate_grasp_offset: false
+  support_extents: false
+  seat_from_plane: true
+  lift_latch_xy: false
+  subgoal_eps: 0.12
