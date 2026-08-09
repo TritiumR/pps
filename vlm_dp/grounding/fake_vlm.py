@@ -230,7 +230,6 @@ def _capsule(out_dir, keypoints, grounded, env, clearance):
     )
     metadata["contact_modes"] = {"0": "press"}
     metadata["grasp_target_keypoints"] = {"0": contact_goal, "4": pod_goal}
-    metadata["grasp_targets"] = {"4": "keypoint"}
     metadata["move_done_targets"] = [3]
     metadata["move_advance_on_done_targets"] = [6]
     metadata["move_advance_on_payload_rise_targets"] = [5]
