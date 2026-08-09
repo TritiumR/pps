@@ -206,10 +206,7 @@ def _capsule(out_dir, keypoints, grounded, env, clearance):
     bay_world = root + _quat_rotate_wxyz(quat, _CAPSULE_BAY_LOCAL)
 
     pod = _nearest_kp_distinct(keypoints, pts["can"].mean(axis=0), set())
-    pod_goal_world = (
-        np.asarray(keypoints[pod], dtype=np.float64)
-        + _quat_rotate_wxyz(quat, _CAPSULE_POD_TCP_OFFSET_LOCAL)
-    )
+    pod_goal_world = pts["can"].mean(axis=0) + np.array([0.0, 0.0, 0.015])
     n = len(keypoints)
     lip, contact_goal, seat_goal = n, n + 1, n + 2
     open_goal, retreat_goal, pod_goal = n + 3, n + 4, n + 5
@@ -235,7 +232,17 @@ def _capsule(out_dir, keypoints, grounded, env, clearance):
     metadata["grasp_target_keypoints"] = {"0": contact_goal, "4": pod_goal}
     metadata["grasp_targets"] = {"4": "keypoint"}
     metadata["move_done_targets"] = [3]
-    metadata["move_advance_on_done_targets"] = [5, 6]
+    metadata["move_advance_on_done_targets"] = [6]
+    metadata["move_advance_on_payload_rise_targets"] = [5]
+    metadata["stage_rise_confirm"] = {"5": 0.40}
+    # Once the simulator confirms physical task progress, stop chasing a stale
+    # geometric waypoint and let the next manipulation stage take over.
+    metadata["done_flags"] = {"2": "open_coffee_lid"}
+    metadata["force_gripper_at_target"] = [4]
+    metadata["grasp_advance_on_visual_rise"] = [4]
+    metadata["grasp_trigger_flags"] = {"4": "grasp_pod"}
+    metadata["rise_confirm"] = {"can": 0.015}
+
     metadata["contact_slack"] = {
         "0": 0.012, "1": 0.015, "2": 0.020, "3": 0.030, "4": 0.020,
     }

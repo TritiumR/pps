@@ -146,6 +146,9 @@ class VlmDpBridge:
         self._reopen = False
         self._grasp_transit_idx = None
         self._grasp_close_latched = False
+        self._grasp_trigger_latched = False
+        self._grasp_trigger_start = None
+        self._grasp_rise_count = 0
         self._pot_drop_lid = False
         self._carry_release_latched = False
         self._grasp_probe = np.zeros(3)
@@ -306,6 +309,9 @@ class VlmDpBridge:
         self._reopen = False
         self._contact_seen = False
         self._released_latch = False
+        self._grasp_trigger_latched = False
+        self._grasp_trigger_start = None
+        self._grasp_rise_count = 0
         self._carry_release_latched = False
         self._grasp_probe = np.zeros(3)
         self._grasp_target0 = None
@@ -417,7 +423,8 @@ class VlmDpBridge:
                 np.linalg.norm(np.asarray(self.env.tcp(), dtype=np.float64) - grasp_target)
                 <= self._closed_empty_radius
             )
-            if self.sensor.closed_on_air() and near_target:
+            if (self.sensor.closed_on_air() and near_target
+                    and not self._grasp_trigger_latched):
                 if not self._reopen:
                     self._closed_empty += 1
                     self.gate_events["closed_empty"] += 1
@@ -448,7 +455,8 @@ class VlmDpBridge:
             ctx["target"] = np.asarray(ctx["target"], dtype=np.float32) + self._grasp_probe.astype(np.float32)
         # Verify a thin pinch by lifting slightly while the aperture still reports a hold.
         if (getattr(self, "_thin_verify_lift", 0.0) > 0.0 and st.gripper == "close"
-                and self.sensor is not None and self.sensor.holding() and not self._reopen):
+                and self.sensor is not None
+                and (self.sensor.holding() or self._grasp_trigger_latched) and not self._reopen):
             base_target = self._active_grasp_target(st, latched=True).astype(np.float32)
             lift_reached = float(np.asarray(self.env.tcp())[2]) >= (
                 float(base_target[2]) + 0.75 * self._thin_verify_lift
@@ -757,8 +765,8 @@ class VlmDpBridge:
         except Exception:
             pass
 
-    def _thin_visual_rose(self, payload, rise=0.005):
-        """Confirm a micro-lift from raw or visually corrected tracking."""
+    def _thin_visual_rose(self, payload, rise=0.005, *, raw_only=False):
+        """Confirm a micro-lift from raw, optionally corrected, visual tracking."""
         visual_position = getattr(self.world, "visual_position", None)
         pos = visual_position(payload) if callable(visual_position) else None
         z0 = self._grasp_visual_z0
@@ -770,6 +778,8 @@ class VlmDpBridge:
         )
         if raw_rose:
             return True
+        if raw_only:
+            return False
         if self.track == "visual":
             belief_pos = self._pos(payload)
             belief_z0 = self.grasp_z0.get(payload)
@@ -831,10 +841,35 @@ class VlmDpBridge:
         """Backtrack on invariant failure or advance when the stage is reached."""
         stage = self.stage()
         self.stage_replans += 1
+        trigger_flag = getattr(stage, "grasp_trigger_flag", None)
+        if trigger_flag is not None and bool(flags.get(trigger_flag, False)):
+            if not self._grasp_trigger_latched:
+                print(f"[vlm_dp] {trigger_flag}: contact trigger -> visual micro-lift",
+                      flush=True)
+                self._grasp_trigger_start = self.stage_replans
+            self._grasp_trigger_latched = True
+            self._grasp_close_latched = True
+            self._reopen = False
         if self._commit_left > 0:
             self._commit_left -= 1
         # Sync FK before reading held-object state.
         self.world.sync_fk(self.env)
+        if (self._grasp_trigger_latched and self._grasp_trigger_start is not None
+                and self.stage_replans - self._grasp_trigger_start >= 8):
+            rise = (self.rise_confirm if getattr(stage, "rise_confirm", None) is None
+                    else float(stage.rise_confirm))
+            if not self._thin_visual_rose(stage.grasp_obj, rise=rise, raw_only=True):
+                self._grasp_trigger_latched = False
+                self._grasp_trigger_start = None
+                self._grasp_close_latched = False
+                self._reopen = True
+                self._grasp_probe_idx += 1
+                self._grasp_probe = self._probe_pts[
+                    self._grasp_probe_idx % len(self._probe_pts)]
+                print(f"[vlm_dp] visual micro-lift timed out -> probe "
+                      f"{self._grasp_probe_idx} {np.round(self._grasp_probe, 3)}",
+                      flush=True)
+
         # Re-perceive stale objects at a throttled rate.
         if self.world.stale() and self.stage_replans % self._REPERCEIVE_EVERY == 0:
             self.world.refresh(self.env)
@@ -953,6 +988,8 @@ class VlmDpBridge:
 
     def _stage_reached(self, stage, flags):
         """Return whether the current stage target is satisfied."""
+        if stage.done_flag is not None and bool(flags.get(stage.done_flag, False)):
+            return True
         if stage.gripper == "close" and stage.grasp_obj is not None:
             if getattr(stage, "advance_on_done", False):  # Task-state completion.
                 return bool(stage.done())
@@ -972,9 +1009,12 @@ class VlmDpBridge:
             if getattr(stage, "grasp_advance_on_visual_rise", False):
                 rise = (self.rise_confirm if getattr(stage, "rise_confirm", None) is None
                         else float(stage.rise_confirm))
-                visual_rise = self._thin_visual_rose(stage.grasp_obj, rise=rise)
+                visual_rise = self._thin_visual_rose(
+                    stage.grasp_obj, rise=rise, raw_only=True)
                 sensor_hold = self.sensor is not None and self.sensor.holding()
-                return visual_rise and (self._grasp_close_latched or sensor_hold)
+                self._grasp_rise_count = self._grasp_rise_count + 1 if visual_rise else 0
+                return (self._grasp_rise_count >= 2
+                        and (self._grasp_close_latched or sensor_hold))
 
             held = self._payload_held(stage.grasp_obj)
             if self._grasp_advance_on_hold:

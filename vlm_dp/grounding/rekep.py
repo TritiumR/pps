@@ -783,6 +783,8 @@ class RekepGrounding:
         steer_policies = metadata.get("steer_policies") or []
         def _pol(idx):
             return steer_policies[idx] if idx < len(steer_policies) else None
+        done_flags = metadata.get("done_flags") or {}
+        grasp_trigger_flags = metadata.get("grasp_trigger_flags") or {}
         move_advance_on_done_targets = {
             int(idx) for idx in metadata.get("move_advance_on_done_targets", [])
         }
@@ -829,6 +831,7 @@ class RekepGrounding:
                     )
                 stages.append(Stage(name=f"{'press' if press else 'grasp'} {name}", gripper="close", steer_policy=_pol(i),
                                     grasp_obj=name, payload=None, held_idx=held,
+                                    done_flag=done_flags.get(str(i)),
                                     target=(kp_point(grasp_target_kp) if press or
                                             (metadata.get("grasp_targets") or {}).get(str(i)) == "keypoint"
                                             else obj_center[name]),
@@ -838,6 +841,7 @@ class RekepGrounding:
                                     grasp_slack=contact_slack_for(i),
                                     force_gripper_at_target=(i in force_gripper_targets),
                                     grasp_advance_on_visual_rise=(i in visual_rise_grasp_targets),
+                                    grasp_trigger_flag=grasp_trigger_flags.get(str(i)),
                                     rise_confirm=stage_rise_confirm_for(i, name),
                                     grasp_transit_offsets=grasp_transit_offsets_for(i),
                                     contact=("press" if press else "pinch")))
@@ -853,6 +857,7 @@ class RekepGrounding:
                 manipulated.update({name} | ({place_target} if place_target else set()))
                 stages.append(Stage(name=f"place {name}", gripper="place", grasp_obj=None, payload=name, steer_policy=_pol(i),
                                     place_target=place_target, target=target, held_idx=held,
+                                    done_flag=done_flags.get(str(i)),
                                     constraint=subgoal, path_fns=path_fns,
                                     done=(target_done(target, contact_slack_for(i))
                                           if i in release_done_targets else subgoal_done(subgoal)),
@@ -870,6 +875,7 @@ class RekepGrounding:
                         if pressed or i in move_done_targets else subgoal_done(subgoal))
                 stages.append(Stage(name=f"move {i}", gripper=("hold" if grasped_body else "open"), steer_policy=_pol(i),
                                     grasp_obj=None, payload=grasped_body,
+                                    done_flag=done_flags.get(str(i)),
                                     target=target, held_idx=held,
                                     constraint=subgoal, path_fns=path_fns, done=done,
                                     advance_on_done=(i in move_advance_on_done_targets),

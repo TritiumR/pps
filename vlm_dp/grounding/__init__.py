@@ -60,6 +60,10 @@ class Stage:
     # Allow an opt-in grasp to advance after a latched close when raw visual
     # tracking confirms that the object rose with the hand.
     grasp_advance_on_visual_rise: bool = False
+    # Optional task contact signal used only to trigger a closed-hand micro-lift.
+    # Stage completion still requires visual object rise, so a transient flag
+    # cannot by itself certify a grasp.
+    grasp_trigger_flag: Optional[str] = None
     # Optional object-relative waypoints used before approaching the ordinary target.
     grasp_transit_offsets: Optional[tuple] = None
     rise_confirm: Optional[float] = None
