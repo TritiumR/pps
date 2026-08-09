@@ -195,7 +195,24 @@ class RekepGrounding:
         else:
             extents = usd_extents(env, scene_objects)
             usd = extents
-        tracker = KeypointTracker(world, keypoints)
+        # Masked point clouds, one per scene object. Built here rather than at their first use
+        # below because keypoint ownership now consults them: "which object's observed surface is
+        # this keypoint on" is the question registration cares about, and the object-centre rule
+        # alone answers it wrongly whenever a small object stands near a large one's centroid
+        # (a teapot near the middle of its table registers to the table and stops moving with it).
+        clouds = {}
+        for _n in scene_objects:
+            _pts = masks._masked_points(grounded, env.env, _n)
+            if _pts is not None:
+                clouds[_n] = _pts
+        tracker = KeypointTracker(world, keypoints, clouds=clouds)
+        # No-regression evidence, printed every run: an empty override list means this scene
+        # registers exactly as the object-centre rule alone would have registered it.
+        print(f"[rekep] keypoint ownership: {len(tracker.membership_overrides)} of "
+              f"{len(tracker.owners)} keypoints moved by cloud membership"
+              + (f" {[(i, a, b) for i, a, b in tracker.membership_overrides]}"
+                 if tracker.membership_overrides else " (identical to the centre rule)"),
+              flush=True)
         if gt_meta is not None:
 
 
@@ -279,12 +296,11 @@ class RekepGrounding:
 
         kp_of, centroid_off, grasp_axis, grasp_ext_of, seat_off = {}, {}, {}, {}, {}
         grasp_region_of = {}
-        clouds, probe_ext = {}, {}
+        probe_ext = {}
         for name in scene_objects:
-            pts = masks._masked_points(grounded, env.env, name)
+            pts = clouds.get(name)          # segmented once above, for the tracker's ownership rule
             if pts is None:
                 continue
-            clouds[name] = pts
             gk = grasp_kp_of.get(name)
 
             # What the gripper actually closes on: the object's width *at the grasp point*, not

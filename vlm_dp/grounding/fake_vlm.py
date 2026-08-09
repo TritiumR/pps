@@ -119,11 +119,22 @@ def _weight(out_dir, keypoints, grounded, env, clearance):
     # Absolute world height the plan's path rule forbids dropping below while carrying.
     carry_z = {n: float(keypoints[k][2] + _LIFT_HEIGHT - _CARRY_SLACK)
                for n, k in (("pear", p), ("apple", a))}
+    # Absolute world height the LIFT stage's sub-goal measures against. The stage states its
+    # sub-goal as a one-sided vertical shortfall rather than a 3-D distance to `lift`, so it
+    # needs the target height as a scalar. `lift` is still supplied: the offset form is what
+    # any plan wanting the full 3-D lift point reads, and dropping it would break them.
+    lift_z = {n: float(keypoints[k][2] + _LIFT_HEIGHT)
+              for n, k in (("pear", p), ("apple", a))}
+    # Absolute world height of the hover point, for the descent stages' gated path rule: it
+    # forbids dropping below this until the object is horizontally over the place point.
+    hover_z = {n: float(keypoints[s][2] + hover[n][2]) for n in ("pear", "apple")}
     metadata = _render("weight", out_dir, p=p, a=a, s=s,
                        off_pear=off["pear"], off_apple=off["apple"],
                        lift_pear=lift["pear"], lift_apple=lift["apple"],
                        hover_pear=hover["pear"], hover_apple=hover["apple"],
-                       carry_z_pear=carry_z["pear"], carry_z_apple=carry_z["apple"])
+                       carry_z_pear=carry_z["pear"], carry_z_apple=carry_z["apple"],
+                       lift_z_pear=lift_z["pear"], lift_z_apple=lift_z["apple"],
+                       hover_z_pear=hover_z["pear"], hover_z_apple=hover_z["apple"])
     # vlm_dp extension, not part of the ReKep response format the parser understands.
     metadata["steer_policies"] = ["on_failure"] * metadata["num_stages"]
     with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
@@ -262,9 +273,25 @@ def _tea(out_dir, keypoints, grounded, env, clearance):
     rest_dz = float(keypoints[m][2] - keypoints[h][2])
     pour_margin = rest_dz - max(0.03, 0.5 * lever)
 
+    # Lift target: the handle's pick-up position raised _LIFT_HEIGHT, expressed as an offset from
+    # the TEACUP keypoint because that one is on a fixture and does not move. Anchoring to the
+    # carried teapot's own keypoint would be degenerate (the target would track the teapot).
     lift_teapot = (keypoints[h] + np.array([0.0, 0.0, _LIFT_HEIGHT]) - keypoints[c]).tolist()
+    # Absolute world heights the plan's scalar rules measure against. The lift stage states its
+    # sub-goal as a one-sided vertical shortfall rather than a 3-D distance to `lift_teapot`, so
+    # it needs the target height as a scalar; `lift_teapot` is still supplied for any plan
+    # wanting the full 3-D lift point. Both are on the HANDLE keypoint -- the grasped feature,
+    # whose height the hand controls directly -- not the mouth at the end of the lever arm.
+    lift_z_teapot = float(keypoints[h][2] + _LIFT_HEIGHT)
+    carry_z_teapot = float(keypoints[h][2] + _LIFT_HEIGHT - _CARRY_SLACK)
+    # Absolute world height of the pour hover point (the cup rim raised by the carry clearance
+    # the stage-3 sub-goal already adds), for stage 3's completion predicate.
+    hover_z_mouth = float(keypoints[c][2] + cup_off[2] + _CARRY_HOVER)
     metadata = _render("tea", out_dir, h=h, m=m, c=c, cup_off=cup_off, pour_margin=pour_margin,
-                       lift_teapot=lift_teapot)
+                       lift_teapot=lift_teapot, lift_z_teapot=lift_z_teapot,
+                       carry_z_teapot=carry_z_teapot, hover_z_mouth=hover_z_mouth)
+    # vlm_dp extension, not part of the ReKep response format the parser understands.
+    metadata["steer_policies"] = ["on_failure"] * metadata["num_stages"]
     with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
     print(f"[fake-vlm] tea roles teapot=kp{h} mouth=kp{m} teacup=kp{c}", flush=True)
@@ -318,8 +345,25 @@ def _pot(out_dir, keypoints, grounded, env, clearance):
     # stays put; anchoring to the carried object's own keypoint would be degenerate).
     lift_lid = (keypoints[lid] + np.array([0.0, 0.0, _LIFT_HEIGHT]) - keypoints[pot]).tolist()
     lift_egg = (keypoints[egg] + np.array([0.0, 0.0, _LIFT_HEIGHT]) - keypoints[pot]).tolist()
+    # Hover points for the two transport stages: each place point raised by the carry clearance,
+    # so the descent in the following stage is straight down. Same pot anchor as the place points.
+    hover = {"lid": (np.array(lid_off) + np.array([0.0, 0.0, _CARRY_HOVER])).tolist(),
+             "egg": (np.array(egg_off) + np.array([0.0, 0.0, _CARRY_HOVER])).tolist()}
+    # Absolute world heights the plan's scalar rules measure against: the LIFT stages' one-sided
+    # vertical sub-goals, the transport stages' carry-height floors, and the descent gates' hover
+    # heights. `lift_lid` / `lift_egg` are still supplied for any plan wanting the 3-D lift point.
+    lift_z = {n: float(keypoints[k][2] + _LIFT_HEIGHT) for n, k in (("lid", lid), ("egg", egg))}
+    carry_z = {n: float(keypoints[k][2] + _LIFT_HEIGHT - _CARRY_SLACK)
+               for n, k in (("lid", lid), ("egg", egg))}
+    hover_z = {n: float(keypoints[pot][2] + hover[n][2]) for n in ("lid", "egg")}
     metadata = _render("pot", out_dir, lid=lid, egg=egg, pot=pot, lid_off=lid_off, egg_off=egg_off,
-                       lift_lid=lift_lid, lift_egg=lift_egg)
+                       lift_lid=lift_lid, lift_egg=lift_egg,
+                       hover_lid=hover["lid"], hover_egg=hover["egg"],
+                       lift_z_lid=lift_z["lid"], lift_z_egg=lift_z["egg"],
+                       carry_z_lid=carry_z["lid"], carry_z_egg=carry_z["egg"],
+                       hover_z_lid=hover_z["lid"], hover_z_egg=hover_z["egg"])
+    # vlm_dp extension, not part of the ReKep response format the parser understands.
+    metadata["steer_policies"] = ["on_failure"] * metadata["num_stages"]
     with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
     print(f"[fake-vlm] pot roles lid=kp{lid} egg=kp{egg} pot=kp{pot}", flush=True)

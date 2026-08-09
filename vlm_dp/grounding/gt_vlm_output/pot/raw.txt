@@ -6,20 +6,49 @@
 #
 # Task: "remove the lid of the pot and put egg in it"
 #
-# The task involves six stages:
+# The task involves eight stages:
 # 1. Grasp the pot lid.
 # 2. Lift the lid clear of the pot.
-# 3. Set the lid aside on the table.
-# 4. Grasp the egg.
-# 5. Lift the egg clear of the table.
-# 6. Place the egg into the pot.
+# 3. Carry the lid above its aside spot on the table.
+# 4. Lower the lid onto the table.
+# 5. Grasp the egg.
+# 6. Lift the egg clear of the table.
+# 7. Carry the egg above the pot rim.
+# 8. Lower the egg onto the pot rim.
 #
-# Stages 2 and 5 are explicit lifts. They carry no grasp or release keypoint; their sub-goal
+# Stages 2 and 6 are explicit lifts. They carry no grasp or release keypoint; their sub-goal
 # constraint certifies the hold before transport begins. Without them the plan advances to
 # transport on grasp proximity alone and discovers mid-carry that the hand is empty
 # (measured on weight: 21 of 23 recoveries were "empty hand").
+#
+# BROUGHT TO PARITY WITH THE WEIGHT PLAN (the validated 16/20 reference). Three judgements,
+# stated here because they are choices and not mechanical ports:
+#
+#  * TRANSPORT SPLIT FROM PLACEMENT (was 6 stages, now 8), for BOTH destinations -- the lid's
+#    aside spot and the egg's pot rim. The old stages 3 and 6 each crossed the workspace and
+#    descended in one stage, so a carry-height path rule on them would have forbidden their own
+#    descent. Split, stages 3 and 7 carry an unconditional carry-height rule and stages 4 and 8
+#    are pure descents. Exactly the structure weight uses for its two placements.
+#
+#  * ONE-SIDED VERTICAL LIFT SUB-GOALS (stages 2 and 6). Was a 3-D distance to a lift point
+#    anchored on the pot keypoint. With subgoal_eps 0.12 a 3-D ball lets a lift complete at a
+#    few centimetres of rise whenever the hand is xy-centred on the lift column; the vertical
+#    shortfall against {lift_z_lid} / {lift_z_egg} makes "below eps" mean height and nothing
+#    else, and stops penalising a lift that overshoots.
+#
+#  * GATED DESCENT ON BOTH LOWER STAGES (4 and 8). Their second path constraint forbids dropping
+#    below the hover height while still horizontally far from the place point, relaxing linearly
+#    to zero inside 8cm. The egg's 8cm gate radius is deliberately the SAME as the lid's and as
+#    weight's, even though the pot mouth is narrower than 8cm across: the radius is the distance
+#    at which the plan stops shaping the descent, not a claim about the opening's width, and one
+#    number across every descent in every plan is worth more than a per-object tuning nobody has
+#    measured.
+#
+# PLACE MODE UNCHANGED: stage 8's sub-goal deliberately avoids the words "into"/"inside"/
+# "within", so rekep._places_into keeps compiling this placement as `surface`, exactly as the
+# six-stage plan did. Restructuring is not the place to also flip an unmeasured cost mode.
 
-num_stages = 6
+num_stages = 8
 
 
 ### stage 1 sub-goal constraints
@@ -32,9 +61,8 @@ def stage1_subgoal_constraint1(end_effector, keypoints):
 
 ### stage 2 sub-goal constraints
 def stage2_subgoal_constraint1(end_effector, keypoints):
-    """The lid (keypoint {lid}) is raised to carry height above its pick-up pose."""
-    offsetted_point = keypoints[{pot}] + np.array({lift_lid})
-    return np.linalg.norm(keypoints[{lid}] - offsetted_point)
+    """The lid (keypoint {lid}) has reached carry height (vertical shortfall only)."""
+    return np.maximum(0.0, ({lift_z_lid}) - keypoints[{lid}][..., 2])
 
 ### stage 2 path constraints
 def stage2_path_constraint1(end_effector, keypoints):
@@ -43,8 +71,8 @@ def stage2_path_constraint1(end_effector, keypoints):
 
 ### stage 3 sub-goal constraints
 def stage3_subgoal_constraint1(end_effector, keypoints):
-    """The lid (keypoint {lid}) rests on the table, clear of the pot (keypoint {pot})."""
-    offsetted_point = keypoints[{pot}] + np.array({lid_off})
+    """The lid (keypoint {lid}) hovers directly above its aside spot beside the pot (keypoint {pot})."""
+    offsetted_point = keypoints[{pot}] + np.array({hover_lid})
     return np.linalg.norm(keypoints[{lid}] - offsetted_point)
 
 ### stage 3 path constraints
@@ -52,44 +80,316 @@ def stage3_path_constraint1(end_effector, keypoints):
     """The robot must still be grasping the lid (keypoint {lid})."""
     return get_grasping_cost_by_keypoint_idx({lid})
 
+def stage3_path_constraint2(end_effector, keypoints):
+    """Keep the lid (keypoint {lid}) clear of the pot and the table while carrying it across."""
+    return np.maximum(0.0, ({carry_z_lid}) - keypoints[{lid}][..., 2])
+
 ### stage 4 sub-goal constraints
 def stage4_subgoal_constraint1(end_effector, keypoints):
-    """Align the end-effector with the egg (keypoint {egg})."""
-    return np.linalg.norm(end_effector - keypoints[{egg}])
+    """The lid (keypoint {lid}) rests on the table, clear of the pot (keypoint {pot})."""
+    offsetted_point = keypoints[{pot}] + np.array({lid_off})
+    return np.linalg.norm(keypoints[{lid}] - offsetted_point)
 
 ### stage 4 path constraints
-# No path constraints needed for grasping.
+def stage4_path_constraint1(end_effector, keypoints):
+    """The robot must still be grasping the lid (keypoint {lid})."""
+    return get_grasping_cost_by_keypoint_idx({lid})
+
+def stage4_path_constraint2(end_effector, keypoints):
+    """Stay above the hover height until horizontally aligned with the aside spot."""
+    place_xy = keypoints[{pot}][..., :2] + np.array({lid_off})[:2]
+    xy_off = np.linalg.norm(keypoints[{lid}][..., :2] - place_xy, axis=-1)
+    low = np.maximum(0.0, ({hover_z_lid}) - keypoints[{lid}][..., 2])
+    return low * np.minimum(1.0, xy_off / 0.08)
 
 ### stage 5 sub-goal constraints
 def stage5_subgoal_constraint1(end_effector, keypoints):
-    """The egg (keypoint {egg}) is raised to carry height above its pick-up pose."""
-    offsetted_point = keypoints[{pot}] + np.array({lift_egg})
-    return np.linalg.norm(keypoints[{egg}] - offsetted_point)
+    """Align the end-effector with the egg (keypoint {egg})."""
+    return np.linalg.norm(end_effector - keypoints[{egg}])
 
 ### stage 5 path constraints
-def stage5_path_constraint1(end_effector, keypoints):
-    """The robot must still be grasping the egg (keypoint {egg})."""
-    return get_grasping_cost_by_keypoint_idx({egg})
+# No path constraints needed for grasping.
 
 ### stage 6 sub-goal constraints
 def stage6_subgoal_constraint1(end_effector, keypoints):
-    """The egg (keypoint {egg}) rests just above the pot rim (keypoint {pot})."""
-    offsetted_point = keypoints[{pot}] + np.array({egg_off})
-    return np.linalg.norm(keypoints[{egg}] - offsetted_point)
+    """The egg (keypoint {egg}) has reached carry height (vertical shortfall only)."""
+    return np.maximum(0.0, ({lift_z_egg}) - keypoints[{egg}][..., 2])
 
 ### stage 6 path constraints
 def stage6_path_constraint1(end_effector, keypoints):
     """The robot must still be grasping the egg (keypoint {egg})."""
     return get_grasping_cost_by_keypoint_idx({egg})
 
+### stage 7 sub-goal constraints
+def stage7_subgoal_constraint1(end_effector, keypoints):
+    """The egg (keypoint {egg}) hovers directly above the pot rim (keypoint {pot})."""
+    offsetted_point = keypoints[{pot}] + np.array({hover_egg})
+    return np.linalg.norm(keypoints[{egg}] - offsetted_point)
+
+### stage 7 path constraints
+def stage7_path_constraint1(end_effector, keypoints):
+    """The robot must still be grasping the egg (keypoint {egg})."""
+    return get_grasping_cost_by_keypoint_idx({egg})
+
+def stage7_path_constraint2(end_effector, keypoints):
+    """Keep the egg (keypoint {egg}) clear of the table while carrying it across."""
+    return np.maximum(0.0, ({carry_z_egg}) - keypoints[{egg}][..., 2])
+
+### stage 8 sub-goal constraints
+def stage8_subgoal_constraint1(end_effector, keypoints):
+    """The egg (keypoint {egg}) rests just above the pot rim (keypoint {pot})."""
+    offsetted_point = keypoints[{pot}] + np.array({egg_off})
+    return np.linalg.norm(keypoints[{egg}] - offsetted_point)
+
+### stage 8 path constraints
+def stage8_path_constraint1(end_effector, keypoints):
+    """The robot must still be grasping the egg (keypoint {egg})."""
+    return get_grasping_cost_by_keypoint_idx({egg})
+
+def stage8_path_constraint2(end_effector, keypoints):
+    """Stay above the hover height until horizontally aligned with the pot rim."""
+    place_xy = keypoints[{pot}][..., :2] + np.array({egg_off})[:2]
+    xy_off = np.linalg.norm(keypoints[{egg}][..., :2] - place_xy, axis=-1)
+    low = np.maximum(0.0, ({hover_z_egg}) - keypoints[{egg}][..., 2])
+    return low * np.minimum(1.0, xy_off / 0.08)
+
 
 """
 Summarize keypoints to be grasped in all grasping stages.
 For a grasping stage write the keypoint index; for a non-grasping stage write -1.
 """
-grasp_keypoints = [{lid}, -1, -1, {egg}, -1, -1]
+grasp_keypoints = [{lid}, -1, -1, -1, {egg}, -1, -1, -1]
 
 """
 Summarize at **the end of which stage** the robot should release each keypoint.
 """
-release_keypoints = [-1, -1, {lid}, -1, -1, {egg}]
+release_keypoints = [-1, -1, -1, {lid}, -1, -1, -1, {egg}]
+
+
+
+# ---------------------------------------------------------------------------
+# Completion predicates (vlm_dp extension to the ReKep response format).
+#
+# Same vocabulary and same interface as the weight plan documents: CONTACT (the finger joint
+# angle stalled in the band (0.08, 0.60) for a whole window, which a close on empty air can
+# never satisfy), CO-MOTION as a dimensionless RATIO (slip / hand_disp < 0.5, evaluated only
+# when the hand actually moved), SUSTAIN (five frames, not one instant), QUIESCENCE (< 0.015
+# m/s -- "it is resting on the table" is a statement about speed, which a distance cannot see),
+# and REGION + ONE-SIDED VERTICAL rather than a 3-D ball. None of them re-expresses
+# `subgoal < eps`: no predicate here measures a distance to its stage's sub-goal point.
+#
+# The pot plan needs no new event type: its eight stages are two grasp / lift / hover / place
+# quartets, so all eight predicates are the weight forms with the lid and the egg substituted
+# for the pear and the apple.
+#
+# Interface: stage<N>_completion(history, end_effector, keypoints, robot_state, components)
+# -> bool, filling `components` with named booleans plus margin_* floats. See
+# vlm_dp/grounding/predicates.py for the full contract.
+# ---------------------------------------------------------------------------
+
+
+### stage 1 completion predicate
+def stage1_completion(history, end_effector, keypoints, robot_state, components):
+    """Lid grasped: the fingers are stalled on something, and the lid rides with the hand."""
+    ap = np.asarray(history["gripper_aperture"], dtype=np.float64)
+    eef = np.asarray(history["eef"], dtype=np.float64)
+    obj = np.asarray([f[{lid}] for f in history["kp"]], dtype=np.float64)
+    w = int(min(len(ap), len(eef), len(obj), 8))
+    closed = bool(w >= 8 and np.all(ap[-w:] > 0.08) and np.all(ap[-w:] < 0.60))
+    hand = float(np.linalg.norm(eef[-1] - eef[-w])) if w > 1 else 0.0
+    slip = float(np.linalg.norm((obj[-1] - eef[-1]) - (obj[-w] - eef[-w]))) if w > 1 else 9.9
+    ratio = slip / hand if hand > 1e-9 else 9.9
+    carried = bool(w >= 8 and hand > 0.02 and ratio < 0.5)
+    reach = float(np.linalg.norm(obj[-1] - eef[-1]))
+    components["closed_on_object"] = closed
+    components["rides_with_hand"] = carried
+    components["at_hand"] = bool(reach < 0.10)
+    components["margin_aperture"] = float(ap[-1])
+    components["margin_slip_ratio"] = ratio
+    components["margin_hand_disp_m"] = hand
+    components["margin_reach_m"] = reach
+    return bool(closed and carried and reach < 0.10)
+
+### stage 2 completion predicate
+def stage2_completion(history, end_effector, keypoints, robot_state, components):
+    """Lid lifted: still owned by the hand, and it has held carry height for the last third of a second."""
+    ap = np.asarray(history["gripper_aperture"], dtype=np.float64)
+    eef = np.asarray(history["eef"], dtype=np.float64)
+    obj = np.asarray([f[{lid}] for f in history["kp"]], dtype=np.float64)
+    w = int(min(len(ap), len(eef), len(obj), 8))
+    closed = bool(w >= 8 and np.all(ap[-w:] > 0.08) and np.all(ap[-w:] < 0.60))
+    hand = float(np.linalg.norm(eef[-1] - eef[-w])) if w > 1 else 0.0
+    slip = float(np.linalg.norm((obj[-1] - eef[-1]) - (obj[-w] - eef[-w]))) if w > 1 else 9.9
+    ratio = slip / hand if hand > 0.02 else 0.0
+    held = bool(closed and ratio < 0.5)
+    k = int(min(len(obj), 5))
+    shortfall = float(np.max(({lift_z_lid}) - obj[-k:][..., 2]))
+    high = bool(k >= 5 and shortfall <= 0.005)
+    components["still_held"] = held
+    components["at_carry_height"] = high
+    components["margin_aperture"] = float(ap[-1])
+    components["margin_slip_ratio"] = ratio
+    components["margin_height_shortfall_m"] = shortfall
+    return bool(held and high)
+
+### stage 3 completion predicate
+def stage3_completion(history, end_effector, keypoints, robot_state, components):
+    """Lid over its aside spot: still owned by the hand, inside the place region in xy, still clear above it."""
+    ap = np.asarray(history["gripper_aperture"], dtype=np.float64)
+    eef = np.asarray(history["eef"], dtype=np.float64)
+    obj = np.asarray([f[{lid}] for f in history["kp"]], dtype=np.float64)
+    w = int(min(len(ap), len(eef), len(obj), 8))
+    closed = bool(w >= 8 and np.all(ap[-w:] > 0.08) and np.all(ap[-w:] < 0.60))
+    hand = float(np.linalg.norm(eef[-1] - eef[-w])) if w > 1 else 0.0
+    slip = float(np.linalg.norm((obj[-1] - eef[-1]) - (obj[-w] - eef[-w]))) if w > 1 else 9.9
+    ratio = slip / hand if hand > 0.02 else 0.0
+    held = bool(closed and ratio < 0.5)
+    place_xy = keypoints[{pot}][..., :2] + np.array({lid_off})[:2]
+    k = int(min(len(obj), 5))
+    xy_off = float(np.max(np.linalg.norm(obj[-k:][..., :2] - place_xy, axis=-1)))
+    over = bool(k >= 5 and xy_off < 0.08)
+    clear = float(np.min(obj[-k:][..., 2]) - (({hover_z_lid}) - 0.05))
+    above = bool(clear >= 0.0)
+    components["still_held"] = held
+    components["inside_place_region"] = over
+    components["still_clear_of_table"] = above
+    components["margin_slip_ratio"] = ratio
+    components["margin_xy_off_m"] = xy_off
+    components["margin_clearance_m"] = clear
+    return bool(held and over and above)
+
+### stage 4 completion predicate
+def stage4_completion(history, end_effector, keypoints, robot_state, components):
+    """Lid placed: down in the place region, no longer owned by the hand, and no longer moving."""
+    ap = np.asarray(history["gripper_aperture"], dtype=np.float64)
+    eef = np.asarray(history["eef"], dtype=np.float64)
+    obj = np.asarray([f[{lid}] for f in history["kp"]], dtype=np.float64)
+    dt = max(float(history["dt"]), 1e-6)
+    w = int(min(len(ap), len(eef), len(obj), 8))
+    place_xy = keypoints[{pot}][..., :2] + np.array({lid_off})[:2]
+    k = int(min(len(obj), 5))
+    xy_off = float(np.max(np.linalg.norm(obj[-k:][..., :2] - place_xy, axis=-1)))
+    seated = bool(k >= 5 and xy_off < 0.08)
+    hand = float(np.linalg.norm(eef[-1] - eef[-w])) if w > 1 else 0.0
+    slip = float(np.linalg.norm((obj[-1] - eef[-1]) - (obj[-w] - eef[-w]))) if w > 1 else 0.0
+    ratio = slip / hand if hand > 0.02 else 0.0
+    departed = bool(w >= 8 and hand > 0.03 and ratio > 0.7)
+    open_frac = float(np.mean(ap[-w:] <= 0.06)) if w >= 4 else 0.0
+    released = bool(departed or open_frac >= 0.25)
+    speed = float(np.linalg.norm(obj[-1] - obj[-w]) / ((w - 1) * dt)) if w > 1 else 9.9
+    still = bool(w >= 8 and speed < 0.015)
+    descend = float((({hover_z_lid}) - 0.05) - np.max(obj[-k:][..., 2]))
+    down = bool(descend >= 0.0)
+    components["inside_place_region"] = seated
+    components["hand_let_go"] = released
+    components["object_quiescent"] = still
+    components["descended"] = down
+    components["margin_xy_off_m"] = xy_off
+    components["margin_slip_ratio"] = ratio
+    components["margin_open_frac"] = open_frac
+    components["margin_speed_mps"] = speed
+    components["margin_descent_m"] = descend
+    return bool(seated and released and still and down)
+
+### stage 5 completion predicate
+def stage5_completion(history, end_effector, keypoints, robot_state, components):
+    """Egg grasped: the fingers are stalled on something, and the egg rides with the hand."""
+    ap = np.asarray(history["gripper_aperture"], dtype=np.float64)
+    eef = np.asarray(history["eef"], dtype=np.float64)
+    obj = np.asarray([f[{egg}] for f in history["kp"]], dtype=np.float64)
+    w = int(min(len(ap), len(eef), len(obj), 8))
+    closed = bool(w >= 8 and np.all(ap[-w:] > 0.08) and np.all(ap[-w:] < 0.60))
+    hand = float(np.linalg.norm(eef[-1] - eef[-w])) if w > 1 else 0.0
+    slip = float(np.linalg.norm((obj[-1] - eef[-1]) - (obj[-w] - eef[-w]))) if w > 1 else 9.9
+    ratio = slip / hand if hand > 1e-9 else 9.9
+    carried = bool(w >= 8 and hand > 0.02 and ratio < 0.5)
+    reach = float(np.linalg.norm(obj[-1] - eef[-1]))
+    components["closed_on_object"] = closed
+    components["rides_with_hand"] = carried
+    components["at_hand"] = bool(reach < 0.10)
+    components["margin_aperture"] = float(ap[-1])
+    components["margin_slip_ratio"] = ratio
+    components["margin_hand_disp_m"] = hand
+    components["margin_reach_m"] = reach
+    return bool(closed and carried and reach < 0.10)
+
+### stage 6 completion predicate
+def stage6_completion(history, end_effector, keypoints, robot_state, components):
+    """Egg lifted: still owned by the hand, and it has held carry height for the last third of a second."""
+    ap = np.asarray(history["gripper_aperture"], dtype=np.float64)
+    eef = np.asarray(history["eef"], dtype=np.float64)
+    obj = np.asarray([f[{egg}] for f in history["kp"]], dtype=np.float64)
+    w = int(min(len(ap), len(eef), len(obj), 8))
+    closed = bool(w >= 8 and np.all(ap[-w:] > 0.08) and np.all(ap[-w:] < 0.60))
+    hand = float(np.linalg.norm(eef[-1] - eef[-w])) if w > 1 else 0.0
+    slip = float(np.linalg.norm((obj[-1] - eef[-1]) - (obj[-w] - eef[-w]))) if w > 1 else 9.9
+    ratio = slip / hand if hand > 0.02 else 0.0
+    held = bool(closed and ratio < 0.5)
+    k = int(min(len(obj), 5))
+    shortfall = float(np.max(({lift_z_egg}) - obj[-k:][..., 2]))
+    high = bool(k >= 5 and shortfall <= 0.005)
+    components["still_held"] = held
+    components["at_carry_height"] = high
+    components["margin_aperture"] = float(ap[-1])
+    components["margin_slip_ratio"] = ratio
+    components["margin_height_shortfall_m"] = shortfall
+    return bool(held and high)
+
+### stage 7 completion predicate
+def stage7_completion(history, end_effector, keypoints, robot_state, components):
+    """Egg over the pot: still owned by the hand, inside the rim region in xy, still clear above it."""
+    ap = np.asarray(history["gripper_aperture"], dtype=np.float64)
+    eef = np.asarray(history["eef"], dtype=np.float64)
+    obj = np.asarray([f[{egg}] for f in history["kp"]], dtype=np.float64)
+    w = int(min(len(ap), len(eef), len(obj), 8))
+    closed = bool(w >= 8 and np.all(ap[-w:] > 0.08) and np.all(ap[-w:] < 0.60))
+    hand = float(np.linalg.norm(eef[-1] - eef[-w])) if w > 1 else 0.0
+    slip = float(np.linalg.norm((obj[-1] - eef[-1]) - (obj[-w] - eef[-w]))) if w > 1 else 9.9
+    ratio = slip / hand if hand > 0.02 else 0.0
+    held = bool(closed and ratio < 0.5)
+    place_xy = keypoints[{pot}][..., :2] + np.array({egg_off})[:2]
+    k = int(min(len(obj), 5))
+    xy_off = float(np.max(np.linalg.norm(obj[-k:][..., :2] - place_xy, axis=-1)))
+    over = bool(k >= 5 and xy_off < 0.08)
+    clear = float(np.min(obj[-k:][..., 2]) - (({hover_z_egg}) - 0.05))
+    above = bool(clear >= 0.0)
+    components["still_held"] = held
+    components["inside_place_region"] = over
+    components["still_clear_of_rim"] = above
+    components["margin_slip_ratio"] = ratio
+    components["margin_xy_off_m"] = xy_off
+    components["margin_clearance_m"] = clear
+    return bool(held and over and above)
+
+### stage 8 completion predicate
+def stage8_completion(history, end_effector, keypoints, robot_state, components):
+    """Egg placed: down in the rim region, no longer owned by the hand, and no longer moving."""
+    ap = np.asarray(history["gripper_aperture"], dtype=np.float64)
+    eef = np.asarray(history["eef"], dtype=np.float64)
+    obj = np.asarray([f[{egg}] for f in history["kp"]], dtype=np.float64)
+    dt = max(float(history["dt"]), 1e-6)
+    w = int(min(len(ap), len(eef), len(obj), 8))
+    place_xy = keypoints[{pot}][..., :2] + np.array({egg_off})[:2]
+    k = int(min(len(obj), 5))
+    xy_off = float(np.max(np.linalg.norm(obj[-k:][..., :2] - place_xy, axis=-1)))
+    seated = bool(k >= 5 and xy_off < 0.08)
+    hand = float(np.linalg.norm(eef[-1] - eef[-w])) if w > 1 else 0.0
+    slip = float(np.linalg.norm((obj[-1] - eef[-1]) - (obj[-w] - eef[-w]))) if w > 1 else 0.0
+    ratio = slip / hand if hand > 0.02 else 0.0
+    departed = bool(w >= 8 and hand > 0.03 and ratio > 0.7)
+    open_frac = float(np.mean(ap[-w:] <= 0.06)) if w >= 4 else 0.0
+    released = bool(departed or open_frac >= 0.25)
+    speed = float(np.linalg.norm(obj[-1] - obj[-w]) / ((w - 1) * dt)) if w > 1 else 9.9
+    still = bool(w >= 8 and speed < 0.015)
+    descend = float((({hover_z_egg}) - 0.05) - np.max(obj[-k:][..., 2]))
+    down = bool(descend >= 0.0)
+    components["inside_place_region"] = seated
+    components["hand_let_go"] = released
+    components["object_quiescent"] = still
+    components["descended"] = down
+    components["margin_xy_off_m"] = xy_off
+    components["margin_slip_ratio"] = ratio
+    components["margin_open_frac"] = open_frac
+    components["margin_speed_mps"] = speed
+    components["margin_descent_m"] = descend
+    return bool(seated and released and still and down)

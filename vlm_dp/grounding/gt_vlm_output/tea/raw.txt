@@ -10,11 +10,34 @@
 # 1. Grasp the teapot.
 # 2. Lift the teapot clear of the table.
 # 3. Carry the teapot mouth above the cup.
-# 4. Tilt the teapot to pour.
+# 4. Pour: drop the mouth below the handle.
 #
 # Stage 2 is an explicit lift: it carries no grasp or release keypoint, so its sub-goal
 # constraint is what certifies the hold before any transport begins. Without it the plan
 # advances on grasp proximity alone and discovers mid-carry that the hand is empty.
+#
+# BROUGHT TO PARITY WITH THE WEIGHT PLAN (the validated 16/20 reference). Three judgements,
+# stated here because they are choices and not mechanical ports:
+#
+#  * ONE-SIDED VERTICAL LIFT (stage 2). Was a 3-D distance to a lift point anchored on the cup
+#    keypoint. With subgoal_eps 0.12 a 3-D ball completes the lift at ~+3cm of rise whenever the
+#    hand happens to be xy-centred on the lift column, so "lifted" could mean "barely off the
+#    table". The sub-goal is now the vertical shortfall of the HANDLE keypoint against
+#    {lift_z_teapot} and nothing else, exactly as weight stages 2/6 read. It also stops
+#    penalising an overshoot, which for a teapot on a lever arm is common.
+#
+#  * CARRY-HEIGHT PATH RULE (stage 3). Stage 3 IS already the hover -- its sub-goal puts the
+#    mouth 10cm above the cup rim, which is the hover point weight synthesizes explicitly -- so
+#    no transport/hover split is added here; only the missing path rule is. It is stated on the
+#    HANDLE keypoint, not the mouth: the handle is the grasped feature and the thing whose
+#    height the hand controls directly, while the mouth is the far end of a lever arm that dips
+#    as the pot swings. Forbidding the handle to drop below {carry_z_teapot} is the statement
+#    "do not drag the pot back across the table on the way to the cup".
+#
+#  * NO PLACE, NO GATED DESCENT. The teapot is never released: the task ends with the pot held
+#    over the cup and tipped. There is no destination to descend onto, so the descent gate the
+#    weight plan puts on its lower stages has nothing to gate here and is deliberately absent.
+#    release_keypoints is all -1 for the same reason.
 
 num_stages = 4
 
@@ -29,9 +52,8 @@ def stage1_subgoal_constraint1(end_effector, keypoints):
 
 ### stage 2 sub-goal constraints
 def stage2_subgoal_constraint1(end_effector, keypoints):
-    """The teapot handle (keypoint {h}) is raised to its carry height above the pick-up pose."""
-    offsetted_point = keypoints[{c}] + np.array({lift_teapot})
-    return np.linalg.norm(keypoints[{h}] - offsetted_point)
+    """The teapot handle (keypoint {h}) has reached carry height (vertical shortfall only)."""
+    return np.maximum(0.0, ({lift_z_teapot}) - keypoints[{h}][..., 2])
 
 ### stage 2 path constraints
 def stage2_path_constraint1(end_effector, keypoints):
@@ -48,6 +70,10 @@ def stage3_subgoal_constraint1(end_effector, keypoints):
 def stage3_path_constraint1(end_effector, keypoints):
     """The robot must still be grasping the teapot (keypoint {h})."""
     return get_grasping_cost_by_keypoint_idx({h})
+
+def stage3_path_constraint2(end_effector, keypoints):
+    """Keep the teapot handle (keypoint {h}) clear of the table while carrying it across."""
+    return np.maximum(0.0, ({carry_z_teapot}) - keypoints[{h}][..., 2])
 
 ### stage 4 sub-goal constraints
 def stage4_subgoal_constraint1(end_effector, keypoints):
@@ -75,3 +101,125 @@ grasp_keypoints = [{h}, -1, -1, -1]
 Summarize at **the end of which stage** the robot should release each keypoint.
 """
 release_keypoints = [-1, -1, -1, -1]
+
+
+
+# ---------------------------------------------------------------------------
+# Completion predicates (vlm_dp extension to the ReKep response format).
+#
+# Same vocabulary and same interface as the weight plan documents: CONTACT (the finger joint
+# angle stalled in the band (0.08, 0.60) for a whole window, which a close on empty air can
+# never satisfy), CO-MOTION as a dimensionless RATIO (slip / hand_disp < 0.5, evaluated only
+# when the hand actually moved), SUSTAIN (conditions hold over the last few frames, not for one
+# instant), and REGION + ONE-SIDED VERTICAL rather than a 3-D ball. None of them re-expresses
+# `subgoal < eps`: no predicate here measures a distance to its stage's sub-goal point.
+#
+# The tea-specific event is the POUR (stage 4). "Poured" is not "the mouth is near a point" --
+# it is "the mouth has been carried BELOW the handle by the lever arm, over the cup, while the
+# pot is still held", sustained for five frames so a single noisy belief sample cannot fire it.
+# Quiescence is deliberately NOT part of it: a pour happens while the pot is moving.
+#
+# Interface: stage<N>_completion(history, end_effector, keypoints, robot_state, components)
+# -> bool, filling `components` with named booleans plus margin_* floats. See
+# vlm_dp/grounding/predicates.py for the full contract.
+# ---------------------------------------------------------------------------
+
+
+### stage 1 completion predicate
+def stage1_completion(history, end_effector, keypoints, robot_state, components):
+    """Teapot grasped: the fingers are stalled on something, and the handle rides with the hand."""
+    ap = np.asarray(history["gripper_aperture"], dtype=np.float64)
+    eef = np.asarray(history["eef"], dtype=np.float64)
+    obj = np.asarray([f[{h}] for f in history["kp"]], dtype=np.float64)
+    w = int(min(len(ap), len(eef), len(obj), 8))
+    closed = bool(w >= 8 and np.all(ap[-w:] > 0.08) and np.all(ap[-w:] < 0.60))
+    hand = float(np.linalg.norm(eef[-1] - eef[-w])) if w > 1 else 0.0
+    slip = float(np.linalg.norm((obj[-1] - eef[-1]) - (obj[-w] - eef[-w]))) if w > 1 else 9.9
+    ratio = slip / hand if hand > 1e-9 else 9.9
+    carried = bool(w >= 8 and hand > 0.02 and ratio < 0.5)
+    reach = float(np.linalg.norm(obj[-1] - eef[-1]))
+    components["closed_on_object"] = closed
+    components["rides_with_hand"] = carried
+    components["at_hand"] = bool(reach < 0.10)
+    components["margin_aperture"] = float(ap[-1])
+    components["margin_slip_ratio"] = ratio
+    components["margin_hand_disp_m"] = hand
+    components["margin_reach_m"] = reach
+    return bool(closed and carried and reach < 0.10)
+
+### stage 2 completion predicate
+def stage2_completion(history, end_effector, keypoints, robot_state, components):
+    """Teapot lifted: still owned by the hand, and the handle has held carry height for five frames."""
+    ap = np.asarray(history["gripper_aperture"], dtype=np.float64)
+    eef = np.asarray(history["eef"], dtype=np.float64)
+    obj = np.asarray([f[{h}] for f in history["kp"]], dtype=np.float64)
+    w = int(min(len(ap), len(eef), len(obj), 8))
+    closed = bool(w >= 8 and np.all(ap[-w:] > 0.08) and np.all(ap[-w:] < 0.60))
+    hand = float(np.linalg.norm(eef[-1] - eef[-w])) if w > 1 else 0.0
+    slip = float(np.linalg.norm((obj[-1] - eef[-1]) - (obj[-w] - eef[-w]))) if w > 1 else 9.9
+    ratio = slip / hand if hand > 0.02 else 0.0
+    held = bool(closed and ratio < 0.5)
+    k = int(min(len(obj), 5))
+    shortfall = float(np.max(({lift_z_teapot}) - obj[-k:][..., 2]))
+    high = bool(k >= 5 and shortfall <= 0.005)
+    components["still_held"] = held
+    components["at_carry_height"] = high
+    components["margin_aperture"] = float(ap[-1])
+    components["margin_slip_ratio"] = ratio
+    components["margin_height_shortfall_m"] = shortfall
+    return bool(held and high)
+
+### stage 3 completion predicate
+def stage3_completion(history, end_effector, keypoints, robot_state, components):
+    """Mouth over the cup: pot still owned by the hand, mouth inside the cup region, still clear above it."""
+    ap = np.asarray(history["gripper_aperture"], dtype=np.float64)
+    eef = np.asarray(history["eef"], dtype=np.float64)
+    grip = np.asarray([f[{h}] for f in history["kp"]], dtype=np.float64)
+    obj = np.asarray([f[{m}] for f in history["kp"]], dtype=np.float64)
+    w = int(min(len(ap), len(eef), len(grip), 8))
+    closed = bool(w >= 8 and np.all(ap[-w:] > 0.08) and np.all(ap[-w:] < 0.60))
+    hand = float(np.linalg.norm(eef[-1] - eef[-w])) if w > 1 else 0.0
+    slip = float(np.linalg.norm((grip[-1] - eef[-1]) - (grip[-w] - eef[-w]))) if w > 1 else 9.9
+    ratio = slip / hand if hand > 0.02 else 0.0
+    held = bool(closed and ratio < 0.5)
+    pour_xy = keypoints[{c}][..., :2] + np.array({cup_off})[:2]
+    k = int(min(len(obj), 5))
+    xy_off = float(np.max(np.linalg.norm(obj[-k:][..., :2] - pour_xy, axis=-1)))
+    over = bool(k >= 5 and xy_off < 0.08)
+    clear = float(np.min(obj[-k:][..., 2]) - (({hover_z_mouth}) - 0.05))
+    above = bool(clear >= 0.0)
+    components["still_held"] = held
+    components["inside_cup_region"] = over
+    components["still_clear_of_cup"] = above
+    components["margin_slip_ratio"] = ratio
+    components["margin_xy_off_m"] = xy_off
+    components["margin_clearance_m"] = clear
+    return bool(held and over and above)
+
+### stage 4 completion predicate
+def stage4_completion(history, end_effector, keypoints, robot_state, components):
+    """Poured: the mouth has been held below the handle by the lever arm, over the cup, still gripped."""
+    ap = np.asarray(history["gripper_aperture"], dtype=np.float64)
+    eef = np.asarray(history["eef"], dtype=np.float64)
+    grip = np.asarray([f[{h}] for f in history["kp"]], dtype=np.float64)
+    obj = np.asarray([f[{m}] for f in history["kp"]], dtype=np.float64)
+    w = int(min(len(ap), len(eef), len(grip), 8))
+    closed = bool(w >= 8 and np.all(ap[-w:] > 0.08) and np.all(ap[-w:] < 0.60))
+    hand = float(np.linalg.norm(eef[-1] - eef[-w])) if w > 1 else 0.0
+    slip = float(np.linalg.norm((grip[-1] - eef[-1]) - (grip[-w] - eef[-w]))) if w > 1 else 9.9
+    ratio = slip / hand if hand > 0.02 else 0.0
+    held = bool(closed and ratio < 0.5)
+    k = int(min(len(obj), len(grip), 5))
+    tilt = float(np.max(obj[-k:][..., 2] - grip[-k:][..., 2] - ({pour_margin})))
+    poured = bool(k >= 5 and tilt <= 0.0)
+    pour_xy = keypoints[{c}][..., :2] + np.array({cup_off})[:2]
+    xy_off = float(np.max(np.linalg.norm(obj[-k:][..., :2] - pour_xy, axis=-1)))
+    over = bool(k >= 5 and xy_off < 0.08)
+    components["still_held"] = held
+    components["mouth_below_handle"] = poured
+    components["over_the_cup"] = over
+    components["margin_aperture"] = float(ap[-1])
+    components["margin_slip_ratio"] = ratio
+    components["margin_pour_tilt_m"] = tilt
+    components["margin_xy_off_m"] = xy_off
+    return bool(held and poured and over)
