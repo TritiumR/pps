@@ -160,7 +160,11 @@ def _capsule(out_dir, keypoints, grounded, env, clearance):
     # Match the successful task-policy posture: descend vertically around the front
     # lip, close the fingers, then lift the lip while retaining the vertical tool axis.
     lip_world = lid_lip_world + np.array([0.0, 0.0, -0.012])
-    open_world = lip_world + np.array([0.0, 0.0, 0.12])
+    # A hinged lid follows an arc rather than a vertical rail. Move the contact
+    # toward the hinge in the machine's local +y direction while lifting, so the
+    # fingers keep pushing underneath the lip instead of sliding off it.
+    hinge_shift = _quat_rotate_wxyz(quat, np.array([0.0, 0.08, 0.0]))
+    open_world = lip_world + hinge_shift + np.array([0.0, 0.0, 0.12])
     approach_axis = np.array([0.0, 0.0, -1.0])
     bay_world = root + _quat_rotate_wxyz(quat, _CAPSULE_BAY_LOCAL)
 
