@@ -29,7 +29,7 @@ def stage1_subgoal_constraint1(end_effector, keypoints):
 
 ### stage 2 sub-goal constraints
 def stage2_subgoal_constraint1(end_effector, keypoints):
-    """The lid lip (keypoint {lip}) reaches the open goal (keypoint {open_goal})."""
+    """Tilt the tool while the lid lip (keypoint {lip}) reaches the open goal (keypoint {open_goal})."""
     return np.linalg.norm(keypoints[{lip}] - keypoints[{open_goal}])
 
 ### stage 2 path constraints

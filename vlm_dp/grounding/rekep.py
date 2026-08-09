@@ -233,14 +233,17 @@ class RekepGrounding:
                     [np.asarray(keypoints, dtype=np.float64),
                      np.stack([np.asarray(p, dtype=np.float64) for p, _ in extra_kps])], axis=0)
                 grounded["keypoints"] = keypoints
+                static_declared = set(metadata.get("static_keypoints", ()))
+
                 for point, owner in extra_kps:
                     point = np.asarray(point, dtype=np.float64)
-                    if owner is None:
+                    kp_idx = len(tracker.owners)
+                    if owner is None or kp_idx in static_declared:
                         tracker.registrations.append((None, point))
                     else:
                         _p, _r = world.object_pose(owner)
                         tracker.registrations.append((owner, _r.T @ (point - _p)))
-                    declared[len(tracker.owners)] = owner
+                    declared[kp_idx] = owner
                     tracker.owners.append(owner)
                 print(f"[rekep] fake VLM declared keypoints {list(range(first, len(keypoints)))} "
                       f"owners={[o for _, o in extra_kps]}", flush=True)
@@ -362,6 +365,22 @@ class RekepGrounding:
         for k, owner in declared.items():
             if owner is not None and k in metadata["grasp_keypoints"]:
                 kp_of[owner], centroid_off[owner] = k, np.zeros(3)
+
+        for owner, geometry in (metadata.get("grasp_geometry") or {}).items():
+            axis = np.asarray(geometry.get("axis"), dtype=np.float64)
+            if axis.shape != (3,) or float(np.linalg.norm(axis)) < 1e-6:
+                raise ValueError(f"invalid declared grasp axis for {owner!r}: {axis}")
+            axis = axis / np.linalg.norm(axis)
+            extent = float(geometry.get("extent", 0.0))
+            if not 0.0 < extent <= self.open_half:
+                raise ValueError(f"invalid declared grasp extent for {owner!r}: {extent}")
+            grasp_axis[owner] = tuple(float(v) for v in axis)
+            grasp_ext_of[owner] = extent
+            print(
+                f"[rekep-ground] {owner}: declared local grasp axis={np.round(axis, 3)} "
+                f"half_width={extent * 1e3:.0f}mm",
+                flush=True,
+            )
 
         if gt_meta is not None:
 
@@ -610,7 +629,10 @@ class RekepGrounding:
             if off > _KP_ON_OBJECT:
                 problems.append(f"stage {i + 1} grasp keypoint {gk} sits {off * 1e3:.0f}mm off the "
                                 f"nearest point of {name!r} -- the role did not land on its object")
-            if self.contact_criterion != "plan":
+            forced_contact = (metadata.get("contact_modes") or {}).get(str(i))
+            if forced_contact not in (None, "pinch", "press"):
+                problems.append(f"stage {i + 1} declares unknown contact mode {forced_contact!r}")
+            if self.contact_criterion != "plan" and forced_contact is None:
                 mode, width, src = self._effective_contact(name, obj_ext, local_ext, probe_ext)
                 if mode == "press":
                     problems.append(
@@ -688,11 +710,33 @@ class RekepGrounding:
 
         def orient_for(stage_idx):
             """Choose whether the stage may control tool orientation."""
+            axis = (metadata.get("approach_axes") or {}).get(str(stage_idx))
+            if axis is not None:
+                print(
+                    f"[rekep-vlm] stage {stage_idx + 1} uses declared tool axis "
+                    f"{np.round(axis, 3)}",
+                    flush=True,
+                )
+                return "axis"
             path = os.path.join(vlm_dir, f"stage{stage_idx + 1}_subgoal_constraints.txt")
             if _constrains_orientation(path):
                 print(f"[rekep-vlm] stage {stage_idx + 1} constrains orientation, free tool axis", flush=True)
                 return "free"
             return "down"
+
+        def approach_for(stage_idx):
+            return (metadata.get("approach_axes") or {}).get(str(stage_idx))
+
+        def orientation_scale_for(stage_idx):
+            return float((metadata.get("approach_axis_scales") or {}).get(str(stage_idx), 1.0))
+
+        def contact_slack_for(stage_idx):
+            value = (metadata.get("contact_slack") or {}).get(str(stage_idx))
+            return None if value is None else float(value)
+
+        def rise_confirm_for(name):
+            value = (metadata.get("rise_confirm") or {}).get(name)
+            return None if value is None else float(value)
 
         def self_displace_next(grasp_i, owner):
             """Return whether the next stage displaces the grasped object's keypoint."""
@@ -712,7 +756,11 @@ class RekepGrounding:
             if grasp_kp >= 0:
                 name = name_for(grasp_kp)
                 owner = tracker.owners[grasp_kp]
-                if self.contact_criterion == "plan":
+                forced_contact = (metadata.get("contact_modes") or {}).get(str(i))
+                if forced_contact is not None:
+                    press = forced_contact == "press"
+                    print(f"[rekep-vlm] {name}: contact={forced_contact} (declared by plan)", flush=True)
+                elif self.contact_criterion == "plan":
                     press = self_displace_next(i, owner)
                     print(f"[rekep-vlm] {name}: contact={'press' if press else 'pinch'} (plan structure)",
                           flush=True)
@@ -726,7 +774,12 @@ class RekepGrounding:
 
                 stages.append(Stage(name=f"{'press' if press else 'grasp'} {name}", gripper="close", steer_policy=_pol(i),
                                     grasp_obj=name, payload=None, held_idx=held,
-                                    target=(kp_point(grasp_kp) if press else obj_center[name]),
+                                    target=(kp_point(grasp_kp) if press or
+                                            (metadata.get("grasp_targets") or {}).get(str(i)) == "keypoint"
+                                            else obj_center[name]),
+                                    orient=orient_for(i), approach_axis=approach_for(i),
+                                    orientation_scale=orientation_scale_for(i),
+                                    grasp_slack=contact_slack_for(i),
                                     contact=("press" if press else "pinch")))
                 grasped_body = owner
                 pressed = press
@@ -737,7 +790,9 @@ class RekepGrounding:
                 stages.append(Stage(name=f"place {name}", gripper="place", grasp_obj=None, payload=name, steer_policy=_pol(i),
                                     place_target=place_target, target=kp_point(release_kp), held_idx=held,
                                     constraint=subgoal, path_fns=path_fns, done=subgoal_done(subgoal),
-                                    orient=orient_for(i),
+                                    orient=orient_for(i), approach_axis=approach_for(i),
+                                    orientation_scale=orientation_scale_for(i),
+                                    rise_confirm=rise_confirm_for(name),
                                     place_mode=place_mode_for(i, place_target),
                                     contact=("press" if pressed else "pinch")))
                 grasped_body = None
@@ -750,7 +805,9 @@ class RekepGrounding:
                                     grasp_obj=None, payload=grasped_body,
                                     target=kp_point(refs[0] if refs else 0), held_idx=held,
                                     constraint=subgoal, path_fns=path_fns, done=subgoal_done(subgoal),
-                                    orient=orient_for(i),
+                                    orient=orient_for(i), approach_axis=approach_for(i),
+                                    orientation_scale=orientation_scale_for(i),
+                                    rise_confirm=rise_confirm_for(grasped_body),
                                     contact=("press" if pressed else "pinch")))
 
         tcp_probe = torch.as_tensor(keypoints, device=dev, dtype=torch.float32)[:1].reshape(1, 1, 3)

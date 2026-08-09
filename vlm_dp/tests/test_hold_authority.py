@@ -84,6 +84,17 @@ def _settle_onto_pear(world, env, steps=None):
     return world
 
 
+def test_refresh_seeds_the_raw_visual_baseline():
+    """The first perception frame must be available before visual tracking takes its first step."""
+    world = _world()
+    initial = np.array([0.1, -0.2, 0.78])
+    world.perception.seen = {"cover": initial}
+
+    world.refresh(_Env())
+
+    np.testing.assert_allclose(world.visual_position("cover"), initial)
+
+
 def test_a_hold_latches_at_all():
     """Baseline: without this the other tests could pass vacuously."""
     world = _world()

@@ -105,6 +105,7 @@ class SensedWorld:
 
 
         self._last_correct = {}
+        self._last_visual = {}
         self.names = []
         self._pos = {}
         self._rot = {}
@@ -128,6 +129,7 @@ class SensedWorld:
         if getattr(self, "relax_identity_when_stale", False):
             self.perception.distrust = set(self._stale)
         seen = self.perception.observe(env)
+        self._last_visual = dict(seen or {})
         displaced = False
         for name, pos in seen.items():
             if name == self._held:
@@ -212,9 +214,18 @@ class SensedWorld:
         self._step += 1
         if self.track == "reperceive":
             if self._step % self.reperceive_every == 0:
-                self._vision_correct(env, self.perception.observe(env))
+                seen = self.perception.observe(env)
+                self._last_visual = dict(seen or {})
+                self._vision_correct(env, seen)
         elif self.track == "visual" and self.visual is not None:
-            self._vision_correct(env, self.visual.step(env))
+            seen = self.visual.step(env)
+            self._last_visual = dict(seen or {})
+            self._vision_correct(env, seen)
+
+    def visual_position(self, name):
+        """Return the latest raw visual position, including objects temporarily held by FK."""
+        pos = self._last_visual.get(name)
+        return None if pos is None else np.asarray(pos, dtype=np.float64).copy()
 
     def set_jump_rate(self, rate: float) -> None:
         """Set the maximum accepted visual correction per control step."""

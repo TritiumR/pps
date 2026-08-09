@@ -197,6 +197,7 @@ class Perception:
         self._last_detections: dict = {}
         self._last_boxes: dict = {}
         self._last_box_scores: dict = {}
+        self._cache_read = False
 
     def warmup(self):
         """Load detector and segmenter models."""
@@ -232,8 +233,9 @@ class Perception:
         cache_path = os.environ.get("VLMDP_PERCEPTION_CACHE_PATH")
         cache_only = os.environ.get("VLMDP_PERCEPTION_CACHE_ONLY") == "1"
         read_path = os.environ.get("VLMDP_PERCEPTION_CACHE_READ_PATH")
-        if read_path:
+        if read_path and not self._cache_read:
             self._load_cache(read_path)
+            self._cache_read = True
         elif cache_only and cache_path and self._cache_matches(cache_path):
             print(f"[perception:cache] already complete: {cache_path}", flush=True)
             raise PerceptionCacheComplete(cache_path, reused=True)
@@ -567,14 +569,15 @@ class Perception:
                 + " ".join(f"p{k}={_r(v)}" for k, v in trims.items())
                 + f" | clusters: frac={frac:.2f} n_main={int(keep.sum())} main={_r(main)}")
 
-    def object_points(self, name) -> np.ndarray | None:
-        """Return valid world points inside an object's eroded mask."""
+    def object_points(self, name, erode=True) -> np.ndarray | None:
+        """Return valid world points inside an object's mask."""
         if name in self._fixture_points:
             return self._fixture_points[name]
         mask = self.masks.get(name)
         if mask is None or self.points is None:
             return None
-        mask = self._erode(mask)
+        if erode:
+            mask = self._erode(mask)
         sel = mask & np.isfinite(self.points).all(axis=-1)
         pts = self.points[sel]
         return pts if pts.shape[0] >= 20 else None

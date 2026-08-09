@@ -9,7 +9,7 @@ import torch
 
 from sim_common.envs.droid import DroidEnv
 from vlm_dp.sim_helpers import ROBOTIQ_GRASP_OFFSET
-from vlm_dp.grasp_sensor import ApertureGraspSensor
+from vlm_dp.grasp_sensor import ApertureGraspSensor, adaptive_stall_margin
 from vlm_dp.grounding import get_source
 from vlm_dp.world import GTWorld, SensedWorld
 from vlm_dp.cost.base_cost import CompositeCost
@@ -62,11 +62,15 @@ class VlmDpBridge:
         self.advance_mode = adv.get("mode", "sensed")               # sensed | env_flags
         # Search recovery probes nearby poses after a closed-empty grasp.
         self._grasp_recovery = adv.get("grasp_recovery", "reopen")
-        self._probe_pts = probe_pattern(float(adv.get("grasp_search_radius", 0.045)))
+        self._base_probe_pts = probe_pattern(float(adv.get("grasp_search_radius", 0.045)))
+        self._probe_pts = list(self._base_probe_pts)
+        self._closed_empty_radius = float(adv.get("closed_empty_radius", 0.04))
         self.stall_margin = float(adv.get("stall_margin", 0.15))
         # Optional hold hysteresis, grace, and backtrack limits.
         self.hold_enter = _opt_float(adv.get("hold_enter"))
         self.hold_exit = _opt_float(adv.get("hold_exit"))
+        self._base_hold_enter = self.stall_margin if self.hold_enter is None else self.hold_enter
+        self._base_hold_exit = self.stall_margin if self.hold_exit is None else self.hold_exit
         self._hold_grace_replans = int(adv.get("hold_grace_replans", 0))
         self._backtrack_budget = int(adv.get("backtrack_budget", 0))  # 0 disables the limit
         self._backtrack_commit = int(adv.get("backtrack_commit_replans", 0))
@@ -140,7 +144,10 @@ class VlmDpBridge:
         self._place_seen = None
         self._place_since = None
         self._reopen = False
+        self._pot_drop_lid = False
         self._grasp_probe = np.zeros(3)
+        self._grasp_target0 = None
+        self._grasp_visual_z0 = None
         self._grasp_probe_idx = 0
         self._closed_empty = 0
         self._open_run = 0
@@ -227,6 +234,7 @@ class VlmDpBridge:
         self._z_hist = []
         self._contact_prev = False
         self._last_cmd_close = False
+        self._pot_drop_lid = False
         self._reset_churn()
         self._enter_stage()
 
@@ -291,16 +299,57 @@ class VlmDpBridge:
         self._contact_seen = False
         self._released_latch = False
         self._grasp_probe = np.zeros(3)
+        self._grasp_target0 = None
+        self._grasp_visual_z0 = None
         self._grasp_probe_idx = 0
         self._closed_empty = 0
         # Reset per-stage failure evidence; backtracks re-add their event after entry.
         self.gate_events = {"closed_empty": 0, "backtracks": 0}
         self._stage_env_steps = 0
         st = self.stage()
+        self._configure_grasp_sensor(st)
         if st.on_enter is not None:
             st.on_enter()
         if st.gripper == "close" and st.grasp_obj is not None:
             self.grasp_z0[st.grasp_obj] = float(self._pos(st.grasp_obj)[2])
+            self._grasp_target0 = np.asarray(st.target(), dtype=np.float32).copy()
+            visual_position = getattr(self.world, "visual_position", None)
+            if callable(visual_position):
+                visual_pos = visual_position(st.grasp_obj)
+                if visual_pos is not None:
+                    self._grasp_visual_z0 = float(visual_pos[2])
+
+    def _configure_grasp_sensor(self, stage):
+        """Adapt hold detection to a declared thin local grasp geometry."""
+        if self.sensor is None:
+            return
+        self.sensor.stall_margin_enter = self._base_hold_enter
+        self.sensor.stall_margin_exit = self._base_hold_exit
+        self._probe_pts = list(self._base_probe_pts)
+        self._thin_verify_lift = 0.0
+        name = stage.grasp_obj or stage.payload
+        obj = next((o for o in self.grounding.objects if o.name == name), None)
+        half_width = getattr(obj, "grasp_extent", None) if obj is not None else None
+        if half_width is None or getattr(stage, "contact", "pinch") == "press":
+            # The pot egg has no declared local extent, but the aperture sensor can
+            # mistake pushing it along the table for a grasp. Require visible lift.
+            if self.task_key == "pot" and name == "egg":
+                self._thin_verify_lift = 0.015
+            return
+        # The expected free-to-contact aperture drop is linear in object width. Put the
+        # hold/air boundary halfway through that drop, capped by the normal object threshold.
+        margin = adaptive_stall_margin(float(half_width), self.stall_margin, self._AP_SLOPE)
+        # Thin structures are also sensitive to a few millimetres of contact-height error.
+        # Try bounded vertical probes before the ordinary XY rings after an empty grasp.
+        vertical = [np.array([0.0, 0.0, z]) for z in (0.006, -0.006, 0.012, -0.012)]
+        self._probe_pts = [self._base_probe_pts[0], *vertical, *self._base_probe_pts[1:]]
+        self._thin_verify_lift = 0.015
+        self.sensor.stall_margin_enter = margin
+        # Once acquired, retain a marginal thin-object grasp until it is nearly free-close.
+        self.sensor.stall_margin_exit = min(margin, 0.02)
+        if margin < self.stall_margin:
+            print(f"[vlm_dp] thin-grasp aperture margin={margin:.3f} for {name} "
+                  f"(half-width {float(half_width) * 1e3:.0f}mm)", flush=True)
 
     def context(self, raw_env, obs, executed_steps=0):
         """Build the current world-frame cost context."""
@@ -323,7 +372,14 @@ class VlmDpBridge:
         st = self.stage()
         # Press stages may close without certifying a pinch hold.
         if st.gripper == "close" and self.sensor is not None and getattr(st, "contact", "pinch") != "press":
-            if self.sensor.closed_on_air():
+            grasp_target = np.asarray(ctx["target"], dtype=np.float64)
+            if self._grasp_recovery == "search":
+                grasp_target = grasp_target + self._grasp_probe
+            near_target = (
+                np.linalg.norm(np.asarray(self.env.tcp(), dtype=np.float64) - grasp_target)
+                <= self._closed_empty_radius
+            )
+            if self.sensor.closed_on_air() and near_target:
                 if not self._reopen:
                     self._closed_empty += 1
                     self.gate_events["closed_empty"] += 1
@@ -351,6 +407,41 @@ class VlmDpBridge:
         if self._grasp_recovery == "search" and st.gripper == "close" \
                 and getattr(st, "contact", "pinch") != "press":
             ctx["target"] = np.asarray(ctx["target"], dtype=np.float32) + self._grasp_probe.astype(np.float32)
+        # Verify a thin pinch by lifting slightly while the aperture still reports a hold.
+        if (getattr(self, "_thin_verify_lift", 0.0) > 0.0 and st.gripper == "close"
+                and self.sensor is not None and self.sensor.holding() and not self._reopen):
+            if self._grasp_target0 is None:
+                base_target = np.asarray(ctx["target"], dtype=np.float32)
+            else:
+                base_target = (self._grasp_target0.copy()
+                               + self._grasp_probe.astype(np.float32))
+            lift_reached = float(np.asarray(self.env.tcp())[2]) >= (
+                float(base_target[2]) + 0.75 * self._thin_verify_lift
+            )
+            if lift_reached and not self._thin_visual_rose(st.grasp_obj):
+                print("[vlm_dp] thin-grasp micro-lift moved FK belief but not visual object; reopening",
+                      flush=True)
+                self._grasp_probe_idx += 1
+                self._grasp_probe = self._probe_pts[self._grasp_probe_idx % len(self._probe_pts)]
+                print(f"[vlm_dp] grasp search -> probe {self._grasp_probe_idx} "
+                      f"{np.round(self._grasp_probe, 3)}", flush=True)
+                self._reopen = True
+                if self.world.mark_stale(st.grasp_obj):
+                    print(f"[vlm_dp] {st.grasp_obj}: failed visual micro-lift -> "
+                          "belief marked stale, re-perceiving", flush=True)
+                ctx["gripper_intent"] = "open"
+            else:
+                # Treat verification as a tiny carry stage. Leaving the context in the
+                # grasp archetype lets the high-weight ReKep contact constraints pin the
+                # TCP to the original handle point, so the requested lift can lose to the
+                # base prior indefinitely.
+                ctx["target"] = base_target.copy()
+                ctx["target"][2] += self._thin_verify_lift
+                ctx["payload"] = st.grasp_obj
+                ctx["grasp_obj"] = None
+                ctx["constraint"] = None
+                ctx["path_fns"] = ()
+                ctx["gripper_intent"] = "close"
         # Detect seat contact from a stalled, commanded-close descent.
         if self.geom.get("release_on_stall", False):
             self._z_hist.append(float(self.env.tcp()[2]))
@@ -399,6 +490,13 @@ class VlmDpBridge:
                   f"events={self.gate_events} dwell={self._stage_env_steps} "
                   f"budget={self._gate_dwell_budget(st)}", flush=True)
         self._auth_prev = auth
+        if self._pot_drop_lid:
+            # Once the lid is clear, release it in place instead of chasing the
+            # optional aside pose and risking a backtrack after the grasp slips.
+            ctx["target"] = np.asarray(self.env.tcp(), dtype=np.float32)
+            ctx["gripper_intent"] = "open"
+            ctx["constraint"] = None
+            ctx["path_fns"] = ()
         ctx["steer_authority"] = auth
         ctx["steer_events"] = dict(self.gate_events)
         ctx["stage_env_steps"] = int(self._stage_env_steps)
@@ -584,6 +682,17 @@ class VlmDpBridge:
         except Exception:
             pass
 
+    def _thin_visual_rose(self, payload, rise=0.005):
+        """Confirm a micro-lift from raw vision rather than the held-object FK belief."""
+        visual_position = getattr(self.world, "visual_position", None)
+        if not callable(visual_position):
+            return True
+        pos = visual_position(payload)
+        z0 = self._grasp_visual_z0
+        if z0 is None:
+            z0 = self.grasp_z0.get(payload)
+        return pos is not None and z0 is not None and float(pos[2]) >= float(z0) + float(rise)
+
     def _payload_held(self, payload):
         """Return whether the configured hold authority reports the payload held."""
         return payload_held(payload, self.hold_authority, self.world, self.sensor,
@@ -649,6 +758,28 @@ class VlmDpBridge:
             self._log_release_gate(stage)
         if self._ground_err_debug:
             self._log_ground_error()
+        if self.task_key == "pot" and bool(flags.get("lid_removed", False)):
+            egg_stage = next(
+                (i for i, candidate in enumerate(self.grounding.stages)
+                 if candidate.grasp_obj == "egg"),
+                None,
+            )
+            if egg_stage is not None and self.stage_idx < egg_stage:
+                if self.sensor is not None and not self.sensor.released():
+                    if not self._pot_drop_lid:
+                        print("[vlm_dp] lid removed: releasing it in place before grasping egg",
+                              flush=True)
+                    self._pot_drop_lid = True
+                    return
+                self._pot_drop_lid = False
+                self.stage_idx = egg_stage
+                self.held_offset = _capture_held(
+                    self.env, self.grounding, self.stage().held_idx
+                )
+                self._enter_stage()
+                self._stage_high = max(self._stage_high, self.stage_idx)
+                print(f"[vlm_dp] lid clear -> {self.stage_idx}: {self.stage().name}", flush=True)
+                return
         violated = self._invariant_violated(stage, flags) if self.backtrack_enabled else None
         if violated and self._backtrack_blocked():
             violated = None  # Commit to the current grip.
@@ -717,9 +848,11 @@ class VlmDpBridge:
             return "poor grip"
         # Subgoal mode does not impose an additional lift-height invariant.
         z0 = self.grasp_z0.get(stage.payload)
+        rise = self.rise_confirm if getattr(stage, "rise_confirm", None) is None \
+            else float(stage.rise_confirm)
         if (self.advance_mode != "subgoal" and z0 is not None
                 and self.stage_replans >= self.grasp_confirm
-                and float(self._pos(stage.payload)[2]) < z0 + self.rise_confirm):
+                and float(self._pos(stage.payload)[2]) < z0 + rise):
             return "never rose"
         return None
 
@@ -742,14 +875,27 @@ class VlmDpBridge:
             if self.advance_mode == "env_flags":
                 return bool(flags.get(f"grasp_{stage.grasp_obj}", False))
             # Measure proximity against the probe-shifted target.
-            tgt = np.asarray(stage.target()) + self._grasp_probe
-            near = float(np.linalg.norm(np.asarray(self.env.tcp()) - tgt)) < self._grasp_slack(stage.grasp_obj)
+            if (getattr(self, "_thin_verify_lift", 0.0) > 0.0
+                    and self._grasp_target0 is not None):
+                tgt = self._grasp_target0 + self._grasp_probe
+            else:
+                tgt = np.asarray(stage.target()) + self._grasp_probe
+            slack = (self._grasp_slack(stage.grasp_obj) if getattr(stage, "grasp_slack", None) is None
+                     else float(stage.grasp_slack))
+            near = float(np.linalg.norm(np.asarray(self.env.tcp()) - tgt)) < slack
             if getattr(stage, "contact", "pinch") == "press":
-                # Press stages advance on completed closure rather than pinch certification.
-                return near and self.sensor.closed()
+                # A press is certified by reaching the contact point. Requiring the aperture
+                # sensor to report a fully closed hand can deadlock articulated contacts: the
+                # lid itself may stop the fingers, and levering does not require a pinch hold.
+                return near
             held = self._payload_held(stage.grasp_obj)
             if self._grasp_advance_on_hold:
-                # A confirmed hold already identifies the grasped object.
+                # Thin contacts first perform a sensor-only micro-lift: surface contact closes
+                # to air after lifting, whereas a real pinch remains obstructed.
+                if held and getattr(self, "_thin_verify_lift", 0.0) > 0.0:
+                    verified_z = float(tgt[2]) + 0.75 * self._thin_verify_lift
+                    return (float(np.asarray(self.env.tcp())[2]) >= verified_z
+                            and self._thin_visual_rose(stage.grasp_obj))
                 return held
             return near and held
         if stage.gripper == "hold" and stage.payload is not None:

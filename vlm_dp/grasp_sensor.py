@@ -11,6 +11,12 @@ import collections
 import numpy as np
 
 
+def adaptive_stall_margin(half_width, default=0.15, aperture_slope=9.3):
+    """Place the hold/air boundary halfway between free-close and expected contact."""
+    drop = float(aperture_slope) * (2.0 * float(half_width))
+    return max(0.02, min(float(default), 0.5 * drop))
+
+
 class ApertureGraspSensor:
     """Detects whether the gripper is holding an object.
 

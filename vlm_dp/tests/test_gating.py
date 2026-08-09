@@ -367,6 +367,18 @@ def test_orientation_stands_down_only_when_the_vlm_rotates():
     assert free["orientation"] == 0.0, "orient='free' must stand the downward tool-axis prior down"
 
 
+def test_declared_orientation_axis_has_stage_local_authority():
+    """A plan may strengthen only its articulated tilt without changing the global config."""
+    base_ctx = _ctx(payload="pear", place_target="scale", orient="axis",
+                    approach_axis=np.array([1.0, 0.0, 0.0], np.float32),
+                    orientation_scale=1.0)
+    strong_ctx = dict(base_ctx, orientation_scale=6.0)
+    base = _evaluate(_Scenario("axis", "", base_ctx, set()))["orientation"]
+    strong = _evaluate(_Scenario("axis-strong", "", strong_ctx, set()))["orientation"]
+    assert base > 0.0
+    assert abs(strong - 6.0 * base) < 1e-5
+
+
 # ------------------------------------------------------------------- the pinch/press contact criterion
 # Narrow horizontal half-extents from each object's own perceived cloud, on clean-mask looks. The
 # criterion compares them against the gripper's 40 mm aperture half-width.

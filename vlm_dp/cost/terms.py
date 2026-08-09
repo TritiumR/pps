@@ -207,11 +207,21 @@ def joint_delta(I):
 
 @register("orientation")
 def orientation(I):
-    """Penalty: mean downward tool-axis misalignment over the horizon."""
-    if I.ee_quat is None or I.context.get("orient", "down") != "down":
+    """Penalty: align the tool axis downward or with a stage-declared world axis."""
+    if I.ee_quat is None:
         return _zeros(I)
-    down = torch.tensor([0.0, 0.0, -1.0], device=I.ee_quat.device, dtype=I.ee_quat.dtype)
-    return (1.0 - (_axis(I.ee_quat, 2) * down.view(1, 1, 3)).sum(dim=-1)).mean(dim=1)
+    mode = I.context.get("orient", "down")
+    if mode == "free":
+        return _zeros(I)
+    target = I.context.get("approach_axis") if mode == "axis" else (0.0, 0.0, -1.0)
+    if target is None:
+        return _zeros(I)
+    target = torch.as_tensor(target, device=I.ee_quat.device, dtype=I.ee_quat.dtype)
+    target = target / torch.clamp(torch.linalg.vector_norm(target), min=1e-8)
+    scale = float(I.context.get("orientation_scale", 1.0))
+    return scale * (
+        1.0 - (_axis(I.ee_quat, 2) * target.view(1, 1, 3)).sum(dim=-1)
+    ).mean(dim=1)
 
 
 @register("consistency")

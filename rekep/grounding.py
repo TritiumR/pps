@@ -56,4 +56,7 @@ def propose_keypoints(camera, env, config, env_index=0, margin=0.6, perception=N
         # How the rest of the front-end asks "which points are this object?". A segmenter answers by name;
         # without one the caller falls back to joining the simulator's instance ids through prim paths.
         "points_of": None if perception is None else perception.object_points,
+        # Thin structures such as a pot-lid handle can disappear under the erosion used for robust
+        # extents. Keep a raw-mask accessor for task geometry that explicitly validates its result.
+        "points_of_raw": None if perception is None else lambda name: perception.object_points(name, erode=False),
     }

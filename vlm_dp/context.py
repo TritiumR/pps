@@ -70,6 +70,7 @@ def build_context(
         "place_target": stage.place_target,
         "contact": getattr(stage, "contact", "pinch"),
         "orient": getattr(stage, "orient", "down"),
+        "orientation_scale": float(getattr(stage, "orientation_scale", 1.0)),
         "place_mode": getattr(stage, "place_mode", "surface"),
         "steer_policy": getattr(stage, "steer_policy", None),
         "gripper_intent": getattr(stage, "gripper", None),
@@ -79,6 +80,11 @@ def build_context(
         "plan_ref": plan_ref,
         "placed": placed,
     }
+
+    approach_axis = getattr(stage, "approach_axis", None)
+    if approach_axis is not None:
+        axis = approach_axis() if callable(approach_axis) else approach_axis
+        ctx["approach_axis"] = np.asarray(axis, dtype=np.float32)
 
     place_point = getattr(stage, "place_point", None)
     if place_point is not None:

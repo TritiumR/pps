@@ -11,7 +11,7 @@ Run: ``python -m vlm_dp.tests.test_grasp_sensor``.
 """
 from __future__ import annotations
 
-from vlm_dp.grasp_sensor import ApertureGraspSensor
+from vlm_dp.grasp_sensor import ApertureGraspSensor, adaptive_stall_margin
 
 # Finger angles from the sensor's docstring calibration, plus the open hand the bug turned on.
 OPEN, APPLE, PEAR, AIR = 0.0, 0.166, 0.258, 0.785
@@ -168,12 +168,34 @@ def test_the_states_partition_the_angle():
         assert s.holding() != s.released(), f"angle {q}: a settled close either holds or does not"
 
 
+def test_thin_declared_geometry_adapts_the_air_boundary():
+    """A 10mm handle must not share the coarse-object empty-hand threshold."""
+    margin = adaptive_stall_margin(0.005, default=0.15)
+    assert abs(margin - 0.0465) < 1e-6
+    sensor = ApertureGraspSensor(stall_margin=0.15,
+                                 stall_margin_enter=margin, stall_margin_exit=0.02)
+    # The calibrated aperture for a 10mm object is 0.692: hold under the adaptive
+    # boundary, but closed-on-air under the old 0.15 threshold.
+    for _ in range(13):
+        sensor.observe(_Env(0.692), True)
+    assert sensor.holding()
+    assert not sensor.closed_on_air()
+    # A marginal contact may relax after acquisition without being mistaken for free close.
+    for _ in range(13):
+        sensor.observe(_Env(0.75), True)
+    assert not sensor.holding()
+    assert not sensor.hold_lost()
+    sensor.observe(_Env(AIR), True)
+    assert sensor.hold_lost()
+
+
 _TESTS = [test_predicates_match_the_calibration, test_an_open_hand_is_never_closed,
           test_holding_is_strictly_stronger_than_closed, test_a_close_is_not_read_before_it_settles,
           test_the_window_spans_a_whole_chunk_of_control_steps,
           test_the_settle_test_is_density_invariant,
           test_a_brief_open_does_not_destroy_the_close_gate,
-          test_a_mostly_open_window_does_not_certify, test_the_states_partition_the_angle]
+          test_a_mostly_open_window_does_not_certify, test_the_states_partition_the_angle,
+          test_thin_declared_geometry_adapts_the_air_boundary]
 
 
 def main():

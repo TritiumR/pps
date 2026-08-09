@@ -45,7 +45,13 @@ class Stage:
     place_target: Optional[str] = None        # object placed onto, collision-excluded during this stage
     done_flag: Optional[str] = None           # env subtask_terms flag gating the advance (task progress)
     done: Callable[[], bool] = lambda: False
+    # Optional desired world-frame tool (+z) axis. Used when orient="axis"; a callable
+    # keeps fixture-relative axes live without exposing simulator state to the cost.
+    approach_axis: Optional[object] = None
     orient: str = "down"
+    orientation_scale: float = 1.0
+    grasp_slack: Optional[float] = None
+    rise_confirm: Optional[float] = None
     place_point: Optional[Callable[[], np.ndarray]] = None    # calibrated top-surface seat point
     carry_z: Optional[Callable[[], float]] = None             # carry altitude for the place transit
     advance_on_done: bool = False             # hold stages: advance on done() instead of the height gate

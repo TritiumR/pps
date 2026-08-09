@@ -106,7 +106,11 @@ advance:
   flag_fallback: false
   release_debug: true            # log the measured release gate each replan (xy/z, in tolerance ...
   grasp_advance_on_hold: true    # a confirmed hold advances the grasp; do not re-gate on the ...
+  gripper_open_debounce: 8      # retain a sensed thin-object hold across brief prior open commands
   ground_error_debug: true       # per-replan drift of the grasp target vs sim pose (logging ...
+  grasp_recovery: search         # move the next grasp locally instead of retrying one empty pose
+  grasp_search_radius: 0.03
+  closed_empty_radius: 0.04      # do not diagnose an empty grasp before reaching the target
 
 grounding:
   rotate_grasp_offset: false     # keypoint->centre offset stored/read in the owning body's frame
