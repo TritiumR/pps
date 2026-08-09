@@ -647,7 +647,12 @@ import re
 
 from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
 from sim_free_mpc import AccelActionMPC, AccelMPCConfig, SimFreeMPC, SimFreeMPCConfig
-from sim_free_mpc.action_space import clamp_real_action_chunk
+from sim_free_mpc.action_space import (
+    DemoDeltaDecodePolicy,
+    clamp_real_action_chunk,
+    decode_model_action_chunks,
+    load_action_norm_stats_json,
+)
 from sim_free_mpc.ddim import ddim_iteration_alphas
 from sim_free_mpc.planner import task_tilt_weight
 from sim_free_mpc.score_steering import combine_scores, steer_scale_for_stage
@@ -1416,6 +1421,28 @@ def _base_decode_only_blockers(args) -> list[str]:
     return blockers
 
 
+def _base_action_space_blockers(args) -> list[str]:
+    """Reasons --base_action_space demo_delta cannot be honored; empty when the flag applies.
+
+    Only the MBD planner bases decode through `decode_model_action_chunks`; every other base
+    hands its chunk to the checkpoint's own output transforms, which cannot be re-scaled here.
+    """
+    blockers = []
+    if not _uses_vlm_mpc_base(args):
+        blockers.append(
+            f"base_source={_base_source_name(args)} decodes through the checkpoint's own "
+            "output transforms (demo-delta decoding is MBD-planner only)"
+        )
+    if _uses_accel_action_mpc(args):
+        blockers.append(
+            "--mpc_optimize_space accel plans in joint/acceleration space and never decodes "
+            "through the action stats"
+        )
+    if not getattr(args, "base_action_stats", ""):
+        blockers.append("--base_action_stats <action_norm_stats.json> is required")
+    return blockers
+
+
 def _disable_out_of_reach_colliders(env, env_ids, prim_path_regex, center, radius):
     """Prestartup: disable colliders in a static asset that the robot can never reach.
 
@@ -1653,6 +1680,7 @@ def infer_actions_with_mpc(
     mpc_planner=None,
     mpc_context=None,
     warm_shift_steps=0,
+    base_decode_policy=None,
 ):
     global _LAST_INFERENCE_RUNTIME
     standalone_role = _standalone_policy_role(args)
@@ -1708,6 +1736,7 @@ def infer_actions_with_mpc(
         mpc_planner=mpc_planner,
         mpc_context=mpc_context,
         warm_shift_steps=warm_shift_steps,
+        base_decode_policy=base_decode_policy,
     )
 
 
@@ -1721,6 +1750,7 @@ def _infer_actions_eager(
     mpc_planner=None,
     mpc_context=None,
     warm_shift_steps=0,
+    base_decode_policy=None,
 ):
     global _LAST_INFERENCE_RUNTIME
     base_obs, base_inputs = _obs_to_input_checked(base_policy, raw_obs, "base")
@@ -2602,7 +2632,18 @@ def _infer_actions_eager(
     if use_vlm_mpc_base and args.mpc_update == "mbd_score_action_warm":
         mpc_planner.set_warm_action(x_t, state=base_inputs["state"])
 
-    actions = base_policy.output_to_actions(base_inputs, x_t)
+    if base_decode_policy is None:
+        actions = base_policy.output_to_actions(base_inputs, x_t)
+    else:
+        # The executed chunk must leave the same space the planner scored it in, so it cannot go
+        # through the checkpoint's output transforms.
+        actions = (
+            decode_model_action_chunks(base_decode_policy, base_inputs, x_t, apply_clamp=False)
+            .real_actions[0]
+            .detach()
+            .cpu()
+            .numpy()
+        )
     if use_vlm_mpc_base:
         current_joint_pos = raw_obs.get("observation/joint_position")
         max_joint_delta = (
@@ -4720,6 +4761,29 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--base_action_space",
+        type=str,
+        default="policy",
+        choices=["policy", "demo_delta"],
+        help=(
+            "Action representation the MBD planner optimizes and decodes in. 'policy' (default) "
+            "keeps the base checkpoint's own normalization -- for pi0.5 that is the DROID "
+            "quantile band, which every validated Isaac result is co-tuned with. 'demo_delta' "
+            "switches to the demonstration joint-delta scale of --base_action_stats, the space "
+            "mujoco_eval/robolab_eval already plan in. Only the ACTION half changes; the state "
+            "is still unnormalized with the checkpoint's stats."
+        ),
+    )
+    parser.add_argument(
+        "--base_action_stats",
+        type=str,
+        default="",
+        help=(
+            "action_norm_stats-style JSON ('mean' and 'std' arrays) used by "
+            "--base_action_space demo_delta. Required by that mode, ignored otherwise."
+        ),
+    )
+    parser.add_argument(
         "--static_collision_off",
         type=str,
         default="",
@@ -5004,6 +5068,13 @@ if args.base_decode_only:
     if _decode_only_blockers:
         parser.error(
             "--base_decode_only cannot be used here: " + "; ".join(_decode_only_blockers)
+        )
+if args.base_action_space != "policy":
+    _action_space_blockers = _base_action_space_blockers(args)
+    if _action_space_blockers:
+        parser.error(
+            f"--base_action_space {args.base_action_space} cannot be used here: "
+            + "; ".join(_action_space_blockers)
         )
 if args.fast_gt:
     _fast_gt_reasons = _fast_gt_blockers(args)
@@ -5314,6 +5385,28 @@ if args.mpc_debug and base_policy is not None:
         "debug_torch_output_to_actions_norm_stats": True,
     }
 
+# Opt-in action representation for the MBD base. None keeps the checkpoint's own decode surface,
+# so every existing run is untouched.
+base_decode_policy = None
+if args.base_action_space == "demo_delta":
+    _delta_mean, _delta_std = load_action_norm_stats_json(args.base_action_stats)
+    base_decode_policy = DemoDeltaDecodePolicy(
+        base_policy,
+        _delta_mean,
+        _delta_std,
+        source=f"demo_delta:{args.base_action_stats}",
+    )
+    print(
+        "Base action space: demo_delta "
+        f"(stats={args.base_action_stats}, mean_shape={tuple(_delta_mean.shape)}, "
+        f"std_shape={tuple(_delta_std.shape)})",
+        flush=True,
+    )
+    print(
+        f"Base demo delta std (model-space scale): {np.round(np.asarray(_delta_std), 4)}",
+        flush=True,
+    )
+
 CONTROL_FREQUENCY = 15
 
 mpc_planner = None
@@ -5334,7 +5427,7 @@ if _uses_vlm_mpc_base(args):
         )
     else:
         mpc_planner = SimFreeMPC(
-            base_policy,
+            base_decode_policy or base_policy,
             SimFreeMPCConfig(
                 task_name=inferred_task,
                 num_samples=args.mpc_num_samples,
@@ -5532,6 +5625,7 @@ with torch.no_grad():
                 else build_mpc_context(env, env_obs_dict, args)
             )
         ),
+        base_decode_policy=base_decode_policy,
     )
 _report_initialization_stage(args, "initialization complete")
 _wait_for_worker_start(args)
@@ -5847,6 +5941,7 @@ for rollout_idx, seed in enumerate(eval_seeds):
                                 mpc_planner=mpc_planner,
                                 mpc_context=mpc_context,
                                 warm_shift_steps=warm_shift_steps,
+                                base_decode_policy=base_decode_policy,
                             )
                             # Converged cost lives in the module-level runtime record, not in the
                             # returned stats (those stay empty unless --compare_difference).
@@ -5872,6 +5967,7 @@ for rollout_idx, seed in enumerate(eval_seeds):
                             mpc_planner=mpc_planner,
                             mpc_context=mpc_context,
                             warm_shift_steps=warm_shift_steps,
+                            base_decode_policy=base_decode_policy,
                         )
                     # Gate observability: stamp authority + evidence every inference (active or
                     # not), so window behavior is auditable from mpc_debug alone.
