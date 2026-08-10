@@ -5100,6 +5100,15 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--base_action_stats_quantile",
+        action="store_true",
+        help=(
+            "Decode --base_action_space demo_delta with q01/q99 from "
+            "--base_action_stats, using the exact affine equivalent of OpenPI quantile "
+            "unnormalization. The stats path may be a full OpenPI norm_stats.json."
+        ),
+    )
+    parser.add_argument(
         "--static_collision_off",
         type=str,
         default="",
@@ -5413,6 +5422,8 @@ if args.base_action_space != "policy":
             f"--base_action_space {args.base_action_space} cannot be used here: "
             + "; ".join(_action_space_blockers)
         )
+if args.base_action_stats_quantile and args.base_action_space != "demo_delta":
+    parser.error("--base_action_stats_quantile requires --base_action_space demo_delta.")
 if args.fast_gt:
     _fast_gt_reasons = _fast_gt_blockers(args)
     if _fast_gt_reasons:
@@ -5761,15 +5772,19 @@ if args.mpc_debug and base_policy is not None:
 # so every existing run is untouched.
 base_decode_policy = None
 if args.base_action_space == "demo_delta":
-    _delta_mean, _delta_std = load_action_norm_stats_json(args.base_action_stats)
+    _delta_mean, _delta_std = load_action_norm_stats_json(
+        args.base_action_stats,
+        use_quantiles=args.base_action_stats_quantile,
+    )
+    _delta_norm_mode = "quantile" if args.base_action_stats_quantile else "mean_std"
     base_decode_policy = DemoDeltaDecodePolicy(
         base_policy,
         _delta_mean,
         _delta_std,
-        source=f"demo_delta:{args.base_action_stats}",
+        source=f"demo_delta_{_delta_norm_mode}:{args.base_action_stats}",
     )
     print(
-        "Base action space: demo_delta "
+        f"Base action space: demo_delta ({_delta_norm_mode}) "
         f"(stats={args.base_action_stats}, mean_shape={tuple(_delta_mean.shape)}, "
         f"std_shape={tuple(_delta_std.shape)})",
         flush=True,

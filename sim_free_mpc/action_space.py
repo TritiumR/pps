@@ -435,9 +435,27 @@ def affine_stats_from_quantiles(stats: Any) -> AffineNormStats:
     )
 
 
-def load_action_norm_stats_json(path: str | pathlib.Path) -> tuple[np.ndarray, np.ndarray]:
-    """Read an action_norm_stats-style JSON into (mean, std) float32 arrays."""
+def load_action_norm_stats_json(
+    path: str | pathlib.Path,
+    *,
+    use_quantiles: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Read action stats and return an affine (mean, std) decode pair.
+
+    ``path`` may be either a flat action-stat JSON or an OpenPI ``norm_stats.json``.
+    Quantile mode returns the exact affine equivalent of OpenPI's q01/q99 unnormalize.
+    """
     raw = json.loads(pathlib.Path(path).read_text())
+    raw = raw.get("norm_stats", raw)
+    raw = raw.get("actions", raw)
+    if use_quantiles:
+        for key in ("q01", "q99"):
+            if key not in raw:
+                raise ValueError(f"{path}: quantile action stats need a '{key}' array.")
+        q01 = np.asarray(raw["q01"], dtype=np.float64)
+        q99 = np.asarray(raw["q99"], dtype=np.float64)
+        half = (q99 - q01 + 1e-6) / 2.0
+        return (q01 + half).astype(np.float32), (half - 1e-6).astype(np.float32)
     for key in ("mean", "std"):
         if key not in raw:
             raise ValueError(f"{path}: action norm stats need a '{key}' array.")
