@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import pathlib
 from dataclasses import dataclass
 from typing import Any
 
@@ -401,3 +403,85 @@ def decode_numpy_action_chunk(
     """Convenience helper for debug paths that need a numpy executable chunk."""
     decoded = decode_model_action_chunks(policy, policy_inputs, model_chunk)
     return np.asarray(decoded.real_actions[0].detach().cpu())
+
+
+# ------------------------------------------------------------------ demo-delta decode surface
+# Everything below is opt-in: nothing above constructs it, so a caller that never builds a
+# DemoDeltaDecodePolicy decodes exactly as before.
+
+
+@dataclass(frozen=True)
+class AffineNormStats:
+    """Mean/std pair in the shape `_unnormalize_torch` reads."""
+
+    mean: np.ndarray
+    std: np.ndarray
+
+
+def affine_stats_from_quantiles(stats: Any) -> AffineNormStats:
+    """Rewrite a q01/q99 band as the mean/std that unnormalizes identically.
+
+    Both branches of `_unnormalize_torch` are affine, so a quantile band has an exact mean/std
+    twin. That lets one stats dict hold a quantile-normalized state next to mean/std actions.
+    """
+    q01 = getattr(stats, "q01", None)
+    q99 = getattr(stats, "q99", None)
+    if q01 is None or q99 is None:
+        raise ValueError("Quantile-normalized stats must carry q01 and q99.")
+    half = (np.asarray(q99, dtype=np.float64) - np.asarray(q01, dtype=np.float64) + 1e-6) / 2.0
+    return AffineNormStats(
+        mean=(np.asarray(q01, dtype=np.float64) + half).astype(np.float32),
+        std=(half - 1e-6).astype(np.float32),
+    )
+
+
+def load_action_norm_stats_json(path: str | pathlib.Path) -> tuple[np.ndarray, np.ndarray]:
+    """Read an action_norm_stats-style JSON into (mean, std) float32 arrays."""
+    raw = json.loads(pathlib.Path(path).read_text())
+    for key in ("mean", "std"):
+        if key not in raw:
+            raise ValueError(f"{path}: action norm stats need a '{key}' array.")
+    return (
+        np.asarray(raw["mean"], dtype=np.float32),
+        np.asarray(raw["std"], dtype=np.float32),
+    )
+
+
+class DemoDeltaDecodePolicy:
+    """Decode surface that reads a model chunk as demonstration joint deltas.
+
+    Mirrors the ChunkDecodePolicy of mujoco_eval/robolab_eval: a chunk row decodes to
+    `q_now + mean + std * x`, so `std` is the model-space scale the planner explores in. The
+    state half is inherited from `policy`, so callers keep feeding that policy's own normalized
+    state and only the ACTION representation changes.
+    """
+
+    def __init__(
+        self,
+        policy: Any,
+        action_mean,
+        action_std,
+        *,
+        source: str = "demo_delta_stats",
+    ):
+        metadata = getattr(policy, "_metadata", {}) or {}
+        output_norm_stats = metadata.get("output_norm_stats") or {}
+        if "state" not in output_norm_stats:
+            raise ValueError("Demo-delta decoding needs the policy's state normalization stats.")
+        state_stats = output_norm_stats["state"]
+        if bool(metadata.get("use_quantile_norm", False)):
+            state_stats = affine_stats_from_quantiles(state_stats)
+        self._metadata = {
+            "output_norm_stats": {
+                "actions": AffineNormStats(
+                    mean=np.asarray(action_mean, dtype=np.float32),
+                    std=np.asarray(action_std, dtype=np.float32),
+                ),
+                "state": state_stats,
+            },
+            "use_quantile_norm": False,
+            "output_norm_stats_source": source,
+            "debug_torch_output_to_actions_norm_stats": bool(
+                metadata.get("debug_torch_output_to_actions_norm_stats", False)
+            ),
+        }
