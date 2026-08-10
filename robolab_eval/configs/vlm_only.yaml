@@ -1,0 +1,140 @@
+# vlm_only -- task-agnostic cost. The VLM owns task behaviour; the predefined terms are
+# robot/scene-level only.
+#
+# Copied from mujoco_eval/configs/vlm_only.yaml (the MimicGen rekep_vlm bring-up). The cost block
+# is byte-identical: every term here is a fact about a Franka-class arm and a table scene, both of
+# which RoboLab shares, so nothing was retuned. Two RoboLab-specific edits, both documented at the
+# line: the control rate (15 Hz here, 20 Hz there) and advance.mode.
+#
+# Partition rule: every term that encodes WHAT the task is (which object, which relation,
+# where it goes, when to release into a goal) is deleted from the config and sourced from the
+# plan through the ReKep constraint functions. What stays is only what is true of the robot and
+# the scene irrespective of task -- actuation/trajectory regularizers, scene feasibility
+# (floor/collision/clearance), and gripper mechanics on dim 7, which is an actuator no ReKep
+# constraint reaches. No reach/terminal_reach/lift_*/place_*/grasp pose-shaping terms appear.
+#
+# Assumes the plan supplies CANDIDATE-VARYING rules: constraints whose value actually changes
+# across sampled proposals. A constraint that is constant over the candidate set (e.g. a
+# grasp-hold path function that reads 0 for every proposal) contributes no gradient to the
+# softmax and this config has nothing else to fall back on.
+#
+# GRASP MECHANICS ARE ROBOT-LEVEL, so they belong here: how a parallel-jaw gripper must be posed
+# to close on a point is a fact about the hand, not about the task. The plan owns only WHICH point
+# -- and it owns it completely, because every term below is centred on `context["target"]`, which
+# --ground rekep_vlm sets to the stage's grasp keypoint (`grasp_keypoints[stage]`).
+#
+# The PLAN IS THE GATE, not a phase label: every restored term reads `_grasp_frame`, which returns
+# None -- and the term zero -- unless the stage carries a grasp_obj and no payload. Only stages
+# with `grasp_keypoints[stage] != -1` get a grasp_obj, so on a place, move or lift stage these
+# terms are identically zero. `straddle`, `center_region`, `aperture_region` and `grasp_axis` are
+# additionally inert on a `press` contact, which is what the drawer handle types as.
+#
+# `orientation` is deliberately NOT restored: it gates on `context["orient"]`, which is "down" on
+# nearly every stage, so it is live off-grasp and cannot be made plan-gated without a phase label.
+
+cost:
+  terms:
+    # VLM task (the only task-specific content, sourced from the plan)
+    rekep_keypose: 25.0     # sub-goal on the TERMINAL row only; clamped at 0 (f<=0 is satisfied)
+    rekep_path: 25.0        # running path constraints, mean-reduced (see rekep_path_mean below)
+    rekep_subgoal: 0.0      # dense all-rows sub-goal: OFF. The terminal row is the sub-goal the
+                            # plan actually states; scoring every row double-counts it and
+                            # dilutes proposal spread ~H-fold. Set >0 for the dense ablation.
+    # actuation/trajectory regularizers
+    smooth: 5.04            # 0.08 x 7 joints x (H-1); mean-reduced
+    joint_delta: 3.5
+    gripper_smooth: 0.5
+    consistency: 5.0        # stay near the previous plan (planner-level, not task-level)
+    not_hold: 8.0           # negate stasis: doing nothing must not be the cheapest plan
+    # scene feasibility
+    floor: 40.0
+    collision: 20.0
+    clear: 0.1              # fixtures are never sphere obstacles
+    carry_clear: 40.0       # a held payload keeps clear of already-placed objects
+    # gripper mechanics (dim 7 is an actuator no ReKep constraint reaches)
+    close_gripper: 2.0
+    release_gripper: 40.0   # reopen recovery (closed-empty at target)
+    carry_hold: 40.0        # hold closed while carrying
+    # grasp mechanics, all base.yaml weights, all centred on the plan's grasp keypoint and all
+    # inert on any stage the plan did not mark as a grasp (see the header)
+    tip_z: 80.0             # fingertip at the grasp point's height
+    straddle: 30.0          # fingertips bracket the point without penetrating it
+    center_region: 120.0    # the point stays inside the closing region
+    aperture_region: 80.0   # the point stays inside the opening along the closing axis
+    grasp_axis: 15.0        # close across the object's narrow axis when elongated
+    yaw: 5.0                # mild world-axis default (round objects)
+    grasp_standoff: 40.0    # hover until laterally aligned, then descend
+  geometry:
+    # Copied verbatim from core.yaml, plus rekep_path_mean.
+    ee_r: 0.035
+    coll_clear: 0.02
+    finger_r: 0.012
+    open_half: 0.0425      # RoboLab edit: MEASURED half-gap between the Robotiq 2F-85 pad faces
+                           # with the gripper open (calibrate_fk.py, fk_fit.json open_half).
+    tool_back: 0.06
+    tcp_to_tip: 0.0
+    center_scale: 0.40      # perception-scale dead-zone (grounding error ~17mm >> GT's 6mm zone)
+    grasp_dead_zone: proportional   # CONTROL arm: the pre-unification dead-zone
+    close_z_scale: 0.025
+    preshape_z: 0.025            # close-while-descending: begin close in the cone above the grasp
+    release_step_motion_cap: 0.008   # rate-corrected (was 0.004 @ 40 Hz); still ~6cm/s @ 20 Hz
+    retreat_margin: 0.02
+    retreat_clear: 0.04
+    rise_first_span: 0.05
+    rise_first_step: 0.02            # rate-corrected (was 0.01 @ 40 Hz)
+    not_hold_sigma: 0.05
+    carry_clear_include_placed: true
+    carry_clear_margin: 0.005        # < seat clearance 0.01 so the apple can reach its own seat
+    preshape_xy_tol: 0.02
+    corridor_margin: 0.01
+    grasp_approach_cap: 0.016       # rate-corrected (was 0.008 @ 40 Hz)
+    grasp_brake_slope: 0.50         # rate-corrected (was 0.25 @ 40 Hz)
+    place_approach_cap: 0.024       # rate-corrected from the 40 Hz default; unweighted here
+    place_brake_slope: 0.50         # rate-corrected from the 40 Hz default; unweighted here
+    grasp_descend_closing_only: true   # charge approach, not lateral/retreat (see header)
+    approach_hover: 0.08
+    approach_xy_tol: 0.02
+    close_xy_floor: 0.008   # gate wider than grounding wobble
+    aperture_margin: 0.006
+    release_xy: 0.06         # xy tolerance of the commitment potential, not a hard edge
+    release_z: 0.02          # release near the surface: ~3 cm max set-down
+    place_approach_margin: 0.01   # payload underside clearance over the destination's top face
+    release_commit_aniso: true    # smooth per-axis commitment instead of the hard AND indicator
+    commit_measured_gate: true    # no opening reward until the payload is measurably near the seat
+    release_commit_band: 3.0      # measured-gate width, in tolerance units
+    place_descend_radius: 0.08      # grasp_flow's binary descend gate
+    place_release_clearance: 0.012   # gentle set-down; a 0.04 drop scattered the payload
+    clear_max_radius: 0.10          # wider objects are fixtures, not sphere obstacles
+    rekep_path_mean: true   # mean-reduce rekep_path over H so it is commensurate with the
+                            # mean-reduced feasibility terms (default sum is back-compat)
+
+advance:
+  # RoboLab edit. The MimicGen vlm_only left `mode` unset, i.e. "sensed", under which a carry
+  # stage advances on the payload's HEIGHT alone -- so a proposal could leave the transit stage
+  # while still nowhere near the destination in xy. `subgoal` is what the rekep_vlm bring-up uses
+  # and what makes advancement honest here: `_vlm_stages.subgoal_done` gates on the WORST of the
+  # stage's own rules, each read at the observed end-effector and the tracked keypoints.
+  mode: subgoal
+  flag_fallback: false        # no privileged env flag may co-confirm a stage
+  release_debug: true         # log the measured release gate each replan (xy/z, in tolerance units)
+  grasp_advance_on_hold: true # a confirmed hold advances the grasp; do not re-gate on the estimate
+  ground_error_debug: true    # per-replan drift of the grasp target vs sim pose (logging only)
+
+grounding:
+  rotate_grasp_offset: false   # keypoint->centre offset stored/read in the owning body's frame
+  support_extents: false       # half-height from the support plane, not the occluded visible span
+  seat_from_plane: true       # seat on the dominant flat plane, not the tallest point
+  lift_latch_xy: false         # anchor the lift xy at stage entry, not on the live payload
+
+steering:
+  # gate_stats: <path>/gate_stats.json   # demo-distribution thresholds for the failure
+  #                                      # gate; none ship for MimicGen, so it stays closed
+  dwell_k: 2.0
+
+planner:
+  # RoboLab edit: rates only. RoboLab controls at 15 Hz (sim.dt 1/120 x decimation 8), MimicGen at
+  # 20; the knot rate keeps the same half-of-control ratio.
+  interpolate: 'on'
+  interpolation_method: bspline
+  interpolate_frequency: 7.5
+  interpolate_high_frequency: 15.0
