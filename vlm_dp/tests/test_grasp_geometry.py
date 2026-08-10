@@ -20,7 +20,9 @@ Run: ``python -m vlm_dp.tests.test_grasp_geometry``.
 """
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
 import types
 
 import numpy as np
@@ -392,6 +394,108 @@ def test_preflight_radii_match_the_cost_terms_exactly():
         assert reported["dead_zone"] == terms.grasp_slack(types.SimpleNamespace(**GEOM), radius)
     print(f"  radii agree with terms.grasp_slack at r in "
           f"{ {RIM_HALF_W, CAPSULE_EXT[1], 0.05} }")
+
+
+def _tea_renderer_fixture(fake_vlm):
+    """Tea anchors and observations in a translated, rotated copy of the real asset frame."""
+    root = np.array([0.40, -0.20, 0.70])
+    s = np.sqrt(0.5)
+    quat = np.array([s, s, 0.0, 0.0])  # +90 degrees about x: local z becomes world y.
+    handle_local = np.array([0.0, 0.0566, -0.0624])
+    mouth_local = np.array([0.0, 0.0516, 0.0651])
+    handle_anchor = root + fake_vlm._quat_rotate_wxyz(quat, handle_local)
+    mouth_anchor = root + fake_vlm._quat_rotate_wxyz(quat, mouth_local)
+
+    # Both ends are genuinely observed. The old inverted implementation seeded itself at the
+    # handle, called that point the mouth, and selected the farthest xy sample -- this mouth point.
+    handle_surface = handle_anchor + np.array([0.001, 0.0, 0.0])
+    mouth_surface = mouth_anchor + np.array([0.001, 0.0, 0.0])
+    cup = np.array([0.72, -0.10, 0.82])
+    keypoints = np.stack([handle_surface, mouth_surface, cup, root])
+    clouds = {
+        "teapot": np.stack([handle_surface, mouth_surface, root]),
+        "teacup": np.stack([cup - np.array([0.01, 0.0, 0.01]),
+                             cup + np.array([0.01, 0.0, 0.01])]),
+    }
+    data = types.SimpleNamespace(
+        root_pos_w=torch.tensor(root, dtype=torch.float64).reshape(1, 3),
+        root_quat_w=torch.tensor(quat, dtype=torch.float64).reshape(1, 4),
+    )
+    env = types.SimpleNamespace(scene={"teapot": types.SimpleNamespace(data=data)})
+    return env, keypoints, clouds, handle_anchor, handle_surface, mouth_anchor
+
+
+def test_tea_renderer_declares_real_handle_anchor_and_extent():
+    """Perception mode must declare the negative-z handle, never the positive-z mouth."""
+    from vlm_dp.grounding import fake_vlm
+
+    env, keypoints, clouds, handle_anchor, handle_surface, mouth_anchor = \
+        _tea_renderer_fixture(fake_vlm)
+
+    old_masked = fake_vlm._masked_points
+    fake_vlm._masked_points = lambda _grounded, _env, name: clouds[name]
+    try:
+        with tempfile.TemporaryDirectory() as out_dir:
+            metadata, roles, extra = fake_vlm.generate(
+                "tea", out_dir, keypoints, {}, env, 0.015)
+            with open(f"{out_dir}/render_fields.json", encoding="utf-8") as f:
+                fields = json.load(f)
+    finally:
+        fake_vlm._masked_points = old_masked
+
+    assert metadata["grasp_keypoints"][0] == len(keypoints)
+    assert roles["teapot"] == len(keypoints)
+    assert roles["mouth"] == 1
+    assert fields["h"] == len(keypoints) and fields["m"] == 1
+    assert len(extra) == 1
+    point, owner, half_width = extra[0]
+    np.testing.assert_allclose(point, handle_surface)
+    assert np.linalg.norm(point - handle_anchor) < 0.002
+    assert np.linalg.norm(point - mouth_anchor) > 0.10
+    assert owner == "teapot"
+    assert half_width == 0.010
+    print(f"  tea handle: declared kp{roles['teapot']} owner={owner} "
+          f"half-width={half_width * 1e3:.0f}mm, "
+          f"anchor error={np.linalg.norm(point - handle_anchor) * 1e3:.1f}mm")
+
+
+def test_tea_renderer_gt_roles_match_privileged_keypoints():
+    """GT mode must retain handle/mouth ordering and the same calibrated local anchors."""
+    from vlm_dp.grounding import fake_vlm, gt_points
+
+    env, _, clouds, handle_anchor, _, mouth_anchor = _tea_renderer_fixture(fake_vlm)
+    root = env.scene["teapot"].data.root_pos_w[0].numpy()
+    quat = env.scene["teapot"].data.root_quat_w[0].numpy()
+    cup = clouds["teacup"].mean(axis=0)
+
+    old_root, old_bbox = gt_points._root, gt_points._world_bbox
+    old_feature = gt_points._feature_from_body_offset
+    gt_points._root = lambda _env, _name: (root, quat)
+    gt_points._world_bbox = lambda _env, _name: (cup - 0.01, cup + 0.01, cup)
+    gt_points._feature_from_body_offset = lambda *_args: cup.copy()
+    try:
+        keypoints, gt_meta = gt_points.tea_gt_keypoints(env)
+    finally:
+        gt_points._root, gt_points._world_bbox = old_root, old_bbox
+        gt_points._feature_from_body_offset = old_feature
+
+    np.testing.assert_allclose(keypoints[0], handle_anchor, atol=1e-7)
+    np.testing.assert_allclose(keypoints[1], mouth_anchor, atol=1e-7)
+    assert gt_meta["owners"][:2] == ["teapot", "teapot"]
+    assert gt_meta["grasp_extent"] == {0: 0.010}
+
+    old_masked = fake_vlm._masked_points
+    fake_vlm._masked_points = lambda _grounded, _env, name: clouds[name]
+    try:
+        with tempfile.TemporaryDirectory() as out_dir:
+            metadata, roles, extra = fake_vlm.generate(
+                "tea", out_dir, keypoints, {"gt_meta": gt_meta}, env, 0.015)
+    finally:
+        fake_vlm._masked_points = old_masked
+
+    assert roles == {"teapot": 0, "mouth": 1, "teacup": 2}
+    assert metadata["grasp_keypoints"] == [0, -1, -1, -1]
+    assert not extra
 
 
 # ---------------------------------------------------------------------------------------------

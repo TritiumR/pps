@@ -137,7 +137,7 @@ each rollout), change one axis at a time, and report the rung with every number 
 |---|---|
 | weight | **16/20** on the reference stack (the hand-written cost tops out at 14/20 with demo-delta) |
 | capsule | grasp machinery verified end-to-end; lid-opening strategy under active iteration |
-| tea | grounds cleanly; handle grasp still sized by the whole-teapot extent (known next fix) |
+| tea | grounds cleanly; handle is now a declared 10mm grasp feature (GPU rollout validation pending) |
 | pot | plan + predicates ready and offline-validated; blocked on the `kitchen_with_parlor` asset |
 
 `configs/test_configs/simple_auth.yaml` is the reference config. The `parity*` ladder is the

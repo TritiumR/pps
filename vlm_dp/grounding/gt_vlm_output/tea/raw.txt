@@ -38,6 +38,11 @@
 #    over the cup and tipped. There is no destination to descend onto, so the descent gate the
 #    weight plan puts on its lower stages has nothing to gate here and is deliberately absent.
 #    release_keypoints is all -1 for the same reason.
+#
+#  * DECLARED HANDLE GEOMETRY. The grasp keypoint {h} names the observed handle feature and the
+#    plan renderer declares its {handle_half_width}m half-width alongside it. The handle is not
+#    the teapot body: grasp feasibility, close gating and grasp_tolerance({h}) must therefore use
+#    this local feature width rather than falling back to the whole pot's 50--71mm half-extent.
 
 num_stages = 4
 

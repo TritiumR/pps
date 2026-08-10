@@ -25,6 +25,17 @@ _CARRY_HOVER, _CARRY_SLACK = 0.10, 0.03
 # Same 5cm the other plans' place predicates use; authored here because the mouth is not a
 # body the plan carries as far as the runtime's ownership rule is concerned (see _tea).
 _TEA_MOUTH_CLEAR = 0.05
+# Authored feature anchors in the teapot root frame. Keep these two points explicit: the asset's
+# handle is on negative local z and its mouth is on positive local z. The old renderer used a
+# handle-coordinate as ``mouth_world`` and then took the farthest xy cloud point as the handle,
+# which swapped the two ends of the pot. These values match tea_gt_keypoints() and the task's
+# authored handle/mouth geometry.
+_TEA_HANDLE_LOCAL = np.array([0.0, 0.0566, -0.0624])
+_TEA_MOUTH_LOCAL = np.array([0.0, 0.0516, 0.0651])
+# Half-width of the handle feature the plan asks the fingers to close around. Like the capsule
+# lid lip below, the handle is much thinner than its owning body: sizing it from the teapot's
+# whole-object extent makes an otherwise pinchable feature look too wide for the gripper.
+_TEA_HANDLE_HALF_W = 0.010
 
 # Capsule geometry, in the machine-root frame. Same numbers vlm_dp/grounding/capsule.py and
 # vlm_dp/offline_context.py use: the pod bay sits on the machine's vertical axis, and the lid
@@ -400,6 +411,7 @@ def _rim_point(pts):
 def _tea(out_dir, keypoints, grounded, env, clearance):
     """Generate constraints for grasping, carrying, and pouring the teapot."""
     roles = {}
+    extra = []
     pts = {}
     for name in ("teapot", "teacup"):
         p = _masked_points(grounded, env, name)
@@ -407,47 +419,61 @@ def _tea(out_dir, keypoints, grounded, env, clearance):
             raise SystemExit(f"[fake-vlm] no masked points for {name}")
         pts[name] = p
     pot = env.scene["teapot"].data
-    mouth_world = pot.root_pos_w[0].cpu().numpy() + _quat_rotate_wxyz(
-        pot.root_quat_w[0].cpu().numpy(), np.array([0.0, 0.05847, -0.06146]))
+    root = pot.root_pos_w[0].cpu().numpy()
+    quat = pot.root_quat_w[0].cpu().numpy()
+    handle_anchor = root + _quat_rotate_wxyz(quat, _TEA_HANDLE_LOCAL)
+    mouth_anchor = root + _quat_rotate_wxyz(quat, _TEA_MOUTH_LOCAL)
     if grounded.get("gt_meta") is not None:
 
         roles["teapot"], roles["mouth"], roles["teacup"] = 0, 1, 2
+        kps = np.asarray(keypoints, dtype=np.float64)
     else:
 
 
         tp = pts["teapot"]
-        d_mouth = np.linalg.norm(tp[:, :2] - mouth_world[None, :2], axis=-1)
-        handle_world = tp[int(np.argmax(d_mouth))]
+        # Ground each semantic feature from its own calibrated anchor. The handle declaration is
+        # kept on observed geometry by taking the closest teapot-cloud sample in full 3-D; the
+        # mouth remains a proposed keypoint, selected against its separate positive-z anchor.
+        handle_world = tp[int(np.argmin(np.linalg.norm(tp - handle_anchor[None], axis=-1)))]
         taken = set()
-        roles["teapot"] = _nearest_kp_distinct(keypoints, handle_world, taken)
-        taken.add(roles["teapot"])
+        # Reserve the proposal the old renderer used for the handle so changing the handle into
+        # a declared feature cannot silently reassign that same proposal to the cup or mouth.
+        handle_snap = _nearest_kp_distinct(keypoints, handle_world, taken)
+        taken.add(handle_snap)
         roles["teacup"] = _nearest_kp_distinct(keypoints, pts["teacup"].mean(axis=0), taken)
         taken.add(roles["teacup"])
-        roles["mouth"] = _nearest_kp_distinct(keypoints, mouth_world, taken)
+        roles["mouth"] = _nearest_kp_distinct(keypoints, mouth_anchor, taken)
+        # A proposed point can name WHERE the handle is, but it carries no feature geometry.
+        # Declare the observed handle explicitly so the grounding seam propagates both its owner
+        # and its plan-authored half-width to every grasp term and completion predicate.
+        roles["teapot"] = len(keypoints)
+        extra = [(handle_world, "teapot", _TEA_HANDLE_HALF_W)]
+        kps = np.concatenate(
+            [np.asarray(keypoints, dtype=np.float64), handle_world.reshape(1, 3)], axis=0)
     cup_top = np.array([pts["teacup"][:, 0].mean(), pts["teacup"][:, 1].mean(),
                         pts["teacup"][:, 2].max()])
-    cup_off = (cup_top - keypoints[roles["teacup"]]).tolist()
+    cup_off = (cup_top - kps[roles["teacup"]]).tolist()
     h, m, c = roles["teapot"], roles["mouth"], roles["teacup"]
 
 
-    lever = float(np.linalg.norm(keypoints[m] - keypoints[h]))
-    rest_dz = float(keypoints[m][2] - keypoints[h][2])
+    lever = float(np.linalg.norm(kps[m] - kps[h]))
+    rest_dz = float(kps[m][2] - kps[h][2])
     pour_margin = rest_dz - max(0.03, 0.5 * lever)
 
     # Lift target: the handle's pick-up position raised _LIFT_HEIGHT, expressed as an offset from
     # the TEACUP keypoint because that one is on a fixture and does not move. Anchoring to the
     # carried teapot's own keypoint would be degenerate (the target would track the teapot).
-    lift_teapot = (keypoints[h] + np.array([0.0, 0.0, _LIFT_HEIGHT]) - keypoints[c]).tolist()
+    lift_teapot = (kps[h] + np.array([0.0, 0.0, _LIFT_HEIGHT]) - kps[c]).tolist()
     # Absolute world heights the plan's scalar rules measure against. The lift stage states its
     # sub-goal as a one-sided vertical shortfall rather than a 3-D distance to `lift_teapot`, so
     # it needs the target height as a scalar; `lift_teapot` is still supplied for any plan
     # wanting the full 3-D lift point. Both are on the HANDLE keypoint -- the grasped feature,
     # whose height the hand controls directly -- not the mouth at the end of the lever arm.
-    lift_z_teapot = float(keypoints[h][2] + _LIFT_HEIGHT)
-    carry_z_teapot = float(keypoints[h][2] + _LIFT_HEIGHT - _CARRY_SLACK)
+    lift_z_teapot = float(kps[h][2] + _LIFT_HEIGHT)
+    carry_z_teapot = float(kps[h][2] + _LIFT_HEIGHT - _CARRY_SLACK)
     # Absolute world height of the pour hover point (the cup rim raised by the carry clearance
     # the stage-3 sub-goal already adds), for stage 3's completion predicate.
-    hover_z_mouth = float(keypoints[c][2] + cup_off[2] + _CARRY_HOVER)
+    hover_z_mouth = float(kps[c][2] + cup_off[2] + _CARRY_HOVER)
     # How far below that hover height the mouth may sit and still count as "clear above the cup".
     # Authored HERE and rendered into the plan as {mouth_clear} rather than resolved by
     # clearance_margin({m}), because clearance_margin is defined only for a keypoint on a body
@@ -458,13 +484,16 @@ def _tea(out_dir, keypoints, grounded, env, clearance):
     metadata = _render("tea", out_dir, h=h, m=m, c=c, cup_off=cup_off, pour_margin=pour_margin,
                        lift_teapot=lift_teapot, lift_z_teapot=lift_z_teapot,
                        carry_z_teapot=carry_z_teapot, hover_z_mouth=hover_z_mouth,
-                       mouth_clear=float(_TEA_MOUTH_CLEAR))
+                       mouth_clear=float(_TEA_MOUTH_CLEAR),
+                       handle_half_width=float(_TEA_HANDLE_HALF_W))
     # vlm_dp extension, not part of the ReKep response format the parser understands.
     metadata["steer_policies"] = ["on_failure"] * metadata["num_stages"]
     with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
-    print(f"[fake-vlm] tea roles teapot=kp{h} mouth=kp{m} teacup=kp{c}", flush=True)
-    return metadata, roles
+    print(f"[fake-vlm] tea roles teapot-handle=kp{h} "
+          f"({'declared 10mm feature' if extra else 'ground-truth feature'}) "
+          f"mouth=kp{m} teacup=kp{c}", flush=True)
+    return metadata, roles, extra
 
 
 def _pot(out_dir, keypoints, grounded, env, clearance):
