@@ -11,10 +11,11 @@ from sim_common.envs.droid import DroidEnv
 from vlm_dp.sim_helpers import ROBOTIQ_GRASP_OFFSET
 from vlm_dp.grasp_sensor import ApertureGraspSensor
 from vlm_dp.grounding import get_source
+from vlm_dp.grounding.predicates import HistoryBuffer
 from vlm_dp.world import GTWorld, SensedWorld
 from vlm_dp.cost.base_cost import CompositeCost
 from vlm_dp.cost.terms import grasp_slack
-from vlm_dp.hold import payload_held
+from vlm_dp.hold import HoldLatch, payload_held
 from vlm_dp.stage import _capture_held, _should_advance
 from vlm_dp.cost import guard_cost
 from vlm_dp.context import build_context
@@ -22,6 +23,24 @@ from vlm_dp.grasp_recovery import debounce_gripper, descent_stalled, probe_patte
 
 # Planner styles that pass tcp_pos instead of ee_pos.
 _TCP_STYLES = ("ref_style", "explore", "grasp_flow", "capsule_flow")
+
+
+class _LatchWorld:
+    """A world stand-in whose only job is to answer ``held()`` from a real HoldLatch.
+
+    Used by the advanceability preflight so that the hold branch of ``_stage_reached`` resolves
+    through the SAME latch, sensor and grasp points a rollout uses, over the synthesized
+    satisfying state. The predecessor of this class was a stub that answered "yes, the nearest
+    object is held" unconditionally, which certified as advanceable exactly the stage that could
+    never advance: the capsule lid grasp, whose real hold test resolved against a centroid belief
+    0.25-0.30m from the rim the fingers were on and therefore never fired.
+    """
+
+    def __init__(self, latch):
+        self._latch = latch
+
+    def held(self):
+        return self._latch.held()
 
 
 def _opt_float(value):
@@ -63,6 +82,13 @@ class VlmDpBridge:
         # Search recovery probes nearby poses after a closed-empty grasp.
         self._grasp_recovery = adv.get("grasp_recovery", "reopen")
         self._probe_pts = probe_pattern(float(adv.get("grasp_search_radius", 0.045)))
+        # Bounds on the reopen recovery, so it cannot hold the gripper open for an entire episode
+        # when the fingers physically cannot reach the open threshold (see _reopen_escape).
+        self._reopen_max = int(adv.get("reopen_max_replans", 12))
+        self._reopen_stall = int(adv.get("reopen_stall_replans", 4))
+        self._reopen_stall_eps = float(adv.get("reopen_stall_eps", 0.01))
+        self._reopen_travel = float(adv.get("reopen_min_travel", 0.02))
+        self._reopen_cooldown = int(adv.get("reopen_cooldown_replans", 8))
         self.stall_margin = float(adv.get("stall_margin", 0.15))
         # Optional hold hysteresis, grace, and backtrack limits.
         self.hold_enter = _opt_float(adv.get("hold_enter"))
@@ -92,6 +118,27 @@ class VlmDpBridge:
                       flush=True)
         # Allow a confirmed hold to bypass noisy target proximity.
         self._grasp_advance_on_hold = bool(adv.get("grasp_advance_on_hold", False))
+        # Opt-in: PLAN-AUTHORITATIVE stage transitions. For every stage the plan itself authored
+        # completion evidence for (a sub-goal constraint or a stage<N>_completion predicate), that
+        # evidence is the ONLY thing allowed to advance the stage. No hardcoded geometric test
+        # second-guesses the plan's stage semantics, and in particular the text-order target()
+        # heuristic (rekep._vlm_stages derives a move stage's target from the FIRST keypoint
+        # mentioned in the constraint source) never feeds an advance decision: under the one-sided
+        # lift rewrite that made the hold-branch z-test compare a payload's belief CENTRE against a
+        # SURFACE keypoint of the same object, a permanent stall (8/10 seeds sat in the lift stage
+        # 380+ replans with the plan's own sub-goal reading 0.000 satisfied; motion_pred_go).
+        # Absent -> strict no-op: every branch keeps its shipped rule.
+        self._plan_authoritative = bool(adv.get("plan_authoritative", False))
+        # Opt-in: certify PLACE stage completion with the plan's completion predicate (hand let
+        # go AND object in the place region AND quiescent) instead of the scalar sub-goal test.
+        # Absent -> strict no-op: _stage_reached keeps the seated/settled/released rule, and the
+        # predicates stay the shadow signal they were. plan_authoritative folds this in: a place
+        # stage's plan-authored evidence IS its completion predicate.
+        self._pred_place_transitions = bool(adv.get("predicate_place_transitions", False)) \
+            or self._plan_authoritative
+        # Advanceability preflight (rekep.advance_preflight, once per episode). On by default;
+        # the escape hatch exists so a diagnostic run can be made in spite of a refusal.
+        self._advance_preflight = bool(adv.get("advance_preflight", True))
         # Re-perceive after repeated closed-empty grasps.
         self._regrasp_perceive = bool(adv.get("regrasp_perceive", False))
         # Allow stale beliefs to bypass appearance matching.
@@ -127,6 +174,7 @@ class VlmDpBridge:
         self.seat_from_plane = bool(cost_cfg.get("grounding", {}).get("seat_from_plane", False))
         self.support_extents = bool(cost_cfg.get("grounding", {}).get("support_extents", False))
         self.kp_source = cost_cfg.get("grounding", {}).get("kp_source", "perception")
+        self.subgoal_eps = float(cost_cfg.get("grounding", {}).get("subgoal_eps", 0.06))
         # "feasibility" uses geometry; "plan" uses stage structure.
         self.contact_criterion = cost_cfg.get("grounding", {}).get("contact_criterion", "feasibility")
         if self.state == "real" and (self.flag_fallback or self.advance_mode == "env_flags"):
@@ -146,14 +194,35 @@ class VlmDpBridge:
         self._place_seen = None
         self._place_since = None
         self._reopen = False
+        self._reopen_ap = []
+        self._reopen_cooldown_left = 0
+        self._hold_world = None
         self._grasp_probe = np.zeros(3)
         self._grasp_probe_idx = 0
         self._closed_empty = 0
         self._open_run = 0
         self._close_val = 1.0
         self._z_hist = []                    # Never stage-reset; contact detection spans stage changes.
+        # Measured TCP one control step back, for carry_accel's chunk-boundary rows. Sampled
+        # per applied step only when a config actually asks for the term, so every other
+        # config pays nothing and sees no new context key.
+        self._track_eef_hist = "carry_accel" in self.terms
+        self._eef_last = None
+        # Payload age for carry_accel's settle window (same gating as eef_hist: configs that
+        # do not ask for the term see no new context key). Counts env steps since the CURRENT
+        # payload was acquired, i.e. since the stage that first names it took over.
+        self._env_steps = 0
+        self._payload_name = None
+        self._payload_acq = None
         self._contact_prev = False
         self._last_cmd_close = False
+        # SHADOW completion predicates. One second of belief / TCP / aperture history, evaluated
+        # for the CURRENT stage on every replan and logged beside the scalar sub-goal decision.
+        # Nothing in advance() reads pred_shadow: this is observation only, and a run with it on
+        # must reproduce exactly the episode a run without it would.
+        self._pred_hist = HistoryBuffer(maxlen=15, dt=1.0 / 15.0)
+        self.pred_shadow = None
+        self._pred_transition = None      # last predicate-certified transition decision, logged
         self._reset_churn()
 
     def _reset_churn(self):
@@ -197,6 +266,10 @@ class VlmDpBridge:
                 self._settle(raw_env)
         except ImportError:
             pass
+        self._eef_last = None                # no cross-episode TCP history
+        self._env_steps = 0                  # no cross-episode payload age
+        self._payload_name = None
+        self._payload_acq = None
         self.env = DroidEnv.attach(raw_env, device=self.device)
         self.sensor = ApertureGraspSensor(stall_margin=self.stall_margin, settle_eps=self.settle_eps,
                                           close_steps=self.close_steps, settle_steps=self.settle_steps,
@@ -209,15 +282,27 @@ class VlmDpBridge:
         src = get_source(self.ground_name, task_key=self.task_key, perception=percep,
                          seat_shift=self.seat_shift, local_grasp=self.local_grasp,
                          local_grasp_radius=self.local_grasp_radius, kp_source=self.kp_source,
-                         contact_criterion=self.contact_criterion,
+                         contact_criterion=self.contact_criterion, subgoal_eps=self.subgoal_eps,
                          rotate_grasp_offset=self.rotate_grasp_offset,
                          lift_latch_xy=self.lift_latch_xy, seat_from_plane=self.seat_from_plane,
-                         open_half=float(self.geom.get("open_half", 0.04)), **self.roles)
+                         open_half=float(self.geom.get("open_half", 0.04)), geom=self.geom,
+                         # The live aperture sensor's own thresholds, so the completion
+                         # predicates' contact band is auditable against the band the hold
+                         # latch actually uses instead of being compared from memory.
+                         sensor_cfg={"q_free": float(self.sensor.q_free),
+                                     "stall_margin": float(self.sensor.stall_margin),
+                                     "q_touch": float(self.sensor.q_touch)},
+                         **self.roles)
         self.world = self._build_world(raw_env, percep, src)
         self.grounding = src.ground(self.env, self.world)
         # Advance checks use grounding estimates rather than simulator poses.
         self._obj_pos = {o.name: o.pos for o in self.grounding.objects}
         self._extents = {o.name: o.extents for o in self.grounding.objects}
+        # Advanceability preflight: every stage, in a state where it is genuinely satisfied, must
+        # be able to advance. Runs once per episode, against the real _stage_reached.
+        run_preflight = getattr(self.grounding, "advance_preflight", None)
+        if self._advance_preflight and callable(run_preflight):
+            run_preflight(self.preflight_probe)
         self.stage_idx = 0
         self.held_offset = _capture_held(self.env, self.grounding,
                                          self.grounding.stages[0].held_idx)
@@ -228,6 +313,9 @@ class VlmDpBridge:
         self._z_hist = []
         self._contact_prev = False
         self._last_cmd_close = False
+        self._pred_hist.reset()          # stale frames across a reset would fire a stage
+        self.pred_shadow = None
+        self._pred_transition = None
         self._reset_churn()
         self._enter_stage()
 
@@ -282,9 +370,15 @@ class VlmDpBridge:
     def _enter_stage(self):
         """Reset stage-local state and capture the initial grasp height."""
         self.stage_replans = 0
+        # The previous stage's (or a backtracked-away) plan must not survive into the new one:
+        # the `consistency` term penalises deviation from plan_ref, so a stale reference makes
+        # recovery pay for not repeating the plan that just failed.
+        self.plan_ref = None
         self._place_seen = None
         self._place_since = None
         self._reopen = False
+        self._reopen_ap = []
+        self._reopen_cooldown_left = 0
         self._contact_seen = False
         self._released_latch = False
         self._grasp_probe = np.zeros(3)
@@ -320,8 +414,14 @@ class VlmDpBridge:
         st = self.stage()
         # Press stages may close without certifying a pinch hold.
         if st.gripper == "close" and self.sensor is not None and getattr(st, "contact", "pinch") != "press":
-            if self.sensor.closed_on_air():
+            if self._reopen_cooldown_left > 0:
+                # Escaped a reopen recently: let the gripper close again before re-arming, or the
+                # recovery re-latches on the same evidence and the escape buys nothing.
+                self._reopen_cooldown_left -= 1
+                self._reopen = False
+            elif self.sensor.closed_on_air():
                 if not self._reopen:
+                    self._reopen_ap = []
                     self._closed_empty += 1
                     self.gate_events["closed_empty"] += 1
                     print("[vlm_dp] closed-empty at grasp target: commanding reopen", flush=True)
@@ -340,6 +440,13 @@ class VlmDpBridge:
                 self._reopen = True
             elif self.sensor.is_open():
                 self._reopen = False
+            if self._reopen:
+                escape = self._reopen_escape()
+                if escape is not None:
+                    self._reopen = False
+                    self._reopen_cooldown_left = self._reopen_cooldown
+                    print(f"[vlm_dp] reopen abandoned ({escape}); commanding close again for "
+                          f"{self._reopen_cooldown} replans", flush=True)
         else:
             self._reopen = False
         if self._reopen:
@@ -377,11 +484,30 @@ class VlmDpBridge:
                       f"z={self._z_hist[-1]:.4f} cmd_close={self._last_cmd_close}", flush=True)
                 self._contact_prev = contact
         self._stage_env_steps += max(int(executed_steps), 0)
+        # Payload age, in seconds since acquisition, for carry_accel's settle window. The
+        # dose-response that set carry_accel_max was measured on the first ~0.4-0.5s after
+        # lift (an unsettled pinch); past the settle window the cap is a transport speed
+        # limit rather than a slip guard, so the term reads this and stands down.
+        # A payload change (None->name or name->other) restarts the clock; releasing clears it.
+        if self._track_eef_hist:
+            self._env_steps += max(int(executed_steps), 0)
+            pay = ctx.get("payload")
+            if pay != self._payload_name:
+                self._payload_name = pay
+                self._payload_acq = self._env_steps if pay is not None else None
+            if pay is not None and self._payload_acq is not None:
+                ctx["payload_age_s"] = (self._env_steps - self._payload_acq) / 15.0
         # Record TCP motion and release state for retreat terms.
         eef_now = np.asarray(ctx["eef_pos"], dtype=np.float64)[:3]
         if getattr(self, "_eef_prev", None) is not None and int(executed_steps) > 0:
             ctx["eef_step_motion"] = float(np.linalg.norm(eef_now - self._eef_prev)) / int(executed_steps)
         self._eef_prev = eef_now
+        # Chunk-boundary history for carry_accel: the TCP one control step ago and now, so
+        # the acceleration of the first planned row is defined against the executed past.
+        # Omitted before the first executed step of an episode -> the term keeps its old shape.
+        if self._track_eef_hist and self._eef_last is not None:
+            ctx["eef_hist"] = np.stack([self._eef_last,
+                                        eef_now.astype(np.float32)]).astype(np.float32)
         ctx["released"] = bool(self.sensor.released()) if self.sensor is not None else False
         ctx["hold_grace"] = self._hold_grace_value(st)
         auth = self._steer_authority(st)
@@ -393,7 +519,39 @@ class VlmDpBridge:
         ctx["steer_authority"] = auth
         ctx["steer_events"] = dict(self.gate_events)
         ctx["stage_env_steps"] = int(self._stage_env_steps)
+        # Shadow only, and deliberately NOT a ctx key: the planner must not be able to see it.
+        self._eval_predicate_shadow(ctx)
         return ctx
+
+    def _reopen_escape(self):
+        """Return why the reopen recovery must be abandoned this replan, or None to continue.
+
+        The recovery latches on ``closed_on_air`` and, as shipped, cleared on ``is_open()`` alone
+        (aperture <= q_touch). Fingers that close on the EDGE of something wedge part-way -- 0.23
+        to 0.38 rad, neither open nor free-closed -- and neither exit condition can ever be met, so
+        the open command is held for the rest of the episode and the stage cannot be retried. Both
+        escapes below are bounded and preserve the normal path: an ordinary reopen travels from the
+        free-close angle to open in a few replans, so it never sits still long enough to stall out
+        and never reaches the timeout.
+        """
+        ap = float(self.sensor.aperture())
+        self._reopen_ap.append(ap)
+        n = len(self._reopen_ap)
+        if n >= self._reopen_max:
+            return (f"timeout: {n} replans commanding open, aperture still {ap:.3f} rad "
+                    f"(open needs <= {self.sensor.q_touch:.3f})")
+        k = self._reopen_stall
+        if n >= k and not self.sensor.closed_on_air():
+            # WEDGED means part-way: neither open nor free-closed. While the fingers are still in
+            # the free-close range this is just an ordinary reopen in progress -- which is allowed
+            # to be slow, and is bounded by the timeout above -- so the stall test stands down and
+            # normal closed-on-air recovery is preserved.
+            window = self._reopen_ap[-k:]
+            moved = self._reopen_ap[0] - ap
+            if max(window) - min(window) <= self._reopen_stall_eps and moved >= self._reopen_travel:
+                return (f"fingers wedged at {ap:.3f} rad: {k} replans within "
+                        f"{self._reopen_stall_eps:.3f} rad after opening {moved:.3f} rad")
+        return None
 
     def _hold_grace_value(self, stage):
         """Return whether the post-grasp hold-grace window is active."""
@@ -458,11 +616,86 @@ class VlmDpBridge:
 
     def observe_step(self, action_step):
         """Record sensor evidence for one applied control step."""
+        self._sample_eef()
+        self._sample_predicate_history()
         if self.sensor_cadence == "replan":
             return                                   # observe_plan already sampled this chunk
         commanded_close = bool(float(torch.as_tensor(action_step).reshape(-1)[7]) > 0.5)
         self._last_cmd_close = commanded_close
         self._observe_sensors(commanded_close)
+
+    def _sample_eef(self):
+        """Record the measured TCP before this control step (carry_accel boundary rows only).
+
+        Called once per APPLIED step, so consecutive samples are exactly one control step
+        apart -- the spacing carry_accel's second difference assumes. The frame is the one
+        build_context reports as ctx["eef_pos"], which is the frame the planner optimizes in.
+        """
+        if not self._track_eef_hist or self.env is None:
+            return
+        try:
+            frame = self.env.env.scene["ee_frame"]
+            frame.update(0.0, force_recompute=True)
+            self._eef_last = np.asarray(
+                frame.data.target_pos_w[0, 0].detach().cpu(), dtype=np.float32)
+        except Exception:                            # never let bookkeeping break a rollout
+            self._eef_last = None
+
+    def _sample_predicate_history(self):
+        """Push one (keypoints, TCP, aperture) frame for the shadow completion predicates.
+
+        Once per APPLIED control step, so the buffer is uniformly spaced at the 15 Hz control
+        rate the predicates assume. Skipped entirely when the plan authored no predicates, and
+        it never raises -- a shadow signal must not be able to end a rollout.
+        """
+        if self.grounding is None or getattr(self.grounding, "completion", None) is None:
+            return
+        try:
+            kps = self.grounding.keypoints()
+            self._pred_hist.push(kps, self.env.tcp(), self.env.gripper_q())
+        except Exception:                            # observation only; never break a rollout
+            pass
+
+    def _eval_predicate_shadow(self, ctx):
+        """Evaluate the current stage's completion predicate beside the scalar sub-goal test.
+
+        Writes self.pred_shadow, which only the debug log reads. The stage machine is untouched:
+        advance() does not consult it, so an arm with predicates loaded produces byte-identical
+        actions to one without.
+        """
+        comp = getattr(self.grounding, "completion", None)
+        if comp is None or len(self._pred_hist) == 0:
+            self.pred_shadow = None
+            return
+        st = self.stage()
+        history = self._pred_hist.view()
+        fired, components = comp.evaluate(self.stage_idx, history)
+        # The scalar decision this would replace, computed exactly as rekep's subgoal_done does.
+        old = None
+        if st.constraint is not None and self.grounding.keypoints is not None:
+            try:
+                dev = self.device
+                ee = torch.as_tensor(self.env.tcp(), device=dev, dtype=torch.float32).reshape(1, 1, 3)
+                kp = torch.as_tensor(self.grounding.keypoints(), device=dev,
+                                     dtype=torch.float32)[:, None, None, :]
+                old = float(torch.as_tensor(st.constraint(ee, kp)).reshape(-1)[0])
+            except Exception:
+                old = None
+        self.pred_shadow = {
+            "stage_idx": int(self.stage_idx),
+            "stage": st.name,
+            "predicate": bool(fired),
+            "subgoal_value": old,
+            "subgoal_fired": None if old is None else bool(old < self.subgoal_eps),
+            "frames": int(len(self._pred_hist)),
+            "components": {k: (bool(v) if isinstance(v, bool) else float(v))
+                           for k, v in components.items()},
+        }
+        # advance() ran just before this context(), so its transition decision (when predicate
+        # transitions are enabled) belongs to this same replan. Carrying it here puts the
+        # certified decision and the scalar decision it replaced in one log record.
+        if self._pred_transition is not None:
+            self.pred_shadow["transition"] = dict(self._pred_transition)
 
     def _observe_sensors(self, commanded_close: bool) -> None:
         """Record one shared world and aperture-sensor observation."""
@@ -471,9 +704,32 @@ class VlmDpBridge:
         cand = {n for n in (st.grasp_obj, st.payload) if n}
         observe = getattr(self.world, "observe", None)
         if callable(observe):
-            observe(self.env, commanded_close, candidates=cand or None)
+            observe(self.env, commanded_close, candidates=cand or None,
+                    points=self._hold_points(cand))
         else:
             self.sensor.observe(self.env, commanded_close)
+
+    def _hold_points(self, names):
+        """Return where the hold test should look for each object: its GROUNDED grasp point.
+
+        The grounding's own accessor (``self._obj_pos``, i.e. the tracked keypoint the stage
+        grasps, with its registered offset) rather than the world's centroid belief. For an object
+        whose grasp point IS its centre the two are the same reading; for a stage that grasps a
+        declared feature -- a lid rim on a coffee machine -- they are 0.25-0.30m apart, and the
+        centroid reading makes the correct grasp invisible to ApertureGraspSensor.held_object,
+        whose proximity gate is 0.10m. The stage's grasp point is what the cost drove the TCP to,
+        so it is the point the hold has to be judged against.
+        """
+        out = {}
+        for name in names or ():
+            fn = self._obj_pos.get(name)
+            if fn is None:
+                continue
+            try:
+                out[name] = np.asarray(fn(), dtype=np.float64)[:3]
+            except Exception:
+                continue                      # an un-grounded name simply keeps the world's belief
+        return out or None
 
     def _pos(self, name):
         """Return the estimated object position, with a world-state fallback."""
@@ -519,6 +775,36 @@ class VlmDpBridge:
             except Exception:
                 pass
 
+    def _log_grasp_state(self, stage):
+        """Log the grasp evidence a close stage advances on, once per replan.
+
+        One line carrying all four quantities that decide a grasp: where the TCP is relative to the
+        point the stage actually grasps, the feasibility radius every grasp term is sized by (and
+        the dead zone it implies), the gripper channel's state including the reopen recovery, and
+        what the hold latch resolves to.
+        """
+        if stage.gripper != "close" or stage.grasp_obj is None or self.sensor is None:
+            return
+        name = stage.grasp_obj
+        obj = next((o for o in self.grounding.objects if o.name == name), None)
+        ge = getattr(obj, "grasp_extent", None) if obj is not None else None
+        ext = self._extents.get(name)
+        radius = float(ge) if ge is not None else (float(ext[1]) if ext is not None else float("nan"))
+        try:
+            tgt = np.asarray(stage.target(), dtype=np.float64)[:3] + self._grasp_probe
+            d = float(np.linalg.norm(np.asarray(self.env.tcp(), dtype=np.float64)[:3] - tgt))
+        except Exception:
+            d = float("nan")
+        latched = getattr(self.world, "held", None)
+        print(f"[vlm_dp] grasp_dbg stage={self.stage_idx} replan={self.stage_replans} obj={name} "
+              f"r={radius:.4f}{'' if ge is not None else '(whole-object)'} "
+              f"dead={self._grasp_slack(name):.4f} d_tcp={d:.4f} ap={self.sensor.aperture():.3f} "
+              f"open={int(self.sensor.is_open())} air={int(self.sensor.closed_on_air())} "
+              f"holding={int(self.sensor.holding())} reopen={int(self._reopen)} "
+              f"cool={self._reopen_cooldown_left} "
+              f"latch={latched() if callable(latched) else None} "
+              f"held={int(self._payload_held(name))}", flush=True)
+
     def _log_release_gate(self, stage):
         """Log placement release errors and simulator-only diagnostics."""
         if stage.gripper != "place" or stage.payload is None or stage.place_point is None:
@@ -558,8 +844,14 @@ class VlmDpBridge:
             pass
 
     def _payload_held(self, payload):
-        """Return whether the configured hold authority reports the payload held."""
-        return payload_held(payload, self.hold_authority, self.world, self.sensor,
+        """Return whether the configured hold authority reports the payload held.
+
+        ``_hold_world`` is the world holding the latch. It is ``self.world`` for a rollout; the
+        advanceability preflight substitutes one carrying a REAL HoldLatch over a REAL
+        ApertureGraspSensor, so that the preflight exercises this same rule rather than a stub.
+        """
+        world = getattr(self, "_hold_world", None) or self.world
+        return payload_held(payload, self.hold_authority, world, self.sensor,
                             self.env.tcp(), self._pos(payload))
 
     def _grip_half_width(self, payload):
@@ -611,6 +903,7 @@ class VlmDpBridge:
         """Backtrack on invariant failure or advance when the stage is reached."""
         stage = self.stage()
         self.stage_replans += 1
+        self._pred_transition = None      # one fresh transition record per replan, never stale
         if self._commit_left > 0:
             self._commit_left -= 1
         # Sync FK before reading held-object state.
@@ -622,6 +915,7 @@ class VlmDpBridge:
             self._log_release_gate(stage)
         if self._ground_err_debug:
             self._log_ground_error()
+            self._log_grasp_state(stage)
         violated = self._invariant_violated(stage, flags) if self.backtrack_enabled else None
         if violated and self._backtrack_blocked():
             violated = None  # Commit to the current grip.
@@ -707,9 +1001,176 @@ class VlmDpBridge:
             radius = ext[1] if ext is not None else None
         return self.grasp_eps if radius is None else grasp_slack(self._geom_ns, float(radius))
 
+    def _place_certified(self, stage, flags):
+        """Return the completion predicate's verdict for a PLACE stage, or None for "no opinion".
+
+        None means "fall through to the shipped rule": the opt-in key is absent, the plan
+        authored no predicate for this stage, or there is no history yet (start of an episode).
+        The scalar sub-goal test answers "is the held object's keypoint near the place point",
+        which a still-gripped object satisfies; the predicate answers "did the placement EVENT
+        happen" -- hand let go AND object inside the region AND quiescent -- so a stage cannot
+        be signed off while the payload is still owned by the gripper.
+        """
+        if not self._pred_place_transitions:
+            return None
+        comp = getattr(self.grounding, "completion", None)
+        if comp is None or self.stage_idx not in comp or len(self._pred_hist) == 0:
+            return None
+        fired, components = comp.evaluate(self.stage_idx, self._pred_hist.view())
+        # The decision this replaces, for the evidence trail. Only the sensed rule is
+        # reconstructed; the other advance modes are not what this key is for.
+        old = None
+        if self.advance_mode not in ("subgoal", "env_flags"):
+            try:
+                seated = (bool(stage.done())
+                          or (self.flag_fallback and stage.done_flag is not None
+                              and bool(flags.get(stage.done_flag, False))))
+                settled = (self._place_since is not None
+                           and self.stage_replans - self._place_since >= self._place_settle)
+                old = bool(seated and settled and self.sensor.released())
+            except Exception:                        # logging must never break a rollout
+                old = None
+        self._pred_transition = {
+            "stage_idx": int(self.stage_idx), "stage": stage.name,
+            "replan": int(self.stage_replans), "predicate": bool(fired), "old_rule": old,
+            "components": {k: (bool(v) if isinstance(v, bool) else float(v))
+                           for k, v in components.items()},
+        }
+        if fired or (old is not None and old != fired):
+            print(f"[vlm_dp] place_certify stage={self.stage_idx} predicate={fired} "
+                  f"old_rule={old} replan={self.stage_replans} "
+                  f"{ {k: v for k, v in components.items() if not k.startswith('margin_')} }",
+                  flush=True)
+        return bool(fired)
+
+    def _preflight_history(self, stage, synth):
+        """Build the predicate history the synthesized satisfying state implies.
+
+        Two recipes, both in the vocabulary predicates.py documents. PLACE: the hand is open and
+        neither it nor the object is moving (released + quiescent). Everything else: the fingers
+        are stalled on the payload, the hand travelled horizontally across the window, and the
+        payload's keypoints kept their offset from it (closed_on_object + rides_with_hand), with
+        the object's height constant so a carry-height component is unaffected by the motion.
+        """
+        kps = np.asarray(synth["kp"], dtype=np.float64)
+        eef = np.asarray(synth["eef"], dtype=np.float64).reshape(3)
+        moved = list(synth.get("moved") or ())
+        hist = HistoryBuffer(maxlen=self._pred_hist.maxlen, dt=self._pred_hist.dt)
+        n = max(int(hist.maxlen), 2)
+        for t in range(n):
+            if stage.gripper == "place":
+                hist.push(kps, eef, 0.0)
+                continue
+            back = np.array([0.06 * (n - 1 - t) / (n - 1), 0.0, 0.0])
+            frame = kps.copy()
+            if moved:
+                frame[moved] -= back
+            hist.push(frame, eef - back, 0.30)
+        return hist
+
+    def preflight_probe(self, stage_idx, stage, synth):
+        """Run the ACTIVE advance test for one stage against an installed satisfying state.
+
+        rekep.advance_preflight has already installed the synthesized keypoints and TCP in the
+        tracker and the env, so every accessor _stage_reached reads -- stage.done(), stage.target(),
+        self._pos, the keypoint beliefs -- sees that state. Only the bridge-side evidence (the
+        predicate history and the aperture sensor) is supplied here. This calls the REAL
+        _stage_reached, so the preflight tests the rule that will run, not a copy of it.
+        """
+        saved = (self.stage_idx, self._pred_hist, self.sensor, self._hold_world,
+                 self._place_seen, self._place_since, self._pred_transition, self._grasp_probe)
+        try:
+            self.stage_idx = int(stage_idx)
+            self._pred_hist = self._preflight_history(stage, synth)
+            holding = stage.gripper != "place"
+            self.sensor = self._preflight_sensor(holding)
+            # The configured hold authority is left ALONE; only the latch's inputs are synthesized.
+            self._hold_world = self._preflight_hold_world(stage)
+            self._place_seen = self.stage_replans
+            self._place_since = self.stage_replans - self._place_settle
+            self._grasp_probe = np.zeros(3)
+            return bool(self._stage_reached(stage, {})), self.advance_test_name(stage)
+        finally:
+            (self.stage_idx, self._pred_hist, self.sensor, self._hold_world,
+             self._place_seen, self._place_since, self._pred_transition, self._grasp_probe) = saved
+
+    def _preflight_sensor(self, holding):
+        """Return a REAL ApertureGraspSensor driven into the state the satisfying state implies.
+
+        Fingers stalled mid-band on a payload while carrying, an open hand once the object has
+        been placed. Same class, same thresholds and same window lengths the rollout configures,
+        driven through its ordinary observe() loop -- so what the preflight certifies is the real
+        certificate, not a promise that one would have been issued.
+        """
+        sensor = ApertureGraspSensor(stall_margin=self.stall_margin, settle_eps=self.settle_eps,
+                                     close_steps=self.close_steps, settle_steps=self.settle_steps,
+                                     legacy=self.legacy_sensor,
+                                     stall_margin_enter=self.hold_enter,
+                                     stall_margin_exit=self.hold_exit)
+        stalled = (sensor.q_touch + (sensor.q_free - sensor.stall_margin_enter)) / 2.0
+        q = stalled if holding else 0.0
+        env = types.SimpleNamespace(gripper_q=(lambda q=q: q))
+        for _ in range(max(sensor.close_steps, sensor.settle_steps) + 2):
+            sensor.observe(env, holding)
+        return sensor
+
+    def _preflight_hold_world(self, stage):
+        """Return a world answering held() from a real latch over the synthesized state."""
+        latch = HoldLatch(self.sensor)
+        names = {n for n in (stage.grasp_obj, stage.payload) if n}
+        latch.update(self._hold_points(names) or {}, self.env.tcp(), names or None)
+        return _LatchWorld(latch)
+
+    def _plan_owns(self, stage):
+        """Return whether the plan authored its own completion evidence for this stage.
+
+        Evidence means a sub-goal constraint (the scalar the plan wrote, read through
+        ``stage.done()``) or a ``stage<N>_completion`` predicate. Under
+        ``advance.plan_authoritative`` such a stage advances on that evidence and on nothing else.
+        A stage the plan said nothing about is not covered and keeps its shipped rule.
+        """
+        if not self._plan_authoritative:
+            return False
+        comp = getattr(self.grounding, "completion", None)
+        return stage.constraint is not None or (comp is not None and self.stage_idx in comp)
+
+    def advance_test_name(self, stage):
+        """Name the branch of _stage_reached this stage will actually take (diagnostics only).
+
+        Mirrors the branch order below; the preflight quotes it in its refusal so the failing
+        test is named rather than guessed. It never decides anything.
+        """
+        plan_auth = self._plan_owns(stage)
+        if stage.gripper == "close" and stage.grasp_obj is not None:
+            if getattr(stage, "advance_on_done", False):
+                return "stage.done()"
+            if self.advance_mode == "env_flags":
+                return "env flag grasp_<obj>"
+            if getattr(stage, "contact", "pinch") == "press":
+                return "target proximity + closed()"
+            return "hold certificate" if self._grasp_advance_on_hold else "target proximity + hold"
+        if stage.gripper == "hold" and stage.payload is not None:
+            if getattr(stage, "advance_on_done", False) or plan_auth \
+                    or self.advance_mode == "subgoal":
+                return "stage.done() (plan sub-goal)" if plan_auth else "stage.done()"
+            return "payload z >= target().z - lift_tol"
+        if stage.gripper == "place":
+            if self._pred_place_transitions:
+                return "completion predicate"
+            if self.advance_mode == "subgoal":
+                return "released() + seat seen"
+            return "seated + settled + released()"
+        return "stage.done() (plan sub-goal)" if plan_auth else "done_flag / stage.done()"
+
     def _stage_reached(self, stage, flags):
         """Return whether the current stage target is satisfied."""
+        plan_auth = self._plan_owns(stage)
         if stage.gripper == "close" and stage.grasp_obj is not None:
+            # Deliberately UNCHANGED by plan_authoritative. The grasp rule is an aperture
+            # certificate -- the fingers are stalled on something of the expected width, in the
+            # place the object is believed to be -- which is a PHYSICAL measurement, not a
+            # geometric re-reading of the plan's prose. The plan cannot observe a grip, so there
+            # is nothing here for it to be authoritative about.
             if getattr(stage, "advance_on_done", False):  # Task-state completion.
                 return bool(stage.done())
             if self.advance_mode == "env_flags":
@@ -728,10 +1189,21 @@ class VlmDpBridge:
         if stage.gripper == "hold" and stage.payload is not None:
             if getattr(stage, "advance_on_done", False):  # Task-state completion.
                 return bool(stage.done())
+            if plan_auth:
+                # PLAN-AUTHORITATIVE: the stage's own sub-goal, and never the z-test below. The
+                # plan states what "lifted" means; the runtime does not get a second opinion.
+                return bool(stage.done())
             if self.advance_mode == "subgoal":  # Subgoal predicate.
                 return bool(stage.done())
+            # Legacy geometric test, retained for plans/compilers that author no sub-goal for a
+            # hold stage. Self-referential whenever target() and the payload belief are two
+            # readings of the SAME object (a surface keypoint vs its centre): the constant
+            # centre-to-surface offset then makes this unsatisfiable at any height.
             return float(self._pos(stage.payload)[2]) >= float(stage.target()[2]) - self.lift_tol
         if stage.gripper == "place":
+            certified = self._place_certified(stage, flags)
+            if certified is not None:
+                return certified
             if self.advance_mode == "subgoal":
                 # A released payload may no longer satisfy a hover-based subgoal.
                 return bool(self.sensor.released()) and self._place_seen is not None
@@ -744,4 +1216,8 @@ class VlmDpBridge:
             settled = (self._place_since is not None
                        and self.stage_replans - self._place_since >= self._place_settle)
             return seated and settled and self.sensor.released()
+        if plan_auth:
+            # Move stages with no payload (gripper "open"): the plan's sub-goal decides, and an
+            # env progress flag may not co-confirm it.
+            return bool(stage.done())
         return bool(_should_advance(stage, flags, 0, self.commit_hold))

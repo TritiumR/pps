@@ -1,0 +1,293 @@
+# weight -- deterministic stand-in for a GPT-4o ReKep response.
+# Format follows rekep/prompts/prompt_template.txt.
+#
+# Task: "put pear and apple on the scale"
+#
+# The task involves eight stages:
+# 1. Grasp the pear.
+# 2. Lift the pear clear of the board.
+# 3. Carry the pear above the scale.
+# 4. Lower the pear onto the scale.
+# 5. Grasp the apple.
+# 6. Lift the apple clear of the board.
+# 7. Carry the apple above the scale.
+# 8. Lower the apple onto the scale.
+#
+# Transport is split from placement so the carry-height path rule can be unconditional:
+# stages 2-3 forbid dropping below carry height, stage 4 is the descent.
+#
+# The descent stages (4 and 8) are themselves GATED: their second path constraint forbids
+# dropping below the hover height while still horizontally far from the place point, and
+# relaxes linearly to zero as the horizontal offset closes inside 8cm. That makes the descent
+# a straight-down move over the target instead of a diagonal dive at it -- motion shaping
+# stated in the plan rather than hidden in a cost term.
+
+# The lift stages (2 and 6) state their sub-goal as a ONE-SIDED VERTICAL shortfall, the same
+# idiom the tea plan uses for its pour margin, rather than a 3-D distance to a lift point.
+# With subgoal_eps 0.12 a 3-D ball lets the lift stage complete at +3cm of rise whenever the
+# gripper happens to be xy-centred on the lift column, which is what the measured carry
+# heights show (0.122-0.145 m against a 0.158 m hand-written baseline). One-sided vertical
+# makes "below eps" mean height and nothing else, and stops penalising a lift that overshoots.
+#
+num_stages = 8
+
+
+### stage 1 sub-goal constraints
+def stage1_subgoal_constraint1(end_effector, keypoints):
+    """Align the end-effector with the pear (keypoint {p})."""
+    return np.linalg.norm(end_effector - keypoints[{p}])
+
+### stage 1 path constraints
+# No path constraints needed for grasping.
+
+### stage 2 sub-goal constraints
+def stage2_subgoal_constraint1(end_effector, keypoints):
+    """The pear (keypoint {p}) has reached carry height (vertical shortfall only)."""
+    return np.maximum(0.0, ({lift_z_pear}) - keypoints[{p}][..., 2])
+
+### stage 2 path constraints
+def stage2_path_constraint1(end_effector, keypoints):
+    """The robot must still be holding the pear (keypoint {p})."""
+    return get_grasping_cost_by_keypoint_idx({p})
+
+### stage 3 sub-goal constraints
+def stage3_subgoal_constraint1(end_effector, keypoints):
+    """The pear (keypoint {p}) hovers directly above its place point on the scale."""
+    offsetted_point = keypoints[{s}] + np.array({hover_pear})
+    return np.linalg.norm(keypoints[{p}] - offsetted_point)
+
+### stage 3 path constraints
+def stage3_path_constraint1(end_effector, keypoints):
+    """The robot must still be holding the pear (keypoint {p})."""
+    return get_grasping_cost_by_keypoint_idx({p})
+
+def stage3_path_constraint2(end_effector, keypoints):
+    """Keep the pear (keypoint {p}) clear of the board while carrying it across."""
+    return np.maximum(0.0, ({carry_z_pear}) - keypoints[{p}][..., 2])
+
+### stage 4 sub-goal constraints
+def stage4_subgoal_constraint1(end_effector, keypoints):
+    """The pear (keypoint {p}) rests at the scale-top placement point."""
+    offsetted_point = keypoints[{s}] + np.array({off_pear})
+    return np.linalg.norm(keypoints[{p}] - offsetted_point)
+
+### stage 4 path constraints
+def stage4_path_constraint1(end_effector, keypoints):
+    """The robot must still be holding the pear (keypoint {p})."""
+    return get_grasping_cost_by_keypoint_idx({p})
+
+def stage4_path_constraint2(end_effector, keypoints):
+    """Stay above the hover height until horizontally aligned with the place point."""
+    place_xy = keypoints[{s}][..., :2] + np.array({off_pear})[:2]
+    xy_off = np.linalg.norm(keypoints[{p}][..., :2] - place_xy, axis=-1)
+    low = np.maximum(0.0, ({hover_z_pear}) - keypoints[{p}][..., 2])
+    return low * np.minimum(1.0, xy_off / 0.08)
+
+### stage 5 sub-goal constraints
+def stage5_subgoal_constraint1(end_effector, keypoints):
+    """Align the end-effector with the apple (keypoint {a})."""
+    return np.linalg.norm(end_effector - keypoints[{a}])
+
+### stage 5 path constraints
+# No path constraints needed for grasping.
+
+### stage 6 sub-goal constraints
+def stage6_subgoal_constraint1(end_effector, keypoints):
+    """The apple (keypoint {a}) has reached carry height (vertical shortfall only)."""
+    return np.maximum(0.0, ({lift_z_apple}) - keypoints[{a}][..., 2])
+
+### stage 6 path constraints
+def stage6_path_constraint1(end_effector, keypoints):
+    """The robot must still be holding the apple (keypoint {a})."""
+    return get_grasping_cost_by_keypoint_idx({a})
+
+### stage 7 sub-goal constraints
+def stage7_subgoal_constraint1(end_effector, keypoints):
+    """The apple (keypoint {a}) hovers directly above its place point on the scale."""
+    offsetted_point = keypoints[{s}] + np.array({hover_apple})
+    return np.linalg.norm(keypoints[{a}] - offsetted_point)
+
+### stage 7 path constraints
+def stage7_path_constraint1(end_effector, keypoints):
+    """The robot must still be holding the apple (keypoint {a})."""
+    return get_grasping_cost_by_keypoint_idx({a})
+
+def stage7_path_constraint2(end_effector, keypoints):
+    """Keep the apple (keypoint {a}) clear of the board while carrying it across."""
+    return np.maximum(0.0, ({carry_z_apple}) - keypoints[{a}][..., 2])
+
+### stage 8 sub-goal constraints
+def stage8_subgoal_constraint1(end_effector, keypoints):
+    """The apple (keypoint {a}) rests at the scale-top placement point."""
+    offsetted_point = keypoints[{s}] + np.array({off_apple})
+    return np.linalg.norm(keypoints[{a}] - offsetted_point)
+
+### stage 8 path constraints
+def stage8_path_constraint1(end_effector, keypoints):
+    """The robot must still be holding the apple (keypoint {a})."""
+    return get_grasping_cost_by_keypoint_idx({a})
+
+def stage8_path_constraint2(end_effector, keypoints):
+    """Stay above the hover height until horizontally aligned with the place point."""
+    place_xy = keypoints[{s}][..., :2] + np.array({off_apple})[:2]
+    xy_off = np.linalg.norm(keypoints[{a}][..., :2] - place_xy, axis=-1)
+    low = np.maximum(0.0, ({hover_z_apple}) - keypoints[{a}][..., 2])
+    return low * np.minimum(1.0, xy_off / 0.08)
+
+
+"""
+Summarize keypoints to be grasped in all grasping stages.
+For a grasping stage write the keypoint index; for a non-grasping stage write -1.
+"""
+grasp_keypoints = [{p}, -1, -1, -1, {a}, -1, -1, -1]
+
+"""
+Summarize at **the end of which stage** the robot should release each keypoint.
+"""
+release_keypoints = [-1, -1, -1, {p}, -1, -1, -1, {a}]
+
+
+
+# ---------------------------------------------------------------------------
+# Completion predicates (vlm_dp extension to the ReKep response format).
+#
+# A sub-goal constraint answers "how far is this stage from done", and the runtime turns that
+# into a transition by testing the scalar against subgoal_eps. These answer a different
+# question -- "has the EVENT this stage names actually happened" -- with semantics and time
+# instead of a scalar crossing a line. None of them re-expresses `subgoal < eps`: no predicate
+# measures a distance to the stage's sub-goal point.
+#
+# They are written in the PRIMITIVE VOCABULARY the runtime provides (vlm_dp/grounding/
+# predicates.py :: PredicateRuntime). The plan states WHICH event each stage names; the
+# primitive states HOW that event is sensed. Nothing here re-derives a window, a sensor
+# threshold or a tolerance -- that is exactly the duplication the primitives exist to remove,
+# and every stage below that used to carry its own copy now names the event instead.
+#
+#   EVENTS, each of which also fills `components` with its named boolean and the margin_*
+#   floats behind it:
+#     grasped(kp, name, "acquire")   the pick-up event: fingers stalled on something for a
+#                                    whole window, POSITIVE co-motion with a hand that
+#                                    actually travelled, and the object within reach.
+#     grasped(kp, name, "maintain")  still holding: fingers stalled and no slip relative to a
+#                                    hand that moved. A still hand cannot slip, so it passes.
+#                                    Acquisition needs evidence; maintenance needs only the
+#                                    absence of counter-evidence, and collapsing the two would
+#                                    let a pick-up fire on an object that never left the board.
+#     released(kp, name)             the hand let go: it departed while the object stayed, or
+#                                    the fingers opened.
+#     stationary(kp, name)           the object stopped moving. "It is resting on the scale" is
+#                                    physically a statement about speed, and a distance to a
+#                                    place point cannot see it at all.
+#     sustained(cost_fn, name)       this plan's OWN geometry, in the ReKep cost convention
+#                                    (<= 0 satisfied, called per frame as cost_fn(ee, kp)),
+#                                    held over the last few belief frames rather than at one
+#                                    instant, so a single noisy sample cannot advance a stage.
+#
+#   TOLERANCES, resolved from the same grounding geometry the cost terms use, so this plan
+#   writes no magic number:
+#     target_region_radius(kp)  the placement region around an anchor keypoint -- a REGION, not
+#                               a ball: the transport goals name the place point's xy
+#                               neighbourhood together with a one-sided vertical, in the idiom
+#                               the rest of this plan is in.
+#     clearance_margin(kp)      the vertical band separating "still clear above the scale" from
+#                               "descended onto it". Defined only for a keypoint on a body this
+#                               plan CARRIES (the pear, the apple); asking for it on a fixture
+#                               feature is refused rather than answered with a wrong number.
+#
+#   DIAGNOSTIC KEYS. Every boolean these stages used to publish keeps its name and its meaning:
+#   closed_on_object, rides_with_hand, at_hand, still_held, inside_place_region,
+#   still_clear_of_scale, descended, hand_let_go, object_quiescent, and the margins
+#   margin_aperture / margin_slip_ratio / margin_hand_disp_m / margin_reach_m /
+#   margin_open_frac / margin_speed_mps. Stage 1 and 5 additionally publish an overall
+#   pear_in_hand / apple_in_hand, which is the conjunction they used to return unnamed.
+#   Three margins are RENAMED because sustained() reports one uniform quantity -- the worst
+#   COST in the window, negative when satisfied -- where the old blocks reported three
+#   differently-signed ad-hoc numbers:
+#     margin_height_shortfall_m -> margin_at_carry_height       (same value)
+#     margin_xy_off_m           -> margin_inside_place_region   (now offset MINUS the radius)
+#     margin_clearance_m        -> margin_still_clear_of_scale  (now negated: cost, not clearance)
+#     margin_descent_m          -> margin_descended             (now negated: cost, not clearance)
+#
+# Interface. Each predicate takes the (end_effector, keypoints) the constraints take, plus
+#   history     -- recent frames, OLDEST FIRST, history["dt"] seconds apart
+#   robot_state -- robot_state["gripper_aperture"] (float), robot_state["gripper_closed_cmd"] (bool)
+#   components  -- a caller-supplied dict the PRIMITIVES fill in
+# Each returns a plain bool, and reads beliefs and proprioception only -- never privileged state.
+# ---------------------------------------------------------------------------
+
+
+### stage 1 completion predicate
+def stage1_completion(history, end_effector, keypoints, robot_state, components):
+    """Pear grasped: the fingers are stalled on something, and the pear rides with the hand."""
+    pear_in_hand = grasped({p}, "pear_in_hand", "acquire")
+    return bool(pear_in_hand)
+
+### stage 2 completion predicate
+def stage2_completion(history, end_effector, keypoints, robot_state, components):
+    """Pear lifted: still owned by the hand, and it has held carry height for the last third of a second."""
+    still_held = grasped({p}, "still_held", "maintain")
+    at_carry_height = sustained(
+        lambda ee, kp: ({lift_z_pear}) - kp[{p}][..., 2], "at_carry_height")
+    return bool(still_held and at_carry_height)
+
+### stage 3 completion predicate
+def stage3_completion(history, end_effector, keypoints, robot_state, components):
+    """Pear over the scale: still owned by the hand, inside the place region in xy, still clear above it."""
+    still_held = grasped({p}, "still_held", "maintain")
+    inside_place_region = sustained(
+        lambda ee, kp: np.linalg.norm(kp[{p}][..., :2] - (kp[{s}][..., :2] + np.array({off_pear})[:2]),
+                                      axis=-1) - target_region_radius({s}), "inside_place_region")
+    still_clear_of_scale = sustained(
+        lambda ee, kp: (({hover_z_pear}) - clearance_margin({p})) - kp[{p}][..., 2],
+        "still_clear_of_scale")
+    return bool(still_held and inside_place_region and still_clear_of_scale)
+
+### stage 4 completion predicate
+def stage4_completion(history, end_effector, keypoints, robot_state, components):
+    """Pear placed: down in the place region, no longer owned by the hand, and no longer moving."""
+    hand_let_go = released({p}, "hand_let_go")
+    inside_place_region = sustained(
+        lambda ee, kp: np.linalg.norm(kp[{p}][..., :2] - (kp[{s}][..., :2] + np.array({off_pear})[:2]),
+                                      axis=-1) - target_region_radius({s}), "inside_place_region")
+    object_quiescent = stationary({p}, "object_quiescent")
+    descended = sustained(
+        lambda ee, kp: kp[{p}][..., 2] - (({hover_z_pear}) - clearance_margin({p})), "descended")
+    return bool(hand_let_go and inside_place_region and object_quiescent and descended)
+
+### stage 5 completion predicate
+def stage5_completion(history, end_effector, keypoints, robot_state, components):
+    """Apple grasped: the fingers are stalled on something, and the apple rides with the hand."""
+    apple_in_hand = grasped({a}, "apple_in_hand", "acquire")
+    return bool(apple_in_hand)
+
+### stage 6 completion predicate
+def stage6_completion(history, end_effector, keypoints, robot_state, components):
+    """Apple lifted: still owned by the hand, and it has held carry height for the last third of a second."""
+    still_held = grasped({a}, "still_held", "maintain")
+    at_carry_height = sustained(
+        lambda ee, kp: ({lift_z_apple}) - kp[{a}][..., 2], "at_carry_height")
+    return bool(still_held and at_carry_height)
+
+### stage 7 completion predicate
+def stage7_completion(history, end_effector, keypoints, robot_state, components):
+    """Apple over the scale: still owned by the hand, inside the place region in xy, still clear above it."""
+    still_held = grasped({a}, "still_held", "maintain")
+    inside_place_region = sustained(
+        lambda ee, kp: np.linalg.norm(kp[{a}][..., :2] - (kp[{s}][..., :2] + np.array({off_apple})[:2]),
+                                      axis=-1) - target_region_radius({s}), "inside_place_region")
+    still_clear_of_scale = sustained(
+        lambda ee, kp: (({hover_z_apple}) - clearance_margin({a})) - kp[{a}][..., 2],
+        "still_clear_of_scale")
+    return bool(still_held and inside_place_region and still_clear_of_scale)
+
+### stage 8 completion predicate
+def stage8_completion(history, end_effector, keypoints, robot_state, components):
+    """Apple placed: down in the place region, no longer owned by the hand, and no longer moving."""
+    hand_let_go = released({a}, "hand_let_go")
+    inside_place_region = sustained(
+        lambda ee, kp: np.linalg.norm(kp[{a}][..., :2] - (kp[{s}][..., :2] + np.array({off_apple})[:2]),
+                                      axis=-1) - target_region_radius({s}), "inside_place_region")
+    object_quiescent = stationary({a}, "object_quiescent")
+    descended = sustained(
+        lambda ee, kp: kp[{a}][..., 2] - (({hover_z_apple}) - clearance_margin({a})), "descended")
+    return bool(hand_let_go and inside_place_region and object_quiescent and descended)

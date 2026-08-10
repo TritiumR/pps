@@ -352,6 +352,19 @@ class ObservationsCfg:
             },
         )
 
+        # Observation only: the success DoneTerm already gates on apple_on_scale, but it was
+        # not exposed as a subtask, so the final leg of the task was invisible in eval logs.
+        # Params mirror the success term exactly so the two can never disagree.
+        apple_on_scale = ObsTerm(
+            func=mdp.apple_on_scale,
+            params={
+                "apple_cfg": SceneEntityCfg("apple"),
+                "scale_cfg": SceneEntityCfg("scale"),
+                "y_offset": -0.05,
+                "xy_threshold": SCALE_XY_THRESHOLD,
+            },
+        )
+
         def __post_init__(self):
             self.enable_corruption = False
             self.concatenate_terms = False

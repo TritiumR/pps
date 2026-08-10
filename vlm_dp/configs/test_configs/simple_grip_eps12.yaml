@@ -1,0 +1,74 @@
+# simple_grip_eps12 -- simple_mean_grip with ONE change: grounding.subgoal_eps 0.06 -> 0.12.
+#
+# Instrumented finding (simple_grip1, 1/10): the pear leg is solved (placed by step 53-103 in
+# 10/10) and 3 seeds COMPLETED the task at ~step 150 then sat in the goal state ~1450 steps --
+# the terminal release fires only when the VLM constraint reads < subgoal_eps, and 6cm against
+# 25-75mm apple perception error never fires. Intermediate stages recover via backtracking; the
+# final release has no recovery path. 12cm lets it fire.
+cost:
+  terms:
+    rekep_subgoal: 100.0
+    rekep_path: 100.0
+    center_region: 120.0
+    aperture_region: 80.0
+    tip_z: 80.0
+    grasp_standoff: 40.0
+    close_gripper: 2.0
+    carry_hold: 40.0
+    release_gripper: 40.0
+    smooth: 50.4
+    joint_delta: 35.0
+    floor: 40.0
+    straddle: 30.0
+    orientation: 8.0
+    yaw: 5.0
+    grasp_axis: 15.0
+  geometry:
+    ee_r: 0.035
+    coll_clear: 0.02
+    finger_r: 0.012
+    open_half: 0.04
+    tool_back: 0.06
+    tcp_to_tip: 0.0
+    center_scale: 0.4
+    grasp_dead_zone: proportional
+    close_z_scale: 0.025
+    preshape_z: 0.025
+    release_step_motion_cap: 0.004
+    retreat_margin: 0.02
+    retreat_clear: 0.04
+    rise_first_span: 0.05
+    rise_first_step: 0.01
+    not_hold_sigma: 0.05
+    carry_clear_include_placed: true
+    carry_clear_margin: 0.005
+    preshape_xy_tol: 0.02
+    corridor_margin: 0.01
+    grasp_approach_cap: 0.008
+    grasp_brake_slope: 0.25
+    grasp_descend_closing_only: true
+    approach_hover: 0.08
+    approach_xy_tol: 0.02
+    close_xy_floor: 0.008
+    aperture_margin: 0.006
+    release_xy: 0.06
+    release_z: 0.02
+    place_approach_margin: 0.01
+    release_commit_aniso: true
+    commit_measured_gate: true
+    release_commit_band: 3.0
+    place_descend_radius: 0.08
+    place_release_clearance: 0.012
+    clear_max_radius: 0.1
+    subgoal_mean: true
+advance:
+  flag_fallback: false
+  release_debug: true
+  grasp_advance_on_hold: true
+  ground_error_debug: true
+grounding:
+  rotate_grasp_offset: false
+  support_extents: false
+  seat_from_plane: true
+  lift_latch_xy: false
+  subgoal_eps: 0.12

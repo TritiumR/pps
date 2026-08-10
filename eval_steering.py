@@ -1,5 +1,6 @@
 import argparse
 import atexit
+import dataclasses
 import json
 import os
 import random
@@ -426,12 +427,43 @@ def _run_multi_worker_launcher(pre_args: argparse.Namespace, argv: list[str]) ->
         rollout_offset += worker_seed_end - worker_seed_start
 
     def terminate_workers() -> None:
+        # A worker that is blocked waiting on the start barrier is inside Isaac Sim, which
+        # installs its own SIGTERM handling and does not necessarily exit on it. Escalate to
+        # SIGKILL, otherwise the "wait for every worker to exit" loop below never returns and
+        # the whole job burns its wall clock with nothing running.
+        live = []
         for worker in workers:
             process = worker["process"]
             if process is not None and process.poll() is None:
                 process.terminate()
+                live.append(process)
+        deadline = time.time() + 30.0
+        for process in live:
+            try:
+                process.wait(timeout=max(deadline - time.time(), 0.1))
+            except subprocess.TimeoutExpired:
+                process.kill()
+
+    def report_worker_failure(worker, reason: str) -> None:
+        """Surface a dead worker's own last words; they are only in its log file."""
+        if worker["log_handle"] is not None:
+            worker["log_handle"].flush()
+        try:
+            with open(worker["log_path"], encoding="utf-8", errors="replace") as handle:
+                tail = [line.rstrip() for line in handle.readlines()[-40:]]
+        except OSError:
+            tail = []
+        print(
+            f"worker {worker['id']} (gpu {worker['gpu']}, seeds "
+            f"{worker['seed_start']}-{worker['seed_end'] - 1}) failed to initialize: {reason}. "
+            f"Tail of {worker['log_path']}:",
+            file=sys.stderr,
+        )
+        for line in tail:
+            print(f"  | {line}", file=sys.stderr)
 
     atexit.register(terminate_workers)
+    init_stall_s = float(os.environ.get("VLMDP_WORKER_INIT_STALL_S", 300.0))
     failed_to_initialize = False
     for wave_start in range(0, len(workers), len(gpu_ids)):
         wave = workers[wave_start : wave_start + len(gpu_ids)]
@@ -450,13 +482,40 @@ def _run_multi_worker_launcher(pre_args: argparse.Namespace, argv: list[str]) ->
                 stdout=worker["log_handle"],
                 stderr=subprocess.STDOUT,
             )
+        for worker in wave:
+            worker["progress_size"] = 0
+            worker["progress_time"] = time.time()
         while not all(worker["ready"] for worker in wave):
             for worker in workers:
                 _read_worker_progress(worker)
+            now = time.time()
             for worker in wave:
-                return_code = worker["process"].poll()
-                if return_code is not None and not worker["ready"]:
-                    failed_to_initialize = True
+                if worker["ready"]:
+                    continue
+                reason = None
+                if worker["process"].poll() is not None:
+                    reason = f"process exited with code {worker['process'].returncode}"
+                else:
+                    # A worker that aborts during grounding (e.g. the ReKep preflight refusing an
+                    # unusable mask) raises SystemExit, and Isaac Sim then wedges on shutdown --
+                    # the process never exits, so polling alone never notices. Treat a worker that
+                    # has stopped emitting init progress as failed, or the launcher waits forever.
+                    try:
+                        size = os.path.getsize(worker["progress_path"])
+                    except OSError:
+                        size = worker["progress_size"]
+                    if size != worker["progress_size"]:
+                        worker["progress_size"] = size
+                        worker["progress_time"] = now
+                    elif now - worker["progress_time"] > init_stall_s:
+                        reason = (f"no initialization progress for {init_stall_s:.0f}s while still "
+                                  f"running (hung, most likely after a fatal error)")
+                if reason is None:
+                    continue
+                if not worker.get("reported"):
+                    worker["reported"] = True
+                    report_worker_failure(worker, reason)
+                failed_to_initialize = True
             if failed_to_initialize:
                 break
             time.sleep(0.1)
@@ -588,7 +647,12 @@ import re
 
 from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
 from sim_free_mpc import AccelActionMPC, AccelMPCConfig, SimFreeMPC, SimFreeMPCConfig
-from sim_free_mpc.action_space import clamp_real_action_chunk
+from sim_free_mpc.action_space import (
+    DemoDeltaDecodePolicy,
+    clamp_real_action_chunk,
+    decode_model_action_chunks,
+    load_action_norm_stats_json,
+)
 from sim_free_mpc.ddim import ddim_iteration_alphas
 from sim_free_mpc.planner import task_tilt_weight
 from sim_free_mpc.score_steering import combine_scores, steer_scale_for_stage
@@ -940,12 +1004,15 @@ def _prepare_proxy_steering(model, observation):
 
     if model_type in (_model.ModelType.PROXY, _model.ModelType.PROXY_SCORE):
         images, img_masks, state = model._preprocess_observation(observation, train=False)
-        prefix_embs, prefix_pad_masks, _ = model.embed_prefix(images, img_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = model.embed_prefix(
+            images, img_masks
+        )
         return {
             "kind": "sequence",
             "state": state,
             "prefix_embs": prefix_embs,
             "prefix_pad_masks": prefix_pad_masks,
+            "prefix_att_masks": prefix_att_masks,
         }
 
     if model_type == _model.ModelType.PROXY_SOUND:
@@ -1070,6 +1137,7 @@ def _predict_proxy_score(prepared_proxy, model, x_t_path, time_cond):
         prepared_proxy["prefix_pad_masks"],
         x_t_model,
         time_cond,
+        prefix_att_masks=prepared_proxy.get("prefix_att_masks"),
     )
 
 
@@ -1336,16 +1404,42 @@ def _base_source_name(args) -> str:
 def _base_decode_only_blockers(args) -> list[str]:
     """Reasons --base_decode_only cannot be honored; empty when the base network is unused.
 
-    Only the geometric MBD base drives the chunk entirely from the planner.
+    Every MBD mode drives the chunk from the planner: the sole base forward pass is gated on
+    `use_vlm_mpc_base`, which is true for base, task and full score steering alike. Score
+    steering adds a proxy score, not a base forward pass, so it decodes without base weights
+    too -- only `base_model.config.*` and `sample_noise` are read, both of which the
+    decode-only stub provides.
     """
     blockers = []
-    if _base_source_name(args) != "mbd_base":
+    if not _uses_vlm_mpc_base(args):
         blockers.append(
             f"base_source={_base_source_name(args)} forward-passes the base network "
-            "(only mbd_base decodes without it)"
+            "(only the MBD planner bases decode without it)"
         )
     if getattr(args, "compare_difference", False):
         blockers.append("--compare_difference runs the base velocity field")
+    return blockers
+
+
+def _base_action_space_blockers(args) -> list[str]:
+    """Reasons --base_action_space demo_delta cannot be honored; empty when the flag applies.
+
+    Only the MBD planner bases decode through `decode_model_action_chunks`; every other base
+    hands its chunk to the checkpoint's own output transforms, which cannot be re-scaled here.
+    """
+    blockers = []
+    if not _uses_vlm_mpc_base(args):
+        blockers.append(
+            f"base_source={_base_source_name(args)} decodes through the checkpoint's own "
+            "output transforms (demo-delta decoding is MBD-planner only)"
+        )
+    if _uses_accel_action_mpc(args):
+        blockers.append(
+            "--mpc_optimize_space accel plans in joint/acceleration space and never decodes "
+            "through the action stats"
+        )
+    if not getattr(args, "base_action_stats", ""):
+        blockers.append("--base_action_stats <action_norm_stats.json> is required")
     return blockers
 
 
@@ -1586,6 +1680,7 @@ def infer_actions_with_mpc(
     mpc_planner=None,
     mpc_context=None,
     warm_shift_steps=0,
+    base_decode_policy=None,
 ):
     global _LAST_INFERENCE_RUNTIME
     standalone_role = _standalone_policy_role(args)
@@ -1641,6 +1736,7 @@ def infer_actions_with_mpc(
         mpc_planner=mpc_planner,
         mpc_context=mpc_context,
         warm_shift_steps=warm_shift_steps,
+        base_decode_policy=base_decode_policy,
     )
 
 
@@ -1654,6 +1750,7 @@ def _infer_actions_eager(
     mpc_planner=None,
     mpc_context=None,
     warm_shift_steps=0,
+    base_decode_policy=None,
 ):
     global _LAST_INFERENCE_RUNTIME
     base_obs, base_inputs = _obs_to_input_checked(base_policy, raw_obs, "base")
@@ -1905,7 +2002,19 @@ def _infer_actions_eager(
         # diagnostics for this inference are only emitted from the LAST level, so the trace has to
         # start empty here or it would carry over from the previous inference.
         mpc_planner.begin_inference()
-    while denoise_time >= -dt / 2:
+    # --ddim_final_level: run the DDIM/score paths' last reverse transition.
+    # ddim_iteration_alphas accepts iteration in [0, num_iterations), and at the last one
+    # (iteration == num_steps) timestep is 0 and prev_timestep < 0, which is the only way to
+    # reach its set_alpha_to_one branch -- i.e. the final refinement level. The default bound
+    # (-dt/2) stops at iteration num_steps-1, so that level never runs and both the parameter
+    # and that branch are dead. Opt-in, because running it changes every MPC inference and so
+    # is not comparable to runs without it. The flow path integrates x_t from t=1 to t=0 in
+    # exactly num_steps steps and must NOT take an extra one, so the bound stays path-local.
+    _ddim_levels = bool(getattr(args, "ddim_final_level", False)) and use_vlm_mpc_base and (
+        disable_steering or score_steering_mode in ("full", "task")
+    )
+    denoise_stop = (dt / 2) if _ddim_levels else (-dt / 2)
+    while denoise_time >= denoise_stop:
         expanded_time = denoise_time.expand(bsize)
 
         if use_vlm_mpc_base and float(getattr(args, "inject_proxy", 0.0)) > 0.0:
@@ -2523,7 +2632,18 @@ def _infer_actions_eager(
     if use_vlm_mpc_base and args.mpc_update == "mbd_score_action_warm":
         mpc_planner.set_warm_action(x_t, state=base_inputs["state"])
 
-    actions = base_policy.output_to_actions(base_inputs, x_t)
+    if base_decode_policy is None:
+        actions = base_policy.output_to_actions(base_inputs, x_t)
+    else:
+        # The executed chunk must leave the same space the planner scored it in, so it cannot go
+        # through the checkpoint's output transforms.
+        actions = (
+            decode_model_action_chunks(base_decode_policy, base_inputs, x_t, apply_clamp=False)
+            .real_actions[0]
+            .detach()
+            .cpu()
+            .numpy()
+        )
     if use_vlm_mpc_base:
         current_joint_pos = raw_obs.get("observation/joint_position")
         max_joint_delta = (
@@ -3734,6 +3854,13 @@ def _write_experiment_results(path: str, payload: dict[str, Any]) -> None:
         "num_successes": successes,
         "success_rate": successes / len(scored) if scored else 0.0,
         "num_errored": len(episodes) - len(scored),
+        # Both readings, so neither has to be recomputed and the excluded-denominator choice
+        # cannot be mistaken for a hidden one: an ungroundable scene is not a policy failure,
+        # but a run with many of them did not attempt as many episodes as it requested.
+        "num_requested": len(episodes),
+        "success_rate_including_errored": (
+            successes / len(episodes) if episodes else 0.0
+        ),
     }
     tmp_path = f"{path}.tmp"
     with open(tmp_path, "w", encoding="utf-8") as handle:
@@ -4065,6 +4192,16 @@ def parse_args():
         type=str,
         default=None,
         help="Task proxy checkpoint directory. Defaults to the matching task_prompts.json entry.",
+    )
+    parser.add_argument(
+        "--task_attention",
+        "--task-attention",
+        choices=("config", "causal", "bidirectional"),
+        default="config",
+        help=(
+            "Attention mask used by the task score proxy. 'config' uses the model config; "
+            "the explicit modes are checkpoint-compatibility/ablation overrides."
+        ),
     )
     parser.add_argument(
         "--ref_checkpoint_dir",
@@ -4543,6 +4680,27 @@ def parse_args():
             "Set to 0 to disable the per-step delta clamp. Joint limits are still enforced."
         ),
     )
+    parser.add_argument(
+        "--ddim_final_level",
+        action="store_true",
+        help=(
+            "Run the final DDIM reverse transition on the score/MPC paths. num_iterations is "
+            "num_steps+1, but the loop stops one short, so iteration num_steps (timestep 0, "
+            "alpha_prev=1.0 -- the only level reaching ddim_iteration_alphas' set_alpha_to_one "
+            "branch) never executes. Changes every MPC inference, so it is not comparable to "
+            "runs without it. Does not affect the flow path, which correctly takes num_steps."
+        ),
+    )
+    parser.add_argument(
+        "--cost_executable_actions",
+        action="store_true",
+        help=(
+            "Score MPC candidates after the execution clamp (joint limits + per-step "
+            "joint delta) instead of before it. Without this the planner can select a "
+            "plan whose low cost depends on motion that is truncated before env.step. "
+            "Changes the optimisation landscape, so it is not comparable to runs without it."
+        ),
+    )
     parser.add_argument("--mpc_debug", action="store_true")
     parser.add_argument(
         "--mpc_debug_stdout",
@@ -4600,6 +4758,29 @@ def parse_args():
             "checkpoint WITHOUT loading model weights. Only valid where the base network is "
             "never forward-passed (the geometric MBD base, --vlm_base). Saves the pi0.5 load "
             "at startup and its GPU residency."
+        ),
+    )
+    parser.add_argument(
+        "--base_action_space",
+        type=str,
+        default="policy",
+        choices=["policy", "demo_delta"],
+        help=(
+            "Action representation the MBD planner optimizes and decodes in. 'policy' (default) "
+            "keeps the base checkpoint's own normalization -- for pi0.5 that is the DROID "
+            "quantile band, which every validated Isaac result is co-tuned with. 'demo_delta' "
+            "switches to the demonstration joint-delta scale of --base_action_stats, the space "
+            "mujoco_eval/robolab_eval already plan in. Only the ACTION half changes; the state "
+            "is still unnormalized with the checkpoint's stats."
+        ),
+    )
+    parser.add_argument(
+        "--base_action_stats",
+        type=str,
+        default="",
+        help=(
+            "action_norm_stats-style JSON ('mean' and 'std' arrays) used by "
+            "--base_action_space demo_delta. Required by that mode, ignored otherwise."
         ),
     )
     parser.add_argument(
@@ -4888,6 +5069,13 @@ if args.base_decode_only:
         parser.error(
             "--base_decode_only cannot be used here: " + "; ".join(_decode_only_blockers)
         )
+if args.base_action_space != "policy":
+    _action_space_blockers = _base_action_space_blockers(args)
+    if _action_space_blockers:
+        parser.error(
+            f"--base_action_space {args.base_action_space} cannot be used here: "
+            + "; ".join(_action_space_blockers)
+        )
 if args.fast_gt:
     _fast_gt_reasons = _fast_gt_blockers(args)
     if _fast_gt_reasons:
@@ -5132,7 +5320,30 @@ if "base" in required_policy_roles:
 if "task" in required_policy_roles:
     task_config_name = _config_name_from_checkpoint_dir(task_checkpoint_dir)
     task_config = _config.get_config(task_config_name)
-    _report_initialization_stage(args, "loading task policy", config=task_config_name)
+    if args.task_attention != "config":
+        if not hasattr(task_config.model, "bidirectional_attention"):
+            raise ValueError(
+                "--task_attention is only supported for ProxyScore task models; "
+                f"config {task_config_name!r} uses {type(task_config.model).__name__}."
+            )
+        task_config = dataclasses.replace(
+            task_config,
+            model=dataclasses.replace(
+                task_config.model,
+                bidirectional_attention=args.task_attention == "bidirectional",
+            ),
+        )
+    task_attention = (
+        "bidirectional"
+        if getattr(task_config.model, "bidirectional_attention", False)
+        else "causal"
+    )
+    _report_initialization_stage(
+        args,
+        "loading task policy",
+        config=task_config_name,
+        attention=task_attention,
+    )
     task_policy = policy_config.create_trained_policy(
         task_config,
         task_checkpoint_dir,
@@ -5174,6 +5385,28 @@ if args.mpc_debug and base_policy is not None:
         "debug_torch_output_to_actions_norm_stats": True,
     }
 
+# Opt-in action representation for the MBD base. None keeps the checkpoint's own decode surface,
+# so every existing run is untouched.
+base_decode_policy = None
+if args.base_action_space == "demo_delta":
+    _delta_mean, _delta_std = load_action_norm_stats_json(args.base_action_stats)
+    base_decode_policy = DemoDeltaDecodePolicy(
+        base_policy,
+        _delta_mean,
+        _delta_std,
+        source=f"demo_delta:{args.base_action_stats}",
+    )
+    print(
+        "Base action space: demo_delta "
+        f"(stats={args.base_action_stats}, mean_shape={tuple(_delta_mean.shape)}, "
+        f"std_shape={tuple(_delta_std.shape)})",
+        flush=True,
+    )
+    print(
+        f"Base demo delta std (model-space scale): {np.round(np.asarray(_delta_std), 4)}",
+        flush=True,
+    )
+
 CONTROL_FREQUENCY = 15
 
 mpc_planner = None
@@ -5194,7 +5427,7 @@ if _uses_vlm_mpc_base(args):
         )
     else:
         mpc_planner = SimFreeMPC(
-            base_policy,
+            base_decode_policy or base_policy,
             SimFreeMPCConfig(
                 task_name=inferred_task,
                 num_samples=args.mpc_num_samples,
@@ -5221,6 +5454,7 @@ if _uses_vlm_mpc_base(args):
                 prior_weight_high=args.prior_weight_high,
                 prior_weight_schedule=args.prior_weight_schedule,
                 feasibility_gate=args.feasibility_gate,
+                cost_executable_actions=args.cost_executable_actions,
             ),
         )
     print(
@@ -5391,6 +5625,7 @@ with torch.no_grad():
                 else build_mpc_context(env, env_obs_dict, args)
             )
         ),
+        base_decode_policy=base_decode_policy,
     )
 _report_initialization_stage(args, "initialization complete")
 _wait_for_worker_start(args)
@@ -5608,6 +5843,12 @@ for rollout_idx, seed in enumerate(eval_seeds):
         step=0,
         phase=current_phase,
         subtasks=current_subtasks,
+        # The {placeholder} values THIS episode's plan was rendered with. With the per-step
+        # grounded keypoints below, the log carries everything an offline re-evaluation of any
+        # completion predicate against this exact episode needs.
+        **({"plan_fields": _pf} if (_pf := (getattr(getattr(vlm_bridge, "grounding", None),
+                                                    "plan_fields", None)
+                                            if vlm_bridge is not None else None)) else {}),
     )
     _emit_worker_progress(
         args,
@@ -5706,6 +5947,7 @@ for rollout_idx, seed in enumerate(eval_seeds):
                                 mpc_planner=mpc_planner,
                                 mpc_context=mpc_context,
                                 warm_shift_steps=warm_shift_steps,
+                                base_decode_policy=base_decode_policy,
                             )
                             # Converged cost lives in the module-level runtime record, not in the
                             # returned stats (those stay empty unless --compare_difference).
@@ -5731,6 +5973,7 @@ for rollout_idx, seed in enumerate(eval_seeds):
                             mpc_planner=mpc_planner,
                             mpc_context=mpc_context,
                             warm_shift_steps=warm_shift_steps,
+                            base_decode_policy=base_decode_policy,
                         )
                     # Gate observability: stamp authority + evidence every inference (active or
                     # not), so window behavior is auditable from mpc_debug alone.
@@ -5761,6 +6004,10 @@ for rollout_idx, seed in enumerate(eval_seeds):
                         _mpc_logged = dict(_mpc_debug_stats(_LAST_INFERENCE_RUNTIME.get("mpc_last")) or {})
                         _mpc_logged.update({k: compare_stats[k] for k in _gate_keys
                                             if isinstance(compare_stats, dict) and k in compare_stats})
+                        # Shadow completion-predicate decision beside the scalar sub-goal one.
+                        # Read off the bridge, never off mpc_context: the planner never saw it.
+                        _pred = (getattr(vlm_bridge, "pred_shadow", None)
+                                 if args.vlm_cost != "none" else None)
                         _write_mpc_debug_log(
                             mpc_debug_log_file,
                             "inference",
@@ -5770,6 +6017,7 @@ for rollout_idx, seed in enumerate(eval_seeds):
                             subtasks=current_subtasks,
                             elapsed_s=infer_elapsed,
                             mpc=_mpc_logged,
+                            **({"pred_shadow": _pred} if _pred is not None else {}),
                             mpc_trace=_LAST_INFERENCE_RUNTIME.get("mpc_trace", []),
                         )
                     episode_inference_time_s += infer_elapsed
@@ -5885,6 +6133,17 @@ for rollout_idx, seed in enumerate(eval_seeds):
                     step_trace["object_beliefs"] = {
                         _n: np.asarray(_p, dtype=np.float64) for _n, _p in _bel._pos.items()
                     }
+                except Exception:      # diagnostics must never take down a rollout
+                    pass
+            # The GROUNDED KEYPOINT ARRAY, plus the TCP and aperture pushed alongside it. This is
+            # the exact frame the completion predicates saw this step, so a log alone is enough to
+            # re-evaluate any predicate offline against the run that produced it.
+            _ph = getattr(vlm_bridge, "_pred_hist", None) if "vlm_bridge" in dir() else None
+            if _ph is not None and len(_ph):
+                try:
+                    step_trace["grounding_kp"] = np.round(_ph.kp[-1], 4)
+                    step_trace["grounding_tcp"] = np.round(_ph.eef[-1], 4)
+                    step_trace["grounding_aperture"] = round(float(_ph.gripper_aperture[-1]), 4)
                 except Exception:      # diagnostics must never take down a rollout
                     pass
             _write_mpc_debug_log(

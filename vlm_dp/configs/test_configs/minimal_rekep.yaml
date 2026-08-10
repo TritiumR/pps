@@ -1,0 +1,94 @@
+# minimal_rekep -- the smallest cost that lets the ReKep plan own the task.
+#
+# Intent: the VLM/ReKep layer owns the subtask decomposition AND the goal of each stage.
+# The cost supplies only what the constraint language cannot express. 7 terms vs parity36's 24.
+#
+# Pair with --vlm_cost rekep_fake_vlm (the _vlm compiler), NOT rekep_fake. Under the default
+# template compiler this config would stall: that compiler injects a `lift` stage carrying no
+# constraint, and `reach`/`terminal_reach` self-disable whenever a payload is held, so the lift
+# would have no attractor at all.
+#
+# Why each term is here, and why nothing else is:
+#
+#   reach / terminal_reach
+#       The _vlm compiler attaches `constraint` to PLACE and MOVE stages only -- its GRASP stage
+#       has constraint=None, payload=None (rekep.py, the grasp branch of _vlm_stages), so the
+#       stage-1/3 grasp constraints fake_vlm writes are never consumed. Without these two, grasp
+#       stages have no attractor whatsoever. They target obj_center, and self-disable on place
+#       stages (terms.py: `if constraint is not None or payload is not None: return zeros`), so
+#       they hand over to rekep_subgoal exactly where the plan takes over.
+#
+#   rekep_subgoal
+#       The semantic objective: stage2/4 are norm(keypoints[obj] - (keypoints[scale] + offset)).
+#       These DO rank candidates -- _rekep_keypoints rides held keypoints on the candidate
+#       gripper pose, so a carried object's predicted position varies per candidate.
+#
+#   rekep_path
+#       Inert on weight: fake_vlm writes four EMPTY path files, and every path constraint in the
+#       repo is get_grasping_cost_by_keypoint_idx(), which is 0/1 on a fixed `held` set and so is
+#       constant across candidates. Kept at its base weight so the term is live the moment real
+#       path constraints are written.
+#
+#   close_gripper / release_gripper / carry_hold
+#       The ReKep constraint signature is f(end_effector, keypoints) -- it has NO gripper
+#       dimension, so no constraint can ever command a grasp or a release. These three are the
+#       whole gripper channel and are the irreducible part the semantic layer cannot own.
+#
+# Deliberately absent (each was doing real work in parity36; expect regressions):
+#   floor, clear          -- nothing now keeps the arm off the table or away from objects
+#   tip_z, center_region, aperture_region, straddle, yaw, grasp_axis, grasp_standoff
+#                         -- all grasp geometry. A distance-to-object-centre goal says nothing
+#                            about approach direction or finger alignment.
+#   smooth, joint_delta, gripper_smooth
+#                         -- raising these 10x is what took pear placement 40% -> 95%, so
+#                            dropping them should visibly return the erratic motion.
+#   lift_*, place_*, carry_clear, release_rise_first, not_hold
+#                         -- the hand-coded motion shaping the plan is meant to replace.
+
+cost:
+  terms:
+    # -- goal: grasp stages (the _vlm grasp stage carries no constraint)
+    reach: 8.0
+    terminal_reach: 40.0
+    # -- goal: place stages, owned by the ReKep plan
+    rekep_subgoal: 25.0
+    rekep_path: 200.0
+    # -- the gripper channel: not expressible as a ReKep constraint
+    close_gripper: 2.0
+    release_gripper: 40.0
+    carry_hold: 40.0
+  geometry:
+    ee_r: 0.035
+    coll_clear: 0.02
+    finger_r: 0.012
+    open_half: 0.04
+    tool_back: 0.06
+    tcp_to_tip: 0.0
+    center_scale: 0.40
+    grasp_dead_zone: proportional
+    close_z_scale: 0.025
+    close_xy_floor: 0.008
+    aperture_margin: 0.006
+    # Parameters of close_gripper, a term this config KEEPS. parity36 added these and they are
+    # the pre-shaped-descent branch (begin closing while xy-aligned just above the grasp point);
+    # parity13 lacked them and never grasped. Retained so this experiment varies the TERM set
+    # only, not the gripper's approach behaviour as well.
+    preshape_z: 0.025
+    preshape_xy_tol: 0.02
+    release_xy: 0.06
+    release_z: 0.02
+    place_descend_radius: 0.08
+    place_release_clearance: 0.012
+    clear_max_radius: 0.10
+
+advance:
+  flag_fallback: false
+  release_debug: true
+  grasp_advance_on_hold: true
+  ground_error_debug: true
+
+grounding:
+  rotate_grasp_offset: false
+  support_extents: false
+  seat_from_plane: true
+  lift_latch_xy: false
