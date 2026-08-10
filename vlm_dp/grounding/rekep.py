@@ -123,16 +123,30 @@ def _satisfying_state(stage, kps0, ee0, owned, refs, dev, eps, steps=400, lr=0.0
     hand-written idea of what the stage means -- the whole point being that the runtime must not
     have such an idea. Only the keypoints of the object the stage manipulates move (plus the TCP);
     if that is not enough to satisfy the constraint, every keypoint the constraint text references
-    is freed as a second attempt. A stage with no constraint (a grasp stage) is satisfied by
-    putting the TCP on its target.
+    is freed as a second attempt.
+
+    A CLOSE STAGE is satisfied by putting the TCP on its target, whether or not it carries a
+    constraint. Its advance test reads target proximity and the gripper (a hold certificate, or a
+    settled close for a press) and never reads the sub-goal, so "the stage genuinely happened"
+    means the hand is AT the grasp point -- exactly, not within the descent's stopping tolerance.
+    Descending a press stage's approach constraint instead lands ~25mm out, which is comfortably
+    inside subgoal_eps and comfortably OUTSIDE the millimetre-scale grasp_slack the proximity
+    test uses, and the preflight would refuse a stage that is perfectly advanceable.
     """
     kp0 = torch.as_tensor(np.asarray(kps0), device=dev, dtype=torch.float32)
-    if stage.constraint is None:
+    if stage.constraint is None or stage.gripper == "close":
         try:
             ee = np.asarray(stage.target(), dtype=np.float64).reshape(3)
         except Exception:
             ee = np.asarray(ee0, dtype=np.float64).reshape(3)
-        return np.asarray(kps0, dtype=np.float64), ee, tuple(owned), 0.0
+        value = 0.0
+        if stage.constraint is not None:
+            # Report the constraint's REAL value at that pose, so the preflight's own
+            # "sub-goal x < eps" line stays an honest reading rather than an assumed zero.
+            kp = kp0[:, None, None, :]
+            ee_t = torch.as_tensor(ee, device=dev, dtype=torch.float32).reshape(1, 1, 3)
+            value = float(torch.as_tensor(stage.constraint(ee_t, kp)).reshape(-1)[0])
+        return np.asarray(kps0, dtype=np.float64), ee, tuple(owned), value
 
     best = (np.asarray(kps0, dtype=np.float64), np.asarray(ee0, dtype=np.float64).reshape(3),
             tuple(owned), float("inf"))
@@ -855,7 +869,15 @@ class RekepGrounding:
             if off > _KP_ON_OBJECT:
                 problems.append(f"stage {i + 1} grasp keypoint {gk} sits {off * 1e3:.0f}mm off the "
                                 f"nearest point of {name!r} -- the role did not land on its object")
-            if self.contact_criterion != "plan":
+            # A stage the PLAN declared a press for is exempt from the pinchability assertion,
+            # for the same reason the contact_criterion="plan" branch is: the assertion reads a
+            # press verdict as evidence the mask or the role is wrong, which is only sound when
+            # nobody asked for a press. (For this capsule plan it is inert -- the 10mm rim is
+            # pinchable and the assertion passes either way -- but a plan pressing a wide part
+            # must not be refused for the width it deliberately chose.)
+            declared_modes = metadata.get("contact_modes") or []
+            plan_press = (declared_modes[i] if i < len(declared_modes) else None) == "press"
+            if self.contact_criterion != "plan" and not plan_press:
                 mode, width, src = self._effective_contact(name, obj_ext, local_ext, probe_ext)
                 if mode == "press":
                     problems.append(
@@ -969,6 +991,20 @@ class RekepGrounding:
             return metadata["release_keypoints"][j] >= 0 and place_target_for(j, owner) is None
 
         stages, manipulated, grasped_body, pressed = [], set(), None, False
+
+        def declared_contact(idx):
+            """Return the contact mode the PLAN declared for a stage, or None if it did not.
+
+            Read ahead of both of the compiler's own inferences (measured grip width, and plan
+            structure under contact_criterion="plan"). Those answer "can the fingers close around
+            this", which is a fact about the gripper and the cloud; a plan declaring `press` is
+            saying something they cannot -- that this feature is to be pushed rather than pinched
+            even though it would fit. Plans that declare nothing keep the inferred behaviour.
+            """
+            modes = metadata.get("contact_modes") or []
+            mode = modes[idx] if idx < len(modes) else None
+            return mode if mode in ("press", "pinch") else None
+
         # Per-stage keypoint bookkeeping for the advanceability preflight: which keypoints the
         # stage's own object owns (the ones a satisfying state may move), and which ones its
         # constraint text references at all (the fallback set).
@@ -978,12 +1014,25 @@ class RekepGrounding:
             return steer_policies[idx] if idx < len(steer_policies) else None
         for i in range(metadata["num_stages"]):
             grasp_kp, release_kp = metadata["grasp_keypoints"][i], metadata["release_keypoints"][i]
-            held = tuple(j for j, o in enumerate(tracker.owners) if grasped_body is not None and o == grasped_body)
+            # held_idx is a claim that these keypoints RIDE THE GRIPPER: the cost terms move them
+            # with each candidate pose (terms._rekep_keypoints). A pinch earns that claim; a press
+            # does not -- the hand is merely touching the part, and a part that is only touched
+            # stays where the belief puts it. Asserting it anyway is what let stage 2's old lid
+            # sub-goal read as satisfied while the lid never moved: the term was evaluated on a
+            # lip keypoint teleported onto the candidate hand.
+            held = () if pressed else tuple(
+                j for j, o in enumerate(tracker.owners)
+                if grasped_body is not None and o == grasped_body)
             subgoal, path_fns = load_stage(i, held)
             if grasp_kp >= 0:
                 name = name_for(grasp_kp)
                 owner = tracker.owners[grasp_kp]
-                if self.contact_criterion == "plan":
+                plan_mode = declared_contact(i)
+                if plan_mode is not None:
+                    press = plan_mode == "press"
+                    print(f"[rekep-vlm] {name}: contact={plan_mode} (DECLARED by the plan, "
+                          f"stage {i + 1})", flush=True)
+                elif self.contact_criterion == "plan":
                     press = self_displace_next(i, owner)
                     print(f"[rekep-vlm] {name}: contact={'press' if press else 'pinch'} (plan structure)",
                           flush=True)
@@ -995,9 +1044,18 @@ class RekepGrounding:
                 manipulated.add(name)
 
 
+                # A PRESS STAGE CARRIES ITS OWN SUB-GOAL as the approach cost. A pinch stage does
+                # not need one: center_region, aperture_region, straddle and grasp_axis are the
+                # attractor that brings the hand to the grasp pose. Those four are exactly the
+                # terms a press stands down (cost.terms._pinch_gated), which would otherwise leave
+                # the approach with no lateral attractor at all. The plan already wrote one -- the
+                # end-effector at the grasp keypoint -- and this is where it is used. The advance
+                # rule is untouched by this: a close stage never advances on its sub-goal.
                 stages.append(Stage(name=f"{'press' if press else 'grasp'} {name}", gripper="close", steer_policy=_pol(i),
                                     grasp_obj=name, payload=None, held_idx=held,
                                     target=(kp_point(grasp_kp) if press else obj_center[name]),
+                                    constraint=(subgoal if press else None),
+                                    path_fns=(path_fns if press else ()),
                                     contact=("press" if press else "pinch")))
                 grasped_body = owner
                 pressed = press

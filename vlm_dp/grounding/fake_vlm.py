@@ -103,9 +103,30 @@ def _render(task_key, out_dir, **fields):
     def _int_list(text):
         return [int(x.strip()) for x in text.replace("[", "").replace("]", "").split(",")]
 
+    def _opt_line(key):
+        """Return a metadata line's text, or None when the plan does not carry it."""
+        for line in lines:
+            if line.startswith(f"{key} = "):
+                return line.split(" = ", 1)[1].strip()
+        return None
+
     metadata = {"num_stages": int(_line("num_stages")),
                 "grasp_keypoints": _int_list(_line("grasp_keypoints")),
                 "release_keypoints": _int_list(_line("release_keypoints"))}
+
+    # Per-stage CONTACT MODE, a vlm_dp extension the ReKep response format has no place for and
+    # every other plan omits. It states, per stage, whether the hand closes AROUND the feature
+    # (pinch) or ON it (press). The compiler infers a contact mode from measured geometry, and
+    # from plan structure under grounding.contact_criterion="plan"; both are inferences about
+    # feasibility, and neither can express "this rim fits the fingers but is to be pressed
+    # anyway", which is task knowledge. Absent, the metadata key is absent and the compiler's
+    # inference is untouched -- so no existing plan changes behaviour.
+    modes = _opt_line("contact_modes")
+    if modes is not None:
+        metadata["contact_modes"] = [s.strip().strip('"\'')
+                                     for s in modes.strip("[]").split(",")]
+        named = [(i + 1, m) for i, m in enumerate(metadata["contact_modes"]) if m]
+        print(f"[fake-vlm] {task_key}: plan declares contact modes {named}", flush=True)
 
     # --- write one file per (stage, kind), including the empty ones ---
     # load_stage() reads every stage{N}_path_constraints.txt unconditionally, so a stage with
