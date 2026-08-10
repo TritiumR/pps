@@ -1,5 +1,6 @@
 import argparse
 import atexit
+import dataclasses
 import json
 import os
 import random
@@ -426,12 +427,43 @@ def _run_multi_worker_launcher(pre_args: argparse.Namespace, argv: list[str]) ->
         rollout_offset += worker_seed_end - worker_seed_start
 
     def terminate_workers() -> None:
+        # A worker that is blocked waiting on the start barrier is inside Isaac Sim, which
+        # installs its own SIGTERM handling and does not necessarily exit on it. Escalate to
+        # SIGKILL, otherwise the "wait for every worker to exit" loop below never returns and
+        # the whole job burns its wall clock with nothing running.
+        live = []
         for worker in workers:
             process = worker["process"]
             if process is not None and process.poll() is None:
                 process.terminate()
+                live.append(process)
+        deadline = time.time() + 30.0
+        for process in live:
+            try:
+                process.wait(timeout=max(deadline - time.time(), 0.1))
+            except subprocess.TimeoutExpired:
+                process.kill()
+
+    def report_worker_failure(worker, reason: str) -> None:
+        """Surface a dead worker's own last words; they are only in its log file."""
+        if worker["log_handle"] is not None:
+            worker["log_handle"].flush()
+        try:
+            with open(worker["log_path"], encoding="utf-8", errors="replace") as handle:
+                tail = [line.rstrip() for line in handle.readlines()[-40:]]
+        except OSError:
+            tail = []
+        print(
+            f"worker {worker['id']} (gpu {worker['gpu']}, seeds "
+            f"{worker['seed_start']}-{worker['seed_end'] - 1}) failed to initialize: {reason}. "
+            f"Tail of {worker['log_path']}:",
+            file=sys.stderr,
+        )
+        for line in tail:
+            print(f"  | {line}", file=sys.stderr)
 
     atexit.register(terminate_workers)
+    init_stall_s = float(os.environ.get("VLMDP_WORKER_INIT_STALL_S", 300.0))
     failed_to_initialize = False
     for wave_start in range(0, len(workers), len(gpu_ids)):
         wave = workers[wave_start : wave_start + len(gpu_ids)]
@@ -450,13 +482,40 @@ def _run_multi_worker_launcher(pre_args: argparse.Namespace, argv: list[str]) ->
                 stdout=worker["log_handle"],
                 stderr=subprocess.STDOUT,
             )
+        for worker in wave:
+            worker["progress_size"] = 0
+            worker["progress_time"] = time.time()
         while not all(worker["ready"] for worker in wave):
             for worker in workers:
                 _read_worker_progress(worker)
+            now = time.time()
             for worker in wave:
-                return_code = worker["process"].poll()
-                if return_code is not None and not worker["ready"]:
-                    failed_to_initialize = True
+                if worker["ready"]:
+                    continue
+                reason = None
+                if worker["process"].poll() is not None:
+                    reason = f"process exited with code {worker['process'].returncode}"
+                else:
+                    # A worker that aborts during grounding (e.g. the ReKep preflight refusing an
+                    # unusable mask) raises SystemExit, and Isaac Sim then wedges on shutdown --
+                    # the process never exits, so polling alone never notices. Treat a worker that
+                    # has stopped emitting init progress as failed, or the launcher waits forever.
+                    try:
+                        size = os.path.getsize(worker["progress_path"])
+                    except OSError:
+                        size = worker["progress_size"]
+                    if size != worker["progress_size"]:
+                        worker["progress_size"] = size
+                        worker["progress_time"] = now
+                    elif now - worker["progress_time"] > init_stall_s:
+                        reason = (f"no initialization progress for {init_stall_s:.0f}s while still "
+                                  f"running (hung, most likely after a fatal error)")
+                if reason is None:
+                    continue
+                if not worker.get("reported"):
+                    worker["reported"] = True
+                    report_worker_failure(worker, reason)
+                failed_to_initialize = True
             if failed_to_initialize:
                 break
             time.sleep(0.1)
@@ -945,12 +1004,15 @@ def _prepare_proxy_steering(model, observation):
 
     if model_type in (_model.ModelType.PROXY, _model.ModelType.PROXY_SCORE):
         images, img_masks, state = model._preprocess_observation(observation, train=False)
-        prefix_embs, prefix_pad_masks, _ = model.embed_prefix(images, img_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = model.embed_prefix(
+            images, img_masks
+        )
         return {
             "kind": "sequence",
             "state": state,
             "prefix_embs": prefix_embs,
             "prefix_pad_masks": prefix_pad_masks,
+            "prefix_att_masks": prefix_att_masks,
         }
 
     if model_type == _model.ModelType.PROXY_SOUND:
@@ -1075,6 +1137,7 @@ def _predict_proxy_score(prepared_proxy, model, x_t_path, time_cond):
         prepared_proxy["prefix_pad_masks"],
         x_t_model,
         time_cond,
+        prefix_att_masks=prepared_proxy.get("prefix_att_masks"),
     )
 
 
@@ -4131,6 +4194,16 @@ def parse_args():
         help="Task proxy checkpoint directory. Defaults to the matching task_prompts.json entry.",
     )
     parser.add_argument(
+        "--task_attention",
+        "--task-attention",
+        choices=("config", "causal", "bidirectional"),
+        default="config",
+        help=(
+            "Attention mask used by the task score proxy. 'config' uses the model config; "
+            "the explicit modes are checkpoint-compatibility/ablation overrides."
+        ),
+    )
+    parser.add_argument(
         "--ref_checkpoint_dir",
         type=str,
         default=None,
@@ -5247,7 +5320,30 @@ if "base" in required_policy_roles:
 if "task" in required_policy_roles:
     task_config_name = _config_name_from_checkpoint_dir(task_checkpoint_dir)
     task_config = _config.get_config(task_config_name)
-    _report_initialization_stage(args, "loading task policy", config=task_config_name)
+    if args.task_attention != "config":
+        if not hasattr(task_config.model, "bidirectional_attention"):
+            raise ValueError(
+                "--task_attention is only supported for ProxyScore task models; "
+                f"config {task_config_name!r} uses {type(task_config.model).__name__}."
+            )
+        task_config = dataclasses.replace(
+            task_config,
+            model=dataclasses.replace(
+                task_config.model,
+                bidirectional_attention=args.task_attention == "bidirectional",
+            ),
+        )
+    task_attention = (
+        "bidirectional"
+        if getattr(task_config.model, "bidirectional_attention", False)
+        else "causal"
+    )
+    _report_initialization_stage(
+        args,
+        "loading task policy",
+        config=task_config_name,
+        attention=task_attention,
+    )
     task_policy = policy_config.create_trained_policy(
         task_config,
         task_checkpoint_dir,
@@ -5747,6 +5843,12 @@ for rollout_idx, seed in enumerate(eval_seeds):
         step=0,
         phase=current_phase,
         subtasks=current_subtasks,
+        # The {placeholder} values THIS episode's plan was rendered with. With the per-step
+        # grounded keypoints below, the log carries everything an offline re-evaluation of any
+        # completion predicate against this exact episode needs.
+        **({"plan_fields": _pf} if (_pf := (getattr(getattr(vlm_bridge, "grounding", None),
+                                                    "plan_fields", None)
+                                            if vlm_bridge is not None else None)) else {}),
     )
     _emit_worker_progress(
         args,
@@ -5902,6 +6004,10 @@ for rollout_idx, seed in enumerate(eval_seeds):
                         _mpc_logged = dict(_mpc_debug_stats(_LAST_INFERENCE_RUNTIME.get("mpc_last")) or {})
                         _mpc_logged.update({k: compare_stats[k] for k in _gate_keys
                                             if isinstance(compare_stats, dict) and k in compare_stats})
+                        # Shadow completion-predicate decision beside the scalar sub-goal one.
+                        # Read off the bridge, never off mpc_context: the planner never saw it.
+                        _pred = (getattr(vlm_bridge, "pred_shadow", None)
+                                 if args.vlm_cost != "none" else None)
                         _write_mpc_debug_log(
                             mpc_debug_log_file,
                             "inference",
@@ -5911,6 +6017,7 @@ for rollout_idx, seed in enumerate(eval_seeds):
                             subtasks=current_subtasks,
                             elapsed_s=infer_elapsed,
                             mpc=_mpc_logged,
+                            **({"pred_shadow": _pred} if _pred is not None else {}),
                             mpc_trace=_LAST_INFERENCE_RUNTIME.get("mpc_trace", []),
                         )
                     episode_inference_time_s += infer_elapsed
@@ -6026,6 +6133,17 @@ for rollout_idx, seed in enumerate(eval_seeds):
                     step_trace["object_beliefs"] = {
                         _n: np.asarray(_p, dtype=np.float64) for _n, _p in _bel._pos.items()
                     }
+                except Exception:      # diagnostics must never take down a rollout
+                    pass
+            # The GROUNDED KEYPOINT ARRAY, plus the TCP and aperture pushed alongside it. This is
+            # the exact frame the completion predicates saw this step, so a log alone is enough to
+            # re-evaluate any predicate offline against the run that produced it.
+            _ph = getattr(vlm_bridge, "_pred_hist", None) if "vlm_bridge" in dir() else None
+            if _ph is not None and len(_ph):
+                try:
+                    step_trace["grounding_kp"] = np.round(_ph.kp[-1], 4)
+                    step_trace["grounding_tcp"] = np.round(_ph.eef[-1], 4)
+                    step_trace["grounding_aperture"] = round(float(_ph.gripper_aperture[-1]), 4)
                 except Exception:      # diagnostics must never take down a rollout
                     pass
             _write_mpc_debug_log(

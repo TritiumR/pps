@@ -23,6 +23,9 @@ class ProxyScoreConfig(_model.BaseModelConfig):
     # "regress": plain chunked regression (no noising, no score); training only -- the
     # score-space serve path (predict_score_from_prefix) has no meaning for it.
     prediction_type: Literal["score", "epsilon", "x0", "regress"] = "score"
+    # Preserve legacy causal checkpoints by default. Bidirectional checkpoints must
+    # opt in during training, or be selected explicitly by eval's --task_attention.
+    bidirectional_attention: bool = False
     compile_sample_actions: bool = False
 
     action_dim: int = 8

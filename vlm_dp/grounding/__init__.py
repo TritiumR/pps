@@ -88,6 +88,21 @@ class Grounding:
     stages: list[Stage]
     manipulated: frozenset[str] = frozenset()      # excluded from scene-disturbance reporting
     keypoints: Optional[Callable[[], np.ndarray]] = None   # live tracked keypoints [N,3] (ReKep grounding)
+    # VLM-authored per-stage completion predicates (vlm_dp.grounding.predicates), when the plan
+    # carries them. Read by the advance path only under the bridge's opt-in keys
+    # (predicate_place_transitions / plan_authoritative); otherwise shadow logging only. None means
+    # the plan authored none, and every consumer must degrade to "no opinion".
+    completion: Optional[object] = None
+    # run(probe) -> None: the advanceability preflight (rekep.advance_preflight). Synthesizes, for
+    # each stage, a state in which the stage is genuinely satisfied and asks `probe` -- the runtime's
+    # real advance test -- whether it can fire there, raising SystemExit if it cannot. None means the
+    # grounding source offers no such check and the caller simply skips it.
+    advance_preflight: Optional[Callable] = None
+    # The {placeholder} values the plan template was rendered with this episode (keypoint indices
+    # and measured offsets). Logged once per rollout so a predicate can be re-rendered and
+    # re-evaluated OFFLINE against the exact plan the episode ran -- without them a log records
+    # what a predicate decided but not what it was deciding about. None for plans not templated.
+    plan_fields: Optional[dict] = None
 
 
 class GroundingSource(Protocol):
@@ -127,8 +142,11 @@ def get_source(name: str, **kwargs) -> GroundingSource:
                               local_grasp_radius=kwargs.get("local_grasp_radius", 0.05),
                               kp_source=kwargs.get("kp_source", "perception"),
                               contact_criterion=kwargs.get("contact_criterion", "feasibility"),
+                              subgoal_eps=kwargs.get("subgoal_eps", 0.06),
                               open_half=kwargs.get("open_half", 0.04),
                               rotate_grasp_offset=kwargs.get("rotate_grasp_offset", False),
                               lift_latch_xy=kwargs.get("lift_latch_xy", False),
-                              seat_from_plane=kwargs.get("seat_from_plane", False))
+                              seat_from_plane=kwargs.get("seat_from_plane", False),
+                              geom=kwargs.get("geom"),
+                              sensor_cfg=kwargs.get("sensor_cfg"))
     raise ValueError(f"unknown grounding source: {name!r}")

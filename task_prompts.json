@@ -52,13 +52,17 @@
     "score_task_checkpoint_dir": "openpi/checkpoints/score_task_tea/task_eps/30000",
     "ref_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_tea_pi05_jointpos/reference/20000",
     "objects": {
-      "teapot": "teapot",
-      "teacup": "teacup"
+      "teapot": "teapot . green teapot . jade teapot . pot with a spout",
+      "teacup": "teacup . green teacup",
+      "teatable": "wooden table . long low table",
+      "bookcase": "bookshelf",
+      "robot": "white robot arm"
     },
     "fixtures": [],
     "grasp_objs": [
       "teapot"
-    ]
+    ],
+    "support": "teatable"
   },
   "capsule": {
     "task_id": "Isaac-Capsule-Droid-Visuomotor-v0",
@@ -71,8 +75,10 @@
       "can"
     ],
     "objects": {
-      "can": "coffee pod can",
-      "capsule": "capsule coffee maker"
+      "can": "can . coffee pod . coffee capsule . small jar",
+      "capsule": "capsule coffee maker",
+      "coffeemaker": "coffee machine . espresso machine",
+      "robot": "white robot arm"
     },
     "fixtures": [
       "capsule"

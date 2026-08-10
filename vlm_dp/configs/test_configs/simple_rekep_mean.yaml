@@ -1,0 +1,73 @@
+# simple_rekep_mean -- simple_rekep with ONE change: geometry.subgoal_mean: true.
+#
+# rekep_subgoal was summing a RAW distance over the 15-step horizon while the hand-written
+# place_reach it replaced uses a SQUARED distance MEANED over the horizon. The sum makes the
+# term ~15x overweighted against the contact-geometry block, and a raw distance keeps pulling
+# at full strength even 1mm from the target, fighting the grasp/release terms instead of
+# yielding near the goal. subgoal_mean switches sum -> mean (the existing flag in terms.py).
+# Squaring would be a code change and is deliberately NOT bundled: one variable per run.
+#
+# Baselines: hand-written cost 11/20; simple_rekep (sum) 1/10 on both the 6- and 8-stage plan,
+# with 6/10 never placing the pear at all.
+cost:
+  terms:
+    rekep_subgoal: 100.0
+    rekep_path: 100.0
+    center_region: 120.0
+    aperture_region: 80.0
+    tip_z: 80.0
+    grasp_standoff: 40.0
+    close_gripper: 2.0
+    carry_hold: 40.0
+    release_gripper: 40.0
+    smooth: 50.4
+    joint_delta: 35.0
+    floor: 40.0
+  geometry:
+    ee_r: 0.035
+    coll_clear: 0.02
+    finger_r: 0.012
+    open_half: 0.04
+    tool_back: 0.06
+    tcp_to_tip: 0.0
+    center_scale: 0.4
+    grasp_dead_zone: proportional
+    close_z_scale: 0.025
+    preshape_z: 0.025
+    release_step_motion_cap: 0.004
+    retreat_margin: 0.02
+    retreat_clear: 0.04
+    rise_first_span: 0.05
+    rise_first_step: 0.01
+    not_hold_sigma: 0.05
+    carry_clear_include_placed: true
+    carry_clear_margin: 0.005
+    preshape_xy_tol: 0.02
+    corridor_margin: 0.01
+    grasp_approach_cap: 0.008
+    grasp_brake_slope: 0.25
+    grasp_descend_closing_only: true
+    approach_hover: 0.08
+    approach_xy_tol: 0.02
+    close_xy_floor: 0.008
+    aperture_margin: 0.006
+    release_xy: 0.06
+    release_z: 0.02
+    place_approach_margin: 0.01
+    release_commit_aniso: true
+    commit_measured_gate: true
+    release_commit_band: 3.0
+    place_descend_radius: 0.08
+    place_release_clearance: 0.012
+    clear_max_radius: 0.1
+    subgoal_mean: true
+advance:
+  flag_fallback: false
+  release_debug: true
+  grasp_advance_on_hold: true
+  ground_error_debug: true
+grounding:
+  rotate_grasp_offset: false
+  support_extents: false
+  seat_from_plane: true
+  lift_latch_xy: false

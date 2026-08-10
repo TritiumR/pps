@@ -178,6 +178,27 @@ def ddim_iteration_alphas(
     return alpha_t, alpha_prev, time_cond
 
 
+def make_att_2d_masks(
+    pad_masks: torch.Tensor,
+    att_masks: torch.Tensor,
+) -> torch.Tensor:
+    """Build pi0-style block attention from padding and block-boundary masks."""
+    if pad_masks.ndim != 2:
+        raise ValueError(f"pad_masks must be rank 2, got {pad_masks.ndim}.")
+    if att_masks.ndim != 2:
+        raise ValueError(f"att_masks must be rank 2, got {att_masks.ndim}.")
+    if pad_masks.shape != att_masks.shape:
+        raise ValueError(
+            "pad_masks and att_masks must have the same shape, got "
+            f"{tuple(pad_masks.shape)} and {tuple(att_masks.shape)}."
+        )
+
+    block_ids = torch.cumsum(att_masks.to(torch.int32), dim=1)
+    block_mask = block_ids[:, None, :] <= block_ids[:, :, None]
+    valid = pad_masks.to(torch.bool)
+    return block_mask & valid[:, None, :] & valid[:, :, None]
+
+
 def _expand_prefix_kv(cache: DynamicCache, bsize: int) -> DynamicCache:
     """Batch-1 prefix cache -> a fresh view-backed cache for `bsize` rows (never mutated)."""
     legacy = cache.to_legacy_cache()
@@ -213,6 +234,7 @@ class ProxyScorePytorch(nn.Module):
             precision=config.dtype,
             freeze_dino_encoder=getattr(config, "freeze_dino_encoder", False),
         )
+        self.bidirectional_attention = getattr(config, "bidirectional_attention", False)
 
         action_dim = config.action_dim
         self.action_in_proj = nn.Linear(action_dim, action_expert_config.width)
@@ -335,22 +357,6 @@ class ProxyScorePytorch(nn.Module):
         self._last_prefix_att = att_masks
         return embs, pad_masks, att_masks
 
-    def build_attention_mask(self, pad_masks, att_masks, *, query_offset=0):
-        """Mask handed to the Gemma expert. Same contract as ProxyPytorch's.
-
-        Disabled -> return the 2-D pad mask and let HF build its causal mask (legacy).
-        Enabled  -> build the pi0 block mask ourselves and hand it over as a 4-D additive mask,
-        which HF forwards unchanged. query_offset is the number of cached prefix tokens when only
-        the suffix is being queried.
-        """
-        if not getattr(self, "bidirectional_suffix", False):
-            return pad_masks
-        att_2d = make_att_2d_masks(pad_masks, att_masks)
-        if query_offset:
-            att_2d = att_2d[:, query_offset:, :]
-        return _to_additive_4d(att_2d, pad_masks.dtype if pad_masks.is_floating_point()
-                               else torch.float32)
-
     def embed_suffix(self, state, noisy_actions, timestep, cond=None, goal=None,
                      noisy_goal_row=None):
         embs = []
@@ -446,9 +452,50 @@ class ProxyScorePytorch(nn.Module):
         self._last_suffix_att = att_masks
         return embs, pad_masks, att_masks, None
 
+    @staticmethod
+    def _prepare_attention_masks_4d(att_2d_masks: torch.Tensor) -> torch.Tensor:
+        att_2d_masks_4d = att_2d_masks[:, None, :, :]
+        return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
+
+    def build_attention_mask(
+        self,
+        pad_masks: torch.Tensor,
+        att_masks: torch.Tensor,
+        *,
+        n_query: int | None = None,
+    ) -> torch.Tensor:
+        """Use the legacy causal mask or the checkpoint-compatible block mask."""
+        if not self.bidirectional_attention:
+            return pad_masks
+        attention_mask = self._prepare_attention_masks_4d(
+            make_att_2d_masks(pad_masks, att_masks)
+        )
+        if n_query is not None:
+            attention_mask = attention_mask[:, :, -int(n_query) :, :]
+        return attention_mask
+
+    def build_expert_masks(
+        self,
+        prefix_pad_masks: torch.Tensor,
+        prefix_att_masks: torch.Tensor,
+        suffix_pad_masks: torch.Tensor,
+        suffix_att_masks: torch.Tensor,
+        *,
+        n_query: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat(
+            [prefix_att_masks.to(torch.int32), suffix_att_masks.to(torch.int32)],
+            dim=1,
+        )
+        return (
+            self.build_attention_mask(pad_masks, att_masks, n_query=n_query),
+            pad_masks,
+        )
+
     @torch.no_grad()
     def prefix_kv_cache(self, prefix_embs, prefix_pad_masks, *, dtype=None) -> DynamicCache:
-        """Per-layer K/V of the image prefix; the expert is causal, so it ignores the suffix.
+        """Per-layer K/V of the image prefix, using the configured attention mask.
 
         Inference reuses one prefix across every DDIM level and every candidate, so caching it
         turns each later call into a 16-token forward. Build at batch 1 and expand. `dtype`
@@ -456,9 +503,13 @@ class ProxyScorePytorch(nn.Module):
         promotes the whole attention back to the wider type.
         """
         position_ids = (torch.cumsum(prefix_pad_masks, dim=1) - 1).to(dtype=torch.long)
+        attention_mask = self.build_attention_mask(
+            prefix_pad_masks,
+            torch.zeros_like(prefix_pad_masks),
+        )
         cache = DynamicCache()
         self.expert_model.forward(
-            attention_mask=prefix_pad_masks,
+            attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=cache,
             inputs_embeds=prefix_embs,
@@ -479,6 +530,8 @@ class ProxyScorePytorch(nn.Module):
         suffix_pad_masks,
         adarms_cond,
         prefix_kv: DynamicCache | None = None,
+        prefix_att_masks=None,
+        suffix_att_masks=None,
     ) -> torch.Tensor:
         if prefix_kv is None:
             embs = torch.cat([prefix_embs, suffix_embs], dim=1)
@@ -505,19 +558,25 @@ class ProxyScorePytorch(nn.Module):
         # token sees every other diffusion token. self.bidirectional_suffix=False restores the old
         # behaviour exactly, for checkpoints trained under it.
         attn = pad_masks
-        if getattr(self, "bidirectional_suffix", False):
+        if prefix_att_masks is None and self.bidirectional_attention:
+            prefix_att_masks = torch.zeros_like(prefix_pad_masks)
+        if prefix_att_masks is not None and suffix_att_masks is not None:
+            attn, pad_masks = self.build_expert_masks(
+                prefix_pad_masks, prefix_att_masks, suffix_pad_masks, suffix_att_masks,
+                n_query=embs.shape[1] if prefix_kv is not None else None)
+        elif getattr(self, "bidirectional_suffix", False):
             pa = getattr(self, "_last_prefix_att", None)
             sa = getattr(self, "_last_suffix_att", None)
             if (pa is not None and sa is not None
                     and pa.shape[1] + sa.shape[1] == pad_masks.shape[1]):
-                # The model's OWN declared block structure: DINO patches are one mutually visible
-                # block, the state its own, the action chunk another. Hardcoding a causal prefix
-                # (the previous _two_block_mask) left patch i unable to attend to patch j > i --
-                # the same defect proxy_pytorch's bidirectional_attention flag fixes.
                 att = torch.cat([pa.expand(pad_masks.shape[0], -1).to(torch.int32),
                                  sa.expand(pad_masks.shape[0], -1).to(torch.int32)], dim=1)
-                attn = self.build_attention_mask(
-                    pad_masks, att, query_offset=pad_masks.shape[1] - embs.shape[1])
+                att_2d = make_att_2d_masks(pad_masks, att)
+                off = pad_masks.shape[1] - embs.shape[1]
+                if off:
+                    att_2d = att_2d[:, off:, :]
+                attn = _to_additive_4d(att_2d, pad_masks.dtype if pad_masks.is_floating_point()
+                                       else torch.float32)
             else:
                 attn = _two_block_mask(pad_masks, suffix_embs.shape[1], embs.dtype,
                                        n_query=embs.shape[1])
@@ -560,8 +619,9 @@ class ProxyScorePytorch(nn.Module):
         goal=None,
         noisy_goal_row=None,
         return_goal_row=False,
+        prefix_att_masks=None,
     ) -> torch.Tensor:
-        suffix_embs, suffix_pad_masks, _, adarms_cond = self.embed_suffix(
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
             state,
             x_t,
             time_cond,
@@ -576,6 +636,8 @@ class ProxyScorePytorch(nn.Module):
             suffix_pad_masks,
             adarms_cond,
             prefix_kv=prefix_kv,
+            prefix_att_masks=prefix_att_masks,
+            suffix_att_masks=suffix_att_masks,
         )
         return (action_out, goal_out) if return_goal_row else action_out
 
@@ -589,6 +651,7 @@ class ProxyScorePytorch(nn.Module):
         prefix_kv: DynamicCache | None = None,
         cond=None,
         goal=None,
+        prefix_att_masks=None,
     ) -> torch.Tensor:
         # Forwarded only when set, so subclasses overriding the hook keep their signature.
         extra = {"prefix_kv": prefix_kv} if prefix_kv is not None else {}
@@ -596,6 +659,8 @@ class ProxyScorePytorch(nn.Module):
             extra["cond"] = cond
         if goal is not None:
             extra["goal"] = goal
+        if prefix_att_masks is not None:
+            extra["prefix_att_masks"] = prefix_att_masks
         output = self._predict_model_output_from_prefix(
             state,
             prefix_embs,
@@ -690,7 +755,9 @@ class ProxyScorePytorch(nn.Module):
                 target = -noise / sqrt_beta[:, None, None]
                 loss_weight = beta[:, None, None]
 
-        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks
+        )
         grouped_labels = x_t.ndim == 4
         if grouped_labels:
             if target.ndim != 4 or time.ndim != 2:
@@ -705,6 +772,9 @@ class ProxyScorePytorch(nn.Module):
             # without rerunning DINO per reverse-diffusion state.
             prefix_embs = prefix_embs.repeat_interleave(labels_per_observation, dim=0)
             prefix_pad_masks = prefix_pad_masks.repeat_interleave(
+                labels_per_observation, dim=0
+            )
+            prefix_att_masks = prefix_att_masks.repeat_interleave(
                 labels_per_observation, dim=0
             )
             state = state.repeat_interleave(labels_per_observation, dim=0)
@@ -749,6 +819,7 @@ class ProxyScorePytorch(nn.Module):
             else self._predict_model_output_from_prefix
         )
         pred = predict(state, prefix_embs, prefix_pad_masks, x_t, time,
+                       prefix_att_masks=prefix_att_masks,
                        **self._goal_kwargs(goal))
         loss = F.mse_loss(pred, target, reduction="none")
         if loss_weight is not None:
@@ -809,7 +880,9 @@ class ProxyScorePytorch(nn.Module):
         images, img_masks, state = self._preprocess_observation(
             observation, train=False
         )
-        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks
+        )
         if self.config.prediction_type == "regress":
             # One forward: the head emits the chunk directly (no reverse chain).
             return self._predict_model_output_from_prefix(
@@ -819,6 +892,7 @@ class ProxyScorePytorch(nn.Module):
                 torch.zeros_like(noise),
                 torch.zeros(bsize, device=device, dtype=noise.dtype),
                 **self._goal_kwargs(goal),
+                prefix_att_masks=prefix_att_masks,
             )
         x_t = noise
         trace = []
@@ -842,7 +916,8 @@ class ProxyScorePytorch(nn.Module):
                     g_t = sqrt_alpha * g_clamp + sqrt_beta * goal_row_noise
                 output, g_out = self._predict_model_output_from_prefix(
                     state, prefix_embs, prefix_pad_masks, x_t, expanded_time, goal=goal,
-                    noisy_goal_row=g_t, return_goal_row=True)
+                    noisy_goal_row=g_t, return_goal_row=True,
+                    prefix_att_masks=prefix_att_masks)
             else:
                 output = self._predict_model_output_from_prefix(
                     state,
@@ -851,6 +926,7 @@ class ProxyScorePytorch(nn.Module):
                     x_t,
                     expanded_time,
                     **self._goal_kwargs(goal),
+                    prefix_att_masks=prefix_att_masks,
                 )
             if self.config.prediction_type == "epsilon":
                 eps_hat = output
