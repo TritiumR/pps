@@ -1,4 +1,5 @@
 import dataclasses
+import logging
 from typing import TYPE_CHECKING, Literal
 
 import jax
@@ -11,6 +12,9 @@ from openpi.shared import array_typing as at
 
 if TYPE_CHECKING:
     from openpi.models_pytorch.proxy_score_pytorch import ProxyScorePytorch
+
+
+logger = logging.getLogger("openpi")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -89,6 +93,46 @@ class ProxyScoreConfig(_model.BaseModelConfig):
         from openpi.models_pytorch.proxy_score_pytorch import ProxyScorePytorch
 
         return ProxyScorePytorch(config=self)
+
+    @override
+    def load_pytorch(self, train_config, weight_path: str) -> "ProxyScorePytorch":
+        """Load score-proxy weights, migrating only the legacy zero-init condition token."""
+        del train_config
+
+        import safetensors.torch
+        import torch
+
+        from openpi.models_pytorch.proxy_score_pytorch import ProxyScorePytorch
+
+        model = ProxyScorePytorch(config=self)
+        missing, unexpected = safetensors.torch.load_model(
+            model, weight_path, strict=False
+        )
+        missing = set(missing)
+        unexpected = set(unexpected)
+        legacy_missing = {"cond_emb.weight"}
+        if unexpected or missing not in (set(), legacy_missing):
+            raise RuntimeError(
+                "ProxyScore checkpoint is incompatible with the current model: "
+                f"missing keys={sorted(missing)}, unexpected keys={sorted(unexpected)}"
+            )
+
+        if missing == legacy_missing:
+            # cond_emb was deliberately introduced with an all-zero initialization so
+            # pre-conditioning checkpoints retain their exact unconditional behavior.
+            # Reset it explicitly rather than depending on constructor initialization.
+            if not hasattr(model, "cond_emb"):
+                raise RuntimeError(
+                    "ProxyScore checkpoint requires the cond_emb compatibility migration, "
+                    "but the current model has no cond_emb module."
+                )
+            with torch.no_grad():
+                model.cond_emb.weight.zero_()
+            logger.warning(
+                "Loaded legacy ProxyScore checkpoint without cond_emb.weight; "
+                "using the backward-compatible all-zero initialization."
+            )
+        return model
 
     @override
     def inputs_spec(

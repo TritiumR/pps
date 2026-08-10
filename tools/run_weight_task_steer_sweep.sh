@@ -8,7 +8,9 @@ SEED_START=${SEED_START:-1}
 SEED_END=${SEED_END:-5}
 GAMMA_BASE=${GAMMA_BASE:?Set GAMMA_BASE to the selected VLM-base gamma.}
 MPC_TEMPERATURE=${MPC_TEMPERATURE:?Set MPC_TEMPERATURE to the selected VLM-base temperature.}
-TASK_CHECKPOINT_DIR=${TASK_CHECKPOINT_DIR:-openpi/checkpoints/score_task_weight/task_eps/30000}
+# This checkpoint was trained with bidirectional diffusion-token attention. Keep the
+# explicit eval override auditable instead of changing the legacy-causal config default.
+TASK_CHECKPOINT_DIR=${TASK_CHECKPOINT_DIR:-openpi/checkpoints/score_task_weight/eps_bidir_image/30000}
 EXP_PREFIX=${EXP_PREFIX:-weight_mpc_sweep/wide_task_steer}
 LOG_DIR="$ROOT_DIR/results/weight_task_steer_wide_logs"
 EXPECTED_EPISODES=$((SEED_END - SEED_START))
@@ -66,6 +68,7 @@ for steer_scale in "$@"; do
         --task Isaac-Weight-Droid-Visuomotor-v0 \
         --task_steer \
         --task_checkpoint_dir "$TASK_CHECKPOINT_DIR" \
+        --task_attention bidirectional \
         --exp_name "$EXP_PREFIX/$config_name" \
         --steer_scale "$steer_scale" \
         --gamma_base "$GAMMA_BASE" \
