@@ -80,6 +80,10 @@ cost:
     center_scale: 0.4
     grasp_dead_zone: proportional
     close_z_scale: 0.025
+    # Plan-authored orient=tilt: broad near-horizontal band. It constrains
+    # elevation only; yaw and the Cartesian path remain free.
+    tilt_down_min: 0.0
+    tilt_down_max: 0.5
     preshape_z: 0.025
     release_step_motion_cap: 0.004
     retreat_margin: 0.02
@@ -115,6 +119,9 @@ advance:
   release_debug: true
   grasp_advance_on_hold: true
   ground_error_debug: true
+  # Thin-handle contact may cross the air threshold before its 12-step settling window closes.
+  thin_feature_contact_ratio: 0.5
+  thin_feature_settle_max_steps: 26
   predicate_place_transitions: true   # place stages advance on the completion predicate
   plan_authoritative: true            # every plan-authored stage advances on the plan's evidence
 grounding:

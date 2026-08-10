@@ -207,11 +207,28 @@ def joint_delta(I):
 
 @register("orientation")
 def orientation(I):
-    """Penalty: mean downward tool-axis misalignment over the horizon."""
-    if I.ee_quat is None or I.context.get("orient", "down") != "down":
+    """Plan-authored tool-axis prior: down, a broad tilt band, or free."""
+    if I.ee_quat is None:
+        return _zeros(I)
+    mode = I.context.get("orient", "down")
+    if mode == "free":
         return _zeros(I)
     down = torch.tensor([0.0, 0.0, -1.0], device=I.ee_quat.device, dtype=I.ee_quat.dtype)
-    return (1.0 - (_axis(I.ee_quat, 2) * down.view(1, 1, 3)).sum(dim=-1)).mean(dim=1)
+    align = (_axis(I.ee_quat, 2) * down.view(1, 1, 3)).sum(dim=-1)
+    if mode == "tilt":
+        # A band, not a target quaternion: azimuth and the Cartesian path stay free,
+        # so contact and the articulated mechanism still determine the motion.
+        lo = float(getattr(I.geom, "tilt_down_min", 0.0))
+        hi = float(getattr(I.geom, "tilt_down_max", 0.5))
+        return (
+            torch.clamp(lo - align, min=0.0).pow(2)
+            + torch.clamp(align - hi, min=0.0).pow(2)
+        ).mean(dim=1)
+    if mode != "down":
+        raise ValueError(
+            f"unknown orientation mode {mode!r}; expected down, tilt, or free"
+        )
+    return (1.0 - align).mean(dim=1)
 
 
 @register("consistency")

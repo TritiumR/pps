@@ -6,17 +6,18 @@
 #
 # Task: "remove the lid of the pot and put egg in it"
 #
-# The task involves eight stages:
-# 1. Grasp the pot lid.
-# 2. Lift the lid clear of the pot.
-# 3. Carry the lid above its aside spot on the table.
-# 4. Lower the lid onto the table.
-# 5. Grasp the egg.
-# 6. Lift the egg clear of the table.
-# 7. Carry the egg above the pot rim.
-# 8. Lower the egg onto the pot rim.
+# The task involves nine stages:
+# 1. Approach the pot-lid handle from above.
+# 2. Grasp the pot lid.
+# 3. Lift the lid clear of the pot.
+# 4. Carry the lid above its aside spot on the table.
+# 5. Lower the lid onto the table.
+# 6. Grasp the egg.
+# 7. Lift the egg clear of the table.
+# 8. Carry the egg above the pot rim.
+# 9. Lower the egg onto the pot rim.
 #
-# Stages 2 and 6 are explicit lifts. They carry no grasp or release keypoint; their sub-goal
+# Stages 3 and 7 are explicit lifts. They carry no grasp or release keypoint; their sub-goal
 # constraint certifies the hold before transport begins. Without them the plan advances to
 # transport on grasp proximity alone and discovers mid-carry that the hand is empty
 # (measured on weight: 21 of 23 recoveries were "empty hand").
@@ -27,16 +28,16 @@
 #  * TRANSPORT SPLIT FROM PLACEMENT (was 6 stages, now 8), for BOTH destinations -- the lid's
 #    aside spot and the egg's pot rim. The old stages 3 and 6 each crossed the workspace and
 #    descended in one stage, so a carry-height path rule on them would have forbidden their own
-#    descent. Split, stages 3 and 7 carry an unconditional carry-height rule and stages 4 and 8
+#    descent. Split, stages 4 and 8 carry an unconditional carry-height rule and stages 5 and 9
 #    are pure descents. Exactly the structure weight uses for its two placements.
 #
-#  * ONE-SIDED VERTICAL LIFT SUB-GOALS (stages 2 and 6). Was a 3-D distance to a lift point
+#  * ONE-SIDED VERTICAL LIFT SUB-GOALS (stages 3 and 7). Was a 3-D distance to a lift point
 #    anchored on the pot keypoint. With subgoal_eps 0.12 a 3-D ball lets a lift complete at a
 #    few centimetres of rise whenever the hand is xy-centred on the lift column; the vertical
 #    shortfall against {lift_z_lid} / {lift_z_egg} makes "below eps" mean height and nothing
 #    else, and stops penalising a lift that overshoots.
 #
-#  * GATED DESCENT ON BOTH LOWER STAGES (4 and 8). Their second path constraint forbids dropping
+#  * GATED DESCENT ON BOTH LOWER STAGES (5 and 9). Their second path constraint forbids dropping
 #    below the hover height while still horizontally far from the place point, relaxing linearly
 #    to zero inside 8cm. The egg's 8cm gate radius is deliberately the SAME as the lid's and as
 #    weight's, even though the pot mouth is narrower than 8cm across: the radius is the distance
@@ -44,50 +45,44 @@
 #    number across every descent in every plan is worth more than a per-object tuning nobody has
 #    measured.
 #
-# PLACE MODE UNCHANGED: stage 8's sub-goal deliberately avoids the words "into"/"inside"/
+# PLACE MODE UNCHANGED: stage 9's sub-goal deliberately avoids the words "into"/"inside"/
 # "within", so rekep._places_into keeps compiling this placement as `surface`, exactly as the
 # six-stage plan did. Restructuring is not the place to also flip an unmeasured cost mode.
 
-num_stages = 8
+num_stages = 9
 
 
 ### stage 1 sub-goal constraints
 def stage1_subgoal_constraint1(end_effector, keypoints):
-    """Align the end-effector with the pot lid (keypoint {lid})."""
-    return np.linalg.norm(end_effector - keypoints[{lid}])
+    """Move the open gripper above the pot-lid handle (keypoint {lid}) before grasping."""
+    approach_point = keypoints[{lid}] + np.array({approach_lid})
+    return np.linalg.norm(end_effector - approach_point)
 
 ### stage 1 path constraints
-# No path constraints needed for grasping.
+# No path constraints: this is a semantic waypoint, not a prescribed trajectory.
 
 ### stage 2 sub-goal constraints
 def stage2_subgoal_constraint1(end_effector, keypoints):
-    """The lid (keypoint {lid}) has reached carry height (vertical shortfall only)."""
-    return np.maximum(0.0, ({lift_z_lid}) - keypoints[{lid}][..., 2])
+    """Align the end-effector with the pot lid (keypoint {lid})."""
+    return np.linalg.norm(end_effector - keypoints[{lid}])
 
 ### stage 2 path constraints
-def stage2_path_constraint1(end_effector, keypoints):
-    """The robot must still be grasping the lid (keypoint {lid})."""
-    return get_grasping_cost_by_keypoint_idx({lid})
+# No path constraints needed for grasping.
 
 ### stage 3 sub-goal constraints
 def stage3_subgoal_constraint1(end_effector, keypoints):
-    """The lid (keypoint {lid}) hovers directly above its aside spot beside the pot (keypoint {pot})."""
-    offsetted_point = keypoints[{pot}] + np.array({hover_lid})
-    return np.linalg.norm(keypoints[{lid}] - offsetted_point)
+    """The lid (keypoint {lid}) has reached carry height (vertical shortfall only)."""
+    return np.maximum(0.0, ({lift_z_lid}) - keypoints[{lid}][..., 2])
 
 ### stage 3 path constraints
 def stage3_path_constraint1(end_effector, keypoints):
     """The robot must still be grasping the lid (keypoint {lid})."""
     return get_grasping_cost_by_keypoint_idx({lid})
 
-def stage3_path_constraint2(end_effector, keypoints):
-    """Keep the lid (keypoint {lid}) clear of the pot and the table while carrying it across."""
-    return np.maximum(0.0, ({carry_z_lid}) - keypoints[{lid}][..., 2])
-
 ### stage 4 sub-goal constraints
 def stage4_subgoal_constraint1(end_effector, keypoints):
-    """The lid (keypoint {lid}) rests on the table, clear of the pot (keypoint {pot})."""
-    offsetted_point = keypoints[{pot}] + np.array({lid_off})
+    """The lid (keypoint {lid}) hovers directly above its aside spot beside the pot (keypoint {pot})."""
+    offsetted_point = keypoints[{pot}] + np.array({hover_lid})
     return np.linalg.norm(keypoints[{lid}] - offsetted_point)
 
 ### stage 4 path constraints
@@ -96,49 +91,49 @@ def stage4_path_constraint1(end_effector, keypoints):
     return get_grasping_cost_by_keypoint_idx({lid})
 
 def stage4_path_constraint2(end_effector, keypoints):
+    """Keep the lid (keypoint {lid}) clear of the pot and the table while carrying it across."""
+    return np.maximum(0.0, ({carry_z_lid}) - keypoints[{lid}][..., 2])
+
+### stage 5 sub-goal constraints
+def stage5_subgoal_constraint1(end_effector, keypoints):
+    """The lid (keypoint {lid}) rests on the table, clear of the pot (keypoint {pot})."""
+    offsetted_point = keypoints[{pot}] + np.array({lid_off})
+    return np.linalg.norm(keypoints[{lid}] - offsetted_point)
+
+### stage 5 path constraints
+def stage5_path_constraint1(end_effector, keypoints):
+    """The robot must still be grasping the lid (keypoint {lid})."""
+    return get_grasping_cost_by_keypoint_idx({lid})
+
+def stage5_path_constraint2(end_effector, keypoints):
     """Stay above the hover height until horizontally aligned with the aside spot."""
     place_xy = keypoints[{pot}][..., :2] + np.array({lid_off})[:2]
     xy_off = np.linalg.norm(keypoints[{lid}][..., :2] - place_xy, axis=-1)
     low = np.maximum(0.0, ({hover_z_lid}) - keypoints[{lid}][..., 2])
     return low * np.minimum(1.0, xy_off / 0.08)
 
-### stage 5 sub-goal constraints
-def stage5_subgoal_constraint1(end_effector, keypoints):
+### stage 6 sub-goal constraints
+def stage6_subgoal_constraint1(end_effector, keypoints):
     """Align the end-effector with the egg (keypoint {egg})."""
     return np.linalg.norm(end_effector - keypoints[{egg}])
 
-### stage 5 path constraints
-# No path constraints needed for grasping.
-
-### stage 6 sub-goal constraints
-def stage6_subgoal_constraint1(end_effector, keypoints):
-    """The egg (keypoint {egg}) has reached carry height (vertical shortfall only)."""
-    return np.maximum(0.0, ({lift_z_egg}) - keypoints[{egg}][..., 2])
-
 ### stage 6 path constraints
-def stage6_path_constraint1(end_effector, keypoints):
-    """The robot must still be grasping the egg (keypoint {egg})."""
-    return get_grasping_cost_by_keypoint_idx({egg})
+# No path constraints needed for grasping.
 
 ### stage 7 sub-goal constraints
 def stage7_subgoal_constraint1(end_effector, keypoints):
-    """The egg (keypoint {egg}) hovers directly above the pot rim (keypoint {pot})."""
-    offsetted_point = keypoints[{pot}] + np.array({hover_egg})
-    return np.linalg.norm(keypoints[{egg}] - offsetted_point)
+    """The egg (keypoint {egg}) has reached carry height (vertical shortfall only)."""
+    return np.maximum(0.0, ({lift_z_egg}) - keypoints[{egg}][..., 2])
 
 ### stage 7 path constraints
 def stage7_path_constraint1(end_effector, keypoints):
     """The robot must still be grasping the egg (keypoint {egg})."""
     return get_grasping_cost_by_keypoint_idx({egg})
 
-def stage7_path_constraint2(end_effector, keypoints):
-    """Keep the egg (keypoint {egg}) clear of the table while carrying it across."""
-    return np.maximum(0.0, ({carry_z_egg}) - keypoints[{egg}][..., 2])
-
 ### stage 8 sub-goal constraints
 def stage8_subgoal_constraint1(end_effector, keypoints):
-    """The egg (keypoint {egg}) rests just above the pot rim (keypoint {pot})."""
-    offsetted_point = keypoints[{pot}] + np.array({egg_off})
+    """The egg (keypoint {egg}) hovers directly above the pot rim (keypoint {pot})."""
+    offsetted_point = keypoints[{pot}] + np.array({hover_egg})
     return np.linalg.norm(keypoints[{egg}] - offsetted_point)
 
 ### stage 8 path constraints
@@ -147,6 +142,21 @@ def stage8_path_constraint1(end_effector, keypoints):
     return get_grasping_cost_by_keypoint_idx({egg})
 
 def stage8_path_constraint2(end_effector, keypoints):
+    """Keep the egg (keypoint {egg}) clear of the table while carrying it across."""
+    return np.maximum(0.0, ({carry_z_egg}) - keypoints[{egg}][..., 2])
+
+### stage 9 sub-goal constraints
+def stage9_subgoal_constraint1(end_effector, keypoints):
+    """The egg (keypoint {egg}) rests just above the pot rim (keypoint {pot})."""
+    offsetted_point = keypoints[{pot}] + np.array({egg_off})
+    return np.linalg.norm(keypoints[{egg}] - offsetted_point)
+
+### stage 9 path constraints
+def stage9_path_constraint1(end_effector, keypoints):
+    """The robot must still be grasping the egg (keypoint {egg})."""
+    return get_grasping_cost_by_keypoint_idx({egg})
+
+def stage9_path_constraint2(end_effector, keypoints):
     """Stay above the hover height until horizontally aligned with the pot rim."""
     place_xy = keypoints[{pot}][..., :2] + np.array({egg_off})[:2]
     xy_off = np.linalg.norm(keypoints[{egg}][..., :2] - place_xy, axis=-1)
@@ -158,12 +168,12 @@ def stage8_path_constraint2(end_effector, keypoints):
 Summarize keypoints to be grasped in all grasping stages.
 For a grasping stage write the keypoint index; for a non-grasping stage write -1.
 """
-grasp_keypoints = [{lid}, -1, -1, -1, {egg}, -1, -1, -1]
+grasp_keypoints = [-1, {lid}, -1, -1, -1, {egg}, -1, -1, -1]
 
 """
 Summarize at **the end of which stage** the robot should release each keypoint.
 """
-release_keypoints = [-1, -1, -1, {lid}, -1, -1, -1, {egg}]
+release_keypoints = [-1, -1, -1, -1, {lid}, -1, -1, -1, {egg}]
 
 
 
@@ -205,9 +215,9 @@ release_keypoints = [-1, -1, -1, {lid}, -1, -1, -1, {egg}]
 #
 #   DIAGNOSTIC KEYS. Every boolean these stages used to publish keeps its name and its meaning:
 #   closed_on_object, rides_with_hand, at_hand, still_held, at_carry_height, inside_place_region,
-#   still_clear_of_table (stage 3), still_clear_of_rim (stage 7), descended, hand_let_go,
+#   still_clear_of_table (stage 4), still_clear_of_rim (stage 8), descended, hand_let_go,
 #   object_quiescent, and the margins margin_aperture / margin_slip_ratio / margin_hand_disp_m /
-#   margin_reach_m / margin_open_frac / margin_speed_mps. Stages 1 and 5 additionally publish an
+#   margin_reach_m / margin_open_frac / margin_speed_mps. Stages 2 and 6 additionally publish an
 #   overall lid_in_hand / egg_in_hand, which is the conjunction they used to return unnamed.
 #   Three margins are RENAMED because sustained() reports one uniform quantity -- the worst COST
 #   in the window, negative when satisfied -- where the old blocks reported differently-signed
@@ -218,7 +228,7 @@ release_keypoints = [-1, -1, -1, {lid}, -1, -1, -1, {egg}]
 #                                                              (now negated: cost, not clearance)
 #     margin_descent_m          -> margin_descended            (now negated: cost, not clearance)
 #
-# The pot plan needs NO new primitive: its eight stages are two grasp / lift / transport / place
+# The pot plan needs NO new primitive: stages 2-9 are two grasp / lift / transport / place
 # quartets, so all eight predicates are the weight forms with the lid and the egg substituted for
 # the pear and the apple. The only pot-specific wording is the two clearance diagnostics, which
 # name what the carried body is being kept clear OF (the table for the lid, the rim for the egg).
@@ -229,34 +239,34 @@ release_keypoints = [-1, -1, -1, {lid}, -1, -1, -1, {egg}]
 # ---------------------------------------------------------------------------
 
 
-### stage 1 completion predicate
-def stage1_completion(history, end_effector, keypoints, robot_state, components):
+### stage 2 completion predicate
+def stage2_completion(history, end_effector, keypoints, robot_state, components):
     """Lid grasped: the fingers are stalled on something, and the lid rides with the hand."""
     lid_in_hand = grasped({lid}, "lid_in_hand", "acquire")
     return bool(lid_in_hand)
 
-### stage 2 completion predicate
-def stage2_completion(history, end_effector, keypoints, robot_state, components):
+### stage 3 completion predicate
+def stage3_completion(history, end_effector, keypoints, robot_state, components):
     """Lid lifted: still owned by the hand, and it has held carry height for the last third of a second."""
     still_held = grasped({lid}, "still_held", "maintain")
     at_carry_height = sustained(
         lambda ee, kp: ({lift_z_lid}) - kp[{lid}][..., 2], "at_carry_height")
     return bool(still_held and at_carry_height)
 
-### stage 3 completion predicate
-def stage3_completion(history, end_effector, keypoints, robot_state, components):
+### stage 4 completion predicate
+def stage4_completion(history, end_effector, keypoints, robot_state, components):
     """Lid over its aside spot: still owned by the hand, inside the place region in xy, still clear above the table."""
     still_held = grasped({lid}, "still_held", "maintain")
     inside_place_region = sustained(
         lambda ee, kp: np.linalg.norm(kp[{lid}][..., :2] - (kp[{pot}][..., :2] + np.array({lid_off})[:2]),
                                       axis=-1) - target_region_radius({pot}), "inside_place_region")
     still_clear_of_table = sustained(
-        lambda ee, kp: (({hover_z_lid}) - clearance_margin({lid})) - kp[{lid}][..., 2],
+        lambda ee, kp: (({hover_z_lid}) - ({lid_clear})) - kp[{lid}][..., 2],
         "still_clear_of_table")
     return bool(still_held and inside_place_region and still_clear_of_table)
 
-### stage 4 completion predicate
-def stage4_completion(history, end_effector, keypoints, robot_state, components):
+### stage 5 completion predicate
+def stage5_completion(history, end_effector, keypoints, robot_state, components):
     """Lid placed: down in the place region, no longer owned by the hand, and no longer moving."""
     hand_let_go = released({lid}, "hand_let_go")
     inside_place_region = sustained(
@@ -264,25 +274,25 @@ def stage4_completion(history, end_effector, keypoints, robot_state, components)
                                       axis=-1) - target_region_radius({pot}), "inside_place_region")
     object_quiescent = stationary({lid}, "object_quiescent")
     descended = sustained(
-        lambda ee, kp: kp[{lid}][..., 2] - (({hover_z_lid}) - clearance_margin({lid})), "descended")
+        lambda ee, kp: kp[{lid}][..., 2] - ({hover_z_lid}), "descended")
     return bool(hand_let_go and inside_place_region and object_quiescent and descended)
 
-### stage 5 completion predicate
-def stage5_completion(history, end_effector, keypoints, robot_state, components):
+### stage 6 completion predicate
+def stage6_completion(history, end_effector, keypoints, robot_state, components):
     """Egg grasped: the fingers are stalled on something, and the egg rides with the hand."""
     egg_in_hand = grasped({egg}, "egg_in_hand", "acquire")
     return bool(egg_in_hand)
 
-### stage 6 completion predicate
-def stage6_completion(history, end_effector, keypoints, robot_state, components):
+### stage 7 completion predicate
+def stage7_completion(history, end_effector, keypoints, robot_state, components):
     """Egg lifted: still owned by the hand, and it has held carry height for the last third of a second."""
     still_held = grasped({egg}, "still_held", "maintain")
     at_carry_height = sustained(
         lambda ee, kp: ({lift_z_egg}) - kp[{egg}][..., 2], "at_carry_height")
     return bool(still_held and at_carry_height)
 
-### stage 7 completion predicate
-def stage7_completion(history, end_effector, keypoints, robot_state, components):
+### stage 8 completion predicate
+def stage8_completion(history, end_effector, keypoints, robot_state, components):
     """Egg over the pot: still owned by the hand, inside the rim region in xy, still clear above the rim."""
     still_held = grasped({egg}, "still_held", "maintain")
     inside_place_region = sustained(
@@ -293,8 +303,8 @@ def stage7_completion(history, end_effector, keypoints, robot_state, components)
         "still_clear_of_rim")
     return bool(still_held and inside_place_region and still_clear_of_rim)
 
-### stage 8 completion predicate
-def stage8_completion(history, end_effector, keypoints, robot_state, components):
+### stage 9 completion predicate
+def stage9_completion(history, end_effector, keypoints, robot_state, components):
     """Egg placed: down in the rim region, no longer owned by the hand, and no longer moving."""
     hand_let_go = released({egg}, "hand_let_go")
     inside_place_region = sustained(

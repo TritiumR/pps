@@ -187,7 +187,10 @@ class SensedWorld:
         else:
             at = dict(self._pos)
             at.update(points or {})
-            near = ({n: p for n, p in at.items() if n in candidates} if candidates else at)
+            # None means unrestricted discovery; an explicit empty set means the current
+            # contact is a press and must not create a carried-object latch.
+            near = ({n: p for n, p in at.items() if n in candidates}
+                    if candidates is not None else at)
             held = self.sensor.held_object(near, env.tcp())
 
         if held != self._held:

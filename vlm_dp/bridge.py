@@ -90,6 +90,7 @@ class VlmDpBridge:
         self._reopen_travel = float(adv.get("reopen_min_travel", 0.02))
         self._reopen_cooldown = int(adv.get("reopen_cooldown_replans", 8))
         self.stall_margin = float(adv.get("stall_margin", 0.15))
+        self._thin_feature_contact_ratio = float(adv.get("thin_feature_contact_ratio", 0.5))
         # Optional hold hysteresis, grace, and backtrack limits.
         self.hold_enter = _opt_float(adv.get("hold_enter"))
         self.hold_exit = _opt_float(adv.get("hold_exit"))
@@ -159,6 +160,10 @@ class VlmDpBridge:
         self.jump_rate = float(self.jump_rate) if self.jump_rate is not None else None
         self.close_steps = int(adv.get("close_steps", 12))
         self.settle_steps = int(adv.get("settle_steps", 12))
+        # A thin contact can enter the generic air band before the aperture has settled.
+        self._thin_feature_settle_max_steps = int(adv.get(
+            "thin_feature_settle_max_steps", 2 * (max(self.close_steps, self.settle_steps) + 1)
+        ))
         self.seat_shift = bool(cost_cfg.get("grounding", {}).get("seat_shift", True))
         self.local_grasp = bool(cost_cfg.get("grounding", {}).get("local_grasp", False))
         self.local_grasp_radius = float(cost_cfg.get("grounding", {}).get("local_grasp_radius", 0.05))
@@ -411,6 +416,13 @@ class VlmDpBridge:
                 # recovery re-latches on the same evidence and the escape buys nothing.
                 self._reopen_cooldown_left -= 1
                 self._reopen = False
+            elif self._thin_feature_held(st.grasp_obj):
+                self._reopen = False
+            elif self.sensor.closed_on_air() and self._thin_feature_settling(st.grasp_obj):
+                self._reopen = False
+                print(f"[vlm_dp] thin-feature contact settling: keep close "
+                      f"age={self.sensor.close_age()}/{self._thin_feature_settle_max_steps}",
+                      flush=True)
             elif self.sensor.closed_on_air():
                 if not self._reopen:
                     self._reopen_ap = []
@@ -680,8 +692,12 @@ class VlmDpBridge:
             "subgoal_value": old,
             "subgoal_fired": None if old is None else bool(old < self.subgoal_eps),
             "frames": int(len(self._pred_hist)),
-            "components": {k: (bool(v) if isinstance(v, bool) else float(v))
-                           for k, v in components.items()},
+            "components": {
+                k: (bool(v) if isinstance(v, bool)
+                    else float(v) if isinstance(v, (int, float, np.number))
+                    else str(v))
+                for k, v in components.items()
+            },
         }
         # advance() ran just before this context(), so its transition decision (when predicate
         # transitions are enabled) belongs to this same replan. Carrying it here puts the
@@ -693,11 +709,15 @@ class VlmDpBridge:
         """Record one shared world and aperture-sensor observation."""
         # Route both state modes through the world to preserve latched holds.
         st = self.stage()
-        cand = {n for n in (st.grasp_obj, st.payload) if n}
+        press = getattr(st, "contact", "pinch") == "press"
+        # A press touches an articulated part but never carries it. Passing an explicit empty
+        # candidate set keeps the hold latch from claiming the lid and freezing its visual track.
+        cand = set() if press else {n for n in (st.grasp_obj, st.payload) if n}
         observe = getattr(self.world, "observe", None)
         if callable(observe):
-            observe(self.env, commanded_close, candidates=cand or None,
-                    points=self._hold_points(cand))
+            observe(self.env, commanded_close,
+                    candidates=(cand if press else (cand or None)),
+                    points=(None if press else self._hold_points(cand)))
         else:
             self.sensor.observe(self.env, commanded_close)
 
@@ -843,8 +863,11 @@ class VlmDpBridge:
         ApertureGraspSensor, so that the preflight exercises this same rule rather than a stub.
         """
         world = getattr(self, "_hold_world", None) or self.world
-        return payload_held(payload, self.hold_authority, world, self.sensor,
+        held = payload_held(payload, self.hold_authority, world, self.sensor,
                             self.env.tcp(), self._pos(payload))
+        if held:
+            return True
+        return self._thin_feature_held(payload)
 
     def _grip_half_width(self, payload):
         """Return the half-width used to predict the payload stall angle."""
@@ -854,6 +877,46 @@ class VlmDpBridge:
             return float(ge)
         ext = self._extents.get(payload)
         return float(ext[0]) if ext is not None else None
+
+    def _thin_feature_contact(self, payload):
+        """Return whether aperture, visual width and TCP proximity agree on thin contact."""
+        if self.sensor is None or payload is None:
+            return False
+        half_w = self._grip_half_width(payload)
+        if half_w is None:
+            return False
+        predicted = self.sensor.q_free - self._AP_SLOPE * (2.0 * half_w)
+        air_threshold = self.sensor.q_free - self.sensor.stall_margin_enter
+        if predicted <= air_threshold:
+            return False
+        ratio = float(getattr(self, "_thin_feature_contact_ratio", 0.5))
+        max_aperture = predicted + ratio * (self.sensor.q_free - predicted)
+        if self.sensor.aperture() >= max_aperture:
+            return False
+        try:
+            distance = float(np.linalg.norm(np.asarray(self.env.tcp()) - self._pos(payload)))
+        except Exception:
+            return False
+        return distance <= self.sensor.proximity
+
+    def _thin_feature_held(self, payload):
+        """Certify a settled contact on a feature thinner than the generic stall band."""
+        return self._thin_feature_contact(payload) and self.sensor.closed()
+
+    def _thin_feature_settling(self, payload):
+        """Keep closing while a plausible thin contact gathers settling evidence.
+
+        The generic air threshold is crossed before ``closed()`` can collect its full window.
+        Deferring recovery prevents it from erasing that evidence. The bounded close age keeps
+        recovery available for a contact that never settles.
+        """
+        if not getattr(self, "_last_cmd_close", False):
+            return False
+        if not self._thin_feature_contact(payload) or self.sensor.closed():
+            return False
+        default_max = 2 * (max(self.sensor.close_steps, self.sensor.settle_steps) + 1)
+        max_steps = int(getattr(self, "_thin_feature_settle_max_steps", default_max))
+        return self.sensor.close_age() < max_steps
 
     _REGRASP_PERCEIVE_AFTER = 2   # Closed-empty grasps before re-perception.
 
@@ -968,7 +1031,7 @@ class VlmDpBridge:
         if self.advance_mode == "env_flags":
             # Privileged-signal ablation.
             return None if flags.get(f"grasp_{stage.payload}", False) else "flag dropped"
-        if self.sensor.closed_on_air():
+        if self.sensor.closed_on_air() and not self._thin_feature_held(stage.payload):
             self._log_grip("empty hand", stage.payload)
             return "empty hand"
         if self.sensor.holding() and not self._grip_ok(stage.payload):

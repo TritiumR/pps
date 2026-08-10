@@ -141,6 +141,10 @@ class ApertureGraspSensor:
         )
         return name if dist <= self.proximity else None
 
+    def close_age(self) -> int:
+        """Return consecutive applied control steps carrying a close command."""
+        return self._closed_for
+
     def aperture(self) -> float:
         """Return the latest finger joint angle in radians."""
         return self._q[-1] if self._q else 0.0

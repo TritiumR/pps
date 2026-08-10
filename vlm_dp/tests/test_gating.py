@@ -365,6 +365,18 @@ def test_orientation_stands_down_only_when_the_vlm_rotates():
     free = _evaluate(_Scenario("f", "", _ctx(payload="pear", place_target="scale", orient="free"), set()))
     assert down["orientation"] > 0.0, "orient='down' must keep the downward tool-axis prior on"
     assert free["orientation"] == 0.0, "orient='free' must stand the downward tool-axis prior down"
+    geom = types.SimpleNamespace(**DEFAULT_GEOM, tilt_down_min=0.0, tilt_down_max=0.5)
+    ctx = _ctx(orient="tilt")
+    q_horizontal = torch.tensor([2 ** -0.5, 0.0, 2 ** -0.5, 0.0])
+    q_down = torch.tensor([0.0, 1.0, 0.0, 0.0])
+
+    def score(q):
+        quat = q.view(1, 1, 4).expand(K, H, 4).contiguous()
+        inputs = CostInputs(ACTIONS, EE, quat, ctx, EXTENTS, geom)
+        return float(TERMS["orientation"](inputs).max())
+
+    assert score(q_horizontal) == 0.0, "a horizontal tool axis must lie inside the tilt band"
+    assert score(q_down) > 0.0, "vertical-down must be pushed out of the tilt stage"
 
 
 # ------------------------------------------------------------------- the pinch/press contact criterion

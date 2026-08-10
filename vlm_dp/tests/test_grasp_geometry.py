@@ -238,6 +238,53 @@ def test_seed6_stage_one_is_advanceable():
         "fixture check: the old centroid-resolved hold must NOT advance (else this proves nothing)"
 
 
+def test_thin_feature_contact_is_not_confused_with_a_free_close():
+    """A settled close on a 10mm handle is above the generic air threshold."""
+    stage = Stage(name="grasp cover", gripper="close", grasp_obj="cover", payload=None,
+                  target=(lambda: RIM), contact="pinch")
+    env = _Env(q=0.69, tcp=RIM)
+    world = types.SimpleNamespace(held=(lambda: None))
+    bridge = _bare_bridge(world, env, stage)
+    bridge.grounding.objects = [
+        SceneObject(name="cover", pos=(lambda: RIM), extents=CAPSULE_EXT,
+                    grasp_extent=0.005)
+    ]
+    bridge._obj_pos = {"cover": (lambda: RIM)}
+    bridge._extents = {"cover": CAPSULE_EXT}
+
+    # Reproduce the runtime race: the aperture enters the air band after four applied close
+    # steps, eight steps before the sensor can possibly certify a settled contact.
+    bridge.sensor = ApertureGraspSensor()
+    for _ in range(4):
+        bridge.sensor.observe(env, True)
+    assert bridge.sensor.closed_on_air() and not bridge.sensor.closed()
+    assert bridge._thin_feature_settling("cover"), "thin contact must keep closing until settled"
+    assert not bridge._thin_feature_held("cover"), "unsettled contact must not certify early"
+
+    def sensor_at(aperture):
+        sensor = ApertureGraspSensor()
+        env.q = aperture
+        for _ in range(20):
+            sensor.observe(env, True)
+        return sensor
+
+    bridge.sensor = sensor_at(0.69)
+    assert bridge.sensor.closed_on_air(), "fixture: old fixed threshold must call this air"
+    assert bridge._payload_held("cover"), "width-predicted thin-handle contact must certify"
+    bridge.sensor = sensor_at(bridge.sensor.q_free)
+    assert bridge.sensor.closed_on_air(), "fixture: a free close must be in the air band"
+    assert not bridge._payload_held("cover"), "a true free close must still trigger recovery"
+    assert not bridge._thin_feature_settling("cover"), "a true free close must reopen immediately"
+
+    # A noisy candidate cannot suppress recovery forever: after the bounded age it is rejected.
+    bridge.sensor = ApertureGraspSensor()
+    for i in range(30):
+        env.q = (0.67, 0.71, 0.69)[i % 3]
+        bridge.sensor.observe(env, True)
+    assert bridge.sensor.closed_on_air() and not bridge.sensor.closed()
+    assert bridge.sensor.close_age() > bridge._thin_feature_settle_max_steps
+    assert not bridge._thin_feature_settling("cover"), "an unsteady contact must eventually reopen"
+
 def _bare_bridge(world, env, stage):
     """A VlmDpBridge with only the attributes the rules under test read."""
     from vlm_dp.bridge import VlmDpBridge
@@ -273,6 +320,9 @@ def _bare_bridge(world, env, stage):
     # Sensor construction parameters, for the preflight's real sensor.
     bridge.stall_margin, bridge.settle_eps = 0.15, 0.01
     bridge.close_steps, bridge.settle_steps = 12, 12
+    bridge._last_cmd_close = True
+    bridge._thin_feature_contact_ratio = 0.5
+    bridge._thin_feature_settle_max_steps = 26
     bridge.legacy_sensor = False
     bridge.hold_enter = bridge.hold_exit = None
     # Reopen bounds.

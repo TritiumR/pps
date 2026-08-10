@@ -2,6 +2,7 @@
 import json
 import os
 
+import cv2
 import numpy as np
 
 from vlm_dp.grounding import predicates
@@ -22,18 +23,33 @@ _CARRY_HOVER, _CARRY_SLACK = 0.10, 0.03
 # body the plan carries as far as the runtime's ownership rule is concerned (see _tea).
 _TEA_MOUTH_CLEAR = 0.05
 
+# Pot-cover handle extraction from the observed cover point cloud. The handle is the small
+# raised component above the broad lid surface; these thresholds are deliberately in sensor
+# space and do not use the cover's simulator pose or asset geometry.
+_POT_HANDLE_MIN_RISE, _POT_HANDLE_MIN_PTS = 0.008, 12
+_POT_HANDLE_HALF_W_BOUNDS = (0.004, 0.025)
+# Semantic pre-grasp waypoint. With simple_auth's 0.12m sub-goal tolerance, 0.20m still
+# guarantees at least 8cm of vertical clearance when the approach stage advances.
+_POT_APPROACH_HEIGHT = 0.20
+# Authored clear-above/descended band for the visually declared lid-handle feature.
+_POT_LID_CLEAR = 0.05
+
 # Capsule geometry, in the machine-root frame. Same numbers vlm_dp/grounding/capsule.py and
 # vlm_dp/offline_context.py use: the pod bay sits on the machine's vertical axis, and the lid
 # travels roughly this far up when it swings open.
 _CAPSULE_BAY_LOCAL = np.array([0.0, 0.0, 0.27])
 _CAPSULE_LID_OPEN_LIFT = np.array([0.0, 0.0, 0.12])
-# How far short of that open lift the lip may stop and still count as OPENED. Authored here,
-# beside the lift it is a band on, and rendered into the plan as {open_clear}: the lid's rise
-# tolerance is the plan's own geometry and must not be laundered through a runtime primitive.
-# clearance_margin() would REFUSE it and rightly so -- the lip is a DECLARED feature on a body
-# the robot never carries, so no clearance of it can be derived from that body's extents. 0.05
-# of the 0.12 lift means the lip has to reach ~58% of the commanded travel; it is a 5cm band and
-# not a 5mm one because a hinge arc does not stop on a millimetre.
+# Closed-lid hinge geometry used only to turn a visually tracked rim point into an angle.
+# The hinge lies one lid radius inboard from the front lip in the calibrated machine frame.
+_CAPSULE_LID_RADIUS = float(_CAPSULE_LID_OPEN_LIFT[2])
+_CAPSULE_HINGE_FROM_LIP_LOCAL = np.array([0.0, _CAPSULE_LID_RADIUS, 0.0])
+_CAPSULE_OPEN_ANGLE_DEG = 85.0  # sensor tolerance around the physical 90-degree stop
+_CAPSULE_ANGLE_RESIDUAL_SCALE = float(np.deg2rad(5.0))
+# Closed-finger pre-contact point directly below the lid lip. Stage 1 closes here; stage 2 then
+# moves upward through the lip so the physical hinge, rather than a hand-authored arc, sets xy.
+_CAPSULE_UNDER_LIP_DROP = 0.03
+# Height band used by the stage-2 sustained-history diagnostic. The control sub-goal below is
+# stricter because it normalizes the remaining push stroke by the full 0.12m travel.
 _CAPSULE_OPEN_CLEAR = 0.05
 # Where the pod comes to rest relative to the bay keypoint. Was a literal np.array([0, 0, 0.02])
 # inside the plan's place stage; it is a field now because the descent gate and the stage's
@@ -218,11 +234,9 @@ def _weight(out_dir, keypoints, grounded, env, clearance):
 def _capsule(out_dir, keypoints, grounded, env, clearance):
     """Resolve the capsule roles against the live scene, then render the fixed plan.
 
-    Three of the four roles have no proposed keypoint to snap to: the lid lip is a thin rim the
-    proposer rarely samples, the open goal is a place in mid-air, and the bay is a recess inside
-    the machine. They are *declared* instead -- returned as extra keypoints the caller appends and
-    registers (the same trick `kp_source=gt` uses for its virtual points), so the plan can name
-    them without any of them being a keypoint index the proposer happened to hand us.
+    Four of the five roles have no proposed keypoint to snap to: the lid lip is a thin rim, the
+    under-lip point and open goal are in mid-air, and the bay is a recess inside the machine.
+    They are *declared* instead -- returned as extra keypoints the caller appends and registers.
 
     Only the pod is resolved by snapping, because the can is a real, segmented, movable object
     and its keypoint has to travel with it.
@@ -250,16 +264,27 @@ def _capsule(out_dir, keypoints, grounded, env, clearance):
     # so one more fixed offset in that frame is the same class of information, and unlike the
     # cloud search it does not depend on which facets the camera happened to see this episode.
     lip_world = _observable(root + _quat_rotate_wxyz(quat, _CAPSULE_LIP_LOCAL), pts["capsule"])
+    hinge_world = lip_world + _quat_rotate_wxyz(quat, _CAPSULE_HINGE_FROM_LIP_LOCAL)
+    under_world = lip_world - np.array([0.0, 0.0, _CAPSULE_UNDER_LIP_DROP])
     open_world = lip_world + _CAPSULE_LID_OPEN_LIFT
     bay_world = root + _quat_rotate_wxyz(quat, _CAPSULE_BAY_LOCAL)
 
     pod = _nearest_kp_distinct(keypoints, pts["can"].mean(axis=0), set())
     n = len(keypoints)
-    lip, open_goal, bay = n, n + 1, n + 2
-    extra = [(lip_world, "capsule", _CAPSULE_LIP_HALF_W), (open_world, None), (bay_world, "capsule")]
+    lip, lip_rest, hinge, open_goal, bay, under_lip = range(n, n + 6)
+    # "lid" is seeded into SensedWorld before CoTracker is primed. The live lip therefore follows
+    # the observed lid surface, while lip_rest and hinge stay fixed in the calibrated fixture
+    # frame. Runtime completion reads their angle; it never reads the simulator joint.
+    extra = [(lip_world, "lid", _CAPSULE_LIP_HALF_W),
+             (lip_world, "capsule"),
+             (hinge_world, "capsule"),
+             (open_world, None),
+             (bay_world, "capsule"),
+             (under_world, "capsule", _CAPSULE_LIP_HALF_W)]
 
     kps = np.concatenate([np.asarray(keypoints, dtype=np.float64),
-                          np.stack([lip_world, open_world, bay_world])], axis=0)
+                          np.stack([lip_world, lip_world, hinge_world, open_world,
+                                    bay_world, under_world])], axis=0)
     # Lift target: the pod's pick-up position raised _LIFT_HEIGHT, expressed as an offset from the
     # BAY keypoint because that one is on the machine and does not move. Anchoring to the carried
     # pod's own keypoint would be degenerate (the target would track the pod).
@@ -274,10 +299,14 @@ def _capsule(out_dir, keypoints, grounded, env, clearance):
     lift_z_pod = float(kps[pod][2] + _LIFT_HEIGHT)
     carry_z_pod = float(kps[pod][2] + _LIFT_HEIGHT - _CARRY_SLACK)
     hover_z_pod = float(kps[bay][2] + hover_pod[2])
-    metadata = _render("capsule", out_dir, lip=lip, open_goal=open_goal, pod=pod, bay=bay,
+    metadata = _render("capsule", out_dir, lip=lip, lip_rest=lip_rest, hinge=hinge,
+                       under_lip=under_lip, open_goal=open_goal, pod=pod, bay=bay,
                        lift_pod=lift_pod, off_pod=off_pod, hover_pod=hover_pod,
                        lift_z_pod=lift_z_pod, carry_z_pod=carry_z_pod, hover_z_pod=hover_z_pod,
-                       open_clear=float(_CAPSULE_OPEN_CLEAR))
+                       open_clear=float(_CAPSULE_OPEN_CLEAR),
+                       open_lift=float(_CAPSULE_LID_OPEN_LIFT[2]),
+                       open_angle_rad=float(np.deg2rad(_CAPSULE_OPEN_ANGLE_DEG)),
+                       angle_residual_scale=float(_CAPSULE_ANGLE_RESIDUAL_SCALE))
     # vlm_dp extension, not part of the ReKep response format the parser understands.
     metadata["steer_policies"] = ["on_failure"] * metadata["num_stages"]
     with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
@@ -285,10 +314,14 @@ def _capsule(out_dir, keypoints, grounded, env, clearance):
 
     print(f"[fake-vlm] capsule roles pod=kp{pod} (snapped, {np.round(kps[pod], 3)}) "
           f"lip=kp{lip} (declared, {np.round(lip_world, 3)}) "
+          f"hinge=kp{hinge} (declared, {np.round(hinge_world, 3)}) "
+          f"under_lip=kp{under_lip} (declared, {np.round(under_world, 3)}) "
           f"open_goal=kp{open_goal} (declared, {np.round(open_world, 3)}) "
           f"bay=kp{bay} (declared, {np.round(bay_world, 3)})", flush=True)
     _capsule_lip_diagnostic(env, lip_world, root, quat)
-    return metadata, {"lid": lip, "open_goal": open_goal, "pod": pod, "bay": bay}, extra
+    return metadata, {"lid": lip, "lid_rest": lip_rest, "hinge": hinge,
+                      "under_lip": under_lip, "open_goal": open_goal,
+                      "pod": pod, "bay": bay}, extra
 
 
 def _capsule_lip_diagnostic(env, lip_world, root, quat):
@@ -373,10 +406,74 @@ def _nearest_kp_distinct(keypoints, point, taken):
     return int(order[0])
 
 
-def _rim_point(pts):
-    """Return a graspable rim point from a point cloud."""
-    c = pts[:, :2].mean(axis=0)
-    return pts[int(np.argmax(np.linalg.norm(pts[:, :2] - c[None], axis=-1)))]
+def _raised_handle(grounded, cover_pts):
+    """Find the lid handle in raw depth inside the visually detected lid region.
+
+    SAM usually segments only the broad lid surface and cuts the raised handle out of the
+    cover mask. The mask still gives a reliable image-space region and lid height, so inspect
+    the unmasked depth inside its bounding rectangle. A supported component immediately above
+    the lid is the handle; substantially higher components are usually the robot crossing the
+    box. This uses only the camera segmentation and depth -- no simulator pose or asset geometry.
+    """
+    cover_pts = np.asarray(cover_pts, dtype=np.float64)
+    cover_pts = cover_pts[np.isfinite(cover_pts).all(axis=1)]
+    points = np.asarray(grounded.get("points"))
+    labels = np.asarray(grounded.get("masks"))
+    if len(cover_pts) < 2 * _POT_HANDLE_MIN_PTS or points.ndim != 3 or labels.ndim != 2:
+        return None
+
+    cover_ids = [
+        int(obj_id) for obj_id, name in grounded.get("id_to_prim", {}).items()
+        if str(name).rsplit("/", 1)[-1] == "cover"
+    ]
+    if not cover_ids:
+        return None
+    cover_pixels = np.isin(labels, cover_ids)
+    rows, cols = np.nonzero(cover_pixels)
+    if len(rows) < 2 * _POT_HANDLE_MIN_PTS:
+        return None
+
+    y0, y1 = int(rows.min()), int(rows.max()) + 1
+    x0, x1 = int(cols.min()), int(cols.max()) + 1
+    patch = points[y0:y1, x0:x1]
+    finite = np.isfinite(patch).all(axis=-1)
+    lid_z = float(np.percentile(cover_pts[:, 2], 60))
+    raised = finite & (patch[..., 2] >= lid_z + _POT_HANDLE_MIN_RISE)
+    count, component, stats, _ = cv2.connectedComponentsWithStats(
+        raised.astype(np.uint8), connectivity=8
+    )
+
+    # Scale support with the observed lid region. On the formal 640x360 views this rejects the
+    # small depth fringe at the lid edge while retaining the handle by a comfortable margin.
+    min_support = max(_POT_HANDLE_MIN_PTS, int(np.ceil(0.01 * raised.size)))
+    candidates = []
+    for idx in range(1, count):
+        support = int(stats[idx, cv2.CC_STAT_AREA])
+        if support < min_support:
+            continue
+        handle = patch[component == idx].astype(np.float64, copy=False)
+        rise = float(np.median(handle[:, 2]) - lid_z)
+        if rise < _POT_HANDLE_MIN_RISE:
+            continue
+        # The handle is the first supported surface above the lid. Robot/gripper components
+        # crossing this ROI are visibly farther above it and therefore rank later.
+        candidates.append((rise, -support, handle))
+    if not candidates:
+        return None
+
+    rise, neg_support, handle = min(candidates, key=lambda item: (item[0], item[1]))
+    support = -neg_support
+    centre = np.median(handle, axis=0)
+    xy = handle[:, :2] - centre[None, :2]
+    cov = xy.T @ xy / max(len(xy) - 1, 1)
+    _, axes = np.linalg.eigh(cov)
+    projected = xy @ axes
+    spans = np.percentile(projected, 95, axis=0) - np.percentile(projected, 5, axis=0)
+    half_width = float(np.clip(0.5 * spans.min(), *_POT_HANDLE_HALF_W_BOUNDS))
+    narrow_axis = axes[:, int(np.argmin(spans))]
+    narrow_axis = narrow_axis / max(float(np.linalg.norm(narrow_axis)), 1e-9)
+    axis = (float(narrow_axis[0]), float(narrow_axis[1]), 0.0)
+    return centre, half_width, axis, support, rise
 
 
 def _tea(out_dir, keypoints, grounded, env, clearance):
@@ -458,6 +555,8 @@ def _pot(out_dir, keypoints, grounded, env, clearance):
         if p is None:
             raise SystemExit(f"[fake-vlm] no masked points for {name}")
         pts[name] = p
+    extra = ()
+    handle_axis = None
     if grounded.get("gt_meta") is not None:
 
         roles["cover"], roles["egg"], roles["pot"] = 0, 1, 2
@@ -467,7 +566,18 @@ def _pot(out_dir, keypoints, grounded, env, clearance):
         taken = set()
         roles["pot"] = _nearest_kp_distinct(keypoints, pts["pot"].mean(axis=0), taken)
         taken.add(roles["pot"])
-        roles["cover"] = _nearest_kp_distinct(keypoints, _rim_point(pts["cover"]), taken)
+        handle = _raised_handle(grounded, pts["cover"])
+        if handle is None:
+            raise SystemExit("[fake-vlm] no supported raised handle in the visually detected "
+                             "pot-lid region; refusing the unsafe rim-keypoint fallback")
+        handle_world, handle_half_w, handle_axis, support, rise = handle
+        roles["cover"] = len(keypoints)
+        extra = ((handle_world, "cover", handle_half_w),)
+        keypoints = np.concatenate(
+            [np.asarray(keypoints, dtype=np.float64), handle_world[None]], axis=0)
+        print(f"[fake-vlm] pot handle=kp{roles['cover']} (declared from {support} observed "
+              f"ROI points, rise={rise:.3f}, half_width={handle_half_w:.3f}, "
+              f"narrow_axis={np.round(handle_axis, 3)})", flush=True)
         taken.add(roles["cover"])
         roles["egg"] = _nearest_kp_distinct(keypoints, pts["egg"].mean(axis=0), taken)
     lid, egg, pot = roles["cover"], roles["egg"], roles["pot"]
@@ -508,6 +618,8 @@ def _pot(out_dir, keypoints, grounded, env, clearance):
                for n, k in (("lid", lid), ("egg", egg))}
     hover_z = {n: float(keypoints[pot][2] + hover[n][2]) for n in ("lid", "egg")}
     metadata = _render("pot", out_dir, lid=lid, egg=egg, pot=pot, lid_off=lid_off, egg_off=egg_off,
+                       approach_lid=[0.0, 0.0, _POT_APPROACH_HEIGHT],
+                       lid_clear=float(_POT_LID_CLEAR),
                        lift_lid=lift_lid, lift_egg=lift_egg,
                        hover_lid=hover["lid"], hover_egg=hover["egg"],
                        lift_z_lid=lift_z["lid"], lift_z_egg=lift_z["egg"],
@@ -515,10 +627,12 @@ def _pot(out_dir, keypoints, grounded, env, clearance):
                        hover_z_lid=hover_z["lid"], hover_z_egg=hover_z["egg"])
     # vlm_dp extension, not part of the ReKep response format the parser understands.
     metadata["steer_policies"] = ["on_failure"] * metadata["num_stages"]
+    if handle_axis is not None:
+        metadata["grasp_axes"] = {str(lid): list(handle_axis)}
     with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
     print(f"[fake-vlm] pot roles lid=kp{lid} egg=kp{egg} pot=kp{pot}", flush=True)
-    return metadata, roles
+    return metadata, roles, extra
 
 
 _FAKE_VLMS = {"weight": _weight, "capsule": _capsule, "tea": _tea, "pot": _pot}

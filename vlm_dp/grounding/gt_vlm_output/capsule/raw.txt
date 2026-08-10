@@ -7,8 +7,8 @@
 # Task: "open the coffee maker lid and put the pod inside"
 #
 # The task involves six stages:
-# 1. Grasp the coffee-maker lid.
-# 2. Open the lid on its hinge.
+# 1. Close the gripper at a waypoint directly below the coffee-maker lid lip.
+# 2. Push upward through the lip so the lid rotates on its hinge.
 # 3. Grasp the pod.
 # 4. Lift the pod clear of the tray.
 # 5. Carry the pod above the bay.
@@ -25,21 +25,14 @@
 #    descent it was supposed to perform. Splitting gives stage 5 an unconditional carry-height
 #    path rule and stage 6 a pure descent -- the same reason weight splits 2-3 from 4.
 #
-#  * ONE-SIDED VERTICAL FOR BOTH RISING STAGES (2 and 4). Stage 4 is the ordinary lift and reads
-#    exactly like weight stages 2/6. Stage 2 -- the lid opening -- is treated as a lift too,
-#    which is the one non-obvious call here: the lip travels on a HINGE ARC, so it rises while
-#    swinging back in xy, and a 3-D distance to the mid-air open point charges the plan for the
-#    arc's horizontal component, which the mechanism dictates and the robot cannot choose. What
-#    the stage actually names is "the lip has risen by the open lift", so the sub-goal is the
-#    vertical shortfall of the lip against the declared open-goal keypoint and nothing else.
-#    The open goal stays a KEYPOINT rather than becoming a baked scalar: it is unowned (it never
-#    moves) and keeping it named is what keeps the declared point meaningful to the plan.
-#    Stage 2's completion predicate is the matching LID-OPENED event. Note that stage 2 is a
-#    RELEASE stage (release_keypoints[1] = the lip), so the runtime classifies it as a place
-#    stage and, under advance.predicate_place_transitions, advances it on that predicate: the
-#    predicate therefore states the event in the place vocabulary -- risen, hand let go, lid no
-#    longer swinging -- and uses a 5cm band rather than a 5mm one, the same band weight's place
-#    predicates use for their descent test, because a hinge arc does not stop on a millimetre.
+#  * CLOSED-FINGER UNDER-LIP PRESS (stages 1 and 2). Stage 1 closes at a declared waypoint 3cm
+#    directly below the observed lid lip. Stage 2 keeps the gripper closed and pushes upward.
+#    Reaching a point above the lid is NOT completion: the visually tracked hinge-to-lip vector
+#    must rotate to the physical 90-degree stop (85 degrees after sensor tolerance). Thus a hand
+#    that misses the lip cannot open and leave for the pod merely because its TCP rose high enough.
+#
+#  * ONE-SIDED VERTICAL POD LIFT (stage 4). This is the ordinary carried-object lift and reads
+#    exactly like weight stages 2/6.
 #
 #  * GATED DESCENT (stage 6). Its second path constraint forbids dropping below the hover height
 #    while still horizontally far from the bay, relaxing linearly to zero inside 8cm. The pod
@@ -56,21 +49,29 @@ num_stages = 6
 
 ### stage 1 sub-goal constraints
 def stage1_subgoal_constraint1(end_effector, keypoints):
-    """Align the end-effector with the lid lip (keypoint {lip})."""
-    return np.linalg.norm(end_effector - keypoints[{lip}])
+    """Bring a gripper tilted toward horizontal to the point directly below the lid lip
+    (keypoint {under_lip}); do not prescribe its Cartesian approach path."""
+    return np.linalg.norm(end_effector - keypoints[{under_lip}])
 
 ### stage 1 path constraints
-# No path constraints needed for grasping.
+# No path constraint: the target itself is below the lid, so the final approach comes from below.
 
 ### stage 2 sub-goal constraints
 def stage2_subgoal_constraint1(end_effector, keypoints):
-    """The lid lip (keypoint {lip}) has swung up to the open goal (keypoint {open_goal}) height."""
-    return np.maximum(0.0, keypoints[{open_goal}][..., 2] - keypoints[{lip}][..., 2])
+    """Keep the closed gripper tilted toward horizontal while pushing upward through the lid
+    lip until the visually tracked hinge-to-lip vector has rotated through the open angle."""
+    hand_shortfall = np.maximum(0.0, keypoints[{open_goal}][..., 2] - end_effector[..., 2]) / ({open_lift})
+    rest_axis = keypoints[{lip_rest}] - keypoints[{hinge}]
+    live_axis = keypoints[{lip}] - keypoints[{hinge}]
+    rest_unit = rest_axis / np.maximum(np.linalg.norm(rest_axis, axis=-1)[..., None], 1e-6)
+    along_rest = np.sum(live_axis * rest_unit, axis=-1)
+    rise = live_axis[..., 2]
+    angle = np.arctan2(np.maximum(0.0, rise), along_rest)
+    angle_shortfall = np.maximum(0.0, ({open_angle_rad}) - angle) / ({angle_residual_scale})
+    return hand_shortfall + angle_shortfall
 
 ### stage 2 path constraints
-def stage2_path_constraint1(end_effector, keypoints):
-    """The robot must still be grasping the lid lip (keypoint {lip})."""
-    return get_grasping_cost_by_keypoint_idx({lip})
+# No xy arc is imposed: contact and the physical hinge determine the lid's rotation.
 
 ### stage 3 sub-goal constraints
 def stage3_subgoal_constraint1(end_effector, keypoints):
@@ -125,104 +126,61 @@ def stage6_path_constraint2(end_effector, keypoints):
 
 
 """
-Summarize keypoints to be grasped in all grasping stages.
-For a grasping stage write the keypoint index; for a non-grasping stage write -1.
+Summarize keypoints to be contacted in all close stages.
 """
-grasp_keypoints = [{lip}, -1, {pod}, -1, -1, -1]
+grasp_keypoints = [{under_lip}, -1, {pod}, -1, -1, -1]
 
 """
-Summarize at **the end of which stage** the robot should release each keypoint.
+No release is authored for the press stroke: stage 2 keeps the fingers closed while pushing.
+The following pod-grasp stage uses the normal closed-empty recovery to reopen before pinching.
 """
-release_keypoints = [-1, {lip}, -1, -1, -1, {pod}]
+release_keypoints = [-1, -1, -1, -1, -1, {pod}]
+
+"""
+Per-stage contact mode. The under-lip waypoint is a closed-finger press, not a pinch.
+"""
+contact_modes = ["press", "", "", "", "", ""]
 
 
 
 # ---------------------------------------------------------------------------
-# Completion predicates (vlm_dp extension to the ReKep response format).
-#
-# Written in the PRIMITIVE VOCABULARY the runtime provides (vlm_dp/grounding/predicates.py ::
-# PredicateRuntime), exactly as the weight and pot plans are. This plan states WHICH event each
-# stage names; the primitive states HOW that event is sensed. Nothing here re-derives a window,
-# a sensor threshold or a contact band.
-#
-#   EVENTS, each of which also fills `components` with its named boolean and the margin_*
-#   floats behind it:
-#     grasped(kp, name, "acquire")   the pick-up event: fingers stalled on something for a
-#                                    whole window, POSITIVE co-motion with a hand that actually
-#                                    travelled, and the object within reach.
-#     grasped(kp, name, "maintain")  still holding: fingers stalled and no slip relative to a
-#                                    hand that moved.
-#     released(kp, name)             the hand let go: it departed while the object stayed, or
-#                                    the fingers opened.
-#     stationary(kp, name)           the object stopped moving.
-#     sustained(cost_fn, name)       this plan's OWN geometry, in the ReKep cost convention
-#                                    (<= 0 satisfied), held over the last few belief frames
-#                                    rather than at one instant.
-#
-#   TOLERANCES. Only two of them are the runtime's to answer here, and WHICH two is the point:
-#     target_region_radius({bay})   the placement region around the bay anchor.
-#     clearance_margin({pod})       the vertical band separating "clear above the bay" from
-#                                   "descended into it". The POD is a body this plan carries,
-#                                   which is exactly the condition the primitive is defined for.
-#
-#   AND ONE THAT IS NOT. The lid's rise tolerance is `{open_clear}`, a RENDERED FIELD authored
-#   in fake_vlm beside _CAPSULE_LID_OPEN_LIFT, the lift it is a band on. It is emphatically NOT
-#   clearance_margin({lip}): the lip is a DECLARED feature on the machine, a body the robot
-#   never carries, and its geometry was declared precisely because the machine's own extents do
-#   not describe it. Asking the primitive for it is refused, and correctly so -- a 10mm rim on a
-#   320mm machine has no clearance the machine's extents could imply. The same holds for the
-#   bay: `{off_pod}` states where the pod seats, and the plan states it, because the bay is a
-#   declared recess and not a body anyone carries.
-#
-#   NOTE ON grasp_tolerance. Stage 1 does not need it -- grasped() is a statement about contact
-#   and co-motion, not about width -- but if it did, grasp_tolerance({lip}) is well defined and
-#   resolves to the DECLARED lip half-width (10mm), never to the machine's whole-body extent.
-#   That declared extent is the same number every grasp cost term is sized by, so the predicate
-#   and the cost would be reading one geometry rather than two.
-#
-#   DIAGNOSTIC KEYS. Every boolean these stages used to publish keeps its name and its meaning:
-#   closed_on_object, rides_with_hand, at_hand, lip_risen, hand_let_go, lid_quiescent,
-#   still_held, at_carry_height, inside_place_region, still_clear_of_bay, descended,
-#   object_quiescent, and the margins margin_aperture / margin_slip_ratio / margin_hand_disp_m /
-#   margin_reach_m / margin_open_frac / margin_speed_mps. Stages 1 and 3 additionally publish an
-#   overall lip_in_hand / pod_in_hand, which is the conjunction they used to return unnamed.
-#   Four margins are RENAMED because sustained() reports one uniform quantity -- the worst COST
-#   in the window, negative when satisfied -- where the old blocks reported differently-signed
-#   ad-hoc numbers:
-#     margin_rise_m             -> margin_lip_risen             (now negated: cost, not rise)
-#     margin_height_shortfall_m -> margin_at_carry_height       (same value)
-#     margin_xy_off_m           -> margin_inside_place_region   (now offset MINUS the radius)
-#     margin_clearance_m        -> margin_still_clear_of_bay    (now negated: cost, not clearance)
-#     margin_descent_m          -> margin_descended             (now negated: cost, not clearance)
-#
-# The capsule-specific event is LID-OPENED (stage 2): the lip has RISEN by the open lift and
-# held that height, while the hand has let go and the lid has stopped swinging. Height, not arc
-# position: the hinge chooses where the lip ends up in xy, so only the rise is evidence the
-# robot produced. Stage 2 is a RELEASE stage, so the runtime classifies it as a place stage and,
-# under advance.predicate_place_transitions, advances it on this predicate -- which is why it is
-# stated in the place vocabulary (risen, let go, quiescent). No new primitive is required for
-# it: "risen and held" is a sustained() over the plan's own one-sided vertical.
-#
-# Interface: stage<N>_completion(history, end_effector, keypoints, robot_state, components)
-# -> bool, filling `components` with named booleans plus margin_* floats. See
-# vlm_dp/grounding/predicates.py for the full contract.
+# Completion predicates are sensed-state diagnostics built only from tracked keypoints and robot
+# proprioception. Stage 1 records that the closed fingertips reached the under-lip waypoint.
+# Stage 2 records that the visually tracked lid reached the authored open-angle band. Under
+# advance.plan_authoritative, the normalized stage-2 sub-goal is the control transition; the
+# predicate remains an independent sustained-history record of the same visually observed event.
 # ---------------------------------------------------------------------------
 
 
 ### stage 1 completion predicate
 def stage1_completion(history, end_effector, keypoints, robot_state, components):
-    """Lid lip grasped: the fingers are stalled on something, and the lip rides with the hand."""
-    lip_in_hand = grasped({lip}, "lip_in_hand", "acquire")
-    return bool(lip_in_hand)
+    """Closed fingertips reached the declared point directly below the lid lip."""
+    tips_at_under_lip = sustained(
+        lambda ee, kp: np.linalg.norm(ee - kp[{under_lip}]) - grasp_tolerance({under_lip}),
+        "tips_at_under_lip")
+    return bool(tips_at_under_lip)
 
 ### stage 2 completion predicate
 def stage2_completion(history, end_effector, keypoints, robot_state, components):
-    """Lid opened: the lip has risen by the open lift and stayed there, the hand let go, nothing moving."""
-    lip_risen = sustained(
-        lambda ee, kp: (kp[{open_goal}][..., 2] - ({open_clear})) - kp[{lip}][..., 2], "lip_risen")
-    hand_let_go = released({lip}, "hand_let_go")
-    lid_quiescent = stationary({lip}, "lid_quiescent")
-    return bool(lip_risen and hand_let_go and lid_quiescent)
+    """The lid itself, not merely the hand, remained at the roughly 90-degree open stop."""
+    rest_axis = keypoints[{lip_rest}] - keypoints[{hinge}]
+    live_axis = keypoints[{lip}] - keypoints[{hinge}]
+    rest_unit = rest_axis / np.maximum(np.linalg.norm(rest_axis, axis=-1), 1e-6)
+    along_rest = np.sum(live_axis * rest_unit, axis=-1)
+    rise = live_axis[..., 2]
+    angle = np.arctan2(np.maximum(0.0, rise), along_rest)
+    components["lid_angle_deg"] = float(np.degrees(angle))
+    lid_rotated = sustained(
+        lambda ee, kp: (
+            ({open_angle_rad}) - np.arctan2(
+                np.maximum(0.0, (kp[{lip}] - kp[{hinge}])[..., 2]),
+                np.sum(
+                    (kp[{lip}] - kp[{hinge}])
+                    * ((kp[{lip_rest}] - kp[{hinge}])
+                       / np.maximum(np.linalg.norm(kp[{lip_rest}] - kp[{hinge}], axis=-1), 1e-6)),
+                    axis=-1))),
+        "lid_rotated_90deg")
+    return bool(lid_rotated)
 
 ### stage 3 completion predicate
 def stage3_completion(history, end_effector, keypoints, robot_state, components):

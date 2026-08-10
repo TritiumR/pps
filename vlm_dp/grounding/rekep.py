@@ -287,6 +287,27 @@ class RekepGrounding:
         self.lift_latch_xy = bool(lift_latch_xy)
         self.seat_from_plane = bool(seat_from_plane)
 
+    def calibration_points(self, env):
+        """Seed visually tracked articulated features needed by a canned plan.
+
+        Capsule uses a live CoTracker query on the lid lip. The initial point comes from the same
+        calibrated fixture geometry and observed fixture cloud as the fake-VLM declaration; after
+        reset, all motion evidence comes from RGB-D rather than the simulator joint/body state.
+        """
+        if self.task_key != "capsule" or self.perception is None:
+            return {}
+        points = self.perception.object_points("capsule")
+        if points is None or not len(points):
+            return {}
+        raw = env.env
+        data = raw.scene["capsule"].data
+        root = data.root_pos_w[0].cpu().numpy().astype(np.float64)
+        quat = data.root_quat_w[0].cpu().numpy()
+        declared = root + fake_vlm._quat_rotate_wxyz(quat, fake_vlm._CAPSULE_LIP_LOCAL)
+        lip = fake_vlm._observable(declared, np.asarray(points, dtype=np.float64))
+        print(f"[rekep] seeded visual lid feature at {np.round(lip, 3)}", flush=True)
+        return {"lid": lip}
+
     def ground(self, env, world) -> Grounding:
 
 
@@ -547,6 +568,29 @@ class RekepGrounding:
                          f"({'declared by the plan' if k in declared_ext else 'measured at the point'})"
                          if ext is not None else "UNRESOLVED")
                       + f" (owner extents={tuple(round(x, 3) for x in extents.get(owner, _DEFAULT_EXTENT))})",
+                      flush=True)
+
+        # Declared visual features can be state-only rather than grasp targets. Capsule's live
+        # lid lip is such a point: it feeds the open-angle constraint but is never pinched. Give
+        # every otherwise-unrepresented declared owner a direct keypoint accessor so context
+        # construction does not require it to masquerade as a grasp object.
+        for k, owner in declared.items():
+            if owner is not None and owner not in kp_of:
+                kp_of[owner], centroid_off[owner] = k, np.zeros(3)
+                print(f"[rekep] declared state kp{k} -> {owner}: direct tracked position",
+                      flush=True)
+
+        # A visually declared feature may carry its own narrow axis. The pot
+        # handle detector measures this from the same depth component as its
+        # centre and width; the round lid mask must not erase that direction.
+        for raw_k, raw_axis in (metadata.get("grasp_axes", {}) or {}).items():
+            k = int(raw_k)
+            owner = declared.get(k)
+            axis = np.asarray(raw_axis, dtype=np.float64).reshape(-1)[:3]
+            if owner is not None and np.linalg.norm(axis[:2]) > 1e-9:
+                axis = axis / np.linalg.norm(axis)
+                grasp_axis[owner] = tuple(float(v) for v in axis)
+                print(f"[grasp-axis] {owner}: {grasp_axis[owner]} (declared visual feature)",
                       flush=True)
 
         if gt_meta is not None:
@@ -999,8 +1043,12 @@ class RekepGrounding:
             """Choose whether the stage may control tool orientation."""
             path = os.path.join(vlm_dir, f"stage{stage_idx + 1}_subgoal_constraints.txt")
             if _constrains_orientation(path):
-                print(f"[rekep-vlm] stage {stage_idx + 1} constrains orientation, free tool axis", flush=True)
-                return "free"
+                with open(path, encoding="utf-8") as f:
+                    src = f.read().lower()
+                mode = "tilt" if ("tilt" in src or "horizontal" in src) else "free"
+                print(f"[rekep-vlm] stage {stage_idx + 1} constrains orientation, "
+                      f"tool-axis mode={mode}", flush=True)
+                return mode
             return "down"
 
         def self_displace_next(grasp_i, owner):
@@ -1076,6 +1124,7 @@ class RekepGrounding:
                                     target=(kp_point(grasp_kp) if press else obj_center[name]),
                                     constraint=(subgoal if press else None),
                                     path_fns=(path_fns if press else ()),
+                                    orient=orient_for(i),
                                     contact=("press" if press else "pinch")))
                 grasped_body = owner
                 pressed = press
