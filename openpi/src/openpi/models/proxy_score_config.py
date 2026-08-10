@@ -27,6 +27,31 @@ class ProxyScoreConfig(_model.BaseModelConfig):
 
     action_dim: int = 8
     action_horizon: int = 10
+    # Goal conditioning. 0 (default) leaves the architecture byte-identical: no goal
+    # projection is built and no goal token enters the suffix. >0 adds ONE context token,
+    # embedded linearly from a goal vector of this width, placed in the state block -- it is
+    # attended to by the action tokens, is never denoised, and carries no loss.
+    goal_dim: int = 0
+    # Joint action/goal denoising: p(a, g_hat | o). False (default) leaves the architecture
+    # byte-identical. True adds ONE extra DENOISED row carrying the goal, with its own
+    # encoder/decoder, so the goal is PREDICTED rather than given -- the opposite direction of
+    # goal_dim, and the two are mutually exclusive (a model cannot be handed the goal it is
+    # meant to infer).
+    #
+    # The row is dedicated and 3-D end to end: it does NOT ride in the [H, action_dim] chunk, so
+    # there are no unused action dims on it to keep inert. It sits in the action tokens'
+    # attention block, which is what lets the two influence each other -- and that requires
+    # MG_PROXY_BIDIR_SUFFIX=1, since under causal attention the action rows could never see a
+    # row placed after them.
+    goal_row: bool = False
+    goal_row_dim: int = 3
+    # Scalar gain applied ONLY inside the goal row's diffusion space. The goal interface stays
+    # exactly the shared workspace-box normalisation (no per-axis std division -- the z axis is
+    # constant, so dividing by its std would divide by zero); this single constant puts the
+    # row's target on the same numeric scale as the normalised action rows, so both denoise on
+    # the same signal-to-noise schedule. Measured on the tray split the normalised goal has
+    # per-axis std 0.128 / 0.155 / 0.0, so a gain of ~7 brings it to ~unit variance.
+    goal_row_gain: float = 7.0
     max_token_len: int = None  # type: ignore
 
     def __post_init__(self):
@@ -37,6 +62,17 @@ class ProxyScoreConfig(_model.BaseModelConfig):
         if self.prediction_type not in ("score", "epsilon", "x0", "regress"):
             raise ValueError(
                 "prediction_type must be 'score', 'epsilon', 'x0' or 'regress'."
+            )
+        if self.goal_row and self.goal_dim:
+            raise ValueError(
+                "goal_row and goal_dim are mutually exclusive: goal_dim HANDS the model the "
+                "goal as context, goal_row asks it to INFER the goal. Enabling both would let "
+                "the goal row copy its own conditioning."
+            )
+        if self.goal_row and self.prediction_type != "x0":
+            raise ValueError(
+                "goal_row is only defined for prediction_type 'x0'; the goal row's target is "
+                "the clean goal."
             )
 
     @property

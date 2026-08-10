@@ -82,6 +82,24 @@ from train_mpc_proxy_score_pytorch import (                            # noqa: E
 )
 
 
+def _checkpoint_goal_dim(checkpoint):
+    """Goal width declared by a train-bc run, or None.
+
+    `bc_metadata.json` is written once per RUN, beside the step directories, so the lookup walks
+    up from `<run>/<step>`. Absent -- every checkpoint written before goal conditioning -- the
+    caller leaves the config's own goal_dim alone and the served model is byte-identical.
+    """
+    path = os.path.join(os.path.dirname(os.path.normpath(str(checkpoint))), "bc_metadata.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return int(json.load(fh).get("goal_dim") or 0) or None
+    except Exception:                                  # a malformed sidecar must not kill serving
+        logging.warning("could not read goal_dim from %s", path)
+        return None
+
+
 def _emit(obj) -> None:
     sys.stdout.write("MGPX " + json.dumps(obj) + "\n")
     sys.stdout.flush()
@@ -182,6 +200,19 @@ class ProxyChainServer:
             config = dataclasses.replace(
                 config,
                 model=dataclasses.replace(config.model, action_dim=int(ckpt_dim)),
+            )
+        # Same argument again for GOAL CONDITIONING. A goal-conditioned checkpoint carries a
+        # `goal_proj` weight the config knows nothing about, so a config-derived goal_dim of 0
+        # builds a model whose state dict cannot load. train-bc records the width in
+        # bc_metadata.json, which sits one level ABOVE the step directory (action_norm_stats.json
+        # predates goal conditioning and has no such field).
+        ckpt_goal_dim = _checkpoint_goal_dim(args.checkpoint)
+        if ckpt_goal_dim and int(ckpt_goal_dim) != int(getattr(config.model, "goal_dim", 0)):
+            logging.info("goal_dim %s -> %s (adopted from the checkpoint's bc_metadata)",
+                         getattr(config.model, "goal_dim", 0), int(ckpt_goal_dim))
+            config = dataclasses.replace(
+                config,
+                model=dataclasses.replace(config.model, goal_dim=int(ckpt_goal_dim)),
             )
         self.model_config = config.model
         data_config, self.input_transform = _build_data_pipeline(
@@ -323,6 +354,21 @@ class ProxyChainServer:
             req, kv_fp16=self.fp16 and self.device.type == "cuda")
         num_iterations = int(req.get("num_iterations", 11))
         generator = torch.Generator().manual_seed(int(req.get("seed", 0)))
+        # Commanded goal / stage keypose. Absent (every arm written before this) the model is
+        # called exactly as it always was. Present, it must be a goal_dim-wide ALREADY NORMALISED
+        # vector -- the caller owns the normalisation because only the caller knows the run's
+        # frozen k_stage_norm. The goal rides the SUFFIX, not the prefix, so it can change between
+        # calls that share a cached observation prefix.
+        goal = req.get("goal")
+        if goal is not None:
+            want = int(getattr(self.model_config, "goal_dim", 0))
+            goal = torch.as_tensor(np.asarray(goal, dtype=np.float32).reshape(1, -1),
+                                   device=self.device)
+            if want and goal.shape[1] != want:
+                raise ValueError(f"goal has width {goal.shape[1]}, model expects {want}")
+        elif int(getattr(self.model_config, "goal_dim", 0)) > 0:
+            raise ValueError("this checkpoint is goal-conditioned (goal_dim > 0) but the request "
+                             "carried no goal; refusing to run it with the goal silently dropped")
         # Autocast covers the expert forward only; the DDIM update stays fp32.
         amp = self.fp16 and self.device.type == "cuda"
         with torch.no_grad():
@@ -340,7 +386,7 @@ class ProxyChainServer:
                 with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
                     score = self.model.predict_score_from_prefix(
                         state, prefix_embs, prefix_pad_masks, x_t, time_cond.expand(1),
-                        prefix_kv=prefix_kv)
+                        prefix_kv=prefix_kv, goal=goal)
                 score = score.float()
                 beta = torch.clamp(1.0 - alpha, min=1e-6)
                 x0 = (x_t + beta * score) / torch.clamp(alpha, min=1e-6).sqrt()
