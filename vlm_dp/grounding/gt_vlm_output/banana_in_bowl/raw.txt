@@ -1,0 +1,98 @@
+# banana_in_bowl -- deterministic stand-in for a GPT-4o ReKep response (RoboLab).
+# Format follows rekep/prompts/prompt_template.txt, so _render() parses it exactly as
+# rekep/constraint_generation.py parses a live response. Placeholders in braces are the values only
+# resolvable at runtime: keypoint indices from the live scene and offsets measured from the
+# observed geometry.
+#
+# Task: "put the banana in the bowl"
+#
+# The task involves four stages:
+# 1. Grasp the banana.
+# 2. Lift the banana clear of the table.
+# 3. Carry the banana above the bowl.
+# 4. Lower the banana to the release point over the bowl and let go.
+#
+# The bowl is the STATIC FIXTURE: keypoint {w} sits at the centre of its mouth, and every target
+# the carried banana must reach is written as an offset from it. Anchoring a target on the banana's
+# own keypoint would be degenerate -- the target would ride the object it is supposed to move.
+#
+# DISCRIMINATION. Every rule below is written on something that changes across sampled proposals:
+# stage 1 speaks about the end-effector, and stages 2-4 speak about keypoints {b}, {e1} and {e2},
+# which are HELD (they ride the candidate gripper pose, position and orientation both). The
+# grasp-hold path rules are the deliberate exception: they read a constant 0 while the hold is
+# certified and exist to state the invariant, not to rank candidates.
+#
+# The banana is elongated, so its two ENDS are tracked as well as its middle: a proposal that
+# carries the banana over the bowl at a yaw that would leave one end hanging outside the mouth is
+# distinguishable from one that does not, which a rule on the centroid alone cannot say.
+
+num_stages = 4
+
+
+### stage 1 sub-goal constraints
+def stage1_subgoal_constraint1(end_effector, keypoints):
+    """Align the end-effector with the middle of the banana (keypoint {b})."""
+    return np.linalg.norm(end_effector - keypoints[{b}])
+
+### stage 1 path constraints
+# No path constraints needed for grasping.
+
+### stage 2 sub-goal constraints
+def stage2_subgoal_constraint1(end_effector, keypoints):
+    """The banana (keypoint {b}) is raised to its carry height above the pick-up pose."""
+    offsetted_point = keypoints[{w}] + np.array({lift_b})
+    return np.linalg.norm(keypoints[{b}] - offsetted_point)
+
+### stage 2 path constraints
+def stage2_path_constraint1(end_effector, keypoints):
+    """The banana (keypoint {b}) must not fall back below the height it was picked up from."""
+    return np.maximum(0.0, keypoints[{w}][..., 2] + ({pick_z}) - keypoints[{b}][..., 2])
+
+def stage2_path_constraint2(end_effector, keypoints):
+    """The robot must still be holding the banana (keypoint {b})."""
+    return get_grasping_cost_by_keypoint_idx({b})
+
+### stage 3 sub-goal constraints
+def stage3_subgoal_constraint1(end_effector, keypoints):
+    """The banana (keypoint {b}) hovers above the mouth of the bowl (keypoint {w})."""
+    offsetted_point = keypoints[{w}] + np.array({carry_b})
+    return np.linalg.norm(keypoints[{b}] - offsetted_point)
+
+### stage 3 path constraints
+def stage3_path_constraint1(end_effector, keypoints):
+    """The banana (keypoint {b}) stays at transport altitude, clear of the rim of the bowl."""
+    return np.maximum(0.0, keypoints[{w}][..., 2] + ({carry_z}) - keypoints[{b}][..., 2])
+
+def stage3_path_constraint2(end_effector, keypoints):
+    """The robot must still be holding the banana (keypoint {b})."""
+    return get_grasping_cost_by_keypoint_idx({b})
+
+### stage 4 sub-goal constraints
+def stage4_subgoal_constraint1(end_effector, keypoints):
+    """The banana (keypoint {b}) reaches the release point inside the bowl (keypoint {w})."""
+    offsetted_point = keypoints[{w}] + np.array({seat_b})
+    return np.linalg.norm(keypoints[{b}] - offsetted_point)
+
+### stage 4 path constraints
+def stage4_path_constraint1(end_effector, keypoints):
+    """Both ends of the banana (keypoints {e1}, {e2}) stay over the mouth of the bowl."""
+    mouth = keypoints[{w}] + np.array({seat_b})
+    first = np.linalg.norm(keypoints[{e1}][..., :2] - mouth[..., :2])
+    second = np.linalg.norm(keypoints[{e2}][..., :2] - mouth[..., :2])
+    return np.maximum(0.0, np.maximum(first, second) - ({mouth_r}))
+
+def stage4_path_constraint2(end_effector, keypoints):
+    """The robot must still be holding the banana (keypoint {b})."""
+    return get_grasping_cost_by_keypoint_idx({b})
+
+
+"""
+Summarize keypoints to be grasped in all grasping stages.
+For a grasping stage write the keypoint index; for a non-grasping stage write -1.
+"""
+grasp_keypoints = [{b}, -1, -1, -1]
+
+"""
+Summarize at **the end of which stage** the robot should release each keypoint.
+"""
+release_keypoints = [-1, -1, -1, {b}]

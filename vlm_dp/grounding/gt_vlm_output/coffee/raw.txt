@@ -1,0 +1,105 @@
+# coffee -- deterministic stand-in for a GPT-4o ReKep response.
+# Format follows rekep/prompts/prompt_template.txt, so _render() parses it exactly as
+# rekep/constraint_generation.py parses a live response. Placeholders in braces are the values only
+# resolvable at runtime: keypoint indices from the live scene and offsets measured from the
+# observed point cloud.
+#
+# Task: "put the pod in the coffee machine and close the lid"
+#
+# The task involves five stages:
+# 1. Grasp the coffee pod.
+# 2. Lift the pod clear of the table.
+# 3. Carry the pod above the pod holder.
+# 4. Insert the pod into the holder and release.
+# 5. Press the machine lid closed.
+#
+# The pod holder (keypoint {d}, the drop point at its mouth) is the static fixture: every target
+# the carried pod must reach is an offset from it, and so is the lid's closed pose. The lid
+# keypoint {l} itself rides the lid and therefore cannot anchor anything.
+#
+# Stage 5 is a press, not a carry: nothing is held, so the rule that has to steer the candidates
+# is written on the end-effector, and the lid-side statement of the same goal is kept alongside it
+# as the semantic one.
+
+num_stages = 5
+
+
+### stage 1 sub-goal constraints
+def stage1_subgoal_constraint1(end_effector, keypoints):
+    """Align the end-effector with the coffee pod (keypoint {c})."""
+    return np.linalg.norm(end_effector - keypoints[{c}])
+
+### stage 1 path constraints
+# No path constraints needed for grasping.
+
+### stage 2 sub-goal constraints
+def stage2_subgoal_constraint1(end_effector, keypoints):
+    """The pod (keypoint {c}) is raised to its carry height above the pick-up pose."""
+    offsetted_point = keypoints[{d}] + np.array({lift_c})
+    return np.linalg.norm(keypoints[{c}] - offsetted_point)
+
+### stage 2 path constraints
+def stage2_path_constraint1(end_effector, keypoints):
+    """The pod (keypoint {c}) must not fall back below the height it was picked up from."""
+    return np.maximum(0.0, keypoints[{d}][..., 2] + ({pick_z}) - keypoints[{c}][..., 2])
+
+def stage2_path_constraint2(end_effector, keypoints):
+    """The robot must still be holding the pod (keypoint {c})."""
+    return get_grasping_cost_by_keypoint_idx({c})
+
+### stage 3 sub-goal constraints
+def stage3_subgoal_constraint1(end_effector, keypoints):
+    """The pod (keypoint {c}) hovers above the pod holder (keypoint {d})."""
+    offsetted_point = keypoints[{d}] + np.array({carry_c})
+    return np.linalg.norm(keypoints[{c}] - offsetted_point)
+
+### stage 3 path constraints
+def stage3_path_constraint1(end_effector, keypoints):
+    """The pod (keypoint {c}) stays at transport altitude, clear of the machine."""
+    return np.maximum(0.0, keypoints[{d}][..., 2] + ({carry_z}) - keypoints[{c}][..., 2])
+
+def stage3_path_constraint2(end_effector, keypoints):
+    """The robot must still be holding the pod (keypoint {c})."""
+    return get_grasping_cost_by_keypoint_idx({c})
+
+### stage 4 sub-goal constraints
+def stage4_subgoal_constraint1(end_effector, keypoints):
+    """The pod (keypoint {c}) sits in the mouth of the pod holder (keypoint {d})."""
+    return np.linalg.norm(keypoints[{c}] - keypoints[{d}])
+
+### stage 4 path constraints
+def stage4_path_constraint1(end_effector, keypoints):
+    """The pod (keypoint {c}) stays over the holder while it descends into it."""
+    return np.linalg.norm(keypoints[{c}][..., :2] - keypoints[{d}][..., :2])
+
+def stage4_path_constraint2(end_effector, keypoints):
+    """The robot must still be holding the pod (keypoint {c})."""
+    return get_grasping_cost_by_keypoint_idx({c})
+
+### stage 5 sub-goal constraints
+def stage5_subgoal_constraint1(end_effector, keypoints):
+    """The end-effector pushes the lid down to where the closed lid sits over the holder."""
+    offsetted_point = keypoints[{d}] + np.array({lid_closed})
+    return np.linalg.norm(end_effector - offsetted_point)
+
+def stage5_subgoal_constraint2(end_effector, keypoints):
+    """The lid (keypoint {l}) reaches its closed pose above the holder (keypoint {d})."""
+    offsetted_point = keypoints[{d}] + np.array({lid_closed})
+    return np.linalg.norm(keypoints[{l}] - offsetted_point)
+
+### stage 5 path constraints
+def stage5_path_constraint1(end_effector, keypoints):
+    """The end-effector stays on the lid (keypoint {l}) while pressing it down."""
+    return np.linalg.norm(end_effector - keypoints[{l}])
+
+
+"""
+Summarize keypoints to be grasped in all grasping stages.
+For a grasping stage write the keypoint index; for a non-grasping stage write -1.
+"""
+grasp_keypoints = [{c}, -1, -1, -1, -1]
+
+"""
+Summarize at **the end of which stage** the robot should release each keypoint.
+"""
+release_keypoints = [-1, -1, -1, {c}, -1]

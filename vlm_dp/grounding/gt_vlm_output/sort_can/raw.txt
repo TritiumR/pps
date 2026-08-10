@@ -1,0 +1,106 @@
+# sort_can -- deterministic stand-in for a GPT-4o ReKep response.
+# Format follows rekep/prompts/prompt_template.txt, so _render() parses it exactly as
+# rekep/constraint_generation.py parses a live response. Placeholders in braces are the values only
+# resolvable at runtime: keypoint indices from the live scene and offsets measured from the
+# observed point cloud.
+#
+# Task: "put the can in the {colour} bin"
+#
+# ONE template, rendered once per instruction. The scene holds TWO walled quadrants, one painted
+# red and one painted blue, and which quadrant carries which colour is redrawn every episode. The
+# instruction names a COLOUR; the scene says where that colour is. So the only thing the
+# instruction changes in this program is which keypoint the placeholder {d} resolves to -- the
+# requested bin's release point -- and, correspondingly, which one is {o}, the bin to stay out of.
+# Rendering this file under "red" and under "blue" therefore produces two complete, genuine ReKep
+# programs that differ in exactly the two integers the task specification is entitled to change.
+#
+# The task involves four stages:
+# 1. Grasp the can.
+# 2. Lift the can clear of the table.
+# 3. Carry the can above the requested bin, without passing over the other one.
+# 4. Lower the can to the release point over the requested bin and let go.
+#
+# The requested bin is the static fixture: keypoint {d} is the release point above its mouth, and
+# every target the carried can must reach is an offset from it. The can is released above the bin
+# rather than lowered to its floor -- the walls are in the way of the gripper, so the last few
+# centimetres are a drop, which is why stage 4 targets the release point itself.
+
+num_stages = 4
+
+
+### stage 1 sub-goal constraints
+def stage1_subgoal_constraint1(end_effector, keypoints):
+    """Align the end-effector with the can (keypoint {c})."""
+    return np.linalg.norm(end_effector - keypoints[{c}])
+
+### stage 1 path constraints
+# No path constraints needed for grasping.
+
+### stage 2 sub-goal constraints
+def stage2_subgoal_constraint1(end_effector, keypoints):
+    """The can (keypoint {c}) is raised to its carry height above the pick-up pose."""
+    offsetted_point = keypoints[{d}] + np.array({lift_c})
+    return np.linalg.norm(keypoints[{c}] - offsetted_point)
+
+### stage 2 path constraints
+def stage2_path_constraint1(end_effector, keypoints):
+    """The can (keypoint {c}) must not fall back below the height it was picked up from."""
+    return np.maximum(0.0, keypoints[{d}][..., 2] + ({pick_z}) - keypoints[{c}][..., 2])
+
+def stage2_path_constraint2(end_effector, keypoints):
+    """The robot must still be holding the can (keypoint {c})."""
+    return get_grasping_cost_by_keypoint_idx({c})
+
+### stage 3 sub-goal constraints
+def stage3_subgoal_constraint1(end_effector, keypoints):
+    """The can (keypoint {c}) hovers above the requested bin's release point (keypoint {d})."""
+    offsetted_point = keypoints[{d}] + np.array({carry_c})
+    return np.linalg.norm(keypoints[{c}] - offsetted_point)
+
+### stage 3 path constraints
+def stage3_path_constraint1(end_effector, keypoints):
+    """The can (keypoint {c}) stays at transport altitude, clear of the bin rim."""
+    return np.maximum(0.0, keypoints[{d}][..., 2] + ({carry_z}) - keypoints[{c}][..., 2])
+
+def stage3_path_constraint2(end_effector, keypoints):
+    """The can (keypoint {c}) stays out of the other bin's airspace (keypoint {o})."""
+    return np.maximum(0.0, ({keepout_r}) - np.linalg.norm(keypoints[{c}][..., :2] - keypoints[{o}][..., :2]))
+
+def stage3_path_constraint3(end_effector, keypoints):
+    """The robot must still be holding the can (keypoint {c})."""
+    return get_grasping_cost_by_keypoint_idx({c})
+
+### stage 4 sub-goal constraints
+def stage4_subgoal_constraint1(end_effector, keypoints):
+    """The can (keypoint {c}) reaches the release point over the requested bin (keypoint {d})."""
+    return np.linalg.norm(keypoints[{c}] - keypoints[{d}])
+
+### stage 4 path constraints
+def stage4_path_constraint1(end_effector, keypoints):
+    """The can (keypoint {c}) stays over the requested bin's mouth while it descends."""
+    return np.linalg.norm(keypoints[{c}][..., :2] - keypoints[{d}][..., :2])
+
+def stage4_path_constraint2(end_effector, keypoints):
+    """The robot must still be holding the can (keypoint {c})."""
+    return get_grasping_cost_by_keypoint_idx({c})
+
+
+"""
+Summarize keypoints to be grasped in all grasping stages.
+For a grasping stage write the keypoint index; for a non-grasping stage write -1.
+"""
+grasp_keypoints = [{c}, -1, -1, -1]
+
+"""
+Summarize at **the end of which stage** the robot should release each keypoint.
+"""
+release_keypoints = [-1, -1, -1, {c}]
+
+"""
+Declare, per stage, how the destination is reached and whether the tool axis is constrained.
+place_mode is "container" when the payload goes INSIDE the destination and "surface" when it is
+set down on top of one; orient is "free" when the stage constrains tool orientation and "down"
+otherwise. Stated rather than left to be inferred from this text.
+"""
+stage_place_mode = ["surface", "surface", "surface", "container"]
+stage_orient = ["down", "down", "down", "down"]

@@ -1,0 +1,176 @@
+# mug_cleanup -- deterministic stand-in for a GPT-4o ReKep response.
+# Format follows rekep/prompts/prompt_template.txt, so _render() parses it exactly as
+# rekep/constraint_generation.py parses a live response. Placeholders in braces are the values only
+# resolvable at runtime: keypoint indices from the live scene and offsets measured from the
+# observed point cloud.
+#
+# Task: "open the drawer, put the mug inside, and close the drawer"
+#
+# The task involves eight stages:
+# 1. Grasp the drawer handle.
+# 2. Pull the drawer open and let go of the handle.
+# 3. Withdraw from the open drawer.
+# 4. Grasp the mug.
+# 5. Lift the mug clear of the table.
+# 6. Carry the mug above the open drawer.
+# 7. Lower the mug into the drawer and release.
+# 8. Push the drawer shut.
+#
+# TWO drawer keypoints, and the difference between them is the whole point of this plan:
+#   {a} is the HANDLE. It rides the sliding front, so it moves exactly as far as the drawer does.
+#   {s} is a point on the cabinet BODY. It never moves, so every offset target below is measured
+#       from it -- the pulled-open line, the retreat pose, the seat inside the drawer.
+# Anchoring on the handle instead would make each target recede as fast as the drawer travels.
+#
+# Pulling a drawer IS a grasp: the handle is a grasp keypoint (stage 1) and is released at the end
+# of the pull (stage 2). That puts the handle in `held` for the pull, which is what makes a rule
+# written on the HANDLE candidate-visible -- and it means the pull can only complete when the
+# handle itself has travelled, not when the hand has swept the arc empty-handed.
+#
+# Every stage that moves something in the world states its goal on that thing's own keypoint:
+# stage 2 and stage 8 on the handle, stages 5-7 on the mug. Stages whose goal is the hand's own
+# pose (1, 3) state it on the end-effector, and stage 8, which holds nothing, carries an
+# end-effector rule alongside its handle rule so the sampler still has a gradient to follow.
+#
+# {closed} is where the handle sits when the drawer is shut, as an offset from the cabinet anchor,
+# so travel is measured from the closed line rather than from the anchor itself.
+
+num_stages = 8
+
+
+### stage 1 sub-goal constraints
+def stage1_subgoal_constraint1(end_effector, keypoints):
+    """Bring the end-effector to the handle (keypoint {a})."""
+    return np.linalg.norm(end_effector - keypoints[{a}])
+
+### stage 1 path constraints
+# No path constraints needed for reaching the handle.
+
+### stage 2 sub-goal constraints
+def stage2_subgoal_constraint1(end_effector, keypoints):
+    """The handle (keypoint {a}) has travelled out along the drawer axis by the drawer's depth."""
+    closed = keypoints[{s}] + np.array({closed})
+    travel = np.dot(keypoints[{a}] - closed, np.array({open_axis}))
+    return np.maximum(0.0, ({pull}) - travel)
+
+def stage2_subgoal_constraint2(end_effector, keypoints):
+    """The hand has followed the same pull arc out along the drawer axis."""
+    closed = keypoints[{s}] + np.array({closed})
+    travel = np.dot(end_effector - closed, np.array({open_axis}))
+    return np.maximum(0.0, ({pull}) - travel)
+
+### stage 2 path constraints
+def stage2_path_constraint1(end_effector, keypoints):
+    """The handle (keypoint {a}) holds the height it started the pull at."""
+    closed = keypoints[{s}] + np.array({closed})
+    return np.abs(keypoints[{a}][..., 2] - closed[..., 2])
+
+def stage2_path_constraint2(end_effector, keypoints):
+    """The handle (keypoint {a}) stays on the drawer's travel line, not off to one side of it."""
+    closed = keypoints[{s}] + np.array({closed})
+    return np.abs(np.dot(keypoints[{a}] - closed, np.array({lateral_axis})))
+
+def stage2_path_constraint3(end_effector, keypoints):
+    """The robot must still be holding the handle (keypoint {a})."""
+    return get_grasping_cost_by_keypoint_idx({a})
+
+### stage 3 sub-goal constraints
+def stage3_subgoal_constraint1(end_effector, keypoints):
+    """The hand withdraws to a pose clear of the open drawer mouth."""
+    offsetted_point = keypoints[{s}] + np.array({retreat})
+    return np.linalg.norm(end_effector - offsetted_point)
+
+def stage3_subgoal_constraint2(end_effector, keypoints):
+    """The handle (keypoint {a}) stays out at the open line while the hand withdraws."""
+    closed = keypoints[{s}] + np.array({closed})
+    travel = np.dot(keypoints[{a}] - closed, np.array({open_axis}))
+    return np.maximum(0.0, ({pull}) - travel)
+
+### stage 3 path constraints
+# No path constraints needed for withdrawing.
+
+### stage 4 sub-goal constraints
+def stage4_subgoal_constraint1(end_effector, keypoints):
+    """Align the end-effector with the mug (keypoint {m})."""
+    return np.linalg.norm(end_effector - keypoints[{m}])
+
+### stage 4 path constraints
+# No path constraints needed for grasping.
+
+### stage 5 sub-goal constraints
+def stage5_subgoal_constraint1(end_effector, keypoints):
+    """The mug (keypoint {m}) is raised to its carry height above the pick-up pose."""
+    offsetted_point = keypoints[{s}] + np.array({lift_m})
+    return np.linalg.norm(keypoints[{m}] - offsetted_point)
+
+### stage 5 path constraints
+def stage5_path_constraint1(end_effector, keypoints):
+    """The mug (keypoint {m}) must not fall back below the height it was picked up from."""
+    return np.maximum(0.0, keypoints[{s}][..., 2] + ({pick_z}) - keypoints[{m}][..., 2])
+
+def stage5_path_constraint2(end_effector, keypoints):
+    """The robot must still be holding the mug (keypoint {m})."""
+    return get_grasping_cost_by_keypoint_idx({m})
+
+### stage 6 sub-goal constraints
+def stage6_subgoal_constraint1(end_effector, keypoints):
+    """The mug (keypoint {m}) hovers above the seat inside the open drawer."""
+    offsetted_point = keypoints[{s}] + np.array({carry_m})
+    return np.linalg.norm(keypoints[{m}] - offsetted_point)
+
+### stage 6 path constraints
+def stage6_path_constraint1(end_effector, keypoints):
+    """The mug (keypoint {m}) stays at transport altitude, clear of the drawer rim."""
+    return np.maximum(0.0, keypoints[{s}][..., 2] + ({carry_z}) - keypoints[{m}][..., 2])
+
+def stage6_path_constraint2(end_effector, keypoints):
+    """The robot must still be holding the mug (keypoint {m})."""
+    return get_grasping_cost_by_keypoint_idx({m})
+
+### stage 7 sub-goal constraints
+def stage7_subgoal_constraint1(end_effector, keypoints):
+    """The mug (keypoint {m}) rests on the seat inside the open drawer."""
+    offsetted_point = keypoints[{s}] + np.array({seat_m})
+    return np.linalg.norm(keypoints[{m}] - offsetted_point)
+
+### stage 7 path constraints
+def stage7_path_constraint1(end_effector, keypoints):
+    """The mug (keypoint {m}) stays over the seat while it descends into the drawer."""
+    offsetted_point = keypoints[{s}] + np.array({seat_m})
+    return np.linalg.norm(keypoints[{m}][..., :2] - offsetted_point[..., :2])
+
+def stage7_path_constraint2(end_effector, keypoints):
+    """The robot must still be holding the mug (keypoint {m})."""
+    return get_grasping_cost_by_keypoint_idx({m})
+
+### stage 8 sub-goal constraints
+def stage8_subgoal_constraint1(end_effector, keypoints):
+    """The hand has pushed forward as far as the closed handle line."""
+    closed = keypoints[{s}] + np.array({closed})
+    return np.maximum(0.0, np.dot(end_effector - closed, np.array({open_axis})))
+
+def stage8_subgoal_constraint2(end_effector, keypoints):
+    """The handle (keypoint {a}) is back at the closed line, so the drawer is shut."""
+    closed = keypoints[{s}] + np.array({closed})
+    return np.maximum(0.0, np.dot(keypoints[{a}] - closed, np.array({open_axis})))
+
+### stage 8 path constraints
+def stage8_path_constraint1(end_effector, keypoints):
+    """The hand stays at the height of the handle (keypoint {a}) through the push."""
+    return np.abs(end_effector[..., 2] - keypoints[{a}][..., 2])
+
+def stage8_path_constraint2(end_effector, keypoints):
+    """The hand stays on the drawer's travel line, not off to one side of it."""
+    return np.abs(np.dot(end_effector - keypoints[{a}], np.array({lateral_axis})))
+
+
+"""
+Summarize keypoints to be grasped in all grasping stages.
+For a grasping stage write the keypoint index; for a non-grasping stage write -1.
+"""
+grasp_keypoints = [{a}, -1, -1, {m}, -1, -1, -1, -1]
+
+"""
+Summarize at **the end of which stage** the robot should release each keypoint.
+"""
+release_keypoints = [-1, {a}, -1, -1, -1, -1, {m}, -1]

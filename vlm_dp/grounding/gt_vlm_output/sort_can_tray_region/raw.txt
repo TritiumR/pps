@@ -1,0 +1,112 @@
+# sort_can_tray_region -- deterministic stand-in for a GPT-4o ReKep response.
+# Format follows rekep/prompts/prompt_template.txt, so _render() parses it exactly as
+# rekep/constraint_generation.py parses a live response. Placeholders in braces are the values only
+# resolvable at runtime: keypoint indices from the live scene and offsets measured from the
+# observed geometry.
+#
+# Task: "place the can in the tray within {radius} m of the marker"
+#
+# The semantic-programmability sibling of sort_can_tray. The scene is IDENTICAL and so are the
+# grasp, lift and carry stages; only the terminal stage changes, and with it the objective the
+# goal optimizer sees. Where sort_can_tray demanded a POINT ("the can rests on the marker"), this
+# program demands a REGION: any position whose horizontal distance to the marker is at most
+# {radius} m satisfies it exactly, so the feasible set is a disc rather than a single number.
+#
+# The marker is the static fixture: keypoint {m} is its centre, and the region is written around
+# it. The can's own keypoint is {c}. Anchoring on {m} rather than on {c} matters -- a target
+# expressed relative to the payload would ride the payload and be satisfied everywhere.
+#
+# The task involves four stages:
+# 1. Grasp the can.
+# 2. Lift the can clear of the bin it starts in.
+# 3. Carry the can over the tray, holding transport altitude so it clears the tray rim. The
+#    transit waypoint is stated over the marker because the marker is the region's centre; the
+#    terminal stage, not this one, is what fixes where the can is finally set down.
+# 4. Lower the can into the tray at a position inside the region, and let go.
+#
+# Stage 4 states the objective in two parts, which the loader sums:
+#   1. the SEMANTIC term -- a hinge that is exactly zero everywhere inside the region and grows
+#      as the horizontal distance to the marker beyond {radius} m,
+#   2. the TIE-BREAK term -- {w} times the horizontal distance from where the can was picked up,
+#      which orders the (infinitely many) satisfying positions by how far the can has to travel.
+# The tie-break weight is small enough that it can never buy a violation: the semantic term grows
+# at one metre per metre of displacement and the tie-break shrinks at most {w} metres per metre,
+# so no point outside the region can undercut a point inside it.
+
+num_stages = 4
+
+
+### stage 1 sub-goal constraints
+def stage1_subgoal_constraint1(end_effector, keypoints):
+    """Align the end-effector with the can (keypoint {c})."""
+    return np.linalg.norm(end_effector - keypoints[{c}])
+
+### stage 1 path constraints
+# No path constraints needed for grasping.
+
+### stage 2 sub-goal constraints
+def stage2_subgoal_constraint1(end_effector, keypoints):
+    """The can (keypoint {c}) is raised to its carry height above the pick-up pose."""
+    offsetted_point = keypoints[{m}] + np.array({lift_c})
+    return np.linalg.norm(keypoints[{c}] - offsetted_point)
+
+### stage 2 path constraints
+def stage2_path_constraint1(end_effector, keypoints):
+    """The can (keypoint {c}) must not fall back below the height it was picked up from."""
+    return np.maximum(0.0, keypoints[{m}][..., 2] + ({pick_z}) - keypoints[{c}][..., 2])
+
+def stage2_path_constraint2(end_effector, keypoints):
+    """The robot must still be holding the can (keypoint {c})."""
+    return get_grasping_cost_by_keypoint_idx({c})
+
+### stage 3 sub-goal constraints
+def stage3_subgoal_constraint1(end_effector, keypoints):
+    """The can (keypoint {c}) hovers over the region centre, the marker (keypoint {m})."""
+    offsetted_point = keypoints[{m}] + np.array({carry_c})
+    return np.linalg.norm(keypoints[{c}] - offsetted_point)
+
+### stage 3 path constraints
+def stage3_path_constraint1(end_effector, keypoints):
+    """The can (keypoint {c}) stays at transport altitude, clear of the tray rim."""
+    return np.maximum(0.0, keypoints[{m}][..., 2] + ({carry_z}) - keypoints[{c}][..., 2])
+
+def stage3_path_constraint2(end_effector, keypoints):
+    """The robot must still be holding the can (keypoint {c})."""
+    return get_grasping_cost_by_keypoint_idx({c})
+
+### stage 4 sub-goal constraints
+def stage4_subgoal_constraint1(end_effector, keypoints):
+    """The can (keypoint {c}) comes to rest within {radius} m of the marker (keypoint {m})."""
+    offset = keypoints[{c}][..., :2] - keypoints[{m}][..., :2]
+    return np.maximum(0.0, np.linalg.norm(offset) - ({radius}))
+
+def stage4_subgoal_constraint2(end_effector, keypoints):
+    """Tie-break: of the satisfying positions, prefer the one nearest where the can was picked up."""
+    start_point = keypoints[{m}] + np.array({start_c})
+    return ({w}) * np.linalg.norm(keypoints[{c}][..., :2] - start_point[..., :2])
+
+### stage 4 path constraints
+def stage4_path_constraint1(end_effector, keypoints):
+    """The robot must still be holding the can (keypoint {c}) while it descends."""
+    return get_grasping_cost_by_keypoint_idx({c})
+
+
+"""
+Summarize keypoints to be grasped in all grasping stages.
+For a grasping stage write the keypoint index; for a non-grasping stage write -1.
+"""
+grasp_keypoints = [{c}, -1, -1, -1]
+
+"""
+Summarize at **the end of which stage** the robot should release each keypoint.
+"""
+release_keypoints = [-1, -1, -1, {c}]
+
+"""
+Declare, per stage, how the destination is reached and whether the tool axis is constrained.
+place_mode is "container" when the payload goes INSIDE the destination and "surface" when it is
+set down on top of one; orient is "free" when the stage constrains tool orientation and "down"
+otherwise. Stated rather than left to be inferred from this text.
+"""
+stage_place_mode = ["surface", "surface", "surface", "surface"]
+stage_orient = ["down", "down", "down", "down"]
