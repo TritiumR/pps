@@ -1120,6 +1120,26 @@ def _score_cosine(lhs: torch.Tensor, rhs: torch.Tensor) -> float:
     )
 
 
+def _score_norm_by_horizon(score: torch.Tensor) -> list[float]:
+    """Mean batch norm over action dims, one scalar per planned horizon step."""
+    values = torch.linalg.vector_norm(score.detach(), dim=-1).mean(dim=0)
+    return values.cpu().tolist()
+
+
+def _score_cosine_by_horizon(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+) -> list[float]:
+    """Mean batch cosine over action dims, one scalar per planned horizon step."""
+    values = F.cosine_similarity(
+        lhs.detach(),
+        rhs.detach(),
+        dim=-1,
+        eps=1e-8,
+    ).mean(dim=0)
+    return values.cpu().tolist()
+
+
 def _relative_score_error(target: torch.Tensor, prediction: torch.Tensor) -> float:
     error_norm = torch.linalg.vector_norm((prediction - target).detach())
     target_norm = torch.linalg.vector_norm(target.detach()).clamp_min(1e-8)
@@ -1921,6 +1941,8 @@ def _infer_actions_eager(
         runtime_stats["mpc_last"] = stats
         if args.mpc_debug:
             runtime_stats["mpc_trace"].append(_mpc_debug_stats(stats))
+        elif args.writeup_debug:
+            runtime_stats["mpc_trace"].append(_writeup_debug_stats(stats))
 
     if _uses_accel_action_mpc(args):
         if not disable_steering:
@@ -2418,6 +2440,18 @@ def _infer_actions_eager(
                     "score_base_combined_cosine": _score_cosine(
                         base_proxy_score, combined_proxy_score
                     ),
+                    "score_base_horizon_norms": _score_norm_by_horizon(base_proxy_score),
+                    "score_task_horizon_norms": _score_norm_by_horizon(task_proxy_score),
+                    "score_residual_horizon_norms": _score_norm_by_horizon(
+                        residual_proxy_score
+                    ),
+                    "score_combined_horizon_norms": _score_norm_by_horizon(
+                        combined_proxy_score
+                    ),
+                    "score_base_task_cosine_by_horizon": _score_cosine_by_horizon(
+                        base_proxy_score,
+                        task_proxy_score,
+                    ),
                     "proxy_score_time": float(score_time[0].detach().cpu()),
                 }
             )
@@ -2441,6 +2475,7 @@ def _infer_actions_eager(
                     base_proxy_score, ref_score
                 )
                 geom_stats["score_task_ref_cosine"] = _score_cosine(task_score, ref_score)
+                geom_stats["score_ref_horizon_norms"] = _score_norm_by_horizon(ref_score)
             # Direction, not just magnitude: norms alone cannot tell a quiet proxy from an opposed one.
             if base_proxy_score.shape[-1] > 7:
                 geom_stats["score_base_task_cosine_gripper"] = _score_cosine(
@@ -2449,6 +2484,20 @@ def _infer_actions_eager(
                 geom_stats["score_base_task_cosine_arm"] = _score_cosine(
                     base_proxy_score[..., :7], task_proxy_score[..., :7]
                 )
+                arm_components = {
+                    "base": base_score,
+                    "task": task_full_score,
+                    "residual": residual_score,
+                    "combined": combined_score,
+                }
+                if ref_full_score is not None:
+                    arm_components["ref"] = ref_full_score
+                for component_name, component_score in arm_components.items():
+                    geom_stats[f"score_{component_name}_arm_norm"] = float(
+                        torch.linalg.vector_norm(
+                            component_score[..., :7].detach()
+                        ).cpu()
+                    )
             if combined_score.shape[-1] > 7:
                 score_components = {
                     "base": base_score,
@@ -3068,7 +3117,21 @@ def _mpc_debug_stats(stats: dict[str, Any] | None) -> dict[str, Any]:
         "score_steer_scale",
         "score_combined_norm",
         "score_base_task_cosine",
+        "score_base_task_cosine_arm",
+        "score_base_task_cosine_gripper",
         "score_base_combined_cosine",
+        "score_steering_mode",
+        "score_base_arm_norm",
+        "score_task_arm_norm",
+        "score_ref_arm_norm",
+        "score_residual_arm_norm",
+        "score_combined_arm_norm",
+        "score_base_horizon_norms",
+        "score_task_horizon_norms",
+        "score_ref_horizon_norms",
+        "score_residual_horizon_norms",
+        "score_combined_horizon_norms",
+        "score_base_task_cosine_by_horizon",
         "score_ref_base_cosine",
         "score_ref_base_relative_error",
         "score_task_ref_cosine",
@@ -3144,6 +3207,151 @@ def _write_mpc_debug_log(handle, event: str, **payload) -> None:
     }
     handle.write(json.dumps(_jsonable_debug_value(record), sort_keys=True) + "\n")
     handle.flush()
+
+
+_WRITEUP_MPC_KEYS = (
+    "update_mode",
+    "cost_stage",
+    "cost_min",
+    "cost_mean",
+    "cost_std",
+    "cost_weighted",
+    "weight_max",
+    "weight_ess",
+    "weight_entropy",
+    "target_delta_norm",
+    "score_norm",
+    "score_base_norm",
+    "score_base_proxy_norm",
+    "score_task_norm",
+    "score_task_base_ratio",
+    "score_ref_norm",
+    "score_residual_norm",
+    "score_residual_proxy_norm",
+    "score_applied_residual_norm",
+    "score_applied_residual_ratio",
+    "score_steer_scale",
+    "score_combined_norm",
+    "score_base_task_cosine",
+    "score_base_task_cosine_arm",
+    "score_base_task_cosine_gripper",
+    "score_base_combined_cosine",
+    "score_steering_mode",
+    "score_base_arm_norm",
+    "score_task_arm_norm",
+    "score_ref_arm_norm",
+    "score_residual_arm_norm",
+    "score_combined_arm_norm",
+    "score_base_horizon_norms",
+    "score_task_horizon_norms",
+    "score_ref_horizon_norms",
+    "score_residual_horizon_norms",
+    "score_combined_horizon_norms",
+    "score_base_task_cosine_by_horizon",
+    "score_ref_base_cosine",
+    "score_ref_base_relative_error",
+    "score_task_ref_cosine",
+    "proxy_score_time",
+    "score_base_gripper_first",
+    "score_base_gripper_mean",
+    "score_base_gripper_norm",
+    "score_task_gripper_first",
+    "score_task_gripper_mean",
+    "score_task_gripper_norm",
+    "score_ref_gripper_first",
+    "score_ref_gripper_mean",
+    "score_ref_gripper_norm",
+    "score_residual_gripper_first",
+    "score_residual_gripper_mean",
+    "score_residual_gripper_norm",
+    "score_combined_gripper_first",
+    "score_combined_gripper_mean",
+    "score_combined_gripper_norm",
+    "gripper_mean",
+    "steer_authority",
+    "steer_events_closed_empty",
+    "steer_events_backtracks",
+    "stage_env_steps",
+    "task_tilt_weight",
+    "task_tilt_authority",
+    "task_tilt_lambda_eff",
+    "exact_cfg_gamma",
+    "exact_cfg_residual_norm",
+    "proposal_center",
+    "proposal_noise_scale",
+    "action_warm_started",
+    "action_warm_shift_steps",
+)
+
+_WRITEUP_CONTEXT_KEYS = (
+    "target",
+    "eef_pos",
+    "grasp_obj",
+    "payload",
+    "place_target",
+    "place_point",
+    "carry_z",
+    "contact",
+    "orient",
+    "place_mode",
+    "steer_policy",
+    "gripper_intent",
+    "destination",
+    "released",
+    "hold_grace",
+    "seat_contact",
+    "place_released",
+    "steer_authority",
+    "stage_env_steps",
+)
+
+
+def _writeup_value(value):
+    """Compact, stable JSON values for the write-up trace."""
+    if isinstance(value, (set, frozenset)):
+        value = sorted(value)
+    value = _jsonable_debug_value(value)
+    if isinstance(value, float):
+        return round(value, 6)
+    if isinstance(value, dict):
+        return {str(key): _writeup_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_writeup_value(item) for item in value]
+    return value
+
+
+def _writeup_debug_stats(stats: dict[str, Any] | None) -> dict[str, Any]:
+    if not stats:
+        return {}
+    return {
+        key: _writeup_value(stats[key])
+        for key in _WRITEUP_MPC_KEYS
+        if key in stats
+    }
+
+
+def _writeup_context(context: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(context, dict):
+        return {}
+    return {
+        key: _writeup_value(context[key])
+        for key in _WRITEUP_CONTEXT_KEYS
+        if key in context
+    }
+
+
+def _write_writeup_debug_log(handle, event: str, *, flush: bool = False, **payload) -> None:
+    """Write a compact causal-analysis trace without per-step synchronous flushes."""
+    if handle is None:
+        return
+    record = {
+        "time": round(time.time(), 6),
+        "event": event,
+        **payload,
+    }
+    handle.write(json.dumps(_writeup_value(record), separators=(",", ":")) + "\n")
+    if flush:
+        handle.flush()
 
 
 def _debug_action_gripper(action_step) -> float | None:
@@ -4743,6 +4951,16 @@ def parse_args():
     )
     parser.add_argument("--mpc_debug", action="store_true")
     parser.add_argument(
+        "--writeup_debug",
+        "--writeup-debug",
+        dest="writeup_debug",
+        action="store_true",
+        help=(
+            "Write a compact writeup_debug.jsonl with paired action/state trajectories, "
+            "score geometry, and per-diffusion-level summaries. Independent of --mpc_debug."
+        ),
+    )
+    parser.add_argument(
         "--mpc_debug_stdout",
         action="store_true",
         help="Also print detailed MPC debug iterations to stdout. By default --mpc_debug writes them to a jsonl log.",
@@ -5181,6 +5399,14 @@ if args.seeds is not None:
         parser.error("--seeds is single-process; use --seed_start/--seed_end with --workers.")
     if args.load_init_from_dataset is not None:
         parser.error("--seeds and --load_init_from_dataset both index episodes; use one.")
+eval_seeds = (
+    [int(s) for s in args.seeds.split(",") if s.strip()]
+    if args.seeds
+    else list(range(args.seed_start, args.seed_end))
+)
+if not eval_seeds:
+    parser.error("no evaluation seeds were specified.")
+warmup_seed = eval_seeds[0]
 
 _report_initialization_stage(
     args,
@@ -5299,7 +5525,7 @@ if args.collider_diet:
 
 env_cfg.env_name = env_name
 if args.determine:
-    env_cfg.seed = args.seed_start
+    env_cfg.seed = warmup_seed
     env_cfg.sim.physx.enable_enhanced_determinism = True
     print(
         "Deterministic eval enabled: "
@@ -5659,10 +5885,10 @@ print(
 )
 
 _report_initialization_stage(args, "resetting environment for warmup")
-env_obs_dict, _ = env.reset(seed=args.seed_start if args.determine else None)
+env_obs_dict, _ = env.reset(seed=warmup_seed if args.determine else None)
 if args.determine:
     # Decouple policy/MPC randomness from random draws consumed by env.reset().
-    _seed_runtime(args.seed_start)
+    _seed_runtime(warmup_seed)
 warmup_actions = None
 if args.vlm_perception_cache_only or args.vlm_preflight_only:
     _report_initialization_stage(args, "cache/preflight-only mode; policy/VLM warmup skipped")
@@ -5673,7 +5899,7 @@ else:
             warmup_read_path = os.path.join(
                 os.path.abspath(os.path.expanduser(args.vlm_perception_cache_read_dir)),
                 _task_name_for_mpc(args.task),
-                f"seed_{args.seed_start:04d}",
+                f"seed_{warmup_seed:04d}",
             )
             os.environ["VLMDP_PERCEPTION_CACHE_READ_PATH"] = warmup_read_path
         try:
@@ -5826,12 +6052,44 @@ if args.mpc_debug:
         steps_per_inference=steps_per_inference,
         task_num_steps=args.task_num_steps,
     )
+writeup_debug_log_file = None
+writeup_debug_log_path = None
+if args.writeup_debug:
+    writeup_debug_log_path = os.path.join(experiment_output_path, "writeup_debug.jsonl")
+    writeup_debug_log_file = open(
+        writeup_debug_log_path,
+        "w",
+        encoding="utf-8",
+        buffering=65536,
+    )
+    print(f"Write-up debug log: {writeup_debug_log_path}", flush=True)
+    _write_writeup_debug_log(
+        writeup_debug_log_file,
+        "run_start",
+        flush=True,
+        run_id=video_run_id,
+        task=args.task,
+        prompt=args.prompt,
+        base_source=_base_source_name(args),
+        steering_mode=_steering_mode_name(args),
+        sampler=args.sampler,
+        grad_calc=args.grad_calc,
+        mpc_cost=args.mpc_cost,
+        mpc_update=args.mpc_update,
+        mpc_optimize_space=args.mpc_optimize_space,
+        mpc_num_samples=args.mpc_num_samples,
+        num_steps=args.num_steps,
+        steer_scale=args.steer_scale,
+        steer_gamma_gripper=args.steer_gamma_gripper,
+        grasp_steer_scale=args.grasp_steer_scale,
+        lift_steer_scale=args.lift_steer_scale,
+        place_steer_scale=args.place_steer_scale,
+        seeds=eval_seeds,
+        determine=args.determine,
+        steps_per_inference=steps_per_inference,
+        task_num_steps=args.task_num_steps,
+    )
 # One booted app serves every seed in the queue; boot is paid once per process, not per episode.
-eval_seeds = (
-    [int(s) for s in args.seeds.split(",") if s.strip()]
-    if args.seeds
-    else list(range(args.seed_start, args.seed_end))
-)
 print(f"[queue] {len(eval_seeds)} episode(s) in one app: seeds={eval_seeds}", flush=True)
 for rollout_idx, seed in enumerate(eval_seeds):
     success = None
@@ -5973,6 +6231,20 @@ for rollout_idx, seed in enumerate(eval_seeds):
                                                     "plan_fields", None)
                                             if vlm_bridge is not None else None)) else {}),
     )
+    _write_writeup_debug_log(
+        writeup_debug_log_file,
+        "rollout_start",
+        flush=True,
+        seed=seed,
+        rollout_idx=rollout_idx,
+        step=0,
+        phase=current_phase,
+        subtasks=current_subtasks,
+        **({"plan_fields": _pf} if (_pf := (
+            getattr(getattr(vlm_bridge, "grounding", None), "plan_fields", None)
+            if vlm_bridge is not None else None
+        )) else {}),
+    )
     _emit_worker_progress(
         args,
         "rollout_start",
@@ -6098,6 +6370,12 @@ for rollout_idx, seed in enumerate(eval_seeds):
                             warm_shift_steps=warm_shift_steps,
                             base_decode_policy=base_decode_policy,
                         )
+                    if args.writeup_debug:
+                        _writeup_plan_raw = (
+                            actions[..., :8].detach().cpu().clone()
+                            if torch.is_tensor(actions)
+                            else np.asarray(actions)[..., :8].copy()
+                        )
                     # Gate observability: stamp authority + evidence every inference (active or
                     # not), so window behavior is auditable from mpc_debug alone.
                     if isinstance(mpc_context, dict) and "steer_authority" in mpc_context:
@@ -6142,6 +6420,52 @@ for rollout_idx, seed in enumerate(eval_seeds):
                             mpc=_mpc_logged,
                             **({"pred_shadow": _pred} if _pred is not None else {}),
                             mpc_trace=_LAST_INFERENCE_RUNTIME.get("mpc_trace", []),
+                        )
+                    if args.writeup_debug:
+                        _writeup_gate_keys = (
+                            "steer_authority",
+                            "steer_events_closed_empty",
+                            "steer_events_backtracks",
+                            "stage_env_steps",
+                            "fk_fork_m",
+                            "fk_best_cost",
+                            "fk_cost_spread",
+                        )
+                        _writeup_runtime = _LAST_INFERENCE_RUNTIME or {}
+                        _writeup_mpc = _writeup_debug_stats(
+                            _writeup_runtime.get("mpc_last")
+                        )
+                        _writeup_mpc.update({
+                            key: _writeup_value(compare_stats[key])
+                            for key in _writeup_gate_keys
+                            if isinstance(compare_stats, dict) and key in compare_stats
+                        })
+                        _writeup_pred = (
+                            getattr(vlm_bridge, "pred_shadow", None)
+                            if args.vlm_cost != "none" else None
+                        )
+                        _write_writeup_debug_log(
+                            writeup_debug_log_file,
+                            "inference",
+                            seed=seed,
+                            step=step_idx,
+                            phase=current_phase,
+                            subtasks=current_subtasks,
+                            elapsed_s=infer_elapsed,
+                            warm_shift_steps=warm_shift_steps,
+                            context=_writeup_context(mpc_context),
+                            mpc=_writeup_mpc,
+                            diffusion_levels=[
+                                _writeup_debug_stats(level)
+                                for level in _writeup_runtime.get("mpc_trace", [])
+                            ],
+                            plan_raw=_writeup_plan_raw,
+                            plan_filtered=(actions[..., :8].detach().cpu()
+                                           if torch.is_tensor(actions)
+                                           else np.asarray(actions)[..., :8]),
+                            latch_suppressed=latch_raw,
+                            **({"pred_shadow": _writeup_pred}
+                               if _writeup_pred is not None else {}),
                         )
                     episode_inference_time_s += infer_elapsed
                     episode_inference_calls += 1
@@ -6212,6 +6536,16 @@ for rollout_idx, seed in enumerate(eval_seeds):
                     to_phase=next_phase,
                     subtasks=next_subtasks,
                 )
+                _write_writeup_debug_log(
+                    writeup_debug_log_file,
+                    "phase_transition",
+                    flush=True,
+                    seed=seed,
+                    step=step_idx + 1,
+                    from_phase=current_phase,
+                    to_phase=next_phase,
+                    subtasks=next_subtasks,
+                )
                 force_replan = True
             current_phase = next_phase
             current_subtasks = next_subtasks
@@ -6225,6 +6559,13 @@ for rollout_idx, seed in enumerate(eval_seeds):
                     and not subtasks_ever_fired):
                 print(f"futility_abort seed={seed} step={step_idx + 1}: no subtask ever fired", flush=True)
                 _write_mpc_debug_log(mpc_debug_log_file, "futility_abort", seed=seed, step=step_idx + 1)
+                _write_writeup_debug_log(
+                    writeup_debug_log_file,
+                    "futility_abort",
+                    flush=True,
+                    seed=seed,
+                    step=step_idx + 1,
+                )
                 break
             _prof_start = time.perf_counter()
             policy_step_obs = env_obs_dict["policy"]
@@ -6279,6 +6620,28 @@ for rollout_idx, seed in enumerate(eval_seeds):
                 action_gripper=_debug_action_gripper(action_step),
                 **step_trace,
             )
+            if args.writeup_debug:
+                _writeup_step_keys = (
+                    "action",
+                    "action_gripper_raw",
+                    "joint_pos",
+                    "eef_pos",
+                    "object_poses",
+                    "object_beliefs",
+                    "grounding_tcp",
+                    "grounding_aperture",
+                )
+                _write_writeup_debug_log(
+                    writeup_debug_log_file,
+                    "step",
+                    seed=seed,
+                    step=step_idx + 1,
+                    phase=current_phase,
+                    subtasks=current_subtasks,
+                    action_gripper=_debug_action_gripper(action_step),
+                    **{key: step_trace[key] for key in _writeup_step_keys
+                       if key in step_trace},
+                )
             _prof_toc("debug.step_log", _prof_start)
 
             _prof_start = time.perf_counter()
@@ -6361,6 +6724,18 @@ for rollout_idx, seed in enumerate(eval_seeds):
                 _write_mpc_debug_log(
                     mpc_debug_log_file,
                     "done",
+                    seed=seed,
+                    step=step_idx,
+                    phase=current_phase,
+                    subtasks=current_subtasks,
+                    terminated=terminated,
+                    truncated=truncated,
+                    task_success=task_success,
+                )
+                _write_writeup_debug_log(
+                    writeup_debug_log_file,
+                    "done",
+                    flush=True,
                     seed=seed,
                     step=step_idx,
                     phase=current_phase,
@@ -6459,6 +6834,18 @@ for rollout_idx, seed in enumerate(eval_seeds):
         success=success,
         video_path=video_path,
         **_profile_extra,
+    )
+    _write_writeup_debug_log(
+        writeup_debug_log_file,
+        "rollout_end",
+        flush=True,
+        seed=seed,
+        rollout_idx=rollout_idx,
+        steps=step_idx,
+        phase=current_phase,
+        subtasks=current_subtasks,
+        success=success,
+        video_path=video_path,
     )
     _emit_worker_progress(
         args,
@@ -6587,6 +6974,15 @@ _write_mpc_debug_log(
 )
 if mpc_debug_log_file is not None:
     mpc_debug_log_file.close()
+_write_writeup_debug_log(
+    writeup_debug_log_file,
+    "run_end",
+    flush=True,
+    total_inference_calls=total_inference_calls,
+    total_inference_time_s=total_inference_time_s,
+)
+if writeup_debug_log_file is not None:
+    writeup_debug_log_file.close()
 _emit_worker_progress(
     args,
     "run_end",
