@@ -689,7 +689,6 @@ import pinocchio  # noqa: F401  -- must import before Isaac Sim (load order)
 from openpi.models import model as _model
 from openpi.training import config as _config
 from openpi.policies import policy_config
-from openpi.shared import normalize as _normalize
 
 
 import cv2
@@ -5078,15 +5077,6 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--base_norm_stats_dir",
-        type=str,
-        default="",
-        help=(
-            "Directory containing norm_stats.json used to build the base policy transforms. "
-            "This lets base-only eval read stats directly from a task checkpoint asset."
-        ),
-    )
-    parser.add_argument(
         "--base_action_space",
         type=str,
         default="policy",
@@ -5416,10 +5406,6 @@ if args.base_decode_only:
         parser.error(
             "--base_decode_only cannot be used here: " + "; ".join(_decode_only_blockers)
         )
-if args.base_norm_stats_from_task and args.base_norm_stats_dir:
-    parser.error(
-        "--base_norm_stats_from_task and --base_norm_stats_dir are mutually exclusive."
-    )
 if args.base_action_space != "policy":
     _action_space_blockers = _base_action_space_blockers(args)
     if _action_space_blockers:
@@ -5660,11 +5646,6 @@ base_policy = None
 task_policy = None
 ref_policy = None
 required_policy_roles = _required_policy_roles(args)
-base_norm_stats_override = None
-base_norm_stats_source = "base checkpoint"
-if args.base_norm_stats_dir:
-    base_norm_stats_override = _normalize.load(args.base_norm_stats_dir)
-    base_norm_stats_source = args.base_norm_stats_dir
 if "base" in required_policy_roles:
     base_config_name = _config_name_from_checkpoint_dir(base_checkpoint_dir)
     base_config = _config.get_config(base_config_name)
@@ -5674,12 +5655,10 @@ if "base" in required_policy_roles:
             "loading base policy",
             config=base_config_name,
             decode_only=args.base_decode_only,
-            norm_stats=base_norm_stats_source,
         )
         base_policy = policy_config.create_trained_policy(
             base_config,
             base_checkpoint_dir,
-            norm_stats=base_norm_stats_override,
             pytorch_device=args.device,
             load_weights=not args.base_decode_only,
         )
