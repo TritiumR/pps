@@ -5758,6 +5758,28 @@ if args.mpc_debug and base_policy is not None:
 base_decode_policy = None
 if args.base_action_space == "demo_delta":
     _delta_mean, _delta_std = load_action_norm_stats_json(args.base_action_stats)
+    if task_policy is not None:
+        _task_metadata = getattr(task_policy, "_metadata", {}) or {}
+        if bool(_task_metadata.get("use_quantile_norm", False)):
+            raise ValueError(
+                "--base_action_space demo_delta uses mean/std actions, but the task checkpoint "
+                "uses quantile normalization. Retrain/load a demo-mean/std task checkpoint."
+            )
+        _task_action_stats = (_task_metadata.get("output_norm_stats") or {}).get("actions")
+        if _task_action_stats is None:
+            raise ValueError("Task checkpoint is missing action normalization stats.")
+        _task_mean = np.asarray(getattr(_task_action_stats, "mean", None))
+        _task_std = np.asarray(getattr(_task_action_stats, "std", None))
+        if (
+            _task_mean.shape != _delta_mean.shape
+            or _task_std.shape != _delta_std.shape
+            or not np.allclose(_task_mean, _delta_mean, rtol=0.0, atol=1e-7)
+            or not np.allclose(_task_std, _delta_std, rtol=0.0, atol=1e-7)
+        ):
+            raise ValueError(
+                "Task checkpoint action mean/std do not match --base_action_stats; "
+                "base and task steering must use one normalized action space."
+            )
     base_decode_policy = DemoDeltaDecodePolicy(
         base_policy,
         _delta_mean,

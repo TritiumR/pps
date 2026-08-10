@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Prepare and train image-only bidirectional task proxies with demo stats."""
+"""Prepare and train image-only bidirectional task proxies with demo mean/std stats."""
 
 from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import os
 import pathlib
 import sys
+
+import numpy as np
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -20,10 +23,37 @@ from openpi.training import config as training_config  # noqa: E402
 
 
 TASKS = ("weight", "tea", "pot", "capsule")
-DEFAULT_EXP_NAME = "task_eps_bidir_openpi_image_only_demo_stats"
+DEFAULT_EXP_NAME = "task_eps_bidir_openpi_image_only_demo_meanstd"
 DEFAULT_STATS_ROOT = pathlib.Path(
-    "/home/yl4535/sharefs/pps/demo_stats/cn356"
+    "/autodl-fs/data/yl4535/pps/demo_stats/cn356"
 )
+
+
+def _validate_mean_std_stats(stats_dir: pathlib.Path, task: str) -> None:
+    """Require demo mean/std and cross-check standalone eval stats when present."""
+    payload = json.loads((stats_dir / "norm_stats.json").read_text())
+    norm_stats = payload.get("norm_stats", payload)
+    actions = norm_stats.get("actions", {})
+    missing = [field for field in ("mean", "std") if field not in actions]
+    if missing:
+        raise ValueError(f"{stats_dir}: actions are missing mean/std fields: {missing}")
+
+    # eval's demo_delta decoder consumes the standalone file. It is redundant with
+    # the action entry in the complete OpenPI bundle, so verify rather than copy it.
+    action_stats_path = stats_dir.parent.parent / f"{task}_action_norm_stats.json"
+    if not action_stats_path.is_file():
+        return
+    action_stats = json.loads(action_stats_path.read_text())
+    for field in ("mean", "std"):
+        embedded = np.asarray(actions[field], dtype=np.float64)
+        standalone = np.asarray(action_stats[field], dtype=np.float64)
+        if embedded.shape != standalone.shape or not np.allclose(
+            embedded, standalone, rtol=0.0, atol=1e-7
+        ):
+            raise ValueError(
+                f"{field} mismatch between {stats_dir / 'norm_stats.json'} and "
+                f"{action_stats_path}"
+            )
 
 
 def build_config(args: argparse.Namespace):
@@ -35,6 +65,7 @@ def build_config(args: argparse.Namespace):
     stats_dir = stats_root / f"isaaclab_{args.task}"
     if not (stats_dir / "norm_stats.json").is_file():
         raise FileNotFoundError(f"Demo stats not found: {stats_dir}")
+    _validate_mean_std_stats(stats_dir, args.task)
 
     config = training_config.get_config(config_name)
     data = dataclasses.replace(
@@ -42,7 +73,7 @@ def build_config(args: argparse.Namespace):
         repo_id=repo_id,
         assets=dataclasses.replace(config.data.assets, asset_id=repo_id),
         norm_stats_dir=str(stats_dir),
-        use_quantile_norm=True,
+        use_quantile_norm=False,
     )
     model = dataclasses.replace(
         config.model,
