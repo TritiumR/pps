@@ -3,6 +3,7 @@ import atexit
 import dataclasses
 import json
 import os
+import pathlib
 import random
 import shutil
 import subprocess
@@ -689,6 +690,7 @@ import pinocchio  # noqa: F401  -- must import before Isaac Sim (load order)
 from openpi.models import model as _model
 from openpi.training import config as _config
 from openpi.policies import policy_config
+from openpi.shared import normalize as _normalize
 
 
 import cv2
@@ -5072,7 +5074,8 @@ def parse_args():
         action="store_true",
         help=(
             "Build the base policy transforms with the task checkpoint's norm stats. "
-            "Use this for score steering when the task proxy was trained with demo stats, "
+            "Works for both base-only and score steering: --task_checkpoint_dir supplies "
+            "the stats, and a decode-only base uses the fixed pi05 Droid decoder, "
             "so base and task operate in the same normalized state/action space."
         ),
     )
@@ -5227,7 +5230,7 @@ def _repo_relative_path(value: str) -> str:
 def _apply_task_prompt_defaults(args, parser: argparse.ArgumentParser) -> None:
     required_fields = ["prompt"]
     required_roles = _required_policy_roles(args)
-    if "task" in required_roles:
+    if "task" in required_roles or args.base_norm_stats_from_task:
         required_fields.append("task_checkpoint_dir")
     if "ref" in required_roles:
         required_fields.append("ref_checkpoint_dir")
@@ -5646,23 +5649,42 @@ base_policy = None
 task_policy = None
 ref_policy = None
 required_policy_roles = _required_policy_roles(args)
+base_norm_stats = None
+base_norm_stats_source = None
+if args.base_norm_stats_from_task:
+    if task_checkpoint_dir is None:
+        raise ValueError("--base_norm_stats_from_task requires --task_checkpoint_dir.")
+    norm_stats_paths = sorted(pathlib.Path(task_checkpoint_dir).glob("**/norm_stats.json"))
+    if len(norm_stats_paths) != 1:
+        raise ValueError(
+            f"Expected exactly one norm_stats.json under {task_checkpoint_dir!r}; "
+            f"found {len(norm_stats_paths)}: {norm_stats_paths}"
+        )
+    base_norm_stats_source = str(norm_stats_paths[0])
+    base_norm_stats = _normalize.load(norm_stats_paths[0].parent)
 if "base" in required_policy_roles:
-    base_config_name = _config_name_from_checkpoint_dir(base_checkpoint_dir)
+    if args.base_decode_only and base_norm_stats is not None:
+        base_config_name = "pi05_droid_jointpos"
+        base_policy_checkpoint_dir = task_checkpoint_dir
+    else:
+        base_config_name = _config_name_from_checkpoint_dir(base_checkpoint_dir)
+        base_policy_checkpoint_dir = base_checkpoint_dir
     base_config = _config.get_config(base_config_name)
-    if not args.base_norm_stats_from_task:
-        _report_initialization_stage(
-            args,
-            "loading base policy",
-            config=base_config_name,
-            decode_only=args.base_decode_only,
-        )
-        base_policy = policy_config.create_trained_policy(
-            base_config,
-            base_checkpoint_dir,
-            pytorch_device=args.device,
-            load_weights=not args.base_decode_only,
-        )
-        _report_initialization_stage(args, "base policy ready", config=base_config_name)
+    _report_initialization_stage(
+        args,
+        "loading base policy",
+        config=base_config_name,
+        decode_only=args.base_decode_only,
+        norm_stats=base_norm_stats_source or "base checkpoint",
+    )
+    base_policy = policy_config.create_trained_policy(
+        base_config,
+        base_policy_checkpoint_dir,
+        norm_stats=base_norm_stats,
+        pytorch_device=args.device,
+        load_weights=not args.base_decode_only,
+    )
+    _report_initialization_stage(args, "base policy ready", config=base_config_name)
 if "task" in required_policy_roles:
     task_config_name = _config_name_from_checkpoint_dir(task_checkpoint_dir)
     task_config = _config.get_config(task_config_name)
@@ -5697,32 +5719,6 @@ if "task" in required_policy_roles:
         pytorch_device=args.device,
     )
     _report_initialization_stage(args, "task policy ready", config=task_config_name)
-if "base" in required_policy_roles and args.base_norm_stats_from_task:
-    if task_policy is None:
-        raise ValueError("--base_norm_stats_from_task requires a task policy checkpoint.")
-    task_norm_stats, _ = _policy_input_norm_stats(task_policy)
-    if task_norm_stats is None:
-        raise ValueError("Task policy has no input norm_stats to share with the base policy.")
-    _report_initialization_stage(
-        args,
-        "loading base policy",
-        config=base_config_name,
-        decode_only=args.base_decode_only,
-        norm_stats="task checkpoint",
-    )
-    base_policy = policy_config.create_trained_policy(
-        base_config,
-        base_checkpoint_dir,
-        norm_stats=task_norm_stats,
-        pytorch_device=args.device,
-        load_weights=not args.base_decode_only,
-    )
-    _report_initialization_stage(
-        args,
-        "base policy ready",
-        config=base_config_name,
-        norm_stats="task checkpoint",
-    )
 if "ref" in required_policy_roles:
     ref_config_name = _config_name_from_checkpoint_dir(ref_checkpoint_dir)
     ref_config = _config.get_config(ref_config_name)
