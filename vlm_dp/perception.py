@@ -6,6 +6,8 @@ import functools
 import json
 import os
 import re
+import tempfile
+from datetime import datetime, timezone
 
 import cv2
 import numpy as np
@@ -35,6 +37,15 @@ _MASK_ESCAPE_TOL = 8.0
 # Fraction of a detection box whose depth must fall inside the workspace for it to be a candidate.
 _BOX_IN_WORKSPACE = 0.5
 _OBSTACLE_MIN_H = 0.01
+
+
+class PerceptionCacheComplete(RuntimeError):
+    """Signal that a cache-only run completed before entering ReKep."""
+
+    def __init__(self, path: str, reused: bool = False):
+        self.path = path
+        self.reused = bool(reused)
+        super().__init__(path)
 
 
 def _backends():
@@ -183,6 +194,9 @@ class Perception:
         self._id_centroids: dict = {}
         self._fixture_masks: dict = {}
         self._fixture_points: dict = {}
+        self._last_detections: dict = {}
+        self._last_boxes: dict = {}
+        self._last_box_scores: dict = {}
 
     def warmup(self):
         """Load detector and segmenter models."""
@@ -215,15 +229,231 @@ class Perception:
 
     def observe_frame(self, rgb, points) -> dict:
         """Segment a frame and return detected object positions."""
-        self.rgb, self.points = rgb, points
-        self.masks = dict(self._segment(rgb), **self._fixture_masks)
-        self._verify_identities()
+        cache_path = os.environ.get("VLMDP_PERCEPTION_CACHE_PATH")
+        cache_only = os.environ.get("VLMDP_PERCEPTION_CACHE_ONLY") == "1"
+        read_path = os.environ.get("VLMDP_PERCEPTION_CACHE_READ_PATH")
+        if read_path:
+            self._load_cache(read_path)
+        elif cache_only and cache_path and self._cache_matches(cache_path):
+            print(f"[perception:cache] already complete: {cache_path}", flush=True)
+            raise PerceptionCacheComplete(cache_path, reused=True)
+        else:
+            self.rgb, self.points = rgb, points
+            self.masks = dict(self._segment(rgb), **self._fixture_masks)
+            self._verify_identities()
+            if cache_path:
+                self._write_cache(cache_path)
+                if cache_only:
+                    raise PerceptionCacheComplete(cache_path)
         out = {}
         for name in self.masks:
             pos = self.position(name)
             if pos is not None:
                 out[name] = pos
         return out
+
+    def _cache_matches(self, path: str) -> bool:
+        """Return whether ``path`` is a complete cache for this perception setup."""
+        try:
+            with open(os.path.join(path, "metadata.json"), encoding="utf-8") as f:
+                metadata = json.load(f)
+            return (
+                metadata.get("format_version") == 1
+                and metadata.get("segment") == self.segment
+                and metadata.get("prompts") == self.prompts
+                and os.path.isfile(os.path.join(path, "perception.npz"))
+                and os.path.isfile(os.path.join(path, "visualization.png"))
+            )
+        except (OSError, ValueError, TypeError):
+            return False
+
+    @staticmethod
+    def _json_detections(detections: dict) -> dict:
+        return {
+            name: [
+                {"box_xyxy": np.asarray(box).astype(float).tolist(), "score": float(score)}
+                for box, score in entries
+            ]
+            for name, entries in detections.items()
+        }
+
+    def _write_cache(self, path: str) -> None:
+        """Atomically save the GroundingDINO+SAM result consumed before ReKep."""
+        path = os.path.abspath(os.path.expanduser(path))
+        os.makedirs(path, exist_ok=True)
+        names = list(self.masks)
+        shape = self.rgb.shape[:2]
+        masks = (
+            np.stack([self.masks[name] for name in names]).astype(bool, copy=False)
+            if names else np.empty((0, *shape), dtype=bool)
+        )
+        labels, id_to_prim = self.label_image()
+        bounds_min, bounds_max = self._bounds if self._bounds is not None else (None, None)
+        metadata = {
+            "format_version": 1,
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "segment": self.segment,
+            "prompts": self.prompts,
+            "mask_names": names,
+            "fixture_names": [name for name in names if name in self._fixture_masks],
+            "mask_pixels": {name: int(self.masks[name].sum()) for name in names},
+            "erode": int(self.erode),
+            "id_to_prim": {str(key): value for key, value in id_to_prim.items()},
+            "workspace_bounds": {
+                "min": None if bounds_min is None else np.asarray(bounds_min).astype(float).tolist(),
+                "max": None if bounds_max is None else np.asarray(bounds_max).astype(float).tolist(),
+            },
+            "detections": self._json_detections(self._last_detections),
+            "selected_boxes": {
+                name: {
+                    "box_xyxy": np.asarray(box).astype(float).tolist(),
+                    "score": float(self._last_box_scores.get(name, 0.0)),
+                }
+                for name, box in self._last_boxes.items()
+            },
+        }
+
+        fd, array_tmp = tempfile.mkstemp(prefix=".perception-", suffix=".npz", dir=path)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                np.savez_compressed(
+                    f,
+                    rgb=np.asarray(self.rgb, dtype=np.uint8),
+                    points=np.asarray(self.points, dtype=np.float32),
+                    masks=masks,
+                    labels=np.asarray(labels, dtype=np.int32),
+                )
+            os.replace(array_tmp, os.path.join(path, "perception.npz"))
+        finally:
+            if os.path.exists(array_tmp):
+                os.unlink(array_tmp)
+
+        self._write_cache_visualization(os.path.join(path, "visualization.png"))
+
+        fd, metadata_tmp = tempfile.mkstemp(prefix=".metadata-", suffix=".json", dir=path)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2, sort_keys=True)
+                f.write("\n")
+            os.replace(metadata_tmp, os.path.join(path, "metadata.json"))
+        finally:
+            if os.path.exists(metadata_tmp):
+                os.unlink(metadata_tmp)
+        print(f"[perception:cache] wrote pre-ReKep cache: {path}", flush=True)
+
+    def _write_cache_visualization(self, path: str) -> None:
+        """Save a diagnostic overlay of accepted masks and selected detector boxes."""
+        image = np.ascontiguousarray(self.rgb.copy())
+        overlay = image.copy()
+        colours = (
+            (255, 64, 64),
+            (64, 220, 64),
+            (64, 128, 255),
+            (255, 210, 64),
+            (220, 64, 220),
+            (64, 220, 220),
+        )
+        ordered_names = list(dict.fromkeys([
+            *self.prompts,
+            *self.masks,
+            *self._last_boxes,
+        ]))
+        colour_for = {
+            name: colours[i % len(colours)] for i, name in enumerate(ordered_names)
+        }
+        for name, mask in self.masks.items():
+            overlay[np.asarray(mask, dtype=bool)] = colour_for[name]
+        image = cv2.addWeighted(image, 0.68, overlay, 0.32, 0.0)
+
+        for name in ordered_names:
+            colour = colour_for[name]
+            mask = self.masks.get(name)
+            box = self._last_boxes.get(name)
+            anchor = None
+            if mask is not None:
+                mask_u8 = np.asarray(mask, dtype=np.uint8)
+                contours, _ = cv2.findContours(
+                    mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )
+                cv2.drawContours(image, contours, -1, colour, 2)
+                ys, xs = np.where(mask_u8)
+                if xs.size:
+                    anchor = (int(xs.min()), max(int(ys.min()) - 5, 16))
+            if box is not None:
+                x0, y0, x1, y1 = (int(round(float(value))) for value in box)
+                cv2.rectangle(image, (x0, y0), (x1, y1), colour, 2)
+                anchor = (x0, max(y0 - 5, 16))
+            if anchor is None:
+                continue
+            score = self._last_box_scores.get(name)
+            label = name
+            if score is not None:
+                label += f" {score:.3f}"
+            if mask is None:
+                label += " [NO MASK]"
+            cv2.putText(
+                image, label, anchor, cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                (0, 0, 0), 3, cv2.LINE_AA,
+            )
+            cv2.putText(
+                image, label, anchor, cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                colour, 1, cv2.LINE_AA,
+            )
+
+        missing = [name for name in self.prompts if name not in self.masks]
+        status = "PASS: all prompted objects masked"
+        status_colour = (64, 220, 64)
+        if missing:
+            status = "MISSING MASK: " + ", ".join(missing)
+            status_colour = (255, 64, 64)
+        cv2.rectangle(image, (5, 5), (min(image.shape[1] - 5, 620), 34), (0, 0, 0), -1)
+        cv2.putText(
+            image, status, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.62,
+            status_colour, 2, cv2.LINE_AA,
+        )
+
+        fd, tmp_path = tempfile.mkstemp(prefix=".visualization-", suffix=".png",
+                                        dir=os.path.dirname(path))
+        os.close(fd)
+        try:
+            if not cv2.imwrite(tmp_path, image[..., ::-1]):
+                raise OSError(f"failed to write perception visualization: {tmp_path}")
+            os.replace(tmp_path, path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    def _load_cache(self, path: str) -> None:
+        """Load cached pre-ReKep masks and geometry, leaving ReKep itself live."""
+        path = os.path.abspath(os.path.expanduser(path))
+        if not self._cache_matches(path):
+            raise ValueError(f"incompatible or incomplete perception cache: {path}")
+        with open(os.path.join(path, "metadata.json"), encoding="utf-8") as f:
+            metadata = json.load(f)
+        with np.load(os.path.join(path, "perception.npz"), allow_pickle=False) as data:
+            self.rgb = np.asarray(data["rgb"])
+            self.points = np.asarray(data["points"])
+            masks = np.asarray(data["masks"], dtype=bool)
+        names = metadata["mask_names"]
+        if len(names) != masks.shape[0]:
+            raise ValueError(f"mask-name count mismatch in perception cache: {path}")
+        self.masks = {name: masks[i] for i, name in enumerate(names)}
+        self._last_detections = {
+            name: [
+                (np.asarray(entry["box_xyxy"], dtype=np.float32), float(entry["score"]))
+                for entry in entries
+            ]
+            for name, entries in metadata.get("detections", {}).items()
+        }
+        self._last_boxes = {
+            name: np.asarray(entry["box_xyxy"], dtype=np.float32)
+            for name, entry in metadata.get("selected_boxes", {}).items()
+        }
+        self._last_box_scores = {
+            name: float(entry["score"])
+            for name, entry in metadata.get("selected_boxes", {}).items()
+        }
+        print(f"[perception:cache] loaded pre-ReKep cache: {path}", flush=True)
 
     def _verify_identities(self):
         """Reject detections that fail appearance consistency."""
@@ -495,7 +725,10 @@ class Perception:
 
         _, image_torch = load_pil_image(Image.fromarray(rgb).convert("RGB"))
         H, W = rgb.shape[:2]
-        boxes = self._assign(self._in_workspace(self._detect(image_torch, W, H)))
+        detections = self._in_workspace(self._detect(image_torch, W, H))
+        self._last_detections = detections
+        boxes = self._assign(detections)
+        self._last_boxes = boxes
         if not boxes:
             return {}
 
@@ -633,4 +866,8 @@ class Perception:
                     if _iou(box, c) > _IOU_MERGE:
                         score[i, j] = max(score[i, j], s)
         rows, cols = linear_sum_assignment(-score)
-        return {self.names[i]: cands[j] for i, j in zip(rows, cols) if score[i, j] > 0}
+        assigned = {self.names[i]: cands[j] for i, j in zip(rows, cols) if score[i, j] > 0}
+        self._last_box_scores = {
+            self.names[i]: float(score[i, j]) for i, j in zip(rows, cols) if score[i, j] > 0
+        }
+        return assigned

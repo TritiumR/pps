@@ -15,6 +15,10 @@ from tqdm import tqdm
 
 _DEFAULT_WORKERS = 1
 _DEFAULT_GPUS = "0"
+_DEFAULT_PERCEPTION_CACHE_DIR = os.environ.get(
+    "VLMDP_PERCEPTION_CACHE_DIR",
+    "/autodl-fs/data/yl4535/pps/perception_cache/groundedsam_pre_rekep",
+)
 _WORKER_PROGRESS_HANDLE = None
 _WORKER_PROGRESS_HANDLE_PATH = None
 _INIT_PROCESS_START = time.perf_counter()
@@ -617,7 +621,9 @@ _REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 _OPENPI_SRC_DIR = os.path.join(_REPO_DIR, "openpi", "src")
 if _OPENPI_SRC_DIR not in sys.path:
     sys.path.insert(0, _OPENPI_SRC_DIR)
-_ISAACLAB_DIR = os.path.join(_REPO_DIR, "IsaacLab")
+_ISAACLAB_DIR = os.path.abspath(
+    os.path.expanduser(os.environ.get("ISAACLAB_ROOT", os.path.join(_REPO_DIR, "IsaacLab")))
+)
 for _isaaclab_pkg in (
     "isaaclab",
     "isaaclab_assets",
@@ -4572,6 +4578,40 @@ def parse_args():
         help="Segmenter for --vlm_state real: text-grounded boxes, or SAM regions named by a VLM.",
     )
     parser.add_argument(
+        "--vlm_perception_cache_dir",
+        default=None,
+        help=(
+            "Write one pre-ReKep perception cache per deterministic seed under this directory. "
+            "The cache contains RGB, world points, GroundingDINO detections, and named SAM masks."
+        ),
+    )
+    parser.add_argument(
+        "--percept_cache",
+        "--vlm_perception_cache_read_dir",
+        dest="vlm_perception_cache_read_dir",
+        nargs="?",
+        const=_DEFAULT_PERCEPTION_CACHE_DIR,
+        default=None,
+        help=(
+            "Read the per-seed GroundingDINO+SAM cache while rerunning ReKep and all later "
+            "grounding logic. With no value, uses "
+            f"{_DEFAULT_PERCEPTION_CACHE_DIR!r}; optionally pass a different cache root."
+        ),
+    )
+    parser.add_argument(
+        "--vlm_perception_cache_only",
+        action="store_true",
+        help="Stop each seed immediately after writing its pre-ReKep perception cache.",
+    )
+    parser.add_argument(
+        "--vlm_preflight_only",
+        action="store_true",
+        help=(
+            "Load each deterministic perception cache, compile ReKep grounding, record whether "
+            "preflight passed, and skip policy rollout. Intended for curating reusable seed sets."
+        ),
+    )
+    parser.add_argument(
         "--vlm_vocab",
         default=None,
         help="Comma-separated object names to restrict the perception vocabulary to (detector text kept "
@@ -4898,6 +4938,26 @@ parser.set_defaults(enable_cameras=True, headless=True)
 args = parser.parse_args()
 if args.workers <= 0:
     parser.error("--workers must be positive.")
+if args.vlm_perception_cache_only:
+    if not args.vlm_perception_cache_dir:
+        parser.error("--vlm_perception_cache_only requires --vlm_perception_cache_dir.")
+    if not args.determine:
+        parser.error("--vlm_perception_cache_only requires --determine.")
+    if args.vlm_perception_cache_read_dir:
+        parser.error("--vlm_perception_cache_only cannot be combined with cache reading.")
+    if args.vlm_cost == "none" or args.vlm_state != "real":
+        parser.error("--vlm_perception_cache_only requires a real-state --vlm_cost configuration.")
+if args.vlm_preflight_only:
+    if not args.vlm_perception_cache_read_dir:
+        parser.error("--vlm_preflight_only requires --percept_cache.")
+    if not args.determine:
+        parser.error("--vlm_preflight_only requires --determine.")
+    if args.vlm_perception_cache_only or args.vlm_perception_cache_dir:
+        parser.error("--vlm_preflight_only reads existing caches and cannot write caches.")
+    if args.vlm_cost == "none" or args.vlm_state != "real":
+        parser.error("--vlm_preflight_only requires a real-state --vlm_cost configuration.")
+if args.vlm_perception_cache_read_dir and not args.determine:
+    parser.error("--vlm_perception_cache_read_dir requires --determine.")
 try:
     configured_gpu_ids = _parse_gpu_ids(args.gpus)
 except ValueError as exc:
@@ -5384,6 +5444,7 @@ if args.vlm_cost != "none":
 
     from vlm_dp import config_paths as vlm_config_paths
     from vlm_dp.bridge import VlmDpBridge
+    from vlm_dp.perception import PerceptionCacheComplete
 
     if mpc_planner is None:
         raise SystemExit(
@@ -5509,30 +5570,46 @@ env_obs_dict, _ = env.reset(seed=args.seed_start if args.determine else None)
 if args.determine:
     # Decouple policy/MPC randomness from random draws consumed by env.reset().
     _seed_runtime(args.seed_start)
-if args.vlm_cost != "none":
-    vlm_bridge.reset(env)
-_report_initialization_stage(args, "building warmup observation")
-obs = get_pi_observation(env_obs_dict["policy"])
-obs["prompt"] = args.prompt
-_report_initialization_stage(args, "compiling/warming policy inference")
-with torch.no_grad():
-    warmup_actions, _ = infer_actions_with_mpc(
-        base_policy,
-        task_policy,
-        ref_policy,
-        copy.deepcopy(obs),
-        args,
-        mpc_planner=mpc_planner,
-        mpc_context=(
-            None
-            if standalone_role is not None
-            else (
-                vlm_bridge.context(env, env_obs_dict)
-                if args.vlm_cost != "none"
-                else build_mpc_context(env, env_obs_dict, args)
+warmup_actions = None
+if args.vlm_perception_cache_only or args.vlm_preflight_only:
+    _report_initialization_stage(args, "cache/preflight-only mode; policy/VLM warmup skipped")
+else:
+    if args.vlm_cost != "none":
+        warmup_read_path = None
+        if args.vlm_perception_cache_read_dir:
+            warmup_read_path = os.path.join(
+                os.path.abspath(os.path.expanduser(args.vlm_perception_cache_read_dir)),
+                _task_name_for_mpc(args.task),
+                f"seed_{args.seed_start:04d}",
             )
-        ),
-    )
+            os.environ["VLMDP_PERCEPTION_CACHE_READ_PATH"] = warmup_read_path
+        try:
+            vlm_bridge.reset(env)
+        finally:
+            if warmup_read_path is not None:
+                os.environ.pop("VLMDP_PERCEPTION_CACHE_READ_PATH", None)
+    _report_initialization_stage(args, "building warmup observation")
+    obs = get_pi_observation(env_obs_dict["policy"])
+    obs["prompt"] = args.prompt
+    _report_initialization_stage(args, "compiling/warming policy inference")
+    with torch.no_grad():
+        warmup_actions, _ = infer_actions_with_mpc(
+            base_policy,
+            task_policy,
+            ref_policy,
+            copy.deepcopy(obs),
+            args,
+            mpc_planner=mpc_planner,
+            mpc_context=(
+                None
+                if standalone_role is not None
+                else (
+                    vlm_bridge.context(env, env_obs_dict)
+                    if args.vlm_cost != "none"
+                    else build_mpc_context(env, env_obs_dict, args)
+                )
+            ),
+        )
 _report_initialization_stage(args, "initialization complete")
 _wait_for_worker_start(args)
 
@@ -5720,8 +5797,39 @@ for rollout_idx, seed in enumerate(eval_seeds):
         )
 
     if args.vlm_cost != "none":
+        cache_write_path = None
+        cache_read_path = None
+        cache_task = _task_name_for_mpc(args.task)
+        if args.vlm_perception_cache_dir:
+            cache_write_path = os.path.join(
+                os.path.abspath(os.path.expanduser(args.vlm_perception_cache_dir)),
+                cache_task,
+                f"seed_{seed:04d}",
+            )
+            os.environ["VLMDP_PERCEPTION_CACHE_PATH"] = cache_write_path
+        if args.vlm_perception_cache_read_dir:
+            cache_read_path = os.path.join(
+                os.path.abspath(os.path.expanduser(args.vlm_perception_cache_read_dir)),
+                cache_task,
+                f"seed_{seed:04d}",
+            )
+            os.environ["VLMDP_PERCEPTION_CACHE_READ_PATH"] = cache_read_path
+        if args.vlm_perception_cache_only:
+            os.environ["VLMDP_PERCEPTION_CACHE_ONLY"] = "1"
         try:
             vlm_bridge.reset(env)
+        except PerceptionCacheComplete as exc:
+            action = "reused" if exc.reused else "wrote"
+            print(f"[eval] seed {seed}: {action} pre-ReKep perception cache {exc.path}", flush=True)
+            experiment_results["episodes"].append({
+                "rollout_index": rollout_idx,
+                "seed": seed,
+                "cached": True,
+                "cache_reused": exc.reused,
+                "cache_path": exc.path,
+            })
+            _write_experiment_results(experiment_results_path, experiment_results)
+            continue
         except (ValueError, AssertionError, IndexError) as exc:
             # An ungroundable scene must cost one episode, not the rest of the run. Recorded as
             # errored and excluded from the success denominator: it is not a policy failure.
@@ -5731,6 +5839,21 @@ for rollout_idx, seed in enumerate(eval_seeds):
                 "seed": seed,
                 "errored": True,
                 "error": f"grounding: {exc}",
+            })
+            _write_experiment_results(experiment_results_path, experiment_results)
+            continue
+        finally:
+            os.environ.pop("VLMDP_PERCEPTION_CACHE_PATH", None)
+            os.environ.pop("VLMDP_PERCEPTION_CACHE_READ_PATH", None)
+            os.environ.pop("VLMDP_PERCEPTION_CACHE_ONLY", None)
+
+        if args.vlm_preflight_only:
+            print(f"[eval] seed {seed}: ReKep preflight passed; rollout skipped", flush=True)
+            experiment_results["episodes"].append({
+                "rollout_index": rollout_idx,
+                "seed": seed,
+                "preflight_ok": True,
+                "cache_path": cache_read_path,
             })
             _write_experiment_results(experiment_results_path, experiment_results)
             continue

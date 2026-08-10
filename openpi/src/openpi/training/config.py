@@ -5518,6 +5518,28 @@ _CONFIGS = [
         batch_size=32,
     ),
     TrainConfig(
+        # Pot-task twin of score_task_weight, matching the trained pot checkpoint.
+        name="score_task_pot",
+        model=proxy_score_config.ProxyScoreConfig(
+            action_horizon=15,
+            action_dim=8,
+            action_expert_variant="gemma_12m",
+            dino_model_name="facebook/dinov3-vits16-pretrain-lvd1689m",
+            ddim_num_train_timesteps=100,
+            prediction_type="epsilon",
+        ),
+        data=ProxyLeRobotDROIDJointPosDataConfig(
+            repo_id="cn356/isaaclab_pot",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="cn356/isaaclab_pot"),
+            norm_stats_dir="checkpoints/pytorch/pi05_droid_jointpos/assets/droid",
+            use_quantile_norm=True,
+        ),
+        num_train_steps=30_000,
+        save_interval=1_000,
+        batch_size=32,
+    ),
+    TrainConfig(
         name="score_ref_weight",
         model=proxy_score_config.ProxyScoreConfig(
             action_horizon=15,
