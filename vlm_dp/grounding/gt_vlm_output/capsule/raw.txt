@@ -6,17 +6,52 @@
 #
 # Task: "open the coffee maker lid and put the pod inside"
 #
-# The task involves four stages:
+# The task involves six stages:
 # 1. Grasp the coffee-maker lid.
 # 2. Open the lid on its hinge.
 # 3. Grasp the pod.
 # 4. Lift the pod clear of the tray.
-# 5. Place the pod in the bay.
+# 5. Carry the pod above the bay.
+# 6. Lower the pod onto the bay opening.
 #
 # Stage 4 is an explicit lift, carrying no grasp or release keypoint: its sub-goal constraint
 # certifies the pod is actually held before transport to the bay begins.
+#
+# BROUGHT TO PARITY WITH THE WEIGHT PLAN (the validated 16/20 reference). Four judgements,
+# stated here because they are choices and not mechanical ports:
+#
+#  * TRANSPORT SPLIT FROM PLACEMENT (was 5 stages, now 6). The old stage 5 both crossed the
+#    workspace and descended into the bay, so a carry-height rule on it would have forbidden the
+#    descent it was supposed to perform. Splitting gives stage 5 an unconditional carry-height
+#    path rule and stage 6 a pure descent -- the same reason weight splits 2-3 from 4.
+#
+#  * ONE-SIDED VERTICAL FOR BOTH RISING STAGES (2 and 4). Stage 4 is the ordinary lift and reads
+#    exactly like weight stages 2/6. Stage 2 -- the lid opening -- is treated as a lift too,
+#    which is the one non-obvious call here: the lip travels on a HINGE ARC, so it rises while
+#    swinging back in xy, and a 3-D distance to the mid-air open point charges the plan for the
+#    arc's horizontal component, which the mechanism dictates and the robot cannot choose. What
+#    the stage actually names is "the lip has risen by the open lift", so the sub-goal is the
+#    vertical shortfall of the lip against the declared open-goal keypoint and nothing else.
+#    The open goal stays a KEYPOINT rather than becoming a baked scalar: it is unowned (it never
+#    moves) and keeping it named is what keeps the declared point meaningful to the plan.
+#    Stage 2's completion predicate is the matching LID-OPENED event. Note that stage 2 is a
+#    RELEASE stage (release_keypoints[1] = the lip), so the runtime classifies it as a place
+#    stage and, under advance.predicate_place_transitions, advances it on that predicate: the
+#    predicate therefore states the event in the place vocabulary -- risen, hand let go, lid no
+#    longer swinging -- and uses a 5cm band rather than a 5mm one, the same band weight's place
+#    predicates use for their descent test, because a hinge arc does not stop on a millimetre.
+#
+#  * GATED DESCENT (stage 6). Its second path constraint forbids dropping below the hover height
+#    while still horizontally far from the bay, relaxing linearly to zero inside 8cm. The pod
+#    then arrives over the bay opening and goes straight down, instead of diving diagonally at
+#    the machine and clipping its rim on the way in.
+#
+#  * PLACE MODE UNCHANGED. Stage 6's sub-goal deliberately avoids the words "into"/"inside"/
+#    "within": rekep._places_into reads that text to choose container vs surface placement, and
+#    this plan has always compiled as `surface`. Restructuring the plan is not the place to also
+#    flip a cost mode that no run has measured.
 
-num_stages = 5
+num_stages = 6
 
 
 ### stage 1 sub-goal constraints
@@ -29,8 +64,8 @@ def stage1_subgoal_constraint1(end_effector, keypoints):
 
 ### stage 2 sub-goal constraints
 def stage2_subgoal_constraint1(end_effector, keypoints):
-    """The lid lip (keypoint {lip}) reaches the open goal (keypoint {open_goal})."""
-    return np.linalg.norm(keypoints[{lip}] - keypoints[{open_goal}])
+    """The lid lip (keypoint {lip}) has swung up to the open goal (keypoint {open_goal}) height."""
+    return np.maximum(0.0, keypoints[{open_goal}][..., 2] - keypoints[{lip}][..., 2])
 
 ### stage 2 path constraints
 def stage2_path_constraint1(end_effector, keypoints):
@@ -47,9 +82,8 @@ def stage3_subgoal_constraint1(end_effector, keypoints):
 
 ### stage 4 sub-goal constraints
 def stage4_subgoal_constraint1(end_effector, keypoints):
-    """The pod (keypoint {pod}) is raised to its carry height above the pick-up pose."""
-    offsetted_point = keypoints[{bay}] + np.array({lift_pod})
-    return np.linalg.norm(keypoints[{pod}] - offsetted_point)
+    """The pod (keypoint {pod}) has reached carry height (vertical shortfall only)."""
+    return np.maximum(0.0, ({lift_z_pod}) - keypoints[{pod}][..., 2])
 
 ### stage 4 path constraints
 def stage4_path_constraint1(end_effector, keypoints):
@@ -58,23 +92,172 @@ def stage4_path_constraint1(end_effector, keypoints):
 
 ### stage 5 sub-goal constraints
 def stage5_subgoal_constraint1(end_effector, keypoints):
-    """The pod (keypoint {pod}) rests at the bay opening (keypoint {bay}), 2cm above."""
-    offsetted_point = keypoints[{bay}] + np.array([0.0, 0.0, 0.02])
+    """The pod (keypoint {pod}) hovers directly above the bay (keypoint {bay})."""
+    offsetted_point = keypoints[{bay}] + np.array({hover_pod})
     return np.linalg.norm(keypoints[{pod}] - offsetted_point)
 
 ### stage 5 path constraints
 def stage5_path_constraint1(end_effector, keypoints):
+    """The robot must still be holding the pod (keypoint {pod})."""
+    return get_grasping_cost_by_keypoint_idx({pod})
+
+def stage5_path_constraint2(end_effector, keypoints):
+    """Keep the pod (keypoint {pod}) clear of the tray while carrying it across."""
+    return np.maximum(0.0, ({carry_z_pod}) - keypoints[{pod}][..., 2])
+
+### stage 6 sub-goal constraints
+def stage6_subgoal_constraint1(end_effector, keypoints):
+    """The pod (keypoint {pod}) rests at the bay opening (keypoint {bay})."""
+    offsetted_point = keypoints[{bay}] + np.array({off_pod})
+    return np.linalg.norm(keypoints[{pod}] - offsetted_point)
+
+### stage 6 path constraints
+def stage6_path_constraint1(end_effector, keypoints):
     """The robot must still be grasping the pod (keypoint {pod})."""
     return get_grasping_cost_by_keypoint_idx({pod})
+
+def stage6_path_constraint2(end_effector, keypoints):
+    """Stay above the hover height until horizontally aligned with the bay opening."""
+    place_xy = keypoints[{bay}][..., :2] + np.array({off_pod})[:2]
+    xy_off = np.linalg.norm(keypoints[{pod}][..., :2] - place_xy, axis=-1)
+    low = np.maximum(0.0, ({hover_z_pod}) - keypoints[{pod}][..., 2])
+    return low * np.minimum(1.0, xy_off / 0.08)
 
 
 """
 Summarize keypoints to be grasped in all grasping stages.
 For a grasping stage write the keypoint index; for a non-grasping stage write -1.
 """
-grasp_keypoints = [{lip}, -1, {pod}, -1, -1]
+grasp_keypoints = [{lip}, -1, {pod}, -1, -1, -1]
 
 """
 Summarize at **the end of which stage** the robot should release each keypoint.
 """
-release_keypoints = [-1, {lip}, -1, -1, {pod}]
+release_keypoints = [-1, {lip}, -1, -1, -1, {pod}]
+
+
+
+# ---------------------------------------------------------------------------
+# Completion predicates (vlm_dp extension to the ReKep response format).
+#
+# Written in the PRIMITIVE VOCABULARY the runtime provides (vlm_dp/grounding/predicates.py ::
+# PredicateRuntime), exactly as the weight and pot plans are. This plan states WHICH event each
+# stage names; the primitive states HOW that event is sensed. Nothing here re-derives a window,
+# a sensor threshold or a contact band.
+#
+#   EVENTS, each of which also fills `components` with its named boolean and the margin_*
+#   floats behind it:
+#     grasped(kp, name, "acquire")   the pick-up event: fingers stalled on something for a
+#                                    whole window, POSITIVE co-motion with a hand that actually
+#                                    travelled, and the object within reach.
+#     grasped(kp, name, "maintain")  still holding: fingers stalled and no slip relative to a
+#                                    hand that moved.
+#     released(kp, name)             the hand let go: it departed while the object stayed, or
+#                                    the fingers opened.
+#     stationary(kp, name)           the object stopped moving.
+#     sustained(cost_fn, name)       this plan's OWN geometry, in the ReKep cost convention
+#                                    (<= 0 satisfied), held over the last few belief frames
+#                                    rather than at one instant.
+#
+#   TOLERANCES. Only two of them are the runtime's to answer here, and WHICH two is the point:
+#     target_region_radius({bay})   the placement region around the bay anchor.
+#     clearance_margin({pod})       the vertical band separating "clear above the bay" from
+#                                   "descended into it". The POD is a body this plan carries,
+#                                   which is exactly the condition the primitive is defined for.
+#
+#   AND ONE THAT IS NOT. The lid's rise tolerance is `{open_clear}`, a RENDERED FIELD authored
+#   in fake_vlm beside _CAPSULE_LID_OPEN_LIFT, the lift it is a band on. It is emphatically NOT
+#   clearance_margin({lip}): the lip is a DECLARED feature on the machine, a body the robot
+#   never carries, and its geometry was declared precisely because the machine's own extents do
+#   not describe it. Asking the primitive for it is refused, and correctly so -- a 10mm rim on a
+#   320mm machine has no clearance the machine's extents could imply. The same holds for the
+#   bay: `{off_pod}` states where the pod seats, and the plan states it, because the bay is a
+#   declared recess and not a body anyone carries.
+#
+#   NOTE ON grasp_tolerance. Stage 1 does not need it -- grasped() is a statement about contact
+#   and co-motion, not about width -- but if it did, grasp_tolerance({lip}) is well defined and
+#   resolves to the DECLARED lip half-width (10mm), never to the machine's whole-body extent.
+#   That declared extent is the same number every grasp cost term is sized by, so the predicate
+#   and the cost would be reading one geometry rather than two.
+#
+#   DIAGNOSTIC KEYS. Every boolean these stages used to publish keeps its name and its meaning:
+#   closed_on_object, rides_with_hand, at_hand, lip_risen, hand_let_go, lid_quiescent,
+#   still_held, at_carry_height, inside_place_region, still_clear_of_bay, descended,
+#   object_quiescent, and the margins margin_aperture / margin_slip_ratio / margin_hand_disp_m /
+#   margin_reach_m / margin_open_frac / margin_speed_mps. Stages 1 and 3 additionally publish an
+#   overall lip_in_hand / pod_in_hand, which is the conjunction they used to return unnamed.
+#   Four margins are RENAMED because sustained() reports one uniform quantity -- the worst COST
+#   in the window, negative when satisfied -- where the old blocks reported differently-signed
+#   ad-hoc numbers:
+#     margin_rise_m             -> margin_lip_risen             (now negated: cost, not rise)
+#     margin_height_shortfall_m -> margin_at_carry_height       (same value)
+#     margin_xy_off_m           -> margin_inside_place_region   (now offset MINUS the radius)
+#     margin_clearance_m        -> margin_still_clear_of_bay    (now negated: cost, not clearance)
+#     margin_descent_m          -> margin_descended             (now negated: cost, not clearance)
+#
+# The capsule-specific event is LID-OPENED (stage 2): the lip has RISEN by the open lift and
+# held that height, while the hand has let go and the lid has stopped swinging. Height, not arc
+# position: the hinge chooses where the lip ends up in xy, so only the rise is evidence the
+# robot produced. Stage 2 is a RELEASE stage, so the runtime classifies it as a place stage and,
+# under advance.predicate_place_transitions, advances it on this predicate -- which is why it is
+# stated in the place vocabulary (risen, let go, quiescent). No new primitive is required for
+# it: "risen and held" is a sustained() over the plan's own one-sided vertical.
+#
+# Interface: stage<N>_completion(history, end_effector, keypoints, robot_state, components)
+# -> bool, filling `components` with named booleans plus margin_* floats. See
+# vlm_dp/grounding/predicates.py for the full contract.
+# ---------------------------------------------------------------------------
+
+
+### stage 1 completion predicate
+def stage1_completion(history, end_effector, keypoints, robot_state, components):
+    """Lid lip grasped: the fingers are stalled on something, and the lip rides with the hand."""
+    lip_in_hand = grasped({lip}, "lip_in_hand", "acquire")
+    return bool(lip_in_hand)
+
+### stage 2 completion predicate
+def stage2_completion(history, end_effector, keypoints, robot_state, components):
+    """Lid opened: the lip has risen by the open lift and stayed there, the hand let go, nothing moving."""
+    lip_risen = sustained(
+        lambda ee, kp: (kp[{open_goal}][..., 2] - ({open_clear})) - kp[{lip}][..., 2], "lip_risen")
+    hand_let_go = released({lip}, "hand_let_go")
+    lid_quiescent = stationary({lip}, "lid_quiescent")
+    return bool(lip_risen and hand_let_go and lid_quiescent)
+
+### stage 3 completion predicate
+def stage3_completion(history, end_effector, keypoints, robot_state, components):
+    """Pod grasped: the fingers are stalled on something, and the pod rides with the hand."""
+    pod_in_hand = grasped({pod}, "pod_in_hand", "acquire")
+    return bool(pod_in_hand)
+
+### stage 4 completion predicate
+def stage4_completion(history, end_effector, keypoints, robot_state, components):
+    """Pod lifted: still owned by the hand, and it has held carry height for the last third of a second."""
+    still_held = grasped({pod}, "still_held", "maintain")
+    at_carry_height = sustained(
+        lambda ee, kp: ({lift_z_pod}) - kp[{pod}][..., 2], "at_carry_height")
+    return bool(still_held and at_carry_height)
+
+### stage 5 completion predicate
+def stage5_completion(history, end_effector, keypoints, robot_state, components):
+    """Pod over the bay: still owned by the hand, inside the bay region in xy, still clear above it."""
+    still_held = grasped({pod}, "still_held", "maintain")
+    inside_place_region = sustained(
+        lambda ee, kp: np.linalg.norm(kp[{pod}][..., :2] - (kp[{bay}][..., :2] + np.array({off_pod})[:2]),
+                                      axis=-1) - target_region_radius({bay}), "inside_place_region")
+    still_clear_of_bay = sustained(
+        lambda ee, kp: (({hover_z_pod}) - clearance_margin({pod})) - kp[{pod}][..., 2],
+        "still_clear_of_bay")
+    return bool(still_held and inside_place_region and still_clear_of_bay)
+
+### stage 6 completion predicate
+def stage6_completion(history, end_effector, keypoints, robot_state, components):
+    """Pod placed: down in the bay region, no longer owned by the hand, and no longer moving."""
+    hand_let_go = released({pod}, "hand_let_go")
+    inside_place_region = sustained(
+        lambda ee, kp: np.linalg.norm(kp[{pod}][..., :2] - (kp[{bay}][..., :2] + np.array({off_pod})[:2]),
+                                      axis=-1) - target_region_radius({bay}), "inside_place_region")
+    object_quiescent = stationary({pod}, "object_quiescent")
+    descended = sustained(
+        lambda ee, kp: kp[{pod}][..., 2] - (({hover_z_pod}) - clearance_margin({pod})), "descended")
+    return bool(hand_let_go and inside_place_region and object_quiescent and descended)

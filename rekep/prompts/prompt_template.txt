@@ -49,6 +49,34 @@ Suppose you are controlling a robot to perform manipulation tasks by writing con
   - `keypoints`: np.array of shape `(K, 3)` representing the keypoint positions.
 - For any path constraint that requires the robot to be still grasping a keypoint `i`, you may use the provided function `get_grasping_cost_by_keypoint_idx` by calling `return get_grasping_cost_by_keypoint_idx(i)` where `i` is the index of the keypoint.
 - Inside of each function, you may use native Python functions, any NumPy functions, and the provided `get_grasping_cost_by_keypoint_idx` function.
+
+**Completion predicates.**
+A sub-goal constraint says how FAR a stage is from done, and the runtime finishes the stage when that number drops below a threshold. For each stage you must ALSO write a `stage<N>_completion` predicate, which answers a different question: has the EVENT this stage names actually happened. Write what the stage MEANS, not a second copy of its sub-goal — never measure a distance to the stage's own sub-goal point in a predicate.
+- Signature: `def stage<N>_completion(history, end_effector, keypoints, robot_state, components):`. It returns a plain `bool`.
+- Write the body as one named condition per line, then a SINGLE final line `return bool(<and of those names>)`. Do not use `if` statements, early returns, or more than one `return`.
+- Build every condition out of these provided primitives, and nothing else. Do not write your own window lengths, gripper thresholds, speeds, or tolerances — the primitives own all of them, and a number you invent will disagree with the runtime.
+  - `grasped(i, name, "acquire")` — the PICK-UP event on keypoint `i`: the fingers closed on something real and the object came along with a hand that moved. Use this in a grasping stage.
+  - `grasped(i, name, "maintain")` — the object is STILL held. Use this while carrying; it does not require the hand to move.
+  - `released(i, name)` — the robot let go of keypoint `i`, by opening the fingers or by leaving the object behind.
+  - `stationary(i, name)` — the object carrying keypoint `i` has stopped moving. Use it to mean "it is resting there"; a distance cannot express that.
+  - `sustained(cost_fn, name)` — YOUR OWN geometry, in the same cost convention as a constraint (`<= 0` means satisfied), required to hold over a short window instead of at one instant. `cost_fn` is a lambda `lambda end_effector, keypoints: <cost>`. Use it for every geometric condition in a predicate.
+  - `grasp_tolerance(i)` — half-width of the grasp feature at keypoint `i`, in metres.
+  - `target_region_radius(i)` — radius of the placement region around anchor keypoint `i`, in metres.
+  - `clearance_margin(i)` — vertical clearance band for keypoint `i`. Valid ONLY when `i` is on an object the robot CARRIES; asking for it on a fixture is an error.
+- `name` is the label the condition appears under in the log. Choose a phrase that says what happened (`"pear_in_hand"`, `"still_held"`, `"inside_place_region"`, `"object_quiescent"`, `"descended"`), not how it was measured.
+- The predicate must be able to fail: a stage whose predicate is true from the first frame has not stated an event.
+
+Example, for a stage that places a grasped object (keypoint 4) onto a fixture (keypoint 7):
+```python
+def stage4_completion(history, end_effector, keypoints, robot_state, components):
+    """The object has been placed on the fixture and let go."""
+    hand_let_go = released(4, "hand_let_go")
+    inside_place_region = sustained(
+        lambda ee, kp: np.linalg.norm(kp[4][..., :2] - kp[7][..., :2], axis=-1)
+        - target_region_radius(7), "inside_place_region")
+    object_quiescent = stationary(4, "object_quiescent")
+    return bool(hand_let_go and inside_place_region and object_quiescent)
+```
 - For grasping stage, you should only write one sub-goal constraint that associates the end-effector with a keypoint. No path constraints are needed.
 - In order to move a keypoint, its associated object must be grasped in one of the previous stages.
 - The robot can only grasp one object at a time.
@@ -82,6 +110,13 @@ def stage1_path_constraint1(end_effector, keypoints):
     return cost
 # Add more path constraints if needed
 ...
+
+### stage 1 completion predicate
+def stage1_completion(history, end_effector, keypoints, robot_state, components):
+    """Put your explanation of the EVENT this stage names here."""
+    <named_condition_1> = <primitive>(...)
+    <named_condition_2> = <primitive>(...)
+    return bool(<named_condition_1> and <named_condition_2>)
 
 # repeat for more stages
 ...

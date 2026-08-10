@@ -1,6 +1,7 @@
 """Build ReKep grounding from tracked keypoints and stage constraints."""
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -12,7 +13,7 @@ from rekep import grounding as rk_grounding
 from rekep.constraint_generation import ConstraintGenerator
 from rekep.keypoint_tracking import KeypointTracker
 from rekep.utils import get_callable_grasping_cost_fn, load_default_config
-from vlm_dp.grounding import Grounding, SceneObject, Stage, fake_vlm, masks
+from vlm_dp.grounding import Grounding, SceneObject, Stage, fake_vlm, masks, predicates
 
 
 from vlm_dp.grounding.gt import _LIFT_HEIGHT as _GT_LIFT, _shifted_seat
@@ -99,6 +100,136 @@ def keypoint_claims(text, names):
     return claims
 
 
+@contextlib.contextmanager
+def _installed(obj, name, fn):
+    """Temporarily shadow ``obj.name`` with ``fn``, restoring the original binding after."""
+    had = name in vars(obj)
+    old = vars(obj).get(name)
+    setattr(obj, name, fn)
+    try:
+        yield
+    finally:
+        if had:
+            setattr(obj, name, old)
+        else:
+            delattr(obj, name)
+
+
+def _satisfying_state(stage, kps0, ee0, owned, refs, dev, eps, steps=400, lr=0.02):
+    """Place the stage's movable keypoints where its own sub-goal constraint is satisfied.
+
+    Returns ``(keypoints, tcp, moved, value)``. The constraint is a differentiable torch callable,
+    so the satisfying state is found by descending the constraint itself rather than by any
+    hand-written idea of what the stage means -- the whole point being that the runtime must not
+    have such an idea. Only the keypoints of the object the stage manipulates move (plus the TCP);
+    if that is not enough to satisfy the constraint, every keypoint the constraint text references
+    is freed as a second attempt.
+
+    A CLOSE STAGE is satisfied by putting the TCP on its target, whether or not it carries a
+    constraint. Its advance test reads target proximity and the gripper (a hold certificate, or a
+    settled close for a press) and never reads the sub-goal, so "the stage genuinely happened"
+    means the hand is AT the grasp point -- exactly, not within the descent's stopping tolerance.
+    Descending a press stage's approach constraint instead lands ~25mm out, which is comfortably
+    inside subgoal_eps and comfortably OUTSIDE the millimetre-scale grasp_slack the proximity
+    test uses, and the preflight would refuse a stage that is perfectly advanceable.
+    """
+    kp0 = torch.as_tensor(np.asarray(kps0), device=dev, dtype=torch.float32)
+    if stage.constraint is None or stage.gripper == "close":
+        try:
+            ee = np.asarray(stage.target(), dtype=np.float64).reshape(3)
+        except Exception:
+            ee = np.asarray(ee0, dtype=np.float64).reshape(3)
+        value = 0.0
+        if stage.constraint is not None:
+            # Report the constraint's REAL value at that pose, so the preflight's own
+            # "sub-goal x < eps" line stays an honest reading rather than an assumed zero.
+            kp = kp0[:, None, None, :]
+            ee_t = torch.as_tensor(ee, device=dev, dtype=torch.float32).reshape(1, 1, 3)
+            value = float(torch.as_tensor(stage.constraint(ee_t, kp)).reshape(-1)[0])
+        return np.asarray(kps0, dtype=np.float64), ee, tuple(owned), value
+
+    best = (np.asarray(kps0, dtype=np.float64), np.asarray(ee0, dtype=np.float64).reshape(3),
+            tuple(owned), float("inf"))
+    for movable in ([tuple(owned)] if owned else []) + [tuple(sorted(set(owned) | set(refs)))]:
+        if not movable:
+            continue
+        delta = torch.zeros(len(movable), 3, device=dev, dtype=torch.float32, requires_grad=True)
+        dee = torch.zeros(1, 1, 3, device=dev, dtype=torch.float32, requires_grad=True)
+        ee_t = torch.as_tensor(np.asarray(ee0), device=dev, dtype=torch.float32).reshape(1, 1, 3)
+        idx = list(movable)
+        opt = torch.optim.Adam([delta, dee], lr=lr)
+        value = float("inf")
+        for _ in range(int(steps)):
+            opt.zero_grad()
+            shift = torch.zeros_like(kp0)
+            shift[idx] = delta
+            kk = (kp0 + shift)[:, None, None, :]
+            val = torch.as_tensor(stage.constraint(ee_t + dee, kk)).reshape(-1)[0]
+            value = float(val.detach())
+            if value <= 0.25 * eps:
+                break
+            val.backward()
+            opt.step()
+        kp_out = kp0.detach().clone()
+        kp_out[idx] = kp0[idx] + delta.detach()
+        cand = (kp_out.cpu().numpy().astype(np.float64),
+                (ee_t + dee).detach().reshape(3).cpu().numpy().astype(np.float64),
+                tuple(movable), value)
+        if cand[3] < best[3]:
+            best = cand
+        if value <= 0.25 * eps:
+            break
+    return best
+
+
+def advance_preflight(probe, stages, plan_kps, tracker, env, dev, eps):
+    """Refuse to roll out on a plan whose stages cannot advance even when they are satisfied.
+
+    For every stage: synthesize a state in which the stage genuinely happened (:func:`_satisfying_state`
+    for the geometry, the caller's ``probe`` for the sensed evidence), install it in the tracker and
+    the env so every accessor the runtime reads sees it, and run THE ACTIVE advance test through
+    ``probe``. ``probe(stage_idx, stage, synth) -> (fired, test_name)`` is the bridge's
+    ``preflight_probe``, i.e. the real ``_stage_reached`` -- not a re-implementation of it, which
+    could agree with a copy of the rule while disagreeing with the rule.
+
+    A stage whose completion cannot fire in its own satisfying state is a permanent stall: the
+    episode would sit there until the step budget ran out. That is the failure this refuses, in the
+    same loud style as the grounding preflight above -- it is exactly the defect that cost the
+    motion_pred_go run 8 of 10 seeds (380+ replans in the lift stage while the plan's own sub-goal
+    read 0.000 satisfied).
+    """
+    problems, lines = [], []
+    kps0 = np.asarray(tracker.get_positions(), dtype=np.float64)
+    ee0 = np.asarray(env.tcp(), dtype=np.float64).reshape(3)
+    for i, st in enumerate(stages):
+        spec = plan_kps[i] if i < len(plan_kps) else {}
+        kp, ee, moved, value = _satisfying_state(st, kps0, ee0, spec.get("owned", ()),
+                                                 spec.get("refs", ()), dev, eps)
+        if st.constraint is not None and not value <= eps:
+            problems.append(f"stage {i + 1} {st.name!r}: no state satisfying its own sub-goal could "
+                            f"be synthesized (best {value:.3f} vs eps {eps:.3f}) -- the constraint "
+                            f"cannot be driven to zero by moving the object the stage manipulates")
+            continue
+        with _installed(tracker, "get_positions", lambda kp=kp: kp), \
+                _installed(env, "tcp", lambda ee=ee: ee):
+            fired, test = probe(i, st, {"kp": kp, "eef": ee, "moved": moved})
+        lines.append(f"stage {i + 1} {st.name!r}: {test} -> {'fires' if fired else 'NEVER FIRES'}"
+                     + (f" (sub-goal {value:.3f} < eps {eps:.3f})" if st.constraint is not None else ""))
+        if not fired:
+            problems.append(f"stage {i + 1} {st.name!r}: the active advance test ({test}) cannot "
+                            f"return True even in a state where the stage is satisfied"
+                            + (f" (its own sub-goal reads {value:.3f} against eps {eps:.3f})"
+                               if st.constraint is not None else "")
+                            + " -- the stage would stall here for the rest of the episode")
+    for line in lines:
+        print(f"[rekep-preflight] {line}", flush=True)
+    if problems:
+        raise SystemExit("[rekep-preflight] the plan's stages cannot advance; refusing to roll "
+                         "out:\n  - " + "\n  - ".join(problems))
+    print(f"[rekep-preflight] advanceability OK: all {len(stages)} stages complete in their own "
+          f"satisfying state", flush=True)
+
+
 def _constrains_orientation(txt_path):
     """Return whether a subgoal constrains orientation."""
     if not os.path.exists(txt_path):
@@ -117,7 +248,8 @@ class RekepGrounding:
                  local_grasp: bool = False, local_grasp_radius: float = 0.05,
                  kp_source: str = "perception", contact_criterion: str = "feasibility",
                  open_half: float = 0.04, rotate_grasp_offset: bool = False,
-                 lift_latch_xy: bool = False, seat_from_plane: bool = False):
+                 lift_latch_xy: bool = False, seat_from_plane: bool = False, geom=None,
+                 sensor_cfg=None):
         self.vlm = vlm
         self.task_key = task_key
         self.place_obj = place_obj
@@ -141,6 +273,14 @@ class RekepGrounding:
 
         self.contact_criterion = contact_criterion
         self.open_half = float(open_half)
+        # The COST geometry block, verbatim. Read only by the grasp-geometry preflight, which must
+        # report the radii the cost terms will actually compute rather than a re-derivation.
+        self.geom = dict(geom) if geom else {}
+        # The APERTURE SENSOR's own thresholds, verbatim. Carried to the predicate runtime so the
+        # aperture band the completion predicates test against is auditable against the band the
+        # hold sensor uses -- the two are stated independently today, and the log line the runtime
+        # prints is what a later change that unifies them has to work from.
+        self.sensor_cfg = dict(sensor_cfg) if sensor_cfg else {}
 
 
         self.rotate_grasp_offset = bool(rotate_grasp_offset)
@@ -195,7 +335,24 @@ class RekepGrounding:
         else:
             extents = usd_extents(env, scene_objects)
             usd = extents
-        tracker = KeypointTracker(world, keypoints)
+        # Masked point clouds, one per scene object. Built here rather than at their first use
+        # below because keypoint ownership now consults them: "which object's observed surface is
+        # this keypoint on" is the question registration cares about, and the object-centre rule
+        # alone answers it wrongly whenever a small object stands near a large one's centroid
+        # (a teapot near the middle of its table registers to the table and stops moving with it).
+        clouds = {}
+        for _n in scene_objects:
+            _pts = masks._masked_points(grounded, env.env, _n)
+            if _pts is not None:
+                clouds[_n] = _pts
+        tracker = KeypointTracker(world, keypoints, clouds=clouds)
+        # No-regression evidence, printed every run: an empty override list means this scene
+        # registers exactly as the object-centre rule alone would have registered it.
+        print(f"[rekep] keypoint ownership: {len(tracker.membership_overrides)} of "
+              f"{len(tracker.owners)} keypoints moved by cloud membership"
+              + (f" {[(i, a, b) for i, a, b in tracker.membership_overrides]}"
+                 if tracker.membership_overrides else " (identical to the centre rule)"),
+              flush=True)
         if gt_meta is not None:
 
 
@@ -220,7 +377,7 @@ class RekepGrounding:
             for _f in os.listdir(vlm_dir):
                 if _f.endswith("_constraints.txt") or _f == "metadata.json":
                     os.remove(os.path.join(vlm_dir, _f))
-        roles, declared = {}, {}
+        roles, declared, declared_ext = {}, {}, {}
         if self.vlm == "fake":
             metadata, roles, extra_kps = fake_vlm.generate(self.task_key, vlm_dir, keypoints, grounded,
                                                            env.env, self.clearance)
@@ -228,12 +385,17 @@ class RekepGrounding:
                 # Points the plan needs that no proposal stands for (a thin lid rim, a place in
                 # mid-air, a recess inside a fixture). Appended after the tracker exists, so they
                 # are registered here by hand rather than re-running the association.
+                # A declaration is ``(point, owner)`` or ``(point, owner, grasp_half_width)``: a
+                # declared GRASP feature carries its own local geometry, because the feature is
+                # exactly what the owner's whole-body extent is not (a 10mm lid rim on a 300mm
+                # machine). See the propagation below.
                 first = len(keypoints)
+                extra_kps = [tuple(e) + (None,) * (3 - len(e)) for e in extra_kps]
                 keypoints = np.concatenate(
                     [np.asarray(keypoints, dtype=np.float64),
-                     np.stack([np.asarray(p, dtype=np.float64) for p, _ in extra_kps])], axis=0)
+                     np.stack([np.asarray(p, dtype=np.float64) for p, _, _ in extra_kps])], axis=0)
                 grounded["keypoints"] = keypoints
-                for point, owner in extra_kps:
+                for point, owner, ext in extra_kps:
                     point = np.asarray(point, dtype=np.float64)
                     if owner is None:
                         tracker.registrations.append((None, point))
@@ -241,9 +403,12 @@ class RekepGrounding:
                         _p, _r = world.object_pose(owner)
                         tracker.registrations.append((owner, _r.T @ (point - _p)))
                     declared[len(tracker.owners)] = owner
+                    if ext is not None:
+                        declared_ext[len(tracker.owners)] = float(ext)
                     tracker.owners.append(owner)
                 print(f"[rekep] fake VLM declared keypoints {list(range(first, len(keypoints)))} "
-                      f"owners={[o for _, o in extra_kps]}", flush=True)
+                      f"owners={[o for _, o, _ in extra_kps]} "
+                      f"grasp_extents={ {k: round(v, 4) for k, v in declared_ext.items()} }", flush=True)
         else:
             metadata = self._real_constraints(vlm_dir, grounded, config)
         bad = [i for i in metadata["grasp_keypoints"] + metadata["release_keypoints"] if not -1 <= i < len(keypoints)]
@@ -279,12 +444,11 @@ class RekepGrounding:
 
         kp_of, centroid_off, grasp_axis, grasp_ext_of, seat_off = {}, {}, {}, {}, {}
         grasp_region_of = {}
-        clouds, probe_ext = {}, {}
+        probe_ext = {}
         for name in scene_objects:
-            pts = masks._masked_points(grounded, env.env, name)
+            pts = clouds.get(name)          # segmented once above, for the tracker's ownership rule
             if pts is None:
                 continue
-            clouds[name] = pts
             gk = grasp_kp_of.get(name)
 
             # What the gripper actually closes on: the object's width *at the grasp point*, not
@@ -359,9 +523,31 @@ class RekepGrounding:
         # A declared grasp keypoint IS the grasp point (a lid rim, not the machine's centroid), so
         # it overrides the cloud-centroid estimate its owner would otherwise be grasped at. Same
         # rule the gt_meta block below applies to privileged keypoints.
+        #
+        # It must also override the grasp EXTENT, for the same reason and by the same rule: if the
+        # plan declares a grasp feature, every downstream grasp geometry (terms._grasp_frame's
+        # feasibility radius, and through grasp_slack the centre dead zone, the close gate, the
+        # straddle keepout and the aperture floor) is the geometry of THAT FEATURE, never the
+        # owner's centroid-scale extent. Propagating the point without the extent is what made the
+        # capsule lid rim a 0.32m "object" to close on: aperture_region floored at 6.4 weighted,
+        # straddle pushed the fingers 33cm off the rim it was standing on, and the centre dead zone
+        # and close gate opened to 12.7cm. Explicit declaration first (the plan measured the
+        # feature), then the width the cloud shows AT the declared point; never the whole body.
+        declared_grasp = {}
         for k, owner in declared.items():
             if owner is not None and k in metadata["grasp_keypoints"]:
                 kp_of[owner], centroid_off[owner] = k, np.zeros(3)
+                declared_grasp[owner] = k
+                ext = declared_ext.get(k, probe_ext.get(owner))
+                if ext is not None:
+                    grasp_ext_of[owner] = float(ext)
+                print(f"[rekep] declared grasp kp{k} -> {owner}: grasp point "
+                      f"{np.round(keypoints[k], 3)}, grasp half-width "
+                      + (f"{grasp_ext_of[owner] * 1e3:.1f}mm "
+                         f"({'declared by the plan' if k in declared_ext else 'measured at the point'})"
+                         if ext is not None else "UNRESOLVED")
+                      + f" (owner extents={tuple(round(x, 3) for x in extents.get(owner, _DEFAULT_EXTENT))})",
+                      flush=True)
 
         if gt_meta is not None:
 
@@ -458,11 +644,48 @@ class RekepGrounding:
 
 
         if self.stages == "vlm":
-            stages, manipulated = self._vlm_stages(metadata, tracker, keypoints, name_for,
-                                                   load_stage, objects, env, dev, vlm_dir,
-                                                   probe_ext, clouds, usd, roles)
+            stages, manipulated, plan_kps = self._vlm_stages(metadata, tracker, keypoints, name_for,
+                                                             load_stage, objects, env, dev, vlm_dir,
+                                                             probe_ext, clouds, usd, roles,
+                                                             declared_grasp)
+            # Completion predicates, when the plan authored them. Read by the advance path only
+            # under the opt-in keys (predicate_place_transitions / plan_authoritative); otherwise
+            # they are carried on the Grounding for logging alone.
+            comp = predicates.CompletionPredicates.from_dir(vlm_dir, metadata["num_stages"])
+            if len(comp):
+                # Bind the primitive runtime BEFORE the advanceability preflight runs, so the
+                # preflight exercises the same bound primitives the rollout will -- an unbound
+                # predicate would fail on a NameError and be diagnosed as an unreachable stage.
+                _owner_cache = {}
+
+                def _owner_of(kp_idx):
+                    if kp_idx not in _owner_cache:
+                        try:
+                            _owner_cache[kp_idx] = name_for(kp_idx)
+                        except Exception:
+                            _owner_cache[kp_idx] = None
+                    return _owner_cache[kp_idx]
+
+                carried = {n for n in (_owner_of(k) for k in metadata["grasp_keypoints"] if k >= 0)
+                           if n}
+                runtime = predicates.PredicateRuntime(
+                    owner_of=_owner_of, grasp_ext_of=grasp_ext_of, extents=extents,
+                    carried=carried, declared=set(declared), open_half=self.open_half,
+                    geom=self.geom, sensor=self.sensor_cfg)
+                comp.bind(runtime)
+                print(f"[rekep-vlm] loaded completion predicates for stages "
+                      f"{[i + 1 for i in comp.stages]}; primitives bound: {runtime.describe()}",
+                      flush=True)
+            plan_fields = None
+            _fields_path = os.path.join(vlm_dir, "render_fields.json")
+            if os.path.isfile(_fields_path):
+                with open(_fields_path, encoding="utf-8") as _f:
+                    plan_fields = json.load(_f)
             return Grounding(objects=objects, stages=stages, manipulated=frozenset(manipulated),
-                             keypoints=(lambda: tracker.get_positions()))
+                             keypoints=(lambda: tracker.get_positions()),
+                             completion=comp if len(comp) else None, plan_fields=plan_fields,
+                             advance_preflight=(lambda probe: advance_preflight(
+                                 probe, stages, plan_kps, tracker, env, dev, self.subgoal_eps)))
 
         stages, manipulated, grasped_body = [], {self.place_obj}, None
         placed_names, last_z0 = [], None
@@ -551,8 +774,44 @@ class RekepGrounding:
                 return alt_mode, alt_grip, f"width at the grasp point, r={_GRASP_PROBE_R:g}m"
         return mode, grip, "whole-object width"
 
+    def _grasp_geometry(self, name, obj_ext, local_ext):
+        """Return the EXACT feasibility radius the cost terms will use, and where it came from.
+
+        This is a transcription of :func:`vlm_dp.cost.terms._grasp_frame`, deliberately, so the
+        preflight reports the number the run will actually use rather than a second opinion about
+        it. Any edit there must be mirrored here (the unit test pins the two together).
+        """
+        radius = local_ext.get(name)
+        if radius is not None:
+            return float(radius), "local grasp extent"
+        ext = obj_ext.get(name, _DEFAULT_EXTENT)
+        return float(ext[1]), "WHOLE-OBJECT keepout extent (fallback)"
+
+    def _grasp_radii(self, radius):
+        """Return the derived grasp radii the cost terms compute from one feasibility radius."""
+        import types as _types
+
+        from vlm_dp.cost.terms import grasp_slack
+        geom = _types.SimpleNamespace(**(self.geom or {}))
+        geom.open_half = float(getattr(geom, "open_half", self.open_half))
+        dead = float(grasp_slack(geom, float(radius)))
+        return {
+            "dead_zone": dead,
+            "close_gate_xy": max(dead, float(getattr(geom, "close_xy_floor", 1e-3))),
+            "straddle_keepout": float(radius) + float(getattr(geom, "finger_r", 0.0)),
+            "aperture_floor": max(float(radius) + float(getattr(geom, "aperture_margin", 0.0))
+                                  - geom.open_half, 0.0),
+        }
+
+    # A grasp geometry is "physically sensible" when the fingers can actually close around the
+    # feature: it fits inside the aperture (so aperture_region can reach zero rather than paying a
+    # constant floor everywhere), and the centre dead zone is no wider than the aperture itself
+    # (a dead zone wider than the hand means "anywhere near this object" counts as at the grasp
+    # pose, which is how a 12.7cm dead zone let the run park on a hover shell and call it done).
+    _DEAD_ZONE_MAX_FRAC = 1.0
+
     def _preflight(self, metadata, keypoints, name_for, obj_ext, local_ext, probe_ext,
-                   usd_ext, clouds, roles):
+                   usd_ext, clouds, roles, declared_grasp=None):
         """Refuse to roll out on grounding the plan cannot act on.
 
         Every failure here used to be discovered ~50 minutes later as an inexplicably bad rollout.
@@ -610,7 +869,15 @@ class RekepGrounding:
             if off > _KP_ON_OBJECT:
                 problems.append(f"stage {i + 1} grasp keypoint {gk} sits {off * 1e3:.0f}mm off the "
                                 f"nearest point of {name!r} -- the role did not land on its object")
-            if self.contact_criterion != "plan":
+            # A stage the PLAN declared a press for is exempt from the pinchability assertion,
+            # for the same reason the contact_criterion="plan" branch is: the assertion reads a
+            # press verdict as evidence the mask or the role is wrong, which is only sound when
+            # nobody asked for a press. (For this capsule plan it is inert -- the 10mm rim is
+            # pinchable and the assertion passes either way -- but a plan pressing a wide part
+            # must not be refused for the width it deliberately chose.)
+            declared_modes = metadata.get("contact_modes") or []
+            plan_press = (declared_modes[i] if i < len(declared_modes) else None) == "press"
+            if self.contact_criterion != "plan" and not plan_press:
                 mode, width, src = self._effective_contact(name, obj_ext, local_ext, probe_ext)
                 if mode == "press":
                     problems.append(
@@ -618,6 +885,47 @@ class RekepGrounding:
                         f"{width * 1e3:.0f}mm ({src}) against a {self.open_half * 1e3:.0f}mm "
                         f"gripper aperture, so the stage would compile as a press: either the mask "
                         f"is wrong or the role resolved to the wrong object")
+            # GRASP GEOMETRY. The pinch/press check above reads the width probe; the COST reads a
+            # different quantity (terms._grasp_frame's feasibility radius), and it was the gap
+            # between those two that hid the capsule defect: the plan was certified pinchable on a
+            # 10mm rim while every grasp term was sized for a 320mm machine. So assert the exact
+            # radius the terms will use, and the radii they derive from it.
+            radius, rsrc = self._grasp_geometry(name, obj_ext, local_ext)
+            rad = self._grasp_radii(radius)
+            declared_kp = (declared_grasp or {}).get(name)
+            print(f"[rekep-preflight] grasp-geometry stage {i + 1} {name!r}: radius="
+                  f"{radius * 1e3:.1f}mm ({rsrc}"
+                  + (f", declared kp{declared_kp}" if declared_kp is not None else "")
+                  + f") -> dead_zone={rad['dead_zone'] * 1e3:.1f}mm "
+                  f"close_gate_xy={rad['close_gate_xy'] * 1e3:.1f}mm "
+                  f"straddle_keepout={rad['straddle_keepout'] * 1e3:.1f}mm "
+                  f"aperture_floor={rad['aperture_floor'] * 1e3:.1f}mm", flush=True)
+            unfit = rad["aperture_floor"] > 0.0
+            wide_dead = rad["dead_zone"] > self._DEAD_ZONE_MAX_FRAC * self.open_half
+            if declared_kp is not None and local_ext.get(name) is None:
+                problems.append(
+                    f"stage {i + 1} grasps DECLARED keypoint {declared_kp} on {name!r}, but no local "
+                    f"grasp extent reached the runtime, so every grasp term would size itself to "
+                    f"{name!r}'s whole-object keepout ({radius * 1e3:.0f}mm): declare the feature's "
+                    f"half-width alongside the point, or leave enough cloud at it to measure one")
+            elif declared_kp is not None and (unfit or wide_dead):
+                problems.append(
+                    f"stage {i + 1} grasp geometry for {name!r} is not physically sensible: radius "
+                    f"{radius * 1e3:.0f}mm ({rsrc}) against a {self.open_half * 1e3:.0f}mm aperture "
+                    f"gives dead_zone {rad['dead_zone'] * 1e3:.0f}mm, close gate "
+                    f"{rad['close_gate_xy'] * 1e3:.0f}mm, straddle keepout "
+                    f"{rad['straddle_keepout'] * 1e3:.0f}mm and an irreducible aperture_region floor "
+                    f"of {rad['aperture_floor'] * 1e3:.0f}mm -- the fingers cannot close on it")
+            elif unfit or wide_dead:
+                # A SNAPPED grasp keypoint carries no declared geometry, so there is nothing to
+                # propagate and refusing would only ground a task the runtime can still attempt.
+                # Loud, with the numbers, because it is the same defect one declaration short.
+                print(f"[rekep-preflight] WARNING: {name!r} (stage {i + 1}, snapped grasp keypoint) "
+                      f"grasps at a {radius * 1e3:.0f}mm radius from its {rsrc}: dead zone "
+                      f"{rad['dead_zone'] * 1e3:.0f}mm, straddle keepout "
+                      f"{rad['straddle_keepout'] * 1e3:.0f}mm, irreducible aperture_region floor "
+                      f"{rad['aperture_floor'] * 1e3:.0f}mm. The grasp terms are sized for the whole "
+                      f"object, not for the feature the plan grasps.", flush=True)
 
         if self.task_key == "pot":
             pot_pts, cover_pts = clouds.get("pot"), clouds.get("cover")
@@ -646,7 +954,7 @@ class RekepGrounding:
               f"pinchable within the {self.open_half * 1e3:.0f}mm aperture", flush=True)
 
     def _vlm_stages(self, metadata, tracker, keypoints, name_for, load_stage, objects, env, dev, vlm_dir,
-                    probe_ext=None, clouds=None, usd_ext=None, roles=None):
+                    probe_ext=None, clouds=None, usd_ext=None, roles=None, declared_grasp=None):
         """Build stages directly from VLM constraints."""
         obj_names = [o.name for o in objects]
         obj_center = {o.name: o.pos for o in objects}
@@ -654,7 +962,7 @@ class RekepGrounding:
         local_ext = {o.name: o.grasp_extent for o in objects if o.grasp_extent is not None}
         probe_ext, clouds, usd_ext = probe_ext or {}, clouds or {}, usd_ext or {}
         self._preflight(metadata, keypoints, name_for, obj_ext, local_ext, probe_ext,
-                        usd_ext, clouds, roles)
+                        usd_ext, clouds, roles, declared_grasp or {})
 
         def kp_point(k):
             return lambda k=k: tracker.get_positions()[k]
@@ -703,17 +1011,48 @@ class RekepGrounding:
             return metadata["release_keypoints"][j] >= 0 and place_target_for(j, owner) is None
 
         stages, manipulated, grasped_body, pressed = [], set(), None, False
+
+        def declared_contact(idx):
+            """Return the contact mode the PLAN declared for a stage, or None if it did not.
+
+            Read ahead of both of the compiler's own inferences (measured grip width, and plan
+            structure under contact_criterion="plan"). Those answer "can the fingers close around
+            this", which is a fact about the gripper and the cloud; a plan declaring `press` is
+            saying something they cannot -- that this feature is to be pushed rather than pinched
+            even though it would fit. Plans that declare nothing keep the inferred behaviour.
+            """
+            modes = metadata.get("contact_modes") or []
+            mode = modes[idx] if idx < len(modes) else None
+            return mode if mode in ("press", "pinch") else None
+
+        # Per-stage keypoint bookkeeping for the advanceability preflight: which keypoints the
+        # stage's own object owns (the ones a satisfying state may move), and which ones its
+        # constraint text references at all (the fallback set).
+        plan_kps = []
         steer_policies = metadata.get("steer_policies") or []
         def _pol(idx):
             return steer_policies[idx] if idx < len(steer_policies) else None
         for i in range(metadata["num_stages"]):
             grasp_kp, release_kp = metadata["grasp_keypoints"][i], metadata["release_keypoints"][i]
-            held = tuple(j for j, o in enumerate(tracker.owners) if grasped_body is not None and o == grasped_body)
+            # held_idx is a claim that these keypoints RIDE THE GRIPPER: the cost terms move them
+            # with each candidate pose (terms._rekep_keypoints). A pinch earns that claim; a press
+            # does not -- the hand is merely touching the part, and a part that is only touched
+            # stays where the belief puts it. Asserting it anyway is what let stage 2's old lid
+            # sub-goal read as satisfied while the lid never moved: the term was evaluated on a
+            # lip keypoint teleported onto the candidate hand.
+            held = () if pressed else tuple(
+                j for j, o in enumerate(tracker.owners)
+                if grasped_body is not None and o == grasped_body)
             subgoal, path_fns = load_stage(i, held)
             if grasp_kp >= 0:
                 name = name_for(grasp_kp)
                 owner = tracker.owners[grasp_kp]
-                if self.contact_criterion == "plan":
+                plan_mode = declared_contact(i)
+                if plan_mode is not None:
+                    press = plan_mode == "press"
+                    print(f"[rekep-vlm] {name}: contact={plan_mode} (DECLARED by the plan, "
+                          f"stage {i + 1})", flush=True)
+                elif self.contact_criterion == "plan":
                     press = self_displace_next(i, owner)
                     print(f"[rekep-vlm] {name}: contact={'press' if press else 'pinch'} (plan structure)",
                           flush=True)
@@ -725,9 +1064,18 @@ class RekepGrounding:
                 manipulated.add(name)
 
 
+                # A PRESS STAGE CARRIES ITS OWN SUB-GOAL as the approach cost. A pinch stage does
+                # not need one: center_region, aperture_region, straddle and grasp_axis are the
+                # attractor that brings the hand to the grasp pose. Those four are exactly the
+                # terms a press stands down (cost.terms._pinch_gated), which would otherwise leave
+                # the approach with no lateral attractor at all. The plan already wrote one -- the
+                # end-effector at the grasp keypoint -- and this is where it is used. The advance
+                # rule is untouched by this: a close stage never advances on its sub-goal.
                 stages.append(Stage(name=f"{'press' if press else 'grasp'} {name}", gripper="close", steer_policy=_pol(i),
                                     grasp_obj=name, payload=None, held_idx=held,
                                     target=(kp_point(grasp_kp) if press else obj_center[name]),
+                                    constraint=(subgoal if press else None),
+                                    path_fns=(path_fns if press else ()),
                                     contact=("press" if press else "pinch")))
                 grasped_body = owner
                 pressed = press
@@ -747,12 +1095,24 @@ class RekepGrounding:
                 refs = _referenced_kps(os.path.join(vlm_dir, f"stage{i + 1}_subgoal_constraints.txt"))
 
 
+                # COST TARGET ONLY. This is a text-order heuristic -- the first keypoint the
+                # constraint's source text happens to mention -- so it is a reference point for the
+                # cost terms and nothing more. It must never feed a stage-advance decision: under
+                # advance.plan_authoritative the stage advances on its own sub-goal (stage.done()),
+                # because a target read out of prose cannot be compared against a belief the way an
+                # advance test needs (a surface keypoint against an object centre never closes).
                 stages.append(Stage(name=f"move {i}", gripper=("hold" if grasped_body else "open"), steer_policy=_pol(i),
                                     grasp_obj=None, payload=grasped_body,
                                     target=kp_point(refs[0] if refs else 0), held_idx=held,
                                     constraint=subgoal, path_fns=path_fns, done=subgoal_done(subgoal),
                                     orient=orient_for(i),
                                     contact=("press" if pressed else "pinch")))
+            owner = stages[-1].payload or stages[-1].grasp_obj
+            plan_kps.append({
+                "owned": tuple(j for j, o in enumerate(tracker.owners) if owner and o == owner),
+                "refs": tuple(_referenced_kps(
+                    os.path.join(vlm_dir, f"stage{i + 1}_subgoal_constraints.txt"))),
+            })
 
         tcp_probe = torch.as_tensor(keypoints, device=dev, dtype=torch.float32)[:1].reshape(1, 1, 3)
         kps_probe = torch.as_tensor(keypoints, device=dev, dtype=torch.float32)
@@ -765,7 +1125,7 @@ class RekepGrounding:
         self._check_keypoint_identity(metadata["num_stages"], vlm_dir, tracker, obj_names)
         print(f"[rekep-vlm] emitted {len(stages)} VLM-driven stages: "
               f"{[s.name for s in stages]}", flush=True)
-        return stages, manipulated
+        return stages, manipulated, plan_kps
 
     def _check_keypoint_identity(self, num_stages, vlm_dir, tracker, obj_names):
         """Compare VLM keypoint claims with tracker ownership."""
