@@ -105,6 +105,9 @@ def save_video(env, states, path, fps=20, overlay=None):
       ee_path    [T, 3] executed end-effector path; drawn progressively so the trail grows
       lines      callable(i) -> list[str] status text for frame i
       goals      [(step, [[q7], ...]), ...] proxy goal rows per replan, drawn as ghost poses
+      markers    callable(i) -> [marker dict] planner-side world points for frame i (see
+                 viz.draw_markers); used for keypose visualisation, where the point to show is
+                 the policy's INTENDED endpoint rather than anything present in the scene
     Absent, the video is byte-for-byte what it was before.
     """
     import imageio
@@ -129,6 +132,7 @@ def save_video(env, states, path, fps=20, overlay=None):
                     goal = overlay.get("subgoal")
                     trail = overlay.get("ee_path")
                     lines = overlay.get("lines")
+                    marks = overlay.get("markers")
                     frame = viz.annotate_rollout_frame(
                         env,
                         keypoints=(kps() if callable(kps) else kps),
@@ -138,6 +142,9 @@ def save_video(env, states, path, fps=20, overlay=None):
                         lines=(lines(i) if callable(lines) else (lines or ())),
                         ghosts=ghost_cache.get("layers", ()),
                         ghost_labels=ghost_cache.get("labels", ()),
+                        markers=(marks(i) if callable(marks) else (marks or ())),
+                        text_bg=overlay.get("text_bg"),
+                        text_scale=overlay.get("text_scale", 1),
                     )
                 except Exception as exc:      # a broken overlay must not cost the whole video
                     if i == 0:
@@ -179,6 +186,9 @@ def steer_fields(steer, stats, plan, env):
     if steer.mode in ("additive", "policy_base", "keypose_fk", "proxy_pair", "vls"):
         out["proxy_embed_s"] = round(float(steer.last_embed_s), 3)
         out["steer_levels"] = steer.level_trace
+        # The shadow goal-row chain under --proxy_aux native; absent otherwise.
+        if getattr(steer, "aux_trace", None):
+            out["aux_levels"] = steer.aux_trace
 
         # policy_base logs per-level call timings but no addend ratio: it blends whole chains
         # rather than adding a score field, so there is nothing to take a ratio of.

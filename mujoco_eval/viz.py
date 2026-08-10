@@ -97,14 +97,75 @@ def draw_labels(frame, items, radius=3):
     return np.asarray(img)
 
 
-def draw_text_lines(frame, lines, origin=(8, 8), color=(255, 255, 0)):
-    """Stamp status lines (stage, subgoal residual, cost) onto a frame."""
+def draw_markers(env, frame, markers, camera="agentview", hw=512, radius=7):
+    """Draw projected point markers, each optionally with a short trail behind it.
+
+    A marker is a dict: {"pos": [3] world point, "color": (r, g, b), "fill": bool,
+    "label": str, "trail": [N, 3] earlier positions, "radius": px, "link": [3] world point}.
+
+    `fill` plus a per-marker `radius` is what keeps two markers readable when they sit close
+    together: a large hollow ring around a small solid disc stays legible at any separation,
+    where two same-size markers in different colours simply occlude each other. `link` draws the
+    segment between a pair, so a displacement of a few pixels still reads as a displacement
+    rather than as one slightly fat dot.
+
+    Kept apart from `draw_keypoints` because that one IS the ReKep VLM prompt image: it draws a
+    numbered dot in a fixed style that a real constraint-generation call depends on, so it is not
+    the place to add styling knobs.
+    """
     from PIL import Image, ImageDraw
 
     img = Image.fromarray(np.ascontiguousarray(frame))
     draw = ImageDraw.Draw(img)
+    for m in markers or ():
+        trail = np.asarray(m.get("trail", ()), dtype=np.float64).reshape(-1, 3)
+        if len(trail) >= 2:
+            px, vis = project_env(env, trail, camera=camera, hw=hw)
+            pts = [tuple(p) for p, ok in zip(px, vis) if ok]
+            if len(pts) >= 2:
+                draw.line(pts, fill=tuple(m.get("color", _SUBGOAL)), width=2)
+        pts = [np.asarray(m["pos"], dtype=np.float64)]
+        if m.get("link") is not None:
+            pts.append(np.asarray(m["link"], dtype=np.float64))
+        px, vis = project_env(env, np.stack(pts), camera=camera, hw=hw)
+        if not bool(vis[0]):
+            continue
+        color = tuple(m.get("color", _SUBGOAL))
+        if len(px) > 1 and bool(vis[1]):
+            draw.line([tuple(px[0]), tuple(px[1])], fill=color, width=2)
+        u, v = px[0]
+        r = int(m.get("radius", radius))
+        box = [u - r, v - r, u + r, v + r]
+        if m.get("fill", True):
+            draw.ellipse(box, fill=color, outline=_RING, width=2)
+        else:
+            draw.ellipse(box, outline=color, width=3)
+        if m.get("label"):
+            draw.text((u + r + 3, v - r - 3), str(m["label"]), fill=color)
+    return np.asarray(img)
+
+
+def draw_text_lines(frame, lines, origin=(8, 8), color=(255, 255, 0), bg=None, scale=1):
+    """Stamp status lines (stage, subgoal residual, cost) onto a frame.
+
+    `bg` fills a band behind the text; `scale` picks a larger bitmap font. Both default to the
+    original behaviour -- yellow, unscaled, no band -- because every video already on disk was
+    rendered that way. They exist because yellow text on the white table is unreadable, which
+    only matters once a video is meant to be READ rather than glanced at.
+    """
+    from PIL import Image, ImageDraw
+
+    img = Image.fromarray(np.ascontiguousarray(frame))
+    draw = ImageDraw.Draw(img)
+    font = None
+    if scale and int(scale) > 1:
+        from PIL import ImageFont
+        font = ImageFont.load_default(size=11 * int(scale))
+    step = 14 * max(int(scale), 1)
+    if bg is not None and lines:
+        draw.rectangle([0, 0, img.width, origin[1] * 2 + step * len(lines)], fill=tuple(bg))
     for i, line in enumerate(lines):
-        draw.text((origin[0], origin[1] + 14 * i), str(line), fill=color)
+        draw.text((origin[0], origin[1] + step * i), str(line), fill=color, font=font)
     return np.asarray(img)
 
 
@@ -163,7 +224,7 @@ def composite_ghost(base, ghost, mask, alpha):
 
 def annotate_rollout_frame(env, keypoints=None, subgoal_pt=None, ee_path=None,
                            camera="agentview", hw=512, lines=(), ghosts=(), radius=None,
-                           ghost_labels=()):
+                           ghost_labels=(), markers=(), text_bg=None, text_scale=1):
     """One debug frame: keypoints, the active subgoal target, and the executed EE path.
 
     Dot size scales with the frame. The VLM prompt image (annotate_keypoints) keeps the fixed
@@ -185,4 +246,6 @@ def annotate_rollout_frame(env, keypoints=None, subgoal_pt=None, ee_path=None,
         frame = composite_ghost(frame, ghost, mask, alpha)
     if ghost_labels:                       # after compositing, so the marks sit on top
         frame = draw_labels(frame, ghost_labels)
-    return draw_text_lines(frame, lines) if lines else frame
+    if markers:                            # planner-side points, drawn over the scene overlay
+        frame = draw_markers(env, frame, markers, camera=camera, hw=hw, radius=r + 1)
+    return (draw_text_lines(frame, lines, bg=text_bg, scale=text_scale) if lines else frame)
