@@ -34,7 +34,37 @@ TASK_BODIES = {
         "coffee_machine_lid",
         "coffee_machine_pod_holder_holder",
     ),
+    # Two-bin can sorting. The bins are arena bodies, so their poses are constant within a
+    # scene and are carried in the per-demo layout attr rather than a states table.
+    "sort_can_d0": ("Can",),
+    # Continuous-goal tray variant: same single can, same arena bodies.
+    "sort_can_tray_d0": ("Can",),
 }
+
+# Per-demo attrs copied through from the source demo. The goal block is what makes the
+# dataset goal-conditioned, so it has to survive the 224 conversion.
+CARRY_ATTRS = (
+    "scene_id",
+    "goal_colour",
+    "prompt",
+    "target_quadrant",
+    "layout",
+    "pair_complete",
+    "retries",
+    "release_idx",
+    "g_task_xyz",
+    "g_task_quat_wxyz",
+    "g_demo_joint8",
+    "g_demo_xyz",
+    "g_demo_quat_wxyz",
+    # sort_can_tray adds the continuous-goal provenance.
+    "split",
+    "goal_index",
+    "collection_order",
+    "scene_complete",
+    "goal_error_m",
+    "g_task_local_xy",
+)
 
 
 def _make_env(hdf5):
@@ -42,6 +72,13 @@ def _make_env(hdf5):
     import robomimic.utils.env_utils as EnvUtils
     import robomimic.utils.file_utils as FileUtils
     import robomimic.utils.obs_utils as ObsUtils
+
+    try:
+        from ..envs import SortCanTwoBin  # noqa: F401  registers this repo's own envs
+    except ImportError:
+        import sys as _sys
+        _sys.path.insert(0, str(_HERE.parent.parent))
+        from mujoco_eval.envs import SortCanTwoBin  # noqa: F401
 
     ObsUtils.initialize_obs_modality_mapping_from_dict(
         {
@@ -85,8 +122,9 @@ def _base_pose(fk_fit):
 
 
 def convert(args):
-    src = _HERE / args.task / "demo.hdf5"
-    out = _HERE / args.task / (
+    root = pathlib.Path(args.data_dir) if args.data_dir else _HERE
+    src = root / args.task / "demo.hdf5"
+    out = root / args.task / (
         f"demo_{args.size}_{args.part}.hdf5"
         if args.part
         else f"demo_{args.size}.hdf5"
@@ -177,6 +215,9 @@ def convert(args):
             o = data.create_group(name)
             o.attrs["model_file"] = xml
             o.attrs["num_samples"] = T
+            for key in CARRY_ATTRS:
+                if key in d.attrs:
+                    o.attrs[key] = d.attrs[key]
             obs = o.create_group("obs")
             obs.create_dataset(
                 "table_cam",
@@ -246,6 +287,10 @@ def convert(args):
                 data=np.repeat(robot_pose, T, axis=0),
             )
 
+            # The source's own "total" was copied above with the rest of data.attrs; it counts
+            # SOURCE frames, and a part counts only its own converted ones. Overwrite it as we
+            # go so a part is self-describing and merge() can just sum.
+            data.attrs["total"] = n_frames
             rate = n_frames / (time.time() - t0)
             print(
                 f"[{args.part or 'all'}] {name} "
@@ -258,15 +303,17 @@ def convert(args):
 
 
 def merge(args):
-    out = _HERE / args.task / f"demo_{args.size}.hdf5"
+    root = pathlib.Path(args.data_dir) if args.data_dir else _HERE
+    out = root / args.task / f"demo_{args.size}.hdf5"
     parts = [
-        _HERE / args.task / f"demo_{args.size}_{p}.hdf5"
+        root / args.task / f"demo_{args.size}_{p}.hdf5"
         for p in args.merge
     ]
 
     with h5py.File(out, "w") as g:
         data = g.create_group("data")
         first = True
+        frames = 0
 
         for p in parts:
             with h5py.File(p, "r") as f:
@@ -275,9 +322,14 @@ def merge(args):
                         data.attrs[k] = v
                     first = False
 
+                # "total" is a frame count, so it has to be summed across parts rather than
+                # inherited from the first one.
+                frames += int(f["data"].attrs.get("total", 0))
+
                 for name in f["data"]:
                     f.copy(f"data/{name}", data, name=name)
 
+        data.attrs["total"] = frames
         total = len(data.keys())
 
     print(f"merged {len(parts)} parts -> {out} ({total} demos)")
@@ -291,6 +343,11 @@ def main():
         choices=sorted(TASK_BODIES),
     )
     parser.add_argument("--size", type=int, default=224)
+    parser.add_argument(
+        "--data_dir",
+        default=None,
+        help="root holding <task>/demo.hdf5; default is this script's own directory",
+    )
     parser.add_argument("--demo_start", type=int, default=0)
     parser.add_argument("--demo_end", type=int, default=200)
     parser.add_argument(

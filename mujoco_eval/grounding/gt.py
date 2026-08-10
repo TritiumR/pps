@@ -202,6 +202,9 @@ _ON_XY, _ON_Z = 0.05, 0.02
 _SQ_XY, _SQ_Z_TOP = 0.03, 0.93
 _CAN_XY = (0.0975, 0.1225)
 _CAN_Z_BAND = (0.8, 0.9)
+# sort_can: release standoff above the seat, and the bin's half height for the keepout box.
+_SORT_CAN_DROP_DZ = 0.03
+_SORT_CAN_BIN_HALF_Z = 0.04
 _INSERT_STANDOFF = 0.05
 
 TASKS = {
@@ -215,6 +218,14 @@ TASKS = {
              "movable": ["cube"]},
     "can": {"grasp_objs": ["can"], "place_obj": "bin2_q3",
             "movable": ["can"]},
+    # Two-bin sorting. The place target is the REQUESTED bin, which changes per episode, so
+    # the destination is read from the live env rather than named by a constant here.
+    "sort_can": {"grasp_objs": ["can"], "place_obj": "target_bin",
+                 "movable": ["can"]},
+    # Continuous-goal tray. The place target is the COMMANDED position, read from the live env,
+    # so like sort_can it cannot be named by a constant here.
+    "sort_can_tray": {"grasp_objs": ["can"], "place_obj": "target_bin",
+                      "movable": ["can"]},
     "threading": {"grasp_objs": ["needle"], "place_obj": "tripod",
                   "movable": ["needle", "tripod"]},
     "coffee": {"grasp_objs": ["coffee_pod"], "place_obj": "coffee_pod_holder",
@@ -239,10 +250,15 @@ TASKS = {
 class MGGroundingSource:
     """Build task stages and targets from exact MuJoCo poses."""
 
-    def __init__(self, task):
+    def __init__(self, task, semantic_neutral=False):
         if task not in TASKS:
             raise ValueError(f"unknown mg task {task!r} (have {sorted(TASKS)})")
         self.task = task
+        # Opt-in: build the ladder WITHOUT consulting anything the task specification is supposed
+        # to decide. Only sort_can has such a thing (which coloured bin), and only make_context
+        # asks for it -- see _ground_sort_can. Default False, so every existing caller is
+        # unchanged.
+        self.semantic_neutral = bool(semantic_neutral)
         spec = TASKS[task]
         self.movable = list(spec["movable"])
         self.roles = {"grasp_obj": spec["grasp_objs"][0], "grasp_objs": spec["grasp_objs"],
@@ -255,6 +271,10 @@ class MGGroundingSource:
             return self._ground_lift(world)
         if self.task == "can":
             return self._ground_can(world)
+        if self.task == "sort_can":
+            return self._ground_sort_can(env, world)
+        if self.task == "sort_can_tray":
+            return self._ground_sort_can_tray(env, world)
         if self.task == "threading":
             return self._ground_threading(world)
         if self.task == "coffee":
@@ -377,6 +397,113 @@ class MGGroundingSource:
         return Grounding(objects=objects, stages=stages,
                          manipulated=frozenset({"cube"}), keypoints=keypoints)
 
+
+    def _ground_sort_can(self, env, world):
+        """Grasp / lift / place ladder aimed at the episode's REQUESTED coloured bin.
+
+        Under `semantic_neutral` the ladder is built without consulting the requested colour at
+        all -- no g_task, no target_quadrant -- and it publishes a release keypoint for EVERY
+        quadrant rather than only the winning one.
+
+        That mode exists for make_context. A context built from the colour-conditioned ladder
+        carries exactly one seat: the correct one. Anything reading it would then have a single
+        candidate, could not be asked to choose, and could not be caught choosing wrongly -- the
+        answer would already be baked into the perception artifact. The neutral ladder describes
+        the scene's geometry (two walled quadrants, two seats) and leaves which of them the task
+        wants to whatever reads the instruction.
+        """
+        raw = env.raw
+        from ..envs.sort_can import BIN_FLOOR_TOP, CAN_HALF_HEIGHT
+
+        def seat_of(qid):
+            """Canonical seat pose of a quadrant: centre, can resting height (env.g_task)."""
+            centre, half = raw.quadrant_frame(qid)
+            return (np.array([centre[0], centre[1], centre[2] + BIN_FLOOR_TOP + CAN_HALF_HEIGHT],
+                             dtype=np.float64), half)
+
+        quadrants = sorted(int(q) for q in raw._quadrants)
+        if self.semantic_neutral:
+            # By INDEX, never by colour: the quadrant/colour assignment is redrawn every episode,
+            # so a fixed quadrant carries no information about the instruction.
+            target_q = quadrants[0]
+        else:
+            target_q = int(raw.target_quadrant)
+        seat, half = seat_of(target_q)
+        drop = seat + np.array([0.0, 0.0, _SORT_CAN_DROP_DZ])
+        pos = lambda n: np.asarray(world.object_pose(n)[0], dtype=np.float64)
+        objects = [
+            SceneObject(name="can", pos=(lambda: pos("can")), extents=EXTENTS["can"]),
+            SceneObject(name="target_bin", pos=(lambda: seat.copy()),
+                        extents=(half[0], half[1], _SORT_CAN_BIN_HALF_Z)),
+        ]
+        z0 = float(pos("can")[2])
+        lift_t = lambda: np.array([*pos("can")[:2], z0 + _LIFT["can"]])
+
+        # The env owns the predicate, so the stage ladder cannot disagree with success.
+        in_bin = lambda: raw.contained_quadrant() == target_q
+
+        # Neutral mode aims the place stage AT the seat rather than at a hover above the drop
+        # point, so make_context registers no stage target that is not already a published
+        # keypoint -- which is what keeps the artifact symmetric between the two bins.
+        place_target_pt = ((lambda: seat.copy()) if self.semantic_neutral
+                           else (lambda: drop + np.array([0.0, 0.0, _PLACE_CLEARANCE])))
+        stages = [
+            Stage(name="grasp can", gripper="close", grasp_obj="can",
+                  target=(lambda: pos("can"))),
+            Stage(name="lift can", gripper="hold", grasp_obj="can", payload="can",
+                  target=lift_t, done=(lambda: float(pos("can")[2]) > z0 + _LIFT_CONFIRM)),
+            Stage(name="place can in target bin", gripper="place", payload="can",
+                  place_target="target_bin", target=place_target_pt,
+                  place_point=(lambda: drop.copy()), carry_z=(lambda: z0 + _LIFT["can"]),
+                  done=in_bin, place_mode="container"),
+        ]
+        if self.semantic_neutral:
+            seats = [seat_of(q)[0] for q in quadrants]
+            keypoints = lambda: np.stack(
+                [pos("can"), np.array([*pos("can")[:2], z0 + _LIFT["can"]])] + seats
+            ).astype(np.float32)
+        else:
+            keypoints = lambda: np.stack([pos("can"), drop]).astype(np.float32)
+        return Grounding(objects=objects, stages=stages,
+                         manipulated=frozenset({"can"}), keypoints=keypoints)
+
+    def _ground_sort_can_tray(self, env, world):
+        """Grasp / lift / place ladder aimed at the episode's COMMANDED tray position.
+
+        The continuous-goal analogue of :meth:`_ground_sort_can`. There is no colour and no
+        quadrant to choose between, so `semantic_neutral` has nothing to withhold: the goal is
+        given to the episode rather than inferred from the scene, and the ladder simply uses it.
+        """
+        raw = env.raw
+        from ..envs.sort_can_tray import GOAL_TOL, TRAY_HALF_INTERIOR
+
+        seat = np.asarray(raw.goal, dtype=np.float64)
+        drop = seat + np.array([0.0, 0.0, _SORT_CAN_DROP_DZ])
+        pos = lambda n: np.asarray(world.object_pose(n)[0], dtype=np.float64)
+        objects = [
+            SceneObject(name="can", pos=(lambda: pos("can")), extents=EXTENTS["can"]),
+            SceneObject(name="target_bin", pos=(lambda: seat.copy()),
+                        extents=(TRAY_HALF_INTERIOR[0], TRAY_HALF_INTERIOR[1],
+                                 _SORT_CAN_BIN_HALF_Z)),
+        ]
+        z0 = float(pos("can")[2])
+        lift_t = lambda: np.array([*pos("can")[:2], z0 + _LIFT["can"]])
+        # The env owns the predicate, so the ladder cannot disagree with success.
+        placed = lambda: bool(raw.in_tray() and raw.goal_error() <= GOAL_TOL)
+        stages = [
+            Stage(name="grasp can", gripper="close", grasp_obj="can",
+                  target=(lambda: pos("can"))),
+            Stage(name="lift can", gripper="hold", grasp_obj="can", payload="can",
+                  target=lift_t, done=(lambda: float(pos("can")[2]) > z0 + _LIFT_CONFIRM)),
+            Stage(name="place can at goal", gripper="place", payload="can",
+                  place_target="target_bin",
+                  target=(lambda: drop + np.array([0.0, 0.0, _PLACE_CLEARANCE])),
+                  place_point=(lambda: drop.copy()), carry_z=(lambda: z0 + _LIFT["can"]),
+                  done=placed, place_mode="container"),
+        ]
+        keypoints = lambda: np.stack([pos("can"), drop]).astype(np.float32)
+        return Grounding(objects=objects, stages=stages,
+                         manipulated=frozenset({"can"}), keypoints=keypoints)
 
     def _ground_can(self, world):
         pos = lambda n: np.asarray(world.object_pose(n)[0], dtype=np.float64)

@@ -47,20 +47,56 @@ def _owner_of(point, poses, extents):
     distant compact object, silently reassigning the drop point to the payload. Distance to the
     box the object actually occupies keeps offset points with the thing they are an offset OF.
     """
-    best, best_score = None, np.inf
+    best, best_score = None, (np.inf, np.inf)
     for name, (pos, _rot) in poses.items():
         half = np.asarray(extents.get(name, (0.05, 0.05, 0.05)), dtype=np.float64)
         delta = np.abs(np.asarray(point) - np.asarray(pos))
-        score = float(np.linalg.norm(np.maximum(delta - half, 0.0)))   # 0 inside the box
+        # Ties are the normal case for NESTED bodies -- the drawer's tray lies inside both the
+        # sliding front's box and the cabinet's -- and dict order used to settle them, which handed
+        # moving parts to the static shell. The tighter box wins instead: it is the more specific
+        # claim, and it is the body the point actually rides.
+        score = (float(np.linalg.norm(np.maximum(delta - half, 0.0))),   # 0 inside the box
+                 float(np.linalg.norm(half)))
         if score < best_score:
             best, best_score = name, score
-    return best, best_score
+    return best, best_score[0]
 
 
 # Beyond this surface distance a keypoint is not rigidly attached to anything: can's drop
 # point sits 80 cm from the can and its destination (bin2_q3) has no MuJoCo body at all, so
 # forcing attribution would make a fixed world target ride the payload.
 _UNOWNED_M = 0.15
+
+# A box describes the geometry AROUND a keypoint only if the keypoint lies on it. Past this
+# surface distance the box is something the point is merely near, and its half-widths say nothing
+# about what the fingers would close on there.
+_LOCAL_PART_M = 0.02
+
+
+def _local_extents_of(point, parts):
+    """Return (half_extents, part_name) describing the geometry local to one keypoint.
+
+    THE INTERFACE IS "local extents around a keypoint". Here the backend is the declared part
+    table -- every SceneObject the task grounding publishes, which includes sub-body parts such as
+    a drawer handle with its own box. On a real robot the same triple would be measured from the
+    perceived point cloud inside a small ball around the keypoint; nothing downstream knows or
+    cares which produced it, so no part- or task-name string is needed to consume it.
+
+    Selection is the same rule `_owner_of` uses -- nearest box surface, smallest box breaks ties --
+    restricted to boxes the keypoint actually lies on (within `_LOCAL_PART_M`). A keypoint that
+    lies on no declared part falls back to its owner body's box, which is the coarsest honest
+    answer and what every consumer read before.
+    """
+    best, best_score = None, (np.inf, np.inf)
+    for name, (pos, half) in parts.items():
+        delta = np.abs(np.asarray(point) - np.asarray(pos))
+        score = (float(np.linalg.norm(np.maximum(delta - np.asarray(half), 0.0))),
+                 float(np.linalg.norm(half)))
+        if score < best_score:
+            best, best_score = name, score
+    if best is None or best_score[0] > _LOCAL_PART_M:
+        return None, None
+    return tuple(float(x) for x in parts[best][1]), best
 
 
 def build_context(task, seed=101, hw=512, camera="agentview"):
@@ -71,7 +107,10 @@ def build_context(task, seed=101, hw=512, camera="agentview"):
     env = MuJoCoEnv(demo, fk)
     env.reset(seed)
 
-    source = MGGroundingSource(task)
+    # A context describes the SCENE, so it must not encode anything the task specification is
+    # entitled to decide. Only sort_can has such a choice (which coloured bin), and neutral mode
+    # is a no-op for every other task -- see MGGroundingSource._ground_sort_can.
+    source = MGGroundingSource(task, semantic_neutral=True)
     world = MGWorld(env, sensor=None, names=source.movable)
     grounding = source.ground(env, world)
     if grounding.keypoints is None:
@@ -105,9 +144,15 @@ def build_context(task, seed=101, hw=512, camera="agentview"):
     # for the can but not for bin2_q3 -- so its drop point had nothing to attribute to and fell to
     # the payload. Query the task's declared roles too.
     declared = list(spec["grasp_objs"]) + ([spec["place_obj"]] if spec.get("place_obj") else [])
+    # The task's TRACKED bodies are candidates too, or a keypoint attached to a moving part is
+    # attributed to whatever static body happens to sit nearby: mug_cleanup's drawer handle was
+    # owned by the cabinet rather than by the sliding front, so nothing downstream -- constraint,
+    # cost or advance predicate -- could observe the drawer moving at all.
+    from .rekep import extent_table
+    known = extent_table(task)
     candidates = {o.name: o.extents for o in grounding.objects}
-    for name in declared:
-        candidates.setdefault(name, EXTENTS.get(name))
+    for name in list(spec["movable"]) + declared:
+        candidates.setdefault(name, known.get(name, EXTENTS.get(name)))
     for name, ext in candidates.items():
         try:
             pos, rot = world.object_pose(name)[:2]
@@ -116,11 +161,28 @@ def build_context(task, seed=101, hw=512, camera="agentview"):
         poses[name] = (np.asarray(pos, dtype=np.float64), np.asarray(rot, dtype=np.float64))
         extents[name] = ext if ext is not None else EXTENTS.get(name, (0.05, 0.05, 0.05))
 
+    # Declared PARTS, for the keypoint-local extents below. grounding.objects publishes sub-body
+    # parts the tracked-body table has no entry for -- mug_cleanup's drawer handle is a
+    # SceneObject with its own 9 mm box while the body it rides is a 24 cm drawer front -- and it
+    # answers pos() for parts that have no MuJoCo body of their own, which `poses` cannot.
+    parts = {}
+    for obj in grounding.objects:
+        if obj.extents is None:
+            continue
+        try:
+            parts[obj.name] = (np.asarray(obj.pos(), dtype=np.float64).reshape(3),
+                               np.asarray(obj.extents, dtype=np.float64).reshape(3))
+        except Exception:                       # no live position: not a localizable part
+            continue
+
     entries = []
     for point in points:
         owner, score = _owner_of(point, poses, extents)
         if owner is not None and score > _UNOWNED_M:
             owner = None                       # static world target
+        local, local_from = _local_extents_of(point, parts)
+        if local is None and owner is not None:
+            local, local_from = tuple(float(x) for x in extents[owner]), owner
         if owner is None:
             entries.append({"owner": None, "offset_local": [0.0, 0.0, 0.0],
                             "world_at_capture": point.tolist()})
@@ -132,6 +194,11 @@ def build_context(task, seed=101, hw=512, camera="agentview"):
             "offset_local": (rot.T @ (point - pos)).tolist(),
             "world_at_capture": point.tolist(),
             "attribution_score": round(float(score), 3),
+            # Half-extents of the geometry AT this keypoint, in the (grip, keepout, half_height)
+            # convention every extents triple uses. `local_extents_from` is provenance for the log
+            # only; no consumer branches on the name.
+            "local_extents": [round(float(x), 6) for x in local],
+            "local_extents_from": local_from,
         })
 
     model = env.env.env.sim.model if hasattr(env.env, "env") else env.env.sim.model
@@ -166,7 +233,9 @@ def write(task, seed=101):
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     owners = [e["owner"] for e in payload["keypoints"]]
-    print(f"[make-context] {task}: {len(owners)} keypoints owners={owners} -> {out}", flush=True)
+    local = [e.get("local_extents_from") for e in payload["keypoints"]]
+    print(f"[make-context] {task}: {len(owners)} keypoints owners={owners} "
+          f"local_extents_from={local} -> {out}", flush=True)
     return out
 
 
