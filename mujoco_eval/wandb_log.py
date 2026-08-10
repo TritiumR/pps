@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import collections
 import json
+import pathlib
 import re
 import statistics
 
@@ -80,6 +81,12 @@ def summarize(run_dir):
             "episode_wall_s": episode.get("episode_wall_s"),
             "replan_wall_median_s": episode.get("replan_wall_median_s"),
         })
+        # Semantic goal selection, when the run carried one. Absent on every run that did not,
+        # and the metrics below drop out with it.
+        for field in ("goal_select_correct", "goal_select_margin_m", "goal_select_selected",
+                      "goal_select_matches_oracle"):
+            if field in episode:
+                rows[-1][field] = episode[field]
         video = paths.seed_artifact(run_dir, episode.get("seed"), "videos", "mp4")
         if video is not None:
             videos.append((episode.get("seed"), bool(episode.get("success")), str(video)))
@@ -104,10 +111,23 @@ def summarize(run_dir):
             key=lambda kv: (kv[0] is None, kv[0])):
         metrics[f"eval/fail_at_stage_{stage}"] = count
 
+    scored = [r for r in rows if r.get("goal_select_correct") is not None]
+    if scored:
+        metrics["goal_select/n_scored"] = len(scored)
+        metrics["goal_select/accuracy"] = sum(
+            1 for r in scored if r["goal_select_correct"]) / len(scored)
+        metrics["goal_select/margin_m_mean"] = _mean(
+            r.get("goal_select_margin_m") for r in scored)
+        matched = [r for r in scored if r.get("goal_select_matches_oracle") is not None]
+        if matched:
+            metrics["goal_select/oracle_bitwise_match_rate"] = sum(
+                1 for r in matched if r["goal_select_matches_oracle"]) / len(matched)
+
     for field in ("ess", "cost_std"):
         for it, value in _per_level(replans, "base_levels", field).items():
             metrics[f"denoise/{field}_level_{it:02d}"] = value
-    for field in ("cos_ref_base", "ref_over_base", "ratio", "supp_d_mean", "cos_task_base"):
+    for field in ("cos_ref_base", "ref_over_base", "ratio", "supp_d_mean", "cos_task_base",
+                  "cos_addend_base"):
         for it, value in _per_level(replans, "steer_levels", field).items():
             metrics[f"steer/{field}_level_{it:02d}"] = value
 
@@ -130,8 +150,23 @@ def publish(task, exp, project="mujoco-eval", entity=None, max_videos=12, use_wa
     config_path = run_dir / "config.json"
     if config_path.exists():
         config = json.loads(config_path.read_text(encoding="utf-8"))
+    return publish_report(task, exp, report, run_dir, config=config, project=project,
+                          entity=entity, max_videos=max_videos, use_wandb=use_wandb)
 
-    out = run_dir / "summary.json"
+
+def publish_report(task, exp, report, out_dir, config=None, project="mujoco-eval", entity=None,
+                   max_videos=12, use_wandb=False):
+    """Write summary.json and optionally log a report to wandb.
+
+    Split out of `publish` so a run whose episodes are NOT mujoco_eval traces -- a standalone
+    harness with its own artifact layout -- can reach the same project, the same run-id scheme
+    and the same table/video conventions by building a report dict of the shape `summarize`
+    returns, instead of growing a second, divergent publisher.
+    """
+    config = dict(config or {})
+    out_dir = pathlib.Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / "summary.json"
     out.write_text(json.dumps({"task": task, "exp": exp, "config": config,
                                "metrics": report["metrics"], "episodes": report["episodes"]},
                               indent=2), encoding="utf-8")
@@ -161,6 +196,10 @@ def publish(task, exp, project="mujoco-eval", entity=None, max_videos=12, use_wa
     for seed, success, path in sorted(report["videos"])[:max_videos]:
         payload[f"videos/seed_{seed}"] = wandb.Video(
             path, format="mp4", caption=f"seed {seed}: {'success' if success else 'failure'}")
+    # Still frames a harness wants to carry alongside its episodes (analysis figures). Keyed by
+    # the caller so panels line up across runs, exactly as the video keys do.
+    for key, path in (report.get("images") or {}).items():
+        payload[f"figures/{key}"] = wandb.Image(str(path), caption=key)
     wandb.log(payload)
     run.finish()
     return report
