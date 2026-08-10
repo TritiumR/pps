@@ -15,18 +15,24 @@ from . import paths
 from .runner import LOG, rollout
 
 TASKS = ("stack", "stack_three", "square", "lift", "can", "threading", "coffee",
-         "mug_cleanup", "three_piece_assembly", "hammer_cleanup", "kitchen", "coffee_prep")
+         "mug_cleanup", "three_piece_assembly", "hammer_cleanup", "kitchen", "coffee_prep",
+         "sort_can", "sort_can_tray")
 
 
 _DATA_NAME = {"lift": "lift", "can": "can", "kitchen": "kitchen",
               "coffee_prep": "coffee_preparation_d0"}
 
+# sort_can reuses the can fit: it is the same Panda on the same bins arena, so the base
+# transform and TCP offset are unchanged (base_xpos_offset["bins"] = (-0.5, -0.1, 0)).
 _FK_FIT_NAME = {"lift": "fk_fit_lift.json", "can": "fk_fit_can.json",
                 "hammer_cleanup": "fk_fit_hammer_cleanup_d0.json",
-                "kitchen": "fk_fit_kitchen.json"}
+                "kitchen": "fk_fit_kitchen.json", "sort_can": "fk_fit_can.json",
+                "sort_can_tray": "fk_fit_can.json"}
 
+# sort_can: the scripted expert finishes in 230-310 steps, so 450 leaves a policy headroom.
 _MAX_STEPS = {"mug_cleanup": 450, "three_piece_assembly": 450, "hammer_cleanup": 450,
-              "coffee": 350, "kitchen": 750, "coffee_prep": 850}
+              "coffee": 350, "kitchen": 750, "coffee_prep": 850, "sort_can": 450,
+              "sort_can_tray": 450}
 
 
 def build_parser():
@@ -91,8 +97,18 @@ def build_parser():
                    help="default: <data>/<task dir>/rekep_context.json (grounding/propose.py)")
     g.add_argument("--rekep_constraints", default=None,
                    help="default: <data>/<task dir>/rekep_constraints/")
+    g.add_argument("--tray_marker", default="off", choices=("on", "off"),
+                   help="sort_can_tray only: add the inert semantic-target marker disc, so a "
+                        "ReKep plan can name a physical referent instead of a bare number")
+    g.add_argument("--tray_goal", default=None,
+                   help="sort_can_tray only: 'x,y' in TRAY-LOCAL metres. Sets the episode's "
+                        "commanded goal (and the marker, when --tray_marker on) after reset. "
+                        "Absent, the env keeps its default tray-centre goal")
     g.add_argument("--visual_only_render", default="on", choices=("on", "off"),
                    help="off draws collision geoms, matching datasets rendered without the fix")
+    g.add_argument("--save_states", default="off", choices=("on", "off"),
+                   help="persist the episode's MuJoCo states beside the trace, so an offline "
+                        "probe can re-enter any step with env.reset_to")
 
     g = p.add_argument_group("keypose sampler (sampling/keypose.py)")
     g.add_argument("--kp", action="store_true",
@@ -146,6 +162,29 @@ def build_parser():
                         "and average the last N overlapping chunks (0 = off, execute a block)")
     g.add_argument("--ensemble_decay", type=float, default=0.01,
                    help="exponential weight decay by chunk age; 0 averages equally")
+    g.add_argument("--expert_best_of", type=int, default=0,
+                   help="draws per replan under --steer expert, ranked by --expert_select. The "
+                        "expert's only randomness is its initial noise, so this is its whole "
+                        "candidate space. 0 (default) leaves the path byte-identical; 1 runs the "
+                        "same single chain through this code as a control. Draw 0 is always that "
+                        "chain, so an abstaining ranking reproduces --steer expert exactly")
+    g.add_argument("--expert_select", default="oracle_progress", choices=("oracle_progress",),
+                   help="ranking under --expert_best_of. oracle_progress is PRIVILEGED and "
+                        "phase-aware: terminal distance to the grasp object while free, and of "
+                        "the carried object to the place point once held. It measures headroom, "
+                        "it is not a deployable selector")
+    g.add_argument("--expert_noise_scale", type=float, default=1.0,
+                   help="std of the initial iterate x_T under --expert_best_of. 1.0 (default) is "
+                        "the trained marginal and is byte-identical; above it the chain starts "
+                        "off-distribution, which is the probe for whether a narrow candidate "
+                        "cloud is intrinsic to the checkpoint or an artifact of unit noise")
+    g.add_argument("--expert_ddim_eta", type=float, default=0.0,
+                   help="stochastic-DDIM coefficient injected at every level (0 = the "
+                        "deterministic update the server uses, 1 = DDPM). The second widening "
+                        "knob: it perturbs the path rather than the starting point")
+    g.add_argument("--expert_best_of_chunk", type=int, default=0,
+                   help="split the batched score request into blocks of this many draws "
+                        "(0 = one request; the server chunks its own forward at 256)")
     g.add_argument("--verify_gate", type=float, default=0.5,
                    help="slack under --steer verify: the expert's chunk is taken unless the base "
                         "scores it this much worse than its own")
@@ -186,10 +225,11 @@ def build_parser():
     g.add_argument("--kfk_max_kl", type=float, default=1.0,
                    help="cap on the guidance displacement: scale = min(1, sqrt(max_kl/raw_kl)). "
                         "0 disables guidance entirely -- the identity control")
-    g.add_argument("--kfk_action_l1_step", type=float, default=0.0,
-                   help="pull the action rows toward the straight joint path to the guided "
-                        "keypose (0 = off). His ARX-tracker gradient without the tracker: our "
-                        "actions ARE joint targets, so the straight line is already feasible")
+    g.add_argument("--kfk_action_l1_step", type=float, default=None,
+                   help="strength of the action-row pull toward the goal (0 = off). Defaults to "
+                        "0.0 under endpoint_particles (as shipped) and to his 0.40 under "
+                        "flow_score_averaging, where it is the ONLY channel from the steered "
+                        "keypose to the rows that execute")
     g.add_argument("--kfk_action_rows", type=int, default=0,
                    help="how many leading rows are EXECUTABLE actions; 0 = up to "
                         "--keypose_row. Needed for AWE proxies, whose chunk is "
@@ -201,19 +241,68 @@ def build_parser():
                         "rather than the keypose row alone. Cory's method estimates "
                         "all 6 goal rows jointly; ours perturbed 1 of 16, which is a "
                         "6x smaller search and barely moves a horizon-reduced cost.")
-    g.add_argument("--kfk_ranker", default="planner", choices=("planner", "keypose"),
+    g.add_argument("--kfk_ranker", default=None,
+                   choices=("planner", "keypose", "rekep_subgoal"),
                    help="what scores the proposal cloud. 'planner' is the CompositeCost "
-                        "(default, unchanged). 'keypose' is surface-contact geometry on the "
-                        "keypose row, in the shape Cory's PickBallCost uses -- a different KIND "
-                        "of signal, after 'fewer terms' was tested and refuted (keypose term "
-                        "alone separated 5.8%% vs the composite's 19.7%% at matched width)")
+                        "(the endpoint_particles default, unchanged). 'keypose' is surface-contact "
+                        "geometry on the keypose row, in the shape Cory's PickBallCost uses -- a "
+                        "different KIND of signal, after 'fewer terms' was tested and refuted "
+                        "(keypose term alone separated 5.8%% vs the composite's 19.7%% at matched "
+                        "width), and the flow_score_averaging default because his ranking cost "
+                        "scores the terminal keypose row ONLY. 'rekep_subgoal' is the PLAN's own "
+                        "stage sub-goal read at the keypose (Cory's C_subgoal(w^K)): the ranker "
+                        "evaluates declared semantics instead of the controller's hand-written "
+                        "composite. Needs a grounding that carries a live constraint on every "
+                        "stage (--ground rekep_vlm); falls back to the planner on a stage without "
+                        "one")
     g.add_argument("--kfk_cost_bucket", default="task_no_ch",
                    choices=("total", "task", "feasibility", "task_no_ch", "task_no_nh"),
                    help="which cost ranks the proposals. Default drops carry_hold, measured as "
                         "~98%% of the base cost's inversion against working behaviour (E4)")
     g.add_argument("--kfk_paired", default="on", choices=("on", "off"),
                    help="emit [base, guided] child pairs so resampling cannot collapse the "
-                        "population onto guidance alone")
+                        "population onto guidance alone (endpoint_particles only)")
+    g.add_argument("--kfk_guidance_mode", default="endpoint_particles",
+                   choices=("endpoint_particles", "flow_score_averaging"),
+                   help="which of Cory's two branches to run. 'endpoint_particles' is what we "
+                        "shipped -- and, measured, the branch he uses only in one checkpoint "
+                        "sweep: per-level FK resampling of a particle population, a KL-capped "
+                        "displacement, and no action-block coefficient. 'flow_score_averaging' is "
+                        "every production wrapper of his: independent particles, no resampling, no "
+                        "KL cap, a per-block clean-space blend at 0.6/0.6/0.9, an L1 action pull "
+                        "toward a near goal row, and a categorical final draw. Selecting "
+                        "endpoint_particles reproduces the old path bitwise")
+    g.add_argument("--kfk_gamma_action", type=float, default=0.6,
+                   help="flow_score_averaging blend coefficient on the executable action rows "
+                        "(his --fk-action-steering-coeff)")
+    g.add_argument("--kfk_gamma_traj", type=float, default=0.6,
+                   help="blend coefficient on the AWE waypoint rows (his --fk-steering-coeff)")
+    g.add_argument("--kfk_gamma_keypose", type=float, default=0.9,
+                   help="blend coefficient on the terminal keypose row "
+                        "(his --fk-keypose-steering-coeff)")
+    g.add_argument("--kfk_final_select", default=None, choices=("argmin", "softmax"),
+                   help="how the particle population collapses to one plan. Defaults to 'argmin' "
+                        "under endpoint_particles (as shipped) and to his 'softmax' categorical "
+                        "draw at --kfk_temperature under flow_score_averaging")
+    g.add_argument("--kfk_reentry", default=None, choices=("frozen_eps", "recompute_eps"),
+                   help="how a guided clean chunk re-enters the DDIM chain. 'frozen_eps' reuses "
+                        "the model's own eps, so the iterate moves by sqrt(alpha_bar_prev) per "
+                        "level -- 2-5x his rectified-flow 1/(N-it), front-loaded on the noisiest "
+                        "levels. 'recompute_eps' re-derives eps from the guided x0, which is the "
+                        "DDIM update proper and tracks his profile. Defaults to frozen_eps under "
+                        "endpoint_particles (unchanged) and recompute_eps under "
+                        "flow_score_averaging")
+    g.add_argument("--kfk_l1_wrist_m", type=float, default=0.04,
+                   help="the action pull aims at the last goal row whose decoded TCP is within "
+                        "this many metres of the current TCP (his --fk-action-l1-wrist-distance)")
+    g.add_argument("--kfk_l1_wrist_fallback_m", type=float, default=0.08,
+                   help="widened radius tried when no goal row qualifies at --kfk_l1_wrist_m; "
+                        "if none qualifies there either the pull aims at the keypose")
+    g.add_argument("--kfk_consistency_weight", type=float, default=4.0,
+                   help="weight of the cross-replan keypose-consistency term added to the "
+                        "proposal cost under flow_score_averaging (his --fk-consistency-weight). "
+                        "The cache resets on a stage change, so a new phase picks its keypose "
+                        "free of the previous phase's")
     g.add_argument("--vls_scale", type=float, default=1.0,
                    help="guidance scale under --steer vls; multiplies a UNIT-NORM gradient, so it "
                         "is in chunk units and does not inherit the objective's magnitude")
@@ -230,6 +319,31 @@ def build_parser():
                    help="rank key-pose proposals on the proxy's CLEAN x0 prediction (on) rather "
                         "than on x_{t-1} (off, the old behaviour: FK of a noisy chunk is not a "
                         "reachable pose). off is kept only as an A/B control")
+    g.add_argument("--kfk_authority", default="off", choices=("off", "gate", "ramp", "const"),
+                   help="per-replan steering authority (steering/authority.py). off is the "
+                        "shipped arm: guidance applies everywhere. gate/ramp read a state signal "
+                        "through --kfk_authority_rule; const applies --kfk_lambda_const. "
+                        "lambda 0 short-circuits the replan to the proxy's own default chain "
+                        "(exactly --steer expert); lambda 1 is bitwise endpoint_particles")
+    g.add_argument("--kfk_authority_signal", default="kp_dispersion",
+                   choices=("kp_dispersion", "plan_cost"),
+                   help="state signal the gate/ramp reads; overridden by the rule file's own "
+                        "'signal' field when one is loaded")
+    g.add_argument("--kfk_authority_rule", default=None,
+                   help="frozen rule JSON: per-stage normalisation constants, tau, s_lo/s_hi. "
+                        "Required by --kfk_authority gate|ramp and never re-fit at rollout time")
+    g.add_argument("--kfk_lambda_const", type=float, default=1.0,
+                   help="authority under --kfk_authority const; the A/B handle for the two "
+                        "identity checks (0 = expert path, 1 = endpoint_particles)")
+    g.add_argument("--kfk_authority_k", type=int, default=16,
+                   help="noise-only redraws behind the kp_dispersion signal; one batched prefix "
+                        "forward covers all of them")
+    g.add_argument("--authority_diag", default="off", choices=("on", "off", "full"),
+                   help="measure authority signals at every replan and write them to the trace "
+                        "WITHOUT changing the plan. on = keypose dispersion + plan cost; full "
+                        "adds the semantic-disagreement measure D (cost-preferred keypose vs the "
+                        "proxy's own). Consumes no global RNG, so a diagnostic run stays "
+                        "byte-identical to the arm it instruments")
     g.add_argument("--estimator", default="mean", choices=("mean", "draw"),
                    help="how the weighted candidate cloud collapses to one chunk. mean = "
                         "sum(w_i x_i), the MBD default, which for a multimodal cost returns a "
@@ -338,6 +452,13 @@ def build_parser():
                         "(generate-cache + train), not a task-trained one")
     g.add_argument("--ref_device", default="cuda:1",
                    help="device for the reference proxy server (--steer_ref proxy)")
+    g.add_argument("--allow_ref_stats_mismatch", default="off", choices=("on", "off"),
+                   help="proceed when the reference proxy's action_norm_stats differ from the "
+                        "task proxy's. Each proxy is bridged with its OWN stats either way, so "
+                        "this is sound in score space; it is off by default because differing "
+                        "stats mean the two models were trained on different action "
+                        "parameterisations (ref_square_v2 centres the gripper at 0.0, the task "
+                        "proxies at 0.5)")
     g.add_argument("--steer_ref", choices=("none", "base", "proxy"), default="none",
                    help="reference term under --steer additive. 'proxy' is PPS Eq (4) proper: "
                         "v_ref is a separate proxy distilled from the base, so the difference "
@@ -351,6 +472,14 @@ def build_parser():
                         "level. 'candidates' scores the whole candidate population and "
                         "weight-averages it: a different estimator, ~1000x the batch, and "
                         "fed clean x0 proposals where the model expects x_t")
+    g.add_argument("--proxy_aux", default="pad", choices=("pad", "native"),
+                   help="how --steer additive fills the proxy's trailing GOAL rows (AWE "
+                        "waypoints + keypose) when --horizon is shorter than the proxy's "
+                        "chunk. 'pad' repeats the last ACTION row, which is off-distribution "
+                        "(the H1 warning). 'native' carries those rows on a SHADOW latent "
+                        "running the proxy's own reverse chain -- its own noise init, its own "
+                        "DDIM update -- with the shadow's action rows tracking the base "
+                        "iterate. Guidance still uses only the first --horizon score rows")
     g.add_argument("--proxy_score_cap", type=int, default=0,
                    help="cap the candidates scored per level under --steer additive (0 = all). "
                         "The addend is a weight-weighted mean, so drawing this many indices with "
@@ -359,6 +488,49 @@ def build_parser():
                         "wall per env step, slower than full Isaac Sim")
     g.add_argument("--proxy_fp16", default="off", choices=("on", "off"),
                    help="fp16 autocast server-side (measured: no gain, launch-bound at batch 1)")
+    g = p.add_argument_group("supervisory composition (steering/supervisor.py; opt-in)")
+    g.add_argument("--supervisor", default="off", choices=("off", "on"),
+                   help="run the milestone phase machine over --steer expert. It never modifies "
+                        "a chunk: it only decides, at chunk boundaries, whether to ask the expert "
+                        "for a fresh sample of its own distribution, and (with "
+                        "--supv_base_fallback) whether the MBD base drives a bounded recovery")
+    g.add_argument("--supv_base_fallback", default="off", choices=("off", "on"),
+                   help="allow escalation to the base. off = arm 3 (the base never executes); "
+                        "on = arm 4")
+    g.add_argument("--supv_stall_w", type=int, default=8,
+                   help="chunks without milestone-residual progress before a retry event")
+    g.add_argument("--supv_dwell", type=int, default=4,
+                   help="minimum chunks between supervisor interventions")
+    g.add_argument("--supv_max_retry_phase", type=int, default=3)
+    g.add_argument("--supv_max_retry_episode", type=int, default=6)
+    g.add_argument("--supv_base_max_chunks", type=int, default=40,
+                   help="chunks of base authority per recovery before a forced handback")
+    g.add_argument("--supv_max_recoveries", type=int, default=2)
+    g.add_argument("--supv_lift_m", type=float, default=0.03,
+                   help="nut rise above its reset height that confirms the grasp milestone")
+    g.add_argument("--supv_over_peg_m", type=float, default=0.06,
+                   help="nut-to-peg xy distance that confirms the carry milestone")
+    g.add_argument("--supv_workspace_pad", type=float, default=0.05,
+                   help="padding on the D0-init-hull union peg workspace box")
+
+    g = p.add_argument_group("injection")
+    g.add_argument("--ddrs_checkpoint", default=None,
+                   help="Direct Density-Ratio Steering: a trained scalar log-ratio "
+                        "log p_expert - log q_base (sim_free_mpc/ddrs.py). Absent = off, and the "
+                        "planner path is then byte-identical to the base")
+    g.add_argument("--ddrs_gamma", type=float, default=0.0,
+                   help="tilt strength: log w_new = log w_base + gamma * r_phi, applied to the "
+                        "FINAL clean MBD cloud ONLY -- the one level whose candidate distribution "
+                        "matches the negatives the ratio was fit against. 0 = identity")
+    g.add_argument("--ddrs_device", default="cpu",
+                   help="where the ratio net runs; it is a 2x256 MLP, so cpu is normal")
+    g.add_argument("--logit_norm", default="raw", choices=("raw", "std"),
+                   help="how the MBD softmax turns candidate costs into weights. 'raw' is "
+                        "softmax(-c/T), what every run on disk used, and it makes T a sharpness "
+                        "in COST units -- so the same T means something different at every noise "
+                        "level and under every cost. 'std' divides by the batch cost std first "
+                        "(DIAL dial_core.py:126), making T a sharpness in std units and hence "
+                        "scale-free. The plumbing existed in DIALSamplerConfig but nothing set it")
     g.add_argument("--inject_rho", type=float, default=0.15,
                    help="fraction of candidates drawn around the proxy x0 (steer=inject)")
     g.add_argument("--inject_schedule", default="flat", choices=("flat", "frontload"),
@@ -366,8 +538,22 @@ def build_parser():
     return p
 
 
+_KFK_MODE_DEFAULTS = {
+    # (endpoint_particles, flow_score_averaging). The left column is exactly what shipped, so the
+    # old mode stays bitwise; the right column is his production wrapper.
+    "kfk_ranker": ("planner", "keypose"),
+    "kfk_action_l1_step": (0.0, 0.4),
+    "kfk_final_select": ("argmin", "softmax"),
+    "kfk_reentry": ("frozen_eps", "recompute_eps"),
+}
+
+
 def resolve_defaults(args):
     """Resolve per-task paths and runtime defaults."""
+    new_mode = getattr(args, "kfk_guidance_mode", "endpoint_particles") == "flow_score_averaging"
+    for name, (old, new) in _KFK_MODE_DEFAULTS.items():
+        if getattr(args, name, None) is None:
+            setattr(args, name, new if new_mode else old)
     args.config = str(paths.config(args.config))
     args.max_steps = args.max_steps or _MAX_STEPS.get(args.task, 300)
     data_dir = paths.DATA / _DATA_NAME.get(args.task, f"{args.task}_d0")

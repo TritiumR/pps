@@ -125,7 +125,7 @@ class MGBridge(VlmDpBridge):
 
 
 _PLANNER_KEYS = ("delta_clip", "interpolate", "interpolate_frequency",
-                 "interpolate_high_frequency", "interpolation_method")
+                 "interpolate_high_frequency", "interpolation_method", "logit_norm")
 
 
 def apply_planner_config(args, cfg):
@@ -188,6 +188,7 @@ def build_planner(args, fit, kp_cfg=None):
         prior_weight_high=args.prior_weight_high,
         prior_weight_schedule=args.prior_weight_schedule,
         estimator=getattr(args, "estimator", "mean"),
+        logit_norm=getattr(args, "logit_norm", "raw"),
         draw_below=float(getattr(args, "draw_below", float("inf"))))
     if args.interpolate == "on":
 
@@ -384,18 +385,154 @@ def _clamp_saturation(planner, inputs, x_t, q0, args, dec, stats):
     return stats
 
 
+def _kfk_row_std(planner, rows):
+    """Per-row action std, so a model-space displacement reports in real joint radians."""
+    std = np.asarray(planner.policy._metadata["output_norm_stats"]["actions"].std,
+                     dtype=np.float32)
+    if std.ndim == 1:
+        std = np.repeat(std[None], rows, axis=0)
+    return torch.as_tensor(std[:rows], dtype=torch.float32)
+
+
+def _kfk_tcp(planner, ctx, joints):
+    """World TCP positions for [N, 7] joint rows, through the planner's own FK."""
+    q = torch.as_tensor(np.asarray(joints), dtype=torch.float32).reshape(1, -1, 7)
+    ee = planner.fk.forward(q).ee_pos
+    root_pos, root_quat = ctx.get("robot_root_pos"), ctx.get("robot_root_quat")
+    if root_pos is not None and root_quat is not None:
+        from sim_free_mpc.fk import transform_points_wxyz
+        ee = transform_points_wxyz(torch.as_tensor(root_pos, dtype=ee.dtype),
+                                   torch.as_tensor(root_quat, dtype=ee.dtype), ee)
+    return ee[0]
+
+
+def _kfk_prev_keypose(steer, stage_key):
+    """The keypose selected at the previous replan, or None once the stage changes.
+
+    His `previous_keypose` is carried on the rollout object; ours rides the steering client, which
+    already lives exactly one episode. Resetting on a stage change is the point: a new phase must
+    be free to pick a keypose far from the last phase's.
+    """
+    if getattr(steer, "_kfk_stage", None) != stage_key:
+        steer._kfk_stage = stage_key
+        steer._kfk_prev_kp = None
+    return getattr(steer, "_kfk_prev_kp", None)
+
+
+def _auth_batch(steer):
+    """One BatchExpert per rollout: it caches nothing but the norm stats, and building it twice
+    per replan would re-read the server's ready_info for no reason."""
+    from .steering.best_of import BatchExpert
+    batch = getattr(steer, "_auth_batch", None)
+    if batch is None:
+        batch = steer._auth_batch = BatchExpert(steer.client)
+    return batch
+
+
+def _auth_rule(args):
+    """The frozen rule file, loaded once. Gate and ramp may never re-fit at rollout time."""
+    rule = getattr(args, "_auth_rule_obj", None)
+    if rule is None:
+        from .steering.authority import AuthorityRule
+        if not args.kfk_authority_rule:
+            raise SystemExit(f"--kfk_authority {args.kfk_authority} needs "
+                             "--kfk_authority_rule <frozen json> (see steering/authority.py)")
+        rule = args._auth_rule_obj = AuthorityRule.load(args.kfk_authority_rule)
+        print(f"{LOG} authority: {args.kfk_authority} on {rule.signal} "
+              f"(tau={rule.tau:.3f}, ramp {rule.s_lo:.3f}->{rule.s_hi:.3f})", flush=True)
+    return rule
+
+
+def _auth_signals(planner, env, ctx, args, steer, replan_idx, want, default_chunk=None):
+    """Measure the requested authority signals at one replan.
+
+    `want` is a subset of authority.SIGNALS. Neither signal touches the global RNG (the draws use
+    per-seed CPU generators and the chain is seeded server-side), so measuring is free of any
+    effect on the rollout it instruments -- which is what makes --authority_diag honest.
+    """
+    from .steering import authority as auth
+    rec = {}
+    if "plan_cost" in want:
+        chunk = default_chunk
+        if chunk is None:
+            chunk, _ = auth.default_chain(steer.client, seed=int(args.seed) * 100003 + replan_idx,
+                                          num_iterations=args.num_steps + 1, env=env)
+        t0 = time.perf_counter()
+        rec.update(auth.plan_cost(planner, chunk, ctx))
+        rec["c_wall_s"] = round(time.perf_counter() - t0, 3)
+    if "kp_dispersion" in want:
+        seeds = auth.dispersion_seeds(args.seed, replan_idx, int(args.kfk_authority_k))
+        rec.update(auth.keypose_dispersion(_auth_batch(steer), planner, env, ctx, seeds=seeds,
+                                           num_iterations=args.num_steps + 1))
+    if "disagreement" in want:
+        chunk = default_chunk
+        if chunk is None:
+            chunk, _ = auth.default_chain(steer.client, seed=int(args.seed) * 100003 + replan_idx,
+                                          num_iterations=args.num_steps + 1, env=env)
+        chunk = np.asarray(chunk, dtype=np.float32)
+        kp_row = int(chunk.shape[0]) - 1
+        rows = int(getattr(args, "kfk_action_rows", 0) or args.horizon)
+        rec.update(auth.semantic_disagreement(
+            planner, env, ctx, chunk, action_rows=min(rows, kp_row), keypose_row=kp_row,
+            std_rows=steer.client.ready_info["action_std_rows"],
+            n_proposals=int(args.kfk_proposals), temperature=float(args.kfk_temperature),
+            seed=int(args.seed) * 100003 + replan_idx))
+    return rec
+
+
+def _auth_lambda(planner, env, ctx, args, steer, stage_idx, replan_idx, default_chunk=None):
+    """(lambda, telemetry) for one replan. lambda 1.0 with no telemetry means 'unchanged arm'."""
+    mode = getattr(args, "kfk_authority", "off")
+    if mode == "off":
+        return 1.0, None
+    if mode == "const":
+        lam = float(args.kfk_lambda_const)
+        return lam, {"auth_mode": mode, "auth_lambda": round(lam, 5)}
+    rule = _auth_rule(args)
+    rec = _auth_signals(planner, env, ctx, args, steer, replan_idx, {rule.signal},
+                        default_chunk=default_chunk)
+    value = rec["u_mm"] if rule.signal == "kp_dispersion" else rec["c_task"]
+    lam, z = rule.lam(value, stage_idx, mode)
+    rec.update({"auth_mode": mode, "auth_signal": rule.signal, "auth_value": round(value, 5),
+                "auth_z": round(z, 5), "auth_lambda": round(lam, 5)})
+    return lam, rec
+
+
+def _auth_expert_plan(args, steer, env, rows):
+    """The proxy's default plan for a lambda = 0 replan, and the replan-index bookkeeping.
+
+    Byte-identical to `--steer expert`: same server-side seed, same observation, same chain. The
+    particle draw is skipped entirely, so the global RNG stream is also left where the expert arm
+    would have left it.
+    """
+    from .steering.authority import default_chain
+    chain, server_s = default_chain(steer.client, seed=int(args.seed) * 100003 + steer.replan_idx,
+                                    num_iterations=args.num_steps + 1, env=env)
+    steer.replan_idx += 1
+    steer.level_trace = []
+    return np.array(chain[:rows], dtype=np.float32, copy=True), server_s
+
+
 def keypose_fk_chunk(planner, env, ctx, args, stage_key, steer, out=None):
     """Cory's keypose FK steering: the trained policy denoises, a keypose-row cost steers it.
 
-    Inverted direction, like --steer policy_base, but the steering signal is no longer a whole
-    MBD step: it is a cost-weighted mean over a proposal cloud around the KEYPOSE ROW only,
-    resampled across particles by a Feynman-Kac potential and KL-capped before it is applied.
-    See steering/keypose_fk.py for the per-step algorithm and the three adaptations.
+    Two branches, selected by --kfk_guidance_mode.
+
+    `endpoint_particles` is what we shipped and is his ABLATION: a cost-weighted mean over a
+    proposal cloud on the goal rows, resampled across particles by a Feynman-Kac potential and
+    KL-capped before it is applied.
+
+    `flow_score_averaging` is his production path. Particles are independent (no resampling, no
+    KL cap); the cloud's cost-weighted mean is blended into the policy's clean chunk PER BLOCK at
+    separate coefficients; the executable rows are then pulled toward one near goal row by a
+    clipped L1 step, which is the only channel from the steered keypose to the rows that execute;
+    and the population collapses by a categorical draw rather than an argmin.
+
+    See steering/keypose_fk.py for the per-step algorithm and the three standing adaptations.
     """
     from .steering import keypose_fk as kfk
     from .steering.chunk_cost import chunk_costs
 
-    del stage_key
     q0 = env.q0()
     state = torch.zeros(8, dtype=torch.float32)
     state[:7] = q0
@@ -416,16 +553,40 @@ def keypose_fk_chunk(planner, env, ctx, args, stage_key, steer, out=None):
     # alone. Perturbing one row of sixteen barely moves a cost that reduces over rows.
     goal_slice = (slice(action_rows, keypose_row + 1) if args.kfk_goal_block == "on"
                   else slice(keypose_row, keypose_row + 1))
+    flow_avg = getattr(args, "kfk_guidance_mode", "endpoint_particles") == "flow_score_averaging"
+    reentry = getattr(args, "kfk_reentry", "frozen_eps") == "recompute_eps"
+    # Bounds on both the policy's clean chunk and the proposal cloud. His come from the dataset's
+    # action_min/action_max, so a proposal can never leave the support the model was trained on;
+    # ours ship mean/std only, in which case this is the +/-4 sigma box the mode always used.
+    lower, upper, box_src = kfk.proposal_box(args.proxy_checkpoint, steer._mean, steer._std)
+
+    # Per-replan authority, resolved BEFORE begin_replan so the signal's draws and the default
+    # chain's seed both read the pre-increment replan index the expert arm uses. lambda == 0 exits
+    # here, which is what makes that branch an identity rather than a low-gain approximation.
+    lam, auth_rec = _auth_lambda(planner, env, ctx, args, steer,
+                                 stage_key[0] if stage_key else 0, steer.replan_idx)
+    if lam <= 0.0:
+        plan, server_s = _auth_expert_plan(args, steer, env, action_rows)
+        rec = {"kfk_mode": args.kfk_guidance_mode, "kfk_authority_skip": True,
+               "kfk_proxy_chain_s": round(server_s, 3)}
+        rec.update(auth_rec or {})
+        return plan, {}, rec, None
 
     steer.begin_replan(env, args.num_steps + 1)
-    x = torch.randn(p, rows, 8)
     gen = torch.Generator().manual_seed(int(args.seed) * 7919 + steer.replan_idx)
+    # H3. endpoint_particles keeps the GLOBAL draw so it stays bitwise identical to every run
+    # already on disk; flow_score_averaging seeds from the per-replan generator, without which a
+    # --seed does not reproduce a rollout.
+    x = torch.randn(p, rows, 8, generator=gen) if flow_avg else torch.randn(p, rows, 8)
     # q0 in MODEL space, so the straight-line path the action rows are pulled along is expressed
     # in the same units as the chunk. demo_delta centres the arm at 0, so q0 maps to the origin.
     q0_model = torch.zeros(8, dtype=torch.float32)
+    row_std = _kfk_row_std(planner, rows)
+    prev_kp = _kfk_prev_keypose(steer, stage_key)
 
     ess_trace, kl_trace, n_resample = [], [], 0
     spread, rel_spread = [], []
+    prop_ess, kp_disp, l1_disp, l1_rows, last_pol = [], [], [], [], []
     stats = {}
     for it in range(args.num_steps + 1):
         alpha, _ = ddim_iteration_alphas(
@@ -444,7 +605,8 @@ def keypose_fk_chunk(planner, env, ctx, args, stage_key, steer, out=None):
             sigma = float(args.kfk_proposal_std) * max(
                 math.sqrt(max(1.0 - float(alpha), 0.0)), 0.1)
 
-        guided_chunks, potentials = [], []
+        guided_chunks, potentials, level_pol = [], [], []
+        slot_potential, slot_parent = [], []
         for i in range(p):
             # C4: rank on the model's clean prediction, not on x_{t-1}. Under --kfk_clean_rank
             # off this reproduces the old (buggy) behaviour bitwise for A/B.
@@ -453,97 +615,215 @@ def keypose_fk_chunk(planner, env, ctx, args, stage_key, steer, out=None):
                 x_pol = _st["x0_hat"][0]
             else:
                 x_pol = steer.policy_step(x[i : i + 1], it, args.num_steps + 1)[0]
+            if flow_avg:
+                x_pol = torch.clamp(x_pol, lower, upper)       # his policy_clean clamp
             proposals = kfk.sample_proposals(
-                x_pol[goal_slice], sigma, int(args.kfk_proposals), gen)
+                x_pol[goal_slice], sigma, int(args.kfk_proposals), gen, lower, upper)
+            if flow_avg:
+                # Proposal 0 is the unperturbed centre, so the guidance self-disables when the
+                # policy is already right. Overwriting after the draw leaves the other proposals,
+                # and the generator stream, exactly as they were.
+                proposals[0] = x_pol[goal_slice]
             # Each proposal is a full chunk that differs from the policy's only in the GOAL rows,
             # so the cost sees a complete, decodable trajectory. Under --kfk_goal_block those are
             # the AWE waypoints AND the keypose, which is what Cory's method perturbs; the default
             # is the keypose row alone, as shipped.
             cand = x_pol.unsqueeze(0).repeat(int(args.kfk_proposals), 1, 1)
             cand[:, goal_slice] = proposals
-            dec = decode_model_action_chunks(planner.policy, inputs, cand, apply_clamp=True,
+            # The rate-limit clamp collapses a wide cloud onto the clamp box BEFORE it is costed,
+            # so the ranking sees fewer distinct trajectories than were proposed. The goal rows are
+            # planning tokens that never execute, so under flow averaging they are costed raw;
+            # endpoint_particles keeps the clamp for comparability with every run on disk.
+            dec = decode_model_action_chunks(planner.policy, inputs, cand,
+                                             apply_clamp=not flow_avg,
                                              current_joint_pos=q0, max_joint_delta=args.delta_clip)
-            costs = chunk_costs(planner, dec.real_actions.detach().cpu().numpy(), ctx,
+            real = dec.real_actions.detach().cpu().numpy()
+            costs = chunk_costs(planner, real, ctx,
                                 bucket=args.kfk_cost_bucket, ranker=args.kfk_ranker,
                                 keypose_row=keypose_row, action_rows=action_rows)
-            guided_kp, potential = kfk.guided_from_costs(proposals, costs, args.kfk_temperature)
+            c = torch.as_tensor(costs, dtype=torch.float32).reshape(-1)
+            if flow_avg:
+                pen = kfk.consistency_penalty(real[:, keypose_row], prev_kp,
+                                              args.kfk_consistency_weight)
+                if pen is not None:
+                    c = c + pen
             # Does the cost actually separate the cloud? A near-zero spread means the softmax is
             # uniform and the "guided" keypose is just the cloud's mean -- guidance in name only.
-            c = torch.as_tensor(costs, dtype=torch.float32).reshape(-1)
             spread.append(float(c.max() - c.min()))
             rel_spread.append(float((c.std() / c.abs().mean().clamp(min=1e-6))))
+            weights, ess_cloud, _ = kfk.cost_weights(c, args.kfk_temperature)
+            prop_ess.append(ess_cloud)
 
-            delta, applied_kl = kfk.kl_capped(
-                guided_kp - x_pol[goal_slice], sigma, float(args.kfk_max_kl))
-            guided = x_pol.clone()
-            guided[goal_slice] = x_pol[goal_slice] + delta
-            # H6: the pull is meant to move EXECUTABLE rows toward the goal; passing keypose_row
-            # let it overwrite the AWE waypoint rows that sit between actions and key-pose.
-            guided = kfk.action_l1_pull(guided, keypose_row, q0_model,
-                                        float(args.kfk_action_l1_step), action_rows=action_rows)
+            if flow_avg:
+                mbd = (weights.view(-1, *([1] * (proposals.ndim - 1))) * proposals).sum(dim=0)
+                guided = x_pol.clone()
+                guided[goal_slice] = kfk.blend_goal_block(
+                    x_pol[goal_slice], mbd, args.kfk_gamma_traj, args.kfk_gamma_keypose)
+                # The pull aims at ONE goal row, chosen by how far its decoded TCP sits from the
+                # arm's own. Selecting on the BLENDED chunk is deliberate: the row it targets is
+                # the steered one, which is what makes this the transmission channel.
+                g_real = decode_model_action_chunks(
+                    planner.policy, inputs, guided.unsqueeze(0), apply_clamp=False,
+                    current_joint_pos=q0).real_actions[0]
+                tcp = _kfk_tcp(planner, ctx,
+                               torch.cat([q0.reshape(1, 7).to(g_real.dtype),
+                                          g_real[action_rows : keypose_row + 1, :7]], dim=0))
+                tgt_rel, _thr = kfk.select_goal_row(tcp[1:], tcp[0], args.kfk_l1_wrist_m,
+                                                    args.kfk_l1_wrist_fallback_m)
+                l1 = float(args.kfk_gamma_action) * kfk.l1_step_to_row(
+                    guided, action_rows + tgt_rel, action_rows, args.kfk_action_l1_step)
+                guided[:action_rows] = guided[:action_rows] + l1
+                guided = torch.clamp(guided, lower, upper)
+                l1_disp.append(float((l1[:, :7].abs() * row_std[:action_rows, :7]).max()))
+                l1_rows.append(action_rows + tgt_rel)
+                applied_kl = 0.0                              # no KL cap under flow averaging
+            else:
+                guided_kp, potential = kfk.guided_from_costs(
+                    proposals, costs, args.kfk_temperature)
+                delta, applied_kl = kfk.kl_capped(
+                    guided_kp - x_pol[goal_slice], sigma, float(args.kfk_max_kl))
+                # Authority scales BOTH channels the guidance reaches the plan through: the
+                # goal-row displacement, and the exponent of the Feynman-Kac potential that
+                # decides which particles survive. Scaling only the first would leave a
+                # low-authority replan still resampled entirely by the cost.
+                if lam != 1.0:
+                    delta = lam * delta
+                    applied_kl = applied_kl * lam * lam
+                    potential = lam * potential
+                guided = x_pol.clone()
+                guided[goal_slice] = x_pol[goal_slice] + delta
+                # H6: the pull is meant to move EXECUTABLE rows toward the goal; passing
+                # keypose_row let it overwrite the AWE waypoint rows between actions and key-pose.
+                guided = kfk.action_l1_pull(guided, keypose_row, q0_model,
+                                            float(args.kfk_action_l1_step),
+                                            action_rows=action_rows)
+                potentials.append(potential)
+            kp_disp.append((guided[keypose_row, :7] - x_pol[keypose_row, :7]).abs()
+                           * row_std[keypose_row, :7])
+            level_pol.append(x_pol)
+
             # C4: both siblings re-enter the chain through the proxy's own DDIM operator, so the
             # guidance is integrated in the parameterisation it was applied in.
-            if getattr(args, "kfk_clean_rank", "on") == "on":
-                pure_next = steer.redo_ddim(x_pol.unsqueeze(0))[0]
-                guided_next = steer.redo_ddim(guided.unsqueeze(0))[0]
+            if flow_avg:
+                guided_chunks.append(steer.redo_ddim(guided.unsqueeze(0),
+                                                     recompute_eps=reentry)[0])
+            elif getattr(args, "kfk_clean_rank", "on") == "on":
+                pure_next = steer.redo_ddim(x_pol.unsqueeze(0), recompute_eps=reentry)[0]
+                guided_next = steer.redo_ddim(guided.unsqueeze(0), recompute_eps=reentry)[0]
                 guided_chunks.append(torch.stack([pure_next, guided_next]))
             else:
                 guided_chunks.append(torch.stack([x_pol, guided]))
-            potentials.append(potential)
             kl_trace.append(applied_kl)
 
-        ess_now = kfk.ess_of(potentials)
-        ess_trace.append(round(ess_now, 2))
-        parents = kfk.resample_parents(potentials, p, gen)
-        n_resample += 1
-
-        # Paired children: half continue the pure policy, half the guided chunk, so resampling
-        # cannot collapse the population onto guidance alone.
-        nxt = torch.empty_like(x)
-        slot_potential, slot_parent = [], []
-        if args.kfk_paired == "on":
-            # F4. Slots used to draw parents INDEPENDENTLY and then let slot parity decide
-            # pure-vs-guided, so slot 2i and 2i+1 were usually descendants of different particles
-            # and the "paired" comparison confounded the intervention with a different base sample.
-            # Draw P//2 parents and give each one both children.
-            half = kfk.resample_parents(potentials, max(p // 2, 1), gen).tolist()
-            for j in range(p):
-                parent = half[(j // 2) % len(half)]
-                nxt[j] = guided_chunks[parent][0 if j % 2 == 0 else 1]
-                slot_potential.append(potentials[parent])
-                slot_parent.append(parent)
+        if flow_avg:
+            # Independent particles: no potential, no resampling, so the population weight stays
+            # uniform and its ESS is the particle count by construction.
+            x = torch.stack(guided_chunks)
+            ess_trace.append(round(float(p), 2))
+            slot_parent = list(range(p))
         else:
-            for slot, parent in enumerate(parents.tolist()):
-                nxt[slot] = guided_chunks[parent][1]
-                slot_potential.append(potentials[parent])
-                slot_parent.append(parent)
-        x = nxt
+            ess_now = kfk.ess_of(potentials)
+            ess_trace.append(round(ess_now, 2))
+            parents = kfk.resample_parents(potentials, p, gen)
+            n_resample += 1
+
+            # Paired children: half continue the pure policy, half the guided chunk, so resampling
+            # cannot collapse the population onto guidance alone.
+            nxt = torch.empty_like(x)
+            if args.kfk_paired == "on":
+                # F4. Slots used to draw parents INDEPENDENTLY and then let slot parity decide
+                # pure-vs-guided, so slot 2i and 2i+1 were usually descendants of different
+                # particles and the "paired" comparison confounded the intervention with a
+                # different base sample. Draw P//2 parents and give each one both children.
+                half = kfk.resample_parents(potentials, max(p // 2, 1), gen).tolist()
+                for j in range(p):
+                    parent = half[(j // 2) % len(half)]
+                    nxt[j] = guided_chunks[parent][0 if j % 2 == 0 else 1]
+                    slot_potential.append(potentials[parent])
+                    slot_parent.append(parent)
+            else:
+                for slot, parent in enumerate(parents.tolist()):
+                    nxt[slot] = guided_chunks[parent][1]
+                    slot_potential.append(potentials[parent])
+                    slot_parent.append(parent)
+            x = nxt
+        last_pol = level_pol
 
     # F5. Selection used the potential INHERITED from the parent, so pure and guided siblings
     # carried the same score even when their final chunks differed. Re-cost the actual final
     # candidates and pick among those.
-    _fin = decode_model_action_chunks(planner.policy, inputs, x, apply_clamp=True,
+    _fin = decode_model_action_chunks(planner.policy, inputs, x, apply_clamp=not flow_avg,
                                       current_joint_pos=q0, max_joint_delta=args.delta_clip)
-    _fc = chunk_costs(planner, _fin.real_actions.detach().cpu().numpy(), ctx,
+    _fin_real = _fin.real_actions.detach().cpu().numpy()
+    _fc = chunk_costs(planner, _fin_real, ctx,
                       bucket=args.kfk_cost_bucket, ranker=args.kfk_ranker,
                       keypose_row=keypose_row, action_rows=action_rows)
     _fc = np.asarray(_fc, dtype=np.float64).reshape(-1)
-    best = int(np.argmin(_fc)) if np.isfinite(_fc).all() else int(np.argmax(slot_potential))
+    select_ess = None
+    if flow_avg:
+        pen = kfk.consistency_penalty(_fin_real[:, keypose_row], prev_kp,
+                                      args.kfk_consistency_weight)
+        if pen is not None:
+            _fc = _fc + np.asarray(pen, dtype=np.float64).reshape(-1)
+    if not np.isfinite(_fc).all():
+        best = int(np.argmax(slot_potential)) if slot_potential else 0
+    elif args.kfk_final_select == "softmax":
+        best, select_ess = kfk.draw_index(_fc, args.kfk_temperature, gen)
+    else:
+        best = int(np.argmin(_fc))
     x_t = x[best : best + 1]
     if out is not None:
         out["x_final"] = x_t.detach().clone()
+        # The keypose PAIR this replan chose between, in real joint space: what the policy alone
+        # predicted, and what selection actually kept. Their difference is the steering
+        # displacement -- the thing a keypose visualisation has to show, and the only place both
+        # halves exist at once. Written only when a caller asks for `out`, so the rollout path
+        # (out=None) is untouched and pays nothing.
+        out["kp_selected"] = np.asarray(_fin_real[best, keypose_row], dtype=np.float32)
+        if last_pol:
+            _pol_idx = slot_parent[best] if slot_parent else best
+            out["kp_policy"] = decode_model_action_chunks(
+                planner.policy, inputs, last_pol[_pol_idx].unsqueeze(0), apply_clamp=True,
+                current_joint_pos=q0, max_joint_delta=args.delta_clip
+            ).real_actions[0, keypose_row].detach().cpu().numpy().astype(np.float32)
     dec = decode_model_action_chunks(planner.policy, inputs, x_t, apply_clamp=True,
                                      current_joint_pos=q0, max_joint_delta=args.delta_clip)
     # The keypose is a PLANNING token, not an action: drop it before the controller sees the
     # plan, or a large spi would command the arm straight to the phase-end pose.
     plan = dec.real_actions[0, :action_rows].detach().cpu().numpy()
+    steer._kfk_prev_kp = np.asarray(_fin_real[best, keypose_row], dtype=np.float32)
+    # Transmission, measured rather than assumed: how far the executed rows sit from the rows the
+    # policy alone would have produced at the last level. The square null was a transmission
+    # failure, so an arm whose act_disp is ~0 is steering nothing whatever its kp_disp says.
+    act_disp = 0.0
+    if last_pol:
+        pol_idx = slot_parent[best] if slot_parent else best
+        pol_real = decode_model_action_chunks(
+            planner.policy, inputs, last_pol[pol_idx].unsqueeze(0), apply_clamp=True,
+            current_joint_pos=q0, max_joint_delta=args.delta_clip
+        ).real_actions[0, :action_rows, :7].detach().cpu().numpy()
+        act_disp = float(np.abs(pol_real - plan[:, :7]).max())
+    kp_stack = torch.stack(kp_disp) if kp_disp else torch.zeros(1, 7)
     rec = {"kfk_particles": p, "kfk_best": best, "kfk_resamples": n_resample,
            "kfk_ess_mean": round(float(np.mean(ess_trace)), 2),
            "kfk_ess_trace": ess_trace,
            "kfk_kl_mean": round(float(np.mean(kl_trace)), 4),
            "kfk_kl_max": round(float(np.max(kl_trace)), 4),
            "kfk_cost_spread": round(float(np.mean(spread)), 4),
-           "kfk_cost_relspread": round(float(np.mean(rel_spread)), 4)}
+           "kfk_cost_relspread": round(float(np.mean(rel_spread)), 4),
+           "kfk_mode": args.kfk_guidance_mode,
+           "kfk_prop_ess_mean": round(float(np.mean(prop_ess)), 2),
+           "kfk_prop_ess_min": round(float(np.min(prop_ess)), 2),
+           "kfk_prop_ess_frac": round(float(np.mean(prop_ess)) / max(args.kfk_proposals, 1), 4),
+           "kfk_kp_disp_max": round(float(kp_stack.max()), 5),
+           "kfk_kp_disp_mean": round(float(kp_stack.mean()), 5),
+           "kfk_kp_disp": np.round(kp_stack.mean(dim=0).numpy(), 5).tolist(),
+           "kfk_act_disp_max": round(act_disp, 5),
+           "kfk_l1_step_max": round(float(np.max(l1_disp)), 5) if l1_disp else 0.0,
+           "kfk_l1_target_row": int(np.median(l1_rows)) if l1_rows else None,
+           "kfk_box": box_src,
+           "kfk_select_ess": None if select_ess is None else round(select_ess, 2)}
+    rec.update(auth_rec or {})
     return plan, stats, rec, None
 
 
@@ -718,13 +998,27 @@ def _build_steering(args, planner):
                 f"--steer keypose_fk executes only {rows} of --horizon {args.horizon} rows (the "
                 f"keypose row is a planning token, not an action); --spi {args.spi} overruns it. "
                 f"Use --spi <= {rows}, or --horizon {int(args.spi) + 1}.")
+        if (args.kfk_guidance_mode == "flow_score_averaging"
+                and getattr(args, "kfk_clean_rank", "on") != "on"):
+            # Flow averaging blends CLEAN chunks; --kfk_clean_rank off hands it x_{t-1} instead,
+            # so the blend and the re-entry would run in different parameterisations.
+            raise SystemExit("--kfk_guidance_mode flow_score_averaging requires "
+                             "--kfk_clean_rank on (it blends clean endpoints, not iterates)")
+        if (getattr(args, "kfk_authority", "off") != "off"
+                and args.kfk_guidance_mode == "flow_score_averaging"):
+            # Only the endpoint branch has a KL-capped displacement and a Feynman-Kac potential
+            # for lambda to scale. Under flow averaging a fractional lambda would silently do
+            # nothing, which is worse than refusing.
+            raise SystemExit("--kfk_authority is defined for --kfk_guidance_mode "
+                             "endpoint_particles only (flow averaging has no KL-capped "
+                             "displacement and no particle potential to temper)")
     if args.kp and args.steer in ("inject", "proxy_only"):
         raise SystemExit(f"--steer {args.steer} does not support --kp: it writes whole candidates "
                          "into the sampler, which would overwrite the waypoint rows")
     if not args.proxy_checkpoint:
         raise SystemExit("--steer needs --proxy_checkpoint")
     from .steering.proxy import (AdditiveScoreSteering, ProxyScoreClient, ProxySteering,
-                                 TASK_PROMPTS)
+                                 TASK_PROMPTS, norm_stats_mismatch)
     prompt = args.proxy_prompt or TASK_PROMPTS.get(args.task)
     if prompt is None:
         raise SystemExit(f"No trained-proxy prompt for task {args.task!r}; pass --proxy_prompt")
@@ -768,8 +1062,27 @@ def _build_steering(args, planner):
                 f"s_task - s_ref is meaningless. Regenerate the reference with the SAME "
                 f"--action_norm as the task proxy so it ships action_norm_stats.json, or pass "
                 f"--ref_action_norm_stats explicitly.")
-        print(f"{LOG} reference proxy on {args.ref_device} (action_norm={r_norm}, matched)",
-              flush=True)
+        # C1b. Matching the NAME is not matching the coordinate system. task_bc_square_n190_pooled
+        # and ref_square_v2 both report "demo_delta" and both pass the check above, yet the task
+        # proxy centres the gripper at 0.5 and the reference at 0.0 (1 sigma apart in its own
+        # normalised units) with arm scales up to 4% apart. score_addend now bridges each proxy
+        # with its OWN stats, so a mismatch is no longer silently wrong -- but it still means the
+        # two models were trained on different action parameterisations, so refuse by default.
+        bad = norm_stats_mismatch(client.ready_info, ref_client.ready_info)
+        if bad and getattr(args, "allow_ref_stats_mismatch", "off") != "on":
+            raise SystemExit(
+                "Task and reference proxies ship different action_norm_stats:\n  "
+                + "\n  ".join(bad)
+                + f"\n  task ckpt: {args.proxy_checkpoint}\n  ref  ckpt: {args.ref_checkpoint}\n"
+                  "Regenerate the reference against the task proxy's stats, or pass "
+                  "--allow_ref_stats_mismatch on (each proxy is then bridged with its own "
+                  "stats, which is correct in score space but still compares two models "
+                  "trained on different action parameterisations).")
+        if bad:
+            print(f"{LOG} WARNING reference stats differ from the task proxy's; each is bridged "
+                  f"with its own stats: {'; '.join(bad[:4])}", flush=True)
+        print(f"{LOG} reference proxy on {args.ref_device} (action_norm={r_norm}, "
+              f"stats {'MISMATCHED' if bad else 'matched'})", flush=True)
     if args.steer in ("additive", "policy_base", "keypose_fk", "proxy_pair", "vls"):
         # policy_base reuses this class for its space bridge and per-level score access; the
         # gamma here is the blend toward MBD, not a score addend.
@@ -778,7 +1091,8 @@ def _build_steering(args, planner):
                                       score_cap=args.proxy_score_cap, seed=args.seed,
                                       at=args.proxy_score_at, ref=args.steer_ref,
                                       ref_client=ref_client,
-                                      last_level=args.steer_last_level)
+                                      last_level=args.steer_last_level,
+                                      aux=getattr(args, "proxy_aux", "pad"))
         steer.mode = args.steer
     else:
         steer = ProxySteering(args.steer, client, rho=args.inject_rho,
@@ -798,9 +1112,36 @@ def _build_perturb(args, source):
                         args.perturb_obj, args.seed, source.movable)
 
 
+def _apply_tray_goal(args, env):
+    """Pin the tray episode's commanded goal, and the marker that stands for it.
+
+    Without this the tray env keeps its default tray-centre goal on every seed, so both the GT
+    ladder and any marker-anchored plan would aim at the same point in all episodes. Called
+    after `env.reset` and before `bridge.reset`, which is when the grounding reads `raw.goal`.
+    """
+    spec = getattr(args, "tray_goal", None)
+    if not spec:
+        return None
+    local = np.asarray([float(v) for v in str(spec).split(",")], dtype=np.float64)
+    if local.shape != (2,):
+        raise SystemExit(f"{LOG} --tray_goal wants 'x,y' in tray-local metres, got {spec!r}")
+    raw = env.raw
+    goal = raw.to_world(local)
+    raw.set_goal(goal)
+    if getattr(args, "tray_marker", "off") == "on":
+        raw.set_marker(goal)
+    print(f"{LOG} tray goal local={local.round(4).tolist()} world={goal.round(4).tolist()} "
+          f"marker={args.tray_marker}", flush=True)
+    return goal
+
+
 def _setup(args):
     """Build all episode components in dependency order."""
-    env = MuJoCoEnv(args.hdf5, args.fk_fit, visual_only_render=args.visual_only_render == "on")
+    # The tray's marker disc is a scene option the recorded dataset predates, so it is requested
+    # through the env-kwargs hook rather than baked into the task.
+    extra = {"marker": True} if getattr(args, "tray_marker", "off") == "on" else None
+    env = MuJoCoEnv(args.hdf5, args.fk_fit, visual_only_render=args.visual_only_render == "on",
+                    env_kwargs_extra=extra)
     with open(args.config, encoding="utf-8") as fh:
         cfg = yaml.safe_load(fh)
     apply_planner_config(args, cfg)
@@ -810,6 +1151,15 @@ def _setup(args):
     bridge = MGBridge(source, cfg, task_key=args.task, device="cpu")
     planner = build_planner(args, env.fk_fit, kp_cfg)
     bridge.attach_cost(planner)
+    # DDRS is attached AFTER the cost, because it tilts that cost's own softmax rather than
+    # entering it as a term. None unless a checkpoint is passed, so every run without the flag
+    # takes the untouched path.
+    if getattr(args, "ddrs_checkpoint", None):
+        from sim_free_mpc.ddrs import DDRS
+        planner.ddrs = DDRS(args.ddrs_checkpoint, gamma=float(args.ddrs_gamma),
+                            device=getattr(args, "ddrs_device", "cpu"))
+        print(f"{LOG} ddrs: gamma={planner.ddrs.gamma} rows={planner.ddrs.meta['chunk_rows']} "
+              f"<- {args.ddrs_checkpoint}", flush=True)
     if kp_cfg is not None:
         planner.cost = guard_cost(KPCost(planner.cost, kp_cfg))
     # A bug Codex did not report. Measured on square with --ground rekep: the template attaches
@@ -847,6 +1197,7 @@ def _setup(args):
 
     torch.manual_seed(args.seed if args.sampler_seed is None else args.sampler_seed)
     env.reset(seed=args.seed)
+    _apply_tray_goal(args, env)          # before bridge.reset: the ladder reads raw.goal
     planner.reset_episode()
     if beam is not None:
         beam.reset_episode()
@@ -857,9 +1208,20 @@ def _setup(args):
         ensemble = ChunkEnsemble(decay=args.ensemble_decay, keep=args.expert_ensemble)
         print(f"{LOG} temporal ensembling: keep {args.expert_ensemble} chunks, "
               f"decay {args.ensemble_decay}", flush=True)
+    supervisor = None
+    if getattr(args, "supervisor", "off") == "on":
+        from .steering import supervisor as supv
+        if steer is None or steer.mode != "expert":
+            raise SystemExit("--supervisor on supervises the expert: pass --steer expert")
+        supervisor = supv.build(args, env, bridge)
+        print(f"{LOG} supervisor: W={args.supv_stall_w} dwell={args.supv_dwell} "
+              f"retries {args.supv_max_retry_phase}/phase {args.supv_max_retry_episode}/ep "
+              f"base_fallback={args.supv_base_fallback} "
+              f"(<={args.supv_base_max_chunks} chunks x {args.supv_max_recoveries})", flush=True)
     return types.SimpleNamespace(env=env, source=source, bridge=bridge, planner=planner,
                                  kp_cfg=kp_cfg, beam=beam, steer=steer, client=client, vls=vls,
-                                 ensemble=ensemble, perturb=_build_perturb(args, source))
+                                 ensemble=ensemble, supervisor=supervisor,
+                                 perturb=_build_perturb(args, source))
 
 
 def _episode_summary(args, s, replan_s, episode_s, success, stage_max, handoff=None):
@@ -875,6 +1237,18 @@ def _episode_summary(args, s, replan_s, episode_s, success, stage_max, handoff=N
         "objects_final": record.object_snapshot(s.env, s.source.movable),
         "held_final": s.bridge.world.held(),
     }
+    # Semantic goal selection, when the grounding performed one (mujoco_eval.grounding.
+    # goal_select publishes its receipt on the source). Absent otherwise, and every reader --
+    # wandb_log.summarize included -- simply sees nothing.
+    receipt = getattr(s.source, "goal_selection", None)
+    if isinstance(receipt, dict):
+        final.update({
+            "goal_select_selected": receipt.get("selected"),
+            "goal_select_margin_m": receipt.get("margin_m"),
+            "goal_select_correct": receipt.get("selection_correct"),
+            "goal_select_matches_oracle": receipt.get("matches_oracle_bitwise"),
+            "goal_select_plan_sha1": receipt.get("plan_sha1"),
+        })
     if args.interpolate == "on":
         final["interpolate"] = {"method": args.interpolation_method,
                                 "low": args.interpolate_frequency,
@@ -884,6 +1258,8 @@ def _episode_summary(args, s, replan_s, episode_s, success, stage_max, handoff=N
     if s.perturb is not None:
         final["perturb"] = s.perturb.record()
         final["recovery"] = s.perturb.summary(success)
+    if getattr(s, "supervisor", None) is not None:
+        final["supervisor"] = s.supervisor.summary()
     if s.beam is not None:
         final["beam"] = {"k": s.beam.cfg.k, "warm": s.beam.cfg.warm,
                          "resample_every": s.beam.cfg.resample_every, "ema": s.beam.cfg.ema,
@@ -894,7 +1270,8 @@ def _episode_summary(args, s, replan_s, episode_s, success, stage_max, handoff=N
                        "warm_start": s.kp_cfg.warm_start}
     if s.steer is not None:
         if args.steer == "additive":
-            mech = {"gamma": args.steer_gamma}
+            mech = {"gamma": args.steer_gamma,
+                    "proxy_aux": getattr(args, "proxy_aux", "pad")}
         elif args.steer == "policy_base":
             # Record the coefficient each block actually used, not the flags: an arm whose gamma
             # is not in its own telemetry cannot be attributed later.
@@ -910,6 +1287,12 @@ def _episode_summary(args, s, replan_s, episode_s, success, stage_max, handoff=N
                     "keypose_row": rows - 1 if args.keypose_row is None else args.keypose_row,
                     "traj_start_row": rows // 2 if args.traj_start_row is None
                     else args.traj_start_row}
+        elif args.steer == "keypose_fk":
+            # Every kfk_* knob, resolved. Four of them default differently per guidance mode, so
+            # the flag line alone does not say what an arm ran; the record has to.
+            mech = {k: getattr(args, k) for k in sorted(vars(args)) if k.startswith("kfk_")}
+            mech["keypose_row"] = (args.horizon - 1 if args.keypose_row is None
+                                   else args.keypose_row)
         else:
             mech = {"rho": args.inject_rho, "schedule": args.inject_schedule}
         final["steer"] = {"mode": args.steer, **mech,
@@ -924,6 +1307,13 @@ def _replan(args, s, step, log, dt):
     """Advance the stage, infer a plan, filter it, and record telemetry."""
     prev_stage = s.bridge.stage_idx
     s.bridge.advance({})
+    sup = getattr(s, "supervisor", None)
+    base_drive = sup is not None and sup.drive == "base"
+    if sup is not None and sup.pin_stage is not None:
+        # A recovery pursues ONE milestone: hold the ladder on the stage that owns it, so the
+        # base cannot wander into the rest of the task while it has authority.
+        from .steering.supervisor import pin_bridge_stage
+        pin_bridge_stage(s.bridge, sup.pin_stage)
     if s.bridge.stage_idx != prev_stage:
         log.stage(step, prev_stage, s.bridge)
     ctx = s.bridge.context(s.env, {}, dt)
@@ -937,7 +1327,11 @@ def _replan(args, s, step, log, dt):
 
     t0 = time.perf_counter()
     beam_rec, w_plan, select_rec = None, None, None
-    if s.steer is not None and s.steer.mode == "keypose_fk":
+    if base_drive:
+        # The MBD base drives this chunk, with the proxy loaded but silent: steer=None is the
+        # unsteered base path exactly as arm 1 runs it.
+        plan, stats, w_plan = infer_chunk(s.planner, s.env, ctx, args, stage_key=stage_key)
+    elif s.steer is not None and s.steer.mode == "keypose_fk":
         plan, stats, select_rec, w_plan = keypose_fk_chunk(
             s.planner, s.env, ctx, args, stage_key, s.steer)
     elif s.steer is not None and s.steer.mode == "fk":
@@ -952,6 +1346,13 @@ def _replan(args, s, step, log, dt):
         state = torch.zeros(8, dtype=torch.float32)
         state[:7] = q0
         plan, select_rec = verify_chunk(s.planner, s.env, ctx, args, plan, s.steer, {"state": state})
+    elif (s.steer is not None and s.steer.mode == "expert"
+          and int(getattr(args, "expert_best_of", 0)) >= 1):
+        # Opt-in: 0 (default) leaves the expert short-circuit in infer_chunk untouched. 1 enters
+        # this path but draws nothing extra, so it executes the same chunk through the new code --
+        # the control that separates a selection effect from a code-path effect.
+        from .steering.best_of import best_of_chunk
+        plan, stats, select_rec = best_of_chunk(s.planner, s.env, ctx, args, s.bridge, s.steer)
     elif s.beam is None:
         plan, stats, w_plan = infer_chunk(s.planner, s.env, ctx, args, stage_key=stage_key,
                                       vls=getattr(s, 'vls', None),
@@ -962,11 +1363,28 @@ def _replan(args, s, step, log, dt):
         plan, stats, beam_rec = s.beam.replan(infer, s.env, ctx, stage_key)
     wall_s = time.perf_counter() - t0
 
-    if s.steer is None or s.steer.mode not in ("expert", "verify"):
+    if base_drive or s.steer is None or s.steer.mode not in ("expert", "verify"):
         plan, _ = s.bridge.filter_plan(plan, args.spi)
     s.bridge.observe_plan(plan)
 
     rec = log.replan(step, s.bridge, s.env, stats, wall_s, s.source.movable)
+    if sup is not None:
+        rec["supv_drive"] = sup.drive
+        rec["supv_phase"] = sup.phase
+        probe = sup.retry_probe(s.steer, s.env, args.num_steps + 1, plan)
+        if probe is not None:
+            rec.update(probe)
+    if getattr(args, "authority_diag", "off") != "off" and s.steer is not None:
+        # Calibration measurement, run AFTER the plan so it cannot reorder anything the plan
+        # depended on. `_x0_real` is the default chain begin_replan already fetched under
+        # --steer expert, so plan_cost costs the executed plan without a second server call.
+        _chain = getattr(s.steer, "_x0_real", None)
+        _want = {"kp_dispersion", "plan_cost"}
+        if args.authority_diag == "full":
+            _want.add("disagreement")
+        rec.update(_auth_signals(s.planner, s.env, ctx, args, s.steer,
+                                 max(s.steer.replan_idx - 1, 0), _want,
+                                 default_chunk=None if _chain is None else _chain[-1]))
     if beam_rec is not None:
         rec["beam"] = beam_rec
     if select_rec is not None:
@@ -1032,6 +1450,14 @@ def rollout(args):
             print(f"{LOG} handoff at step {step}: {was} -> {s.steer.mode} (nothing held)",
                   flush=True)
         if actions is None or step - start >= args.spi:
+            if s.supervisor is not None:
+                # Chunk-boundary supervision, BEFORE the replan: a retry has to change the seed
+                # the chunk about to be drawn will use, and an escalation has to change who draws
+                # it. Nothing here touches the plan itself.
+                for rec in s.supervisor.boundary(step, s.steer, s.bridge):
+                    log.write(rec)
+                    print(f"{LOG} supv {rec['event']} step={step} phase={rec['phase']} "
+                          f"drive={rec['drive']} why={rec.get('why', '')}", flush=True)
             plan, wall_s = _replan(args, s, step, log, dt=0 if actions is None else args.spi)
             replan_s.append(wall_s)
             stage_max = max(stage_max, s.bridge.stage_idx)
@@ -1091,6 +1517,9 @@ def rollout(args):
                    "lines": lambda i: [f"{args.task} | {args.exp}",
                                        f"step {i}/{len(states) - 1}"]}
     record.save_video(s.env, states, video_path, overlay=overlay)
+    if getattr(args, "save_states", "off") == "on":
+        np.save(paths.episode_path(out_dir, args.seed, success, "states", "npy"),
+                np.asarray(states, dtype=np.float64))
     print(f"{LOG} log:   {jsonl_path}", flush=True)
     print(f"{LOG} video: {video_path}", flush=True)
     return final
