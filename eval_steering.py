@@ -154,6 +154,7 @@ def _multi_worker_preparse(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--exp_name", default="eval")
     parser.add_argument("--seed_start", type=int, default=1)
     parser.add_argument("--seed_end", type=int, default=51)
+    parser.add_argument("--seeds", default=None)
     parser.add_argument("--task_num_steps", type=int, default=225)
     parser.add_argument("--workers", type=int, default=_DEFAULT_WORKERS)
     parser.add_argument("--gpus", default=_DEFAULT_GPUS)
@@ -193,6 +194,35 @@ def _split_seed_ranges(
         ranges.append((start, start + count))
         start += count
     return ranges
+
+
+def _parse_explicit_seeds(value: str) -> list[int]:
+    try:
+        seeds = [int(token) for token in value.split(",") if token.strip()]
+    except ValueError as exc:
+        raise ValueError(
+            f"--seeds must be a comma-separated list of integers, got {value!r}."
+        ) from exc
+    if not seeds:
+        raise ValueError("--seeds must contain at least one seed.")
+    if len(set(seeds)) != len(seeds):
+        raise ValueError("--seeds must not contain duplicates.")
+    return seeds
+
+
+def _split_seed_values(seeds: list[int], workers: int) -> list[list[int]]:
+    """Split an ordered explicit seed list into balanced, order-preserving groups."""
+    if not seeds:
+        raise ValueError("at least one seed is required.")
+    workers = min(workers, len(seeds))
+    base, remainder = divmod(len(seeds), workers)
+    groups = []
+    start = 0
+    for worker_id in range(workers):
+        count = base + (1 if worker_id < remainder else 0)
+        groups.append(seeds[start : start + count])
+        start += count
+    return groups
 
 
 def _emit_worker_progress(args: argparse.Namespace, event: str, **payload: Any) -> None:
@@ -323,16 +353,27 @@ def _run_multi_worker_launcher(pre_args: argparse.Namespace, argv: list[str]) ->
         return 2
     try:
         gpu_ids = _parse_gpu_ids(pre_args.gpus)
-        seed_ranges = _split_seed_ranges(
-            pre_args.seed_start, pre_args.seed_end, pre_args.workers
-        )
+        if pre_args.seeds is not None:
+            requested_seeds = _parse_explicit_seeds(pre_args.seeds)
+            explicit_seeds = True
+        else:
+            seed_ranges = _split_seed_ranges(
+                pre_args.seed_start, pre_args.seed_end, pre_args.workers
+            )
+            requested_seeds = [
+                seed
+                for seed_start, seed_end in seed_ranges
+                for seed in range(seed_start, seed_end)
+            ]
+            explicit_seeds = False
+        seed_groups = _split_seed_values(requested_seeds, pre_args.workers)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    if len(seed_ranges) < pre_args.workers:
+    if len(seed_groups) < pre_args.workers:
         print(
-            f"Using {len(seed_ranges)} workers because only {len(seed_ranges)} seeds were requested.",
+            f"Using {len(seed_groups)} workers because only {len(requested_seeds)} seeds were requested.",
             file=sys.stderr,
         )
 
@@ -360,6 +401,7 @@ def _run_multi_worker_launcher(pre_args: argparse.Namespace, argv: list[str]) ->
             "--worker-parent-pid",
             "--seed_start",
             "--seed_end",
+            "--seeds",
             "--exp_name",
             "--device",
         },
@@ -367,7 +409,9 @@ def _run_multi_worker_launcher(pre_args: argparse.Namespace, argv: list[str]) ->
 
     workers = []
     rollout_offset = 0
-    for worker_id, (worker_seed_start, worker_seed_end) in enumerate(seed_ranges):
+    for worker_id, worker_seeds in enumerate(seed_groups):
+        worker_seed_start = worker_seeds[0]
+        worker_seed_end = worker_seeds[-1] + 1
         gpu_id = gpu_ids[worker_id % len(gpu_ids)]
         progress_path = os.path.join(launcher_dir, f"worker_{worker_id:02d}.jsonl")
         log_path = os.path.join(launcher_dir, f"worker_{worker_id:02d}.log")
@@ -402,8 +446,10 @@ def _run_multi_worker_launcher(pre_args: argparse.Namespace, argv: list[str]) ->
             "--device",
             "cuda:0",
         ]
+        if explicit_seeds:
+            command.extend(("--seeds", ",".join(str(seed) for seed in worker_seeds)))
         bar = tqdm(
-            total=(worker_seed_end - worker_seed_start) * pre_args.task_num_steps,
+            total=len(worker_seeds) * pre_args.task_num_steps,
             desc=f"worker {worker_id + 1} gpu {gpu_id} initializing",
             position=worker_id,
             leave=True,
@@ -415,6 +461,7 @@ def _run_multi_worker_launcher(pre_args: argparse.Namespace, argv: list[str]) ->
                 "gpu": gpu_id,
                 "seed_start": worker_seed_start,
                 "seed_end": worker_seed_end,
+                "seeds": worker_seeds,
                 "rollout_offset": rollout_offset,
                 "progress_path": progress_path,
                 "progress_offset": 0,
@@ -428,7 +475,7 @@ def _run_multi_worker_launcher(pre_args: argparse.Namespace, argv: list[str]) ->
                 "bar": bar,
             }
         )
-        rollout_offset += worker_seed_end - worker_seed_start
+        rollout_offset += len(worker_seeds)
 
     def terminate_workers() -> None:
         # A worker that is blocked waiting on the start barrier is inside Isaac Sim, which
@@ -459,7 +506,7 @@ def _run_multi_worker_launcher(pre_args: argparse.Namespace, argv: list[str]) ->
             tail = []
         print(
             f"worker {worker['id']} (gpu {worker['gpu']}, seeds "
-            f"{worker['seed_start']}-{worker['seed_end'] - 1}) failed to initialize: {reason}. "
+            f"{worker['seeds']}) failed to initialize: {reason}. "
             f"Tail of {worker['log_path']}:",
             file=sys.stderr,
         )
@@ -567,6 +614,7 @@ def _run_multi_worker_launcher(pre_args: argparse.Namespace, argv: list[str]) ->
                 "gpu": worker["gpu"],
                 "seed_start": worker["seed_start"],
                 "seed_end": worker["seed_end"],
+                "seeds": worker["seeds"],
                 "return_code": return_code,
                 "log_path": worker["log_path"],
                 "results_path": worker["results_path"],
@@ -583,6 +631,7 @@ def _run_multi_worker_launcher(pre_args: argparse.Namespace, argv: list[str]) ->
                 "gpus": gpu_ids,
                 "seed_start": pre_args.seed_start,
                 "seed_end": pre_args.seed_end,
+                "seeds": requested_seeds if explicit_seeds else None,
                 "worker_runs": manifest_workers,
             },
             handle,
@@ -5129,8 +5178,9 @@ def parse_args():
         type=str,
         default=None,
         help=(
-            "Explicit seed list (e.g. '42,43,44') run back-to-back inside one booted app, "
-            "instead of the --seed_start/--seed_end range. Amortizes app boot across arms."
+            "Explicit seed list (e.g. '42,43,44') instead of the "
+            "--seed_start/--seed_end range. With multiple workers, seeds are split "
+            "evenly in the given order."
         ),
     )
     return parser
