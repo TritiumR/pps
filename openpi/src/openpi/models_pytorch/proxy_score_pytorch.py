@@ -9,6 +9,28 @@ import torch.nn.functional as F  # noqa: N812
 from transformers.cache_utils import DynamicCache
 
 
+def make_att_2d_masks(pad_masks: Tensor, att_masks: Tensor) -> Tensor:
+    """pi0 / big_vision block mask: token i sees j iff cumsum(att)[j] <= cumsum(att)[i].
+
+    att_masks is per token: 1 starts a new block, 0 continues the previous one. So a run of
+    zeros is one MUTUALLY VISIBLE block, and blocks are causal with respect to each other.
+    The model already declares this -- embed_prefix emits [0]*num_img_embs (the DINO patches are
+    one block) and embed_suffix emits [1] for the state then [1] + [0]*(H-1) for the action chunk
+    -- and both call sites were discarding it, which is what left the expert fully causal.
+    """
+    cumsum = torch.cumsum(att_masks.to(torch.int32), dim=1)
+    att_2d = cumsum[:, None, :] <= cumsum[:, :, None]
+    pad_2d = pad_masks[:, None, :] * pad_masks[:, :, None]
+    return att_2d & pad_2d.to(torch.bool)
+
+
+def _to_additive_4d(att_2d: Tensor, dtype: torch.dtype) -> Tensor:
+    """[B, Q, K] bool -> [B, 1, Q, K] additive mask (0 keep, -inf drop)."""
+    out = torch.zeros(att_2d.shape[0], 1, att_2d.shape[1], att_2d.shape[2],
+                      dtype=dtype, device=att_2d.device)
+    return out.masked_fill(~att_2d[:, None], torch.finfo(dtype).min)
+
+
 def _two_block_mask(pad_masks: Tensor, n_suffix: int, dtype: torch.dtype,
                     n_query: int | None = None) -> Tensor:
     """Build the [B, 1, Q, K] additive mask the diffusion head is supposed to use.
@@ -225,6 +247,24 @@ class ProxyScorePytorch(nn.Module):
         # ZERO-INITIALISED, so at load time both branches are identical and a checkpoint trained
         # before this existed behaves exactly as before. Training is what separates them.
         self.cond_emb = nn.Embedding(2, action_expert_config.width)
+        # Goal context token. Built only when the config asks for one, so a goal_dim=0
+        # checkpoint has exactly the parameters it had before.
+        self.goal_proj = (
+            nn.Linear(config.goal_dim, action_expert_config.width)
+            if getattr(config, "goal_dim", 0) > 0
+            else None
+        )
+        # Joint action/goal denoising. A DEDICATED encoder/decoder pair for the goal row, so the
+        # row is goal_row_dim wide end to end rather than borrowing the action chunk's feature
+        # axis -- which is what removes the "keep dims 3..action_dim inert" problem entirely
+        # instead of managing it. Built only when asked, so goal_row=False checkpoints are
+        # parameter-identical to before.
+        if getattr(config, "goal_row", False):
+            self.goal_row_in_proj = nn.Linear(config.goal_row_dim, action_expert_config.width)
+            self.goal_row_out_proj = nn.Linear(action_expert_config.width, config.goal_row_dim)
+        else:
+            self.goal_row_in_proj = None
+            self.goal_row_out_proj = None
         nn.init.zeros_(self.cond_emb.weight)
         self.action_time_mlp_in = nn.Linear(
             2 * action_expert_config.width, action_expert_config.width
@@ -311,9 +351,14 @@ class ProxyScorePytorch(nn.Module):
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
         att_masks = att_masks[None, :].expand(pad_masks.shape[0], len(att_masks))
+        # Stashed because both call sites discard the returned value; _run_diffusion_head needs it
+        # to build the block mask, and threading it through three signatures would touch the
+        # serving path for no benefit.
+        self._last_prefix_att = att_masks
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, state, noisy_actions, timestep, cond=None):
+    def embed_suffix(self, state, noisy_actions, timestep, cond=None, goal=None,
+                     noisy_goal_row=None):
         embs = []
         pad_masks = []
         att_masks = []
@@ -335,6 +380,21 @@ class ProxyScorePytorch(nn.Module):
         device = state_emb.device
         pad_masks.append(torch.ones(bsize, 1, dtype=torch.bool, device=device))
         att_masks += [1]
+
+        if self.goal_proj is not None:
+            if goal is None:
+                raise ValueError(
+                    "goal_dim > 0 but no goal was passed; a goal-conditioned checkpoint must "
+                    "never be run with the goal silently dropped.")
+            goal = torch.as_tensor(goal, device=device)
+            goal = goal.to(self.goal_proj.weight.dtype).reshape(bsize, -1)
+            goal_emb = self.goal_proj(goal).to(state_emb.dtype)
+            embs.append(goal_emb[:, None, :])
+            pad_masks.append(torch.ones(bsize, 1, dtype=torch.bool, device=device))
+            # att_mask 0 puts the goal in the STATE's attention block, so the block structure
+            # the action tokens see is unchanged and the goal is pure context: attended to by
+            # the action rows, never denoised, never scored.
+            att_masks += [0]
 
         time_emb = create_sinusoidal_pos_embedding(
             timestep,
@@ -363,10 +423,33 @@ class ProxyScorePytorch(nn.Module):
         )
         att_masks += [1] + ([0] * (self.config.action_horizon - 1))
 
+        # getattr, not attribute access: subclasses in the tests build a bare nn.Module
+        # without running this class's __init__, and a diffusion path that raises there
+        # would be a regression in code that has nothing to do with the goal row.
+        if getattr(self, "goal_row_in_proj", None) is not None:
+            if noisy_goal_row is None:
+                raise ValueError(
+                    "goal_row is enabled but no noisy goal row was passed; the row is denoised "
+                    "jointly with the actions and cannot be silently dropped.")
+            gr = noisy_goal_row.to(self.goal_row_in_proj.weight.dtype).reshape(bsize, 1, -1)
+            gr_emb = self.goal_row_in_proj(gr)
+            # Same time conditioning and the same MLP as the action rows, so the goal row rides
+            # the identical noise schedule and adds no parameters beyond its own projections.
+            gr_time = time_emb[:, :1, :].expand_as(gr_emb)
+            gr_emb = self.action_time_mlp_out(
+                F.silu(self.action_time_mlp_in(torch.cat([gr_emb, gr_time], dim=2))))
+            embs.append(gr_emb)
+            pad_masks.append(torch.ones(bsize, 1, dtype=torch.bool, device=device))
+            # att_mask 0 keeps the goal row inside the ACTION block, so with a bidirectional
+            # suffix the action rows attend to it and it attends to them -- the joint denoising
+            # this model exists to test.
+            att_masks += [0]
+
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
+        self._last_suffix_att = att_masks
         return embs, pad_masks, att_masks, None
 
     @staticmethod
@@ -471,36 +554,58 @@ class ProxyScorePytorch(nn.Module):
         # to 52.6 and the action outputs by exactly 0.0 at every level. That makes the whole
         # premise of joint action/goal denoising inoperative: steering the key pose cannot reach
         # the executed actions through the network.
-        # Two independent fixes exist and are kept, in precedence order: (1) explicit att masks
-        # from the caller (or synthesized under config.bidirectional_attention) build the expert
-        # masks; (2) otherwise MG_PROXY_BIDIR_SUFFIX=1 builds the two-block mask -- prefix
-        # causal-with-padding, every diffusion token seeing every other. With neither, the old
-        # causal behaviour is exact, for checkpoints trained under it.
-        attention_mask = pad_masks
+        # The intended mask is two-block: prefix stays causal-with-padding, and every diffusion
+        # token sees every other diffusion token. self.bidirectional_suffix=False restores the old
+        # behaviour exactly, for checkpoints trained under it.
+        attn = pad_masks
         if prefix_att_masks is None and self.bidirectional_attention:
             prefix_att_masks = torch.zeros_like(prefix_pad_masks)
         if prefix_att_masks is not None and suffix_att_masks is not None:
-            attention_mask, pad_masks = self.build_expert_masks(
-                prefix_pad_masks,
-                prefix_att_masks,
-                suffix_pad_masks,
-                suffix_att_masks,
-                n_query=embs.shape[1] if prefix_kv is not None else None,
-            )
-        elif self.bidirectional_suffix:
-            attention_mask = _two_block_mask(pad_masks, suffix_embs.shape[1], embs.dtype,
-                                             n_query=embs.shape[1])
+            attn, pad_masks = self.build_expert_masks(
+                prefix_pad_masks, prefix_att_masks, suffix_pad_masks, suffix_att_masks,
+                n_query=embs.shape[1] if prefix_kv is not None else None)
+        elif getattr(self, "bidirectional_suffix", False):
+            pa = getattr(self, "_last_prefix_att", None)
+            sa = getattr(self, "_last_suffix_att", None)
+            if (pa is not None and sa is not None
+                    and pa.shape[1] + sa.shape[1] == pad_masks.shape[1]):
+                att = torch.cat([pa.expand(pad_masks.shape[0], -1).to(torch.int32),
+                                 sa.expand(pad_masks.shape[0], -1).to(torch.int32)], dim=1)
+                att_2d = make_att_2d_masks(pad_masks, att)
+                off = pad_masks.shape[1] - embs.shape[1]
+                if off:
+                    att_2d = att_2d[:, off:, :]
+                attn = _to_additive_4d(att_2d, pad_masks.dtype if pad_masks.is_floating_point()
+                                       else torch.float32)
+            else:
+                attn = _two_block_mask(pad_masks, suffix_embs.shape[1], embs.dtype,
+                                       n_query=embs.shape[1])
         hidden_states, _ = self.expert_model.forward(
-            attention_mask=attention_mask,
+            attention_mask=attn,
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=embs,
             use_cache=False,
             adarms_cond=adarms_cond,
         )
+        if getattr(self, "goal_row_out_proj", None) is not None:
+            # Suffix tail is [action rows | goal row]; decode each with its own head.
+            rows = hidden_states[:, -(self.config.action_horizon + 1) :].to(dtype=torch.float32)
+            return (self.action_out_proj(rows[:, : self.config.action_horizon]),
+                    self.goal_row_out_proj(rows[:, self.config.action_horizon :]))
         suffix_out = hidden_states[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
-        return self.action_out_proj(suffix_out)
+        return self.action_out_proj(suffix_out), None
+
+    @staticmethod
+    def _goal_kwargs(goal):
+        """Forward `goal` only when there is one.
+
+        predict_score_from_prefix already did this; the two direct call sites did not, so a
+        subclass that overrides _predict_model_output_from_prefix without a `goal` parameter --
+        which the unit tests do -- got a TypeError on every unconditional path.
+        """
+        return {} if goal is None else {"goal": goal}
 
     def _predict_model_output_from_prefix(
         self,
@@ -511,6 +616,9 @@ class ProxyScorePytorch(nn.Module):
         time_cond,
         prefix_kv: DynamicCache | None = None,
         cond=None,
+        goal=None,
+        noisy_goal_row=None,
+        return_goal_row=False,
         prefix_att_masks=None,
     ) -> torch.Tensor:
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
@@ -518,8 +626,10 @@ class ProxyScorePytorch(nn.Module):
             x_t,
             time_cond,
             cond=cond,
+            goal=goal,
+            noisy_goal_row=noisy_goal_row,
         )
-        return self._run_diffusion_head(
+        action_out, goal_out = self._run_diffusion_head(
             prefix_embs,
             prefix_pad_masks,
             suffix_embs,
@@ -529,6 +639,7 @@ class ProxyScorePytorch(nn.Module):
             prefix_att_masks=prefix_att_masks,
             suffix_att_masks=suffix_att_masks,
         )
+        return (action_out, goal_out) if return_goal_row else action_out
 
     def predict_score_from_prefix(
         self,
@@ -539,12 +650,15 @@ class ProxyScorePytorch(nn.Module):
         time_cond,
         prefix_kv: DynamicCache | None = None,
         cond=None,
+        goal=None,
         prefix_att_masks=None,
     ) -> torch.Tensor:
         # Forwarded only when set, so subclasses overriding the hook keep their signature.
         extra = {"prefix_kv": prefix_kv} if prefix_kv is not None else {}
         if cond is not None:
             extra["cond"] = cond
+        if goal is not None:
+            extra["goal"] = goal
         if prefix_att_masks is not None:
             extra["prefix_att_masks"] = prefix_att_masks
         output = self._predict_model_output_from_prefix(
@@ -578,8 +692,11 @@ class ProxyScorePytorch(nn.Module):
         noise=None,
         time=None,
         score_target=None,
+        goal=None,
+        goal_target=None,
         *,
         mode="train",
+        return_parts=False,
         **_,
     ) -> Tensor:
         if mode != "train":
@@ -661,28 +778,55 @@ class ProxyScorePytorch(nn.Module):
                 labels_per_observation, dim=0
             )
             state = state.repeat_interleave(labels_per_observation, dim=0)
+            if goal is not None:
+                goal = goal.repeat_interleave(labels_per_observation, dim=0)
             x_t = x_t.flatten(0, 1)
             target = target.flatten(0, 1)
             time = time.flatten(0, 1)
+        if getattr(self, "goal_row_in_proj", None) is not None:
+            # Joint denoising: the goal row is noised with the SAME alpha/time as the action
+            # chunk, so the two are recovered on one schedule and the model has to use whatever
+            # it can infer about the goal while denoising the actions.
+            if goal_target is None:
+                raise ValueError("goal_row is enabled but no goal_target was passed.")
+            if grouped_labels:
+                raise ValueError("goal_row does not support grouped score labels.")
+            if direct_score_target or self.config.prediction_type != "x0":
+                raise ValueError(
+                    "goal_row training requires the x0 diffusion path; direct score targets "
+                    "and 'regress' never build the alpha schedule the goal row rides on.")
+            g_clean = (torch.as_tensor(goal_target, device=actions.device, dtype=actions.dtype)
+                       .reshape(actions.shape[0], 1, self.config.goal_row_dim)
+                       * self.config.goal_row_gain)
+            g_noise = self.sample_noise(g_clean.shape, g_clean.device).to(g_clean.dtype)
+            g_t = sqrt_alpha[:, None, None] * g_clean + sqrt_beta[:, None, None] * g_noise
+            pred, pred_goal = self._predict_model_output_from_prefix(
+                state, prefix_embs, prefix_pad_masks, x_t, time, goal=goal,
+                noisy_goal_row=g_t, return_goal_row=True)
+            loss = F.mse_loss(pred, target, reduction="none")
+            if loss_weight is not None:
+                loss = loss * loss_weight
+            goal_loss = F.mse_loss(pred_goal, g_clean, reduction="none")
+            if not return_parts:
+                raise ValueError(
+                    "goal_row training must be called with return_parts=True; the two losses "
+                    "carry different element counts and must not be silently pooled.")
+            return {"action": loss, "goal": goal_loss}
+
         predict = (
             self.predict_score_from_prefix
             if direct_score_target or self.config.prediction_type == "score"
             else self._predict_model_output_from_prefix
         )
-        pred = predict(
-            state,
-            prefix_embs,
-            prefix_pad_masks,
-            x_t,
-            time,
-            prefix_att_masks=prefix_att_masks,
-        )
+        pred = predict(state, prefix_embs, prefix_pad_masks, x_t, time,
+                       prefix_att_masks=prefix_att_masks,
+                       **self._goal_kwargs(goal))
         loss = F.mse_loss(pred, target, reduction="none")
         if loss_weight is not None:
             loss = loss * loss_weight
         if grouped_labels:
             loss = loss.unflatten(0, (batch_size, labels_per_observation))
-        return loss
+        return {"action": loss, "goal": None} if return_parts else loss
 
     @torch.no_grad()
     def sample_actions(
@@ -692,12 +836,46 @@ class ProxyScorePytorch(nn.Module):
         noise=None,
         num_steps=10,
         start_time=1.0,
+        goal=None,
+        return_trace=False,
+        goal_row_noise=None,
+        goal_row_clamp=None,
+        goal_row_clamp_from=0,
+        return_goal_row=False,
     ) -> Tensor:
+        """Reverse diffusion; with goal_row, the goal is denoised jointly with the actions.
+
+        Args:
+            goal_row_clamp: [B, goal_row_dim] in the shared interface units. When given, the
+                goal row is OVERWRITTEN at every level with that value forward-noised to the
+                level's alpha, instead of being denoised freely. That makes the row a commanded
+                input rather than a prediction, which is exactly the implicit-transmission probe:
+                whatever the actions do differently is caused by the clamped row.
+            goal_row_clamp_from: first denoising ITERATION at which the clamp applies (0 = all).
+                The clamp is forward-noised, so at early levels it is mostly noise and carries
+                little of the commanded goal -- unlike a context token, which is clean at every
+                level. Clamping only the late, high-alpha levels isolates that asymmetry instead
+                of leaving it as an unmeasured confound in the A-vs-B comparison.
+            return_goal_row: also return the model's own final goal estimate, in interface units.
+        """
         del start_time
         bsize = observation.state.shape[0]
         if noise is None:
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
+        joint_goal = getattr(self, "goal_row_in_proj", None) is not None
+        if joint_goal:
+            g_shape = (bsize, 1, self.config.goal_row_dim)
+            if goal_row_noise is None:
+                goal_row_noise = self.sample_noise(g_shape, device)
+            goal_row_noise = goal_row_noise.reshape(g_shape).to(noise.dtype)
+            g_t = goal_row_noise
+            g_clamp = None
+            if goal_row_clamp is not None:
+                g_clamp = (torch.as_tensor(goal_row_clamp, device=device, dtype=noise.dtype)
+                           .reshape(g_shape) * self.config.goal_row_gain)
+        elif goal_row_clamp is not None or return_goal_row:
+            raise ValueError("goal_row_clamp/return_goal_row need a goal_row model.")
 
         images, img_masks, state = self._preprocess_observation(
             observation, train=False
@@ -713,9 +891,11 @@ class ProxyScorePytorch(nn.Module):
                 prefix_pad_masks,
                 torch.zeros_like(noise),
                 torch.zeros(bsize, device=device, dtype=noise.dtype),
+                **self._goal_kwargs(goal),
                 prefix_att_masks=prefix_att_masks,
             )
         x_t = noise
+        trace = []
         for iteration in range(int(num_steps)):
             alpha, alpha_prev, time_cond = ddim_iteration_alphas(
                 iteration=iteration,
@@ -725,17 +905,29 @@ class ProxyScorePytorch(nn.Module):
                 dtype=x_t.dtype,
             )
             expanded_time = time_cond.expand(bsize)
-            output = self._predict_model_output_from_prefix(
-                state,
-                prefix_embs,
-                prefix_pad_masks,
-                x_t,
-                expanded_time,
-                prefix_att_masks=prefix_att_masks,
-            )
             beta = torch.clamp(1.0 - alpha, min=1e-6)
             sqrt_alpha = torch.sqrt(torch.clamp(alpha, min=1e-6))
             sqrt_beta = torch.sqrt(beta)
+            if joint_goal:
+                if g_clamp is not None and iteration >= int(goal_row_clamp_from):
+                    # Replacement conditioning: the row carries the COMMANDED goal at this
+                    # level's noise scale, re-imposed every level so it cannot drift back to
+                    # whatever the model would have inferred.
+                    g_t = sqrt_alpha * g_clamp + sqrt_beta * goal_row_noise
+                output, g_out = self._predict_model_output_from_prefix(
+                    state, prefix_embs, prefix_pad_masks, x_t, expanded_time, goal=goal,
+                    noisy_goal_row=g_t, return_goal_row=True,
+                    prefix_att_masks=prefix_att_masks)
+            else:
+                output = self._predict_model_output_from_prefix(
+                    state,
+                    prefix_embs,
+                    prefix_pad_masks,
+                    x_t,
+                    expanded_time,
+                    **self._goal_kwargs(goal),
+                    prefix_att_masks=prefix_att_masks,
+                )
             if self.config.prediction_type == "epsilon":
                 eps_hat = output
                 x0_hat = (x_t - sqrt_beta * eps_hat) / sqrt_alpha
@@ -746,11 +938,26 @@ class ProxyScorePytorch(nn.Module):
                 score = output
                 x0_hat = (x_t + beta * score) / sqrt_alpha
                 eps_hat = -sqrt_beta * score
+            if return_trace:
+                # The clean-chunk estimate at this level: what the denoising analysis plots.
+                trace.append(x0_hat.detach().clone())
             x_t = (
                 torch.sqrt(torch.clamp(alpha_prev, min=0.0)) * x0_hat
                 + torch.sqrt(torch.clamp(1.0 - alpha_prev, min=0.0)) * eps_hat
             )
+            if joint_goal:
+                g0_hat = g_out
+                g_eps_hat = (g_t - sqrt_alpha * g0_hat) / sqrt_beta
+                g_t = (torch.sqrt(torch.clamp(alpha_prev, min=0.0)) * g0_hat
+                       + torch.sqrt(torch.clamp(1.0 - alpha_prev, min=0.0)) * g_eps_hat)
 
         if torch.is_grad_enabled():
             logging.warning("ProxyScorePytorch.sample_actions is expected to run under no_grad.")
-        return x_t
+        out = (x_t,)
+        if return_trace:
+            out = out + (torch.stack(trace, dim=1),)
+        if return_goal_row:
+            # Back to the shared interface units the caller speaks.
+            out = out + (g_t.reshape(bsize, self.config.goal_row_dim)
+                         / self.config.goal_row_gain,)
+        return out[0] if len(out) == 1 else out

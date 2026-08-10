@@ -80,6 +80,12 @@ import openpi.training.config as _config
 from openpi.training import checkpoints as _checkpoints
 from openpi.training import awe_waypoints as awe_waypoints_mod
 from openpi.training import keypose_labels
+from openpi.training import stage_keypose
+
+# Sentinel `goal_key` for the COMMANDED stage keypose. Not an HDF5 attribute name like the other
+# goal keys: k is per WINDOW and is computed from the demo's own trajectory, so there is nothing
+# to look up. Keeping it in the same variable lets every `if goal_key` branch stay as it was.
+K_STAGE_KEY = "__k_stage__"
 from openpi.shared import normalize as _normalize
 from sim_free_mpc import SimFreeMPC, SimFreeMPCConfig
 from sim_free_mpc.ddim import ddim_iteration_alphas
@@ -184,6 +190,7 @@ def demo_action_norm_stats(
     keypose_tail: bool = False,
     awe_waypoints: int = 0,
     keypose_dims: bool = False,
+    awe_norm: str = "legacy",
 ) -> dict[str, Any]:
     """Scale of the DeltaActions target a[t+offset+h] - q[t], measured on the training demos.
 
@@ -191,8 +198,21 @@ def demo_action_norm_stats(
     quantity that reaches the loss. Arm rows are centred at 0 and the gripper keeps eval_mg's
     ChunkDecodePolicy coding, so proxy model space matches the planner's.
 
-    The chunk partitions into [action | awe_waypoints | keypose]; only the action rows are
-    ordinary next-step targets, so only they take a pooled scale.
+    The chunk partitions into [action | awe_waypoints | keypose]. Under ``awe_norm='legacy'``
+    only the action rows share a pooled scale. Under ``'pooled_all'`` ONE per-dim scale is fit
+    over every row's deltas and broadcast to all of them -- Cory's shared-scale representation.
+    Per-row whitening makes the goal rows 1.7-3.3x wider than the action rows in model space, so
+    a uniform steering vector is silently rescaled ~3x on exactly the row being steered.
+
+    Scope: the encoding stays DELTA (target - q[t]). Cory's targets are ABSOLUTE, but absolute is
+    a decode-side change (mujoco_eval/runner.py rebases every chunk against the current state)
+    and is deliberately out of scope here.
+
+    The mean is written as zeros on the arm because the decode side does not read it:
+    ChunkDecodePolicy builds its own ``act_mean = zeros`` with 0.5 at the gripper. The goal rows'
+    true delta mean (up to 0.42 rad on j3) therefore stays uncorrected and is recorded under
+    ``arm_delta_mean`` for the record rather than folded in, where it would silently disagree with
+    the planner.
     """
     arm = 7
     # Trailing blocks are goals, not action rows: waypoints tile the path to the phase end and
@@ -224,7 +244,15 @@ def demo_action_norm_stats(
                 per_row[action_horizon - 1].append(targets - joint_pos[:windows])
     std = np.stack([np.concatenate(rows, 0).std(0) for rows in per_row])  # [H, arm]
     raw_mean = np.stack([np.concatenate(rows, 0).mean(0) for rows in per_row])
-    if pooled:
+    if awe_norm not in ("legacy", "pooled_all"):
+        raise ValueError(f"Unknown awe_norm {awe_norm!r}.")
+    if awe_norm == "pooled_all":
+        # ONE per-dim scale over every row, broadcast to all of them: the shared-scale twin of
+        # Cory's representation, expressed in the [H, D] table the decode side already reads.
+        # Every row identical means align_proxy_norm hands the planner a single scale per dim,
+        # so a steering displacement means the same thing on a goal row as on an action row.
+        std = np.broadcast_to(np.sqrt((std**2).mean(0)), std.shape).copy()
+    elif pooled:
         # demo_delta_stats' own reduction: one per-dim scale for the whole chunk. The keypose row
         # is EXCLUDED: it reaches a whole phase ahead and is an order of magnitude larger, so
         # folding it in would inflate the scale of every action row.
@@ -274,6 +302,7 @@ def demo_action_norm_stats(
         "keypose_tail": bool(keypose_tail),
         "awe_waypoints": int(awe_waypoints),
         "keypose_dims": bool(keypose_dims),
+        "awe_norm": str(awe_norm),
         # F1: record which attention mask this checkpoint was TRAINED under, so the server can
         # reproduce it. Causal (the historical default) hides the goal rows from the action rows
         # entirely -- measured: perturbing rows 15-20 moved the action outputs by exactly 0.0.
@@ -1222,6 +1251,29 @@ def _collate_cache_batch(batch):
     )
 
 
+# Goal normalisation. A z-score over the train split is degenerate here: g_task takes exactly
+# two values and its z axis has ZERO variance, so whitening would divide by ~0. A fixed affine
+# map from a documented workspace box is used instead -- it has no degenerate axis, it is
+# independent of which scenes happen to be in the split, and it stays valid for goals a
+# keypoint front end may emit later anywhere in the workspace.
+GOAL_NORM = {
+    "kind": "workspace_box",
+    "center": [0.10, 0.00, 0.90],
+    "half_extent": [0.40, 0.50, 0.20],
+    "note": "g_norm = (g - center) / half_extent; bins-arena workspace, metres, world frame",
+}
+
+
+def normalize_goal(g, norm=GOAL_NORM):
+    c = np.asarray(norm["center"], dtype=np.float32)
+    h = np.asarray(norm["half_extent"], dtype=np.float32)
+    return ((np.asarray(g, dtype=np.float32) - c) / h).astype(np.float32)
+
+
+def _demo_goal(demo, key="g_task_xyz"):
+    return np.asarray(demo.attrs[key], dtype=np.float32)[:3]
+
+
 class BCDemoActionDataset(torch.utils.data.Dataset):
     """Demo-BC frames: score-pipeline obs + the demo's normalized model-space action chunk.
 
@@ -1245,7 +1297,21 @@ class BCDemoActionDataset(torch.utils.data.Dataset):
         keypose_tail: bool = False,
         awe_waypoints: int = 0,
         keypose_dims: bool = False,
+        target_tail_steps: int = 0,
+        target_jitter_steps: tuple[int, ...] = (),
+        goal_key: str | None = None,
+        include_demos: set[str] | None = None,
+        emit_phase: bool = False,
+        k_stage_norm: dict | None = None,
+        k_awe: int = 1,
+        k_stride: int = 2,
     ):
+        self.emit_phase = bool(emit_phase)
+        self._phase: dict[str, np.ndarray] = {}
+        # goal_key None keeps the sample dict exactly as it was; set, it adds one "goal" entry
+        # that the training loop pops before building the Observation.
+        self.goal_key = goal_key
+        self._goal: dict[str, np.ndarray] = {}
         self.hdf5_path = hdf5_path
         self.prompt = prompt
         self.config = config
@@ -1253,6 +1319,16 @@ class BCDemoActionDataset(torch.utils.data.Dataset):
         self.keypose_tail = bool(keypose_tail)
         self.awe_waypoints = int(awe_waypoints)
         self.keypose_dims = bool(keypose_dims)
+        self.target_tail_steps = int(target_tail_steps)
+        self.target_jitter_steps = tuple(int(v) for v in (target_jitter_steps or ()))
+        # Re-drawing the phase target every __getitem__ turns p(keypose | obs) from a near-delta
+        # into a region; a delta is un-steerable because inference-time displacement is
+        # off-manifold. Off by default so existing configs reproduce bit for bit.
+        self.target_jitter = bool(
+            (self.target_tail_steps > 1 or self.target_jitter_steps)
+            and (self.awe_waypoints or self.keypose_tail)
+        )
+        self._rng: np.random.Generator | None = None
         if self.keypose_dims and (self.keypose_tail or self.awe_waypoints):
             raise ValueError("--keypose_dims widens rows; combining it with row-appending "
                              "modes has never been tested and is refused rather than guessed at.")
@@ -1264,19 +1340,59 @@ class BCDemoActionDataset(torch.utils.data.Dataset):
             config, action_norm_stats=action_norm_stats
         )
         exclude_demos = exclude_demos or set()
+        # Per-WINDOW 5-D commanded keypose. Unlike `_goal`, which is one vector per demo, this is
+        # a [T, 5] table because the commanded stage keypose is what changes as the episode walks
+        # through its stages -- that is the whole point of the interface.
+        self.k_stage_norm = k_stage_norm
+        self.k_awe = int(k_awe)
+        self.k_stride = int(k_stride)
+        self._kstage: dict[str, np.ndarray] = {}
         self._keypose: dict[str, np.ndarray] = {}
         self._waypoints: dict[str, np.ndarray] = {}
+        self._target_idx: dict[str, np.ndarray] = {}
+        self._joint_actions: dict[str, np.ndarray] = {}
         with h5py.File(hdf5_path, "r") as f:
             self.demo_names = [
                 name
                 for name in sorted(f["data"].keys())[demo_offset::demo_stride]
                 if name not in exclude_demos
+                and (include_demos is None or name in include_demos)
             ]
             self.index: list[tuple[str, int]] = []
             for name in self.demo_names:
                 joint_actions = f["data"][name]["obs/joint_actions"]
+                if self.goal_key == K_STAGE_KEY:
+                    self._kstage[name] = stage_keypose.normalize(
+                        stage_keypose.stage_keypose_targets(
+                            np.asarray(f["data"][name]["obs/eef_pos"]),
+                            np.asarray(f["data"][name]["obs/eef_quat"]),
+                            np.asarray(joint_actions),
+                            k_awe=self.k_awe, stride=self.k_stride),
+                        self.k_stage_norm)
+                elif self.goal_key:
+                    self._goal[name] = normalize_goal(
+                        _demo_goal(f["data"][name], self.goal_key))
+                if self.emit_phase:
+                    cmd = np.asarray(joint_actions[:, keypose_labels.GRIPPER_DIM])
+                    edges = np.flatnonzero(np.diff(cmd) != 0) + 1
+                    ph = np.zeros(len(cmd), dtype=np.int64)
+                    for k, e in enumerate(edges):
+                        ph[e:] = k + 1
+                    self._phase[name] = ph
                 num_windows = len(joint_actions) - self.action_rows
                 self.index.extend((name, step) for step in range(0, max(num_windows, 0), stride))
+                if self.target_jitter:
+                    # Jitter needs the target FRAMES (and the poses to index), not the precomputed
+                    # target poses: a jitter is a shift along the trajectory.
+                    self._joint_actions[name] = np.asarray(joint_actions, dtype=np.float32)
+                    self._target_idx[name] = (
+                        awe_waypoints_mod.waypoint_target_indices(
+                            self._joint_actions[name], k=self.awe_waypoints
+                        )
+                        if self.awe_waypoints
+                        else keypose_labels.phase_end_indices(self._joint_actions[name])[:, None]
+                    )
+                    continue
                 if self.keypose_tail or self.keypose_dims:
                     # Precomputed once per demo (~1 MB for the whole set): the alternative is an
                     # h5 read of the gripper column on every __getitem__.
@@ -1303,16 +1419,59 @@ class BCDemoActionDataset(torch.utils.data.Dataset):
             self._file = h5py.File(self.hdf5_path, "r")
         return self._file["data"][name]
 
+    def _generator(self) -> np.random.Generator:
+        """Per-worker RNG. PyTorch reseeds `random`/`torch` in each worker but NOT numpy, so a
+        shared global stream would hand every worker identical draws."""
+        if self._rng is None:
+            info = torch.utils.data.get_worker_info()
+            seed = int(info.seed) if info is not None else int(torch.initial_seed())
+            self._rng = np.random.default_rng(seed)
+        return self._rng
+
+    def _drawn_targets(self, demo_name: str, step: int):
+        """Re-draw this step's phase target; returns (waypoints, keypose, diagnostics)."""
+        actions = self._joint_actions[demo_name]
+        canonical = self._target_idx[demo_name][step]
+        drawn = awe_waypoints_mod.randomized_target_indices(
+            canonical,
+            anchor=step,
+            tail_steps=self.target_tail_steps,
+            jitter_steps=self.target_jitter_steps,
+            rng=self._generator(),
+        )
+        shift = (
+            float(np.abs(drawn[:-1] - canonical[:-1]).mean()) if self.awe_waypoints else 0.0
+        )
+        # [endpoint offset from canonical, mean realised waypoint shift, endpoint reach] in steps.
+        # Logged as the proof that the jitter is live; a degenerate histogram means it is not.
+        diagnostics = np.array(
+            [float(drawn[-1] - canonical[-1]), shift, float(drawn[-1] - step)],
+            dtype=np.float32,
+        )
+        waypoints = actions[drawn[: self.awe_waypoints]] if self.awe_waypoints else None
+        keypose = actions[drawn[-1]] if self.keypose_tail else None
+        return waypoints, keypose, diagnostics
+
     def __getitem__(self, idx: int):
         demo_name, step = self.index[idx]
+        if self.target_jitter:
+            waypoints, keypose, diagnostics = self._drawn_targets(demo_name, step)
+        else:
+            keypose = self._keypose[demo_name][step] if self.keypose_tail else None
+            waypoints = self._waypoints[demo_name][step] if self.awe_waypoints else None
+            diagnostics = np.zeros(3, dtype=np.float32)
+        demo = self._demo(demo_name)
+        # Goal-conditioned datasets vary the instruction per episode (e.g. two-bin sorting
+        # names the destination), so a per-demo `prompt` attr wins over the CLI default.
+        prompt = demo.attrs.get("prompt", self.prompt)
         raw = _demo_sample(
-            self._demo(demo_name),
+            demo,
             step,
             action_horizon=self.action_rows,
-            prompt=self.prompt,
+            prompt=prompt if isinstance(prompt, str) else prompt.decode(),
             action_offset=self.action_offset,
-            keypose=self._keypose[demo_name][step] if self.keypose_tail else None,
-            waypoints=self._waypoints[demo_name][step] if self.awe_waypoints else None,
+            keypose=keypose,
+            waypoints=waypoints,
             # Receding: row h carries the phase-end keypose as of the row's own timestep.
             keypose_rows=(self._keypose[demo_name][step + self.action_offset:
                                                    step + self.action_offset + self.action_rows]
@@ -1337,7 +1496,17 @@ class BCDemoActionDataset(torch.utils.data.Dataset):
                 np.asarray(inputs["tokenized_prompt_mask"], dtype=np.bool_)
             ),
         }
-        return sample, actions
+        if self.goal_key == K_STAGE_KEY:
+            # The window's OWN stage keypose: the same row index the chunk's first action row
+            # comes from, so k is the terminal event of the segment this window sits in.
+            table = self._kstage[demo_name]
+            sample["goal"] = torch.from_numpy(
+                table[min(step + self.action_offset, len(table) - 1)].copy())
+        elif self.goal_key:
+            sample["goal"] = torch.from_numpy(self._goal[demo_name].copy())
+        if self.emit_phase:
+            sample["phase"] = torch.as_tensor(int(self._phase[demo_name][step]))
+        return sample, actions, torch.from_numpy(diagnostics)
 
 
 def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
@@ -1511,7 +1680,13 @@ def _bc_action_norm_stats(args, config, val_demos: set[str]):
         keypose_tail=bool(getattr(args, "keypose_tail", False)),
         awe_waypoints=int(getattr(args, "awe_waypoints", 0)),
         keypose_dims=bool(getattr(args, "keypose_dims", False)),
+        awe_norm=str(getattr(args, "awe_norm", "legacy")),
     )
+    # The stats are fit on the CANONICAL targets even when the jitter is on: the jitter is a
+    # +-0.8 s slide inside the same phase, and stats drawn from a random quantity would not
+    # reproduce. Recorded here so the decode side can see what the table describes.
+    raw["awe_target_tail_steps"] = int(getattr(args, "awe_target_tail_steps", 0))
+    raw["awe_target_jitter_steps"] = list(getattr(args, "awe_target_jitter_steps", ()) or ())
     return {
         "mean": np.asarray(raw["mean"], dtype=np.float32),
         "std": np.asarray(raw["std"], dtype=np.float32),
@@ -1530,6 +1705,320 @@ def _write_action_norm_stats(checkpoint_dir: pathlib.Path, stats) -> None:
     )
 
 
+ARM_DIMS = 7
+PROBE_DIRNAME = "probe"
+
+
+def _row_blocks(action_horizon: int, action_rows: int, awe_waypoints: int, keypose_tail: bool):
+    """Named row slices of the chunk: [action | awe waypoints | keypose]."""
+    blocks = {"action": slice(0, action_rows)}
+    if awe_waypoints:
+        blocks["waypoint"] = slice(action_rows, action_rows + awe_waypoints)
+    if keypose_tail:
+        blocks["keypose"] = slice(action_horizon - 1, action_horizon)
+    return blocks
+
+
+def _block_metrics(losses, blocks, arm_std):
+    """Per-block mean loss, plus per-block MAE in real radians when `arm_std` is given.
+
+    The model returns the UN-reduced squared error, so an element's sqrt is exactly
+    |pred - target| in normalized space (the x0 head carries no loss weight); scaling by the row's
+    own std turns it back into radians. Only the 7 arm dims are radians -- the gripper is a 0/1
+    command on a 0.5 scale, so it is excluded rather than averaged into a joint-angle number.
+    """
+    out = {}
+    for name, rows in blocks.items():
+        block = losses[:, rows, :]
+        out[f"block_loss/{name}"] = block.mean()
+        if arm_std is not None:
+            out[f"block_mae_rad/{name}"] = (
+                block[..., :ARM_DIMS].clamp_min(0.0).sqrt() * arm_std[rows]
+            ).mean()
+    return out
+
+
+def _probe_dir(config: _config.TrainConfig) -> pathlib.Path:
+    return config.checkpoint_dir / PROBE_DIRNAME
+
+
+def _probe_request(config: _config.TrainConfig, args: argparse.Namespace, step: int) -> None:
+    """Ask the host-side watcher for a rollout of the checkpoint just written.
+
+    The trainer runs inside the Isaac Sim container while the MuJoCo eval runs on the host
+    (mujoco/robosuite are host-only and the container has no docker socket), so the rollout
+    cannot be a subprocess of training. The two sides meet on the shared checkpoint mount: the
+    trainer drops a request, agent_tests/_probe_watcher.py runs the seeds and drops a result, and
+    the trainer -- the single wandb writer -- logs it. With no watcher running this only leaves
+    stale request files; training is never blocked and never fails on it.
+    """
+    try:
+        directory = _probe_dir(config)
+        directory.mkdir(parents=True, exist_ok=True)
+        # The container writes as root and the host watcher as the user, so the exchange
+        # directory -- and only it -- has to be writable by both.
+        os.chmod(directory, 0o777)
+        (directory / f"request_{step}.json").write_text(
+            json.dumps(
+                {
+                    "step": int(step),
+                    "task": str(args.probe_task),
+                    "seeds": [int(s) for s in args.probe_seeds],
+                    "exp": f"_train_probe_{step}",
+                    "prompt": str(args.prompt),
+                    "horizon": int(config.model.action_horizon),
+                    "requested_at": time.time(),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    except Exception:  # noqa: BLE001 -- a probe must never take training down
+        logging.exception("Probe request at step %s failed; training continues.", step)
+
+
+def _probe_drain(config: _config.TrainConfig, completed_step: int) -> None:
+    """Log any finished probe rollouts to wandb and consume their result files. Never raises."""
+    try:
+        directory = _probe_dir(config)
+        for result_path in sorted(directory.glob("result_*.json")):
+            payload = json.loads(result_path.read_text())
+            step = int(payload.get("step", completed_step))
+            if payload.get("error"):
+                logging.warning("Probe %s failed: %s", step, payload["error"])
+            else:
+                logging.info(
+                    "Probe %s: success=%.2f stage_max=%.2f",
+                    step,
+                    payload.get("success_rate", float("nan")),
+                    payload.get("stage_max_mean", float("nan")),
+                )
+            if config.wandb_enabled and wandb.run is not None:
+                record = {
+                    f"probe/{key}": value
+                    for key, value in payload.items()
+                    if isinstance(value, (int, float)) and key != "step"
+                }
+                video = payload.get("video")
+                video_path = directory / video if video else None
+                if video_path is not None and video_path.exists():
+                    record["probe/rollout"] = wandb.Video(str(video_path), format="mp4")
+                record["probe/at_step"] = step
+                # Logged at the CURRENT step: the probe lands minutes after its checkpoint, and
+                # wandb refuses to write to an earlier step than the run has already reached.
+                wandb.log(record, step=completed_step)
+            result_path.unlink()
+    except Exception:  # noqa: BLE001 -- a probe must never take training down
+        logging.exception("Probe drain failed; training continues.")
+
+
+def _phase_of_window(demo_group, step, action_rows):
+    """0 pre-grasp, 1 transport (held), 2 post-release -- from the COMMANDED gripper channel."""
+    ja = np.asarray(demo_group["obs/joint_actions"][:, keypose_labels.GRIPPER_DIM])
+    edges = np.flatnonzero(np.diff(ja) != 0) + 1
+    return int(np.searchsorted(edges, step, side="right"))
+
+
+@torch.no_grad()
+def _scene_swap_table(hdf5_path, demo_names, goal_key):
+    """Map each demo's goal to a SIBLING goal from the same scene.
+
+    The two-bin task had exactly two goals, so "the other goal" was unambiguous. With a
+    continuous goal every demo has its own, and the meaningful control is a goal that is real,
+    from the same scene, and reachable from the identical observation -- which is exactly what
+    the multi-goal snapshot protocol collected. Falls back to the farthest goal overall when a
+    demo has no sibling, so the control is never silently the demo's own goal.
+    """
+    import collections
+    goals, scenes = [], []
+    with h5py.File(hdf5_path, "r") as f:
+        for name in demo_names:
+            d = f["data"][name]
+            goals.append(normalize_goal(_demo_goal(d, goal_key)))
+            scenes.append(int(d.attrs["scene_id"]) if "scene_id" in d.attrs else -1)
+    goals = np.stack(goals).astype(np.float32)
+    by_scene = collections.defaultdict(list)
+    for i, sc in enumerate(scenes):
+        by_scene[sc].append(i)
+    sibling = np.empty(len(goals), dtype=np.int64)
+    rng = np.random.default_rng(0)
+    for i, sc in enumerate(scenes):
+        peers = [j for j in by_scene[sc] if j != i]
+        if peers:
+            sibling[i] = peers[rng.integers(len(peers))]
+        else:
+            sibling[i] = int(np.linalg.norm(goals - goals[i], axis=1).argmax())
+    return goals, sibling
+
+
+def _goal_transmission_probe(model, batch, device, *, pair_of, arm_std, goal_mode,
+                             aug_shift_px=0, time_value=0.5):
+    """Behavioural channel check: vary g at FIXED states/noise and measure the action response.
+
+    One forward per goal at a fixed mid noise level rather than a full reverse chain -- the
+    quantity of interest is whether the goal reaches the action rows at all, and a single level
+    answers that for a fraction of the cost. Reported in radians so "did the channel open" has a
+    physical reading rather than a normalised one.
+    """
+    inputs, actions, _ = batch
+    inputs = move_to_device(inputs, device)
+    goal = inputs.pop("goal")
+    inputs.pop("phase", None)
+    observation = _model.Observation.from_dict(inputs)
+    if aug_shift_px:
+        observation = _augment_observation(observation, aug_shift_px)
+    actions = actions.to(torch.float32).to(device)
+    bsize = actions.shape[0]
+    net = _unwrap_model(model)
+    g1 = goal.to(device).float()
+    g2 = pair_of(g1)
+
+    torch.manual_seed(1234)
+    noise = net.sample_noise(actions.shape, device)
+    time = torch.full((bsize,), float(time_value), device=device, dtype=actions.dtype)
+    alpha = net._alpha_from_time(time, device, actions.dtype)
+    x_t = (torch.sqrt(alpha)[:, None, None] * actions
+           + torch.sqrt(torch.clamp(1 - alpha, min=1e-6))[:, None, None] * noise)
+    images, img_masks, state = net._preprocess_observation(observation, train=False)
+    prefix_embs, prefix_pad_masks, _ = net.embed_prefix(images, img_masks)
+
+    with torch.no_grad():
+        if goal_mode == "context":
+            o1 = net._predict_model_output_from_prefix(
+                state, prefix_embs, prefix_pad_masks, x_t, time, goal=g1)
+            o2 = net._predict_model_output_from_prefix(
+                state, prefix_embs, prefix_pad_masks, x_t, time, goal=g2)
+        else:
+            gn = net.sample_noise((bsize, 1, net.config.goal_row_dim), device)
+            sa = torch.sqrt(alpha)[:, None, None]
+            sb = torch.sqrt(torch.clamp(1 - alpha, min=1e-6))[:, None, None]
+            gain = net.config.goal_row_gain
+            r1 = sa * (g1[:, None, :] * gain) + sb * gn
+            r2 = sa * (g2[:, None, :] * gain) + sb * gn
+            o1, _ = net._predict_model_output_from_prefix(
+                state, prefix_embs, prefix_pad_masks, x_t, time,
+                noisy_goal_row=r1, return_goal_row=True)
+            o2, _ = net._predict_model_output_from_prefix(
+                state, prefix_embs, prefix_pad_masks, x_t, time,
+                noisy_goal_row=r2, return_goal_row=True)
+
+    d = (o1 - o2)[..., :ARM_DIMS].abs()
+    dg = (g1 - g2).norm(dim=-1).mean()
+    out = {"probe/chunk_delta_norm": float(d.mean()),
+           "probe/last_row_delta_norm": float(d[:, -1].mean()),
+           "probe/dg_mean": float(dg)}
+    if arm_std is not None:
+        rad = d * arm_std[None, :, :].to(d.device)
+        out["probe/chunk_delta_rad"] = float(rad.mean())
+        out["probe/last_row_delta_rad"] = float(rad[:, -1].mean())
+    return out
+
+
+def _goal_row_eval(model, loader, device, *, aug_shift_px, max_batches):
+    """Model B only: how well does its own goal row recover the commanded goal?
+
+    Reported in METRES on the shared interface scale, so it is comparable with the task's 35 mm
+    success tolerance rather than living in normalised units.
+    """
+    net = _unwrap_model(model)
+    half = torch.as_tensor(GOAL_NORM["half_extent"], device=device, dtype=torch.float32)
+    errs = []
+    for i, (inputs, actions, _) in enumerate(loader):
+        if i >= max_batches:
+            break
+        inputs = move_to_device(inputs, device)
+        goal = inputs.pop("goal").to(device).float()
+        inputs.pop("phase", None)
+        observation = _model.Observation.from_dict(inputs)
+        if aug_shift_px:
+            observation = _augment_observation(observation, aug_shift_px)
+        with torch.no_grad():
+            _, ghat = net.sample_actions(
+                device, observation,
+                noise=net.sample_noise(
+                    (actions.shape[0], net.config.action_horizon, net.config.action_dim), device),
+                num_steps=4, return_goal_row=True)
+        errs.append(((ghat - goal) * half[None, :]).norm(dim=-1).cpu())
+    if not errs:
+        return {}
+    e = torch.cat(errs)
+    return {"goal_row/pred_err_m": float(e.mean()),
+            "goal_row/pred_err_p90_m": float(e.quantile(0.9)),
+            "goal_row/n": int(e.numel())}
+
+
+def _goal_control_eval(model, loader, device, *, aug_shift_px, max_batches, pair_of):
+    """Val diffusion loss under TRUE, SHUFFLED and OPPOSITE-PAIRED goals.
+
+    The paired dataset makes the opposite-goal control exact: every val scene contributes both
+    members, so 'the other goal' is a real goal from the identical observation rather than a
+    random draw. Shared noise and shared timesteps across the three conditions, so the gaps are
+    the goal's effect and not sampling.
+    """
+    was_training = model.training
+    model.eval()
+    out = {k: [] for k in ("true", "shuffled", "opposite")}
+    phases, per_row = [], {k: [] for k in out}
+    gen = torch.Generator(device="cpu").manual_seed(1234)
+    for i, (batch, actions, _extra) in enumerate(loader):
+        if i >= max_batches:
+            break
+        batch = move_to_device(dict(batch), device)
+        goal = batch.pop("goal")
+        phase = batch.pop("phase").to(device) if "phase" in batch else None
+        observation = _model.Observation.from_dict(batch)
+        if aug_shift_px:
+            observation = _augment_observation(observation, aug_shift_px)
+        actions = actions.to(torch.float32).to(device)
+        b = actions.shape[0]
+        # One noise/time draw shared by all three conditions.
+        noise = torch.randn(actions.shape, generator=gen).to(device)
+        time = torch.rand(b, generator=gen).to(device)
+        perm = torch.randperm(b, generator=gen).to(device)
+        variants = {
+            "true": goal,
+            "shuffled": goal[perm],
+            "opposite": pair_of(goal),
+        }
+        for name, g in variants.items():
+            losses = _unwrap_model(model)(
+                observation, actions, noise=noise, time=time, goal=g)
+            losses = ensure_tensor_loss(losses, device)
+            out[name].append(losses.mean(dim=(1, 2)).detach().float().cpu())
+            per_row[name].append(losses.mean(dim=2).detach().float().cpu())
+        if phase is not None:
+            phases.append(phase.detach().cpu())
+    if was_training:
+        model.train()
+    if not out["true"]:
+        return {}
+    res = {}
+    cat = {k: torch.cat(v) for k, v in out.items()}
+    ph = torch.cat(phases) if phases else None
+    for k, v in cat.items():
+        res[f"goal_eval/{k}_loss"] = float(v.mean())
+    res["goal_eval/gap_shuffled"] = res["goal_eval/shuffled_loss"] - res["goal_eval/true_loss"]
+    res["goal_eval/gap_opposite"] = res["goal_eval/opposite_loss"] - res["goal_eval/true_loss"]
+    res["goal_eval/rel_gap_opposite"] = (
+        res["goal_eval/gap_opposite"] / max(res["goal_eval/true_loss"], 1e-9))
+    res["_hist"] = {f"goal_eval/{k}_hist": v.numpy() for k, v in cat.items()}
+    res["_hist"]["goal_eval/per_sample_gap_opposite"] = (
+        cat["opposite"] - cat["true"]).numpy()
+    if ph is not None:
+        for pid, label in ((0, "reach"), (1, "carry")):
+            m = ph == pid
+            if int(m.sum()) < 2:
+                continue
+            for k, v in cat.items():
+                res[f"goal_eval/{label}/{k}_loss"] = float(v[m].mean())
+            res[f"goal_eval/{label}/gap_opposite"] = (
+                res[f"goal_eval/{label}/opposite_loss"] - res[f"goal_eval/{label}/true_loss"])
+            res[f"goal_eval/{label}/gap_shuffled"] = (
+                res[f"goal_eval/{label}/shuffled_loss"] - res[f"goal_eval/{label}/true_loss"])
+            res[f"goal_eval/{label}/n"] = int(m.sum())
+    return res
+
+
 def train_bc(args: argparse.Namespace) -> None:
     """Diffusion-BC on demo actions with an x0 head (the demo-content A/B of `train`)."""
     config = _apply_train_overrides(_config.get_config(args.config), args)
@@ -1546,6 +2035,29 @@ def train_bc(args: argparse.Namespace) -> None:
         # Extra predicted rows carrying goal targets. The action chunk keeps the config's
         # horizon, so these runs are the base run plus tokens, not a shorter chunk.
         model_overrides["action_horizon"] = config.model.action_horizon + extra_rows
+    goal_key = {"off": None, "g_task": "g_task_xyz", "g_demo": "g_demo_xyz",
+                "k_stage": K_STAGE_KEY}[getattr(args, "goal_cond", "off")]
+    goal_mode = getattr(args, "goal_mode", "context")
+    k_stage_norm = None                       # fitted below, once the train split is known
+    if goal_key == K_STAGE_KEY and goal_mode != "context":
+        raise ValueError("--goal_cond k_stage is the COMMANDED-keypose interface; it only "
+                         "exists in --goal_mode context. A predicted keypose is the thing "
+                         "this run exists to be compared against.")
+    if goal_key is not None:
+        if goal_mode == "context":
+            # The PI's choice: the canonical placement xyz, 3-D, embedded by a linear goal token.
+            model_overrides["goal_dim"] = (stage_keypose.KEYPOSE_DIM
+                                           if goal_key == K_STAGE_KEY else 3)
+        else:
+            # Model B: the goal is a PREDICTION, not an input, so no context token is built and
+            # goal_dim stays 0. One extra denoised 3-D row carries it instead.
+            model_overrides["goal_row"] = True
+            if os.environ.get("MG_PROXY_BIDIR_SUFFIX", "0") != "1":
+                raise ValueError(
+                    "--goal_mode joint requires MG_PROXY_BIDIR_SUFFIX=1. The goal row sits "
+                    "after the action rows, so under causal attention the actions cannot see "
+                    "it and the joint model is a null by construction (measured: the action "
+                    "output moves by exactly 0.0 when the row changes).")
     if getattr(args, "keypose_dims", False):
         # Cory's representation: [action | keypose] per row, so the FEATURE axis doubles and the
         # horizon stays the config's. The row-appending modes above are the other axis of the
@@ -1554,6 +2066,16 @@ def train_bc(args: argparse.Namespace) -> None:
     config = dataclasses.replace(
         config, model=dataclasses.replace(config.model, **model_overrides)
     )
+
+    if args.rollout_every > 0 and not args.probe_task:
+        logging.warning("--rollout_every set without --probe_task; periodic rollouts are off.")
+        args.rollout_every = 0
+    if args.rollout_every > 0 and args.rollout_every % config.save_interval:
+        # A probe evaluates a checkpoint, so it can only fire where one was written.
+        raise ValueError(
+            f"--rollout_every {args.rollout_every} is not a multiple of the config's "
+            f"save_interval {config.save_interval}; no checkpoint would exist to probe."
+        )
 
     use_ddp, local_rank, device = setup_ddp()
     rank = torch.distributed.get_rank() if use_ddp else 0
@@ -1574,6 +2096,14 @@ def train_bc(args: argparse.Namespace) -> None:
         wandb.init(mode="disabled")
 
     val_demos = _held_out_demos(args.hdf5_path, args.val_demos)
+    if goal_key == K_STAGE_KEY:
+        # Fitted on the TRAIN split only and frozen into the metadata, so an evaluator can
+        # normalise a COMMANDED k exactly as training normalised a demonstrated one.
+        import h5py as _h5
+        with _h5.File(args.hdf5_path, "r") as _f:
+            _train_names = [n for n in sorted(_f["data"].keys()) if n not in val_demos]
+        k_stage_norm = stage_keypose.workspace_box(args.hdf5_path, demo_names=_train_names)
+        logging.info("k_stage norm: %s", json.dumps(k_stage_norm))
     action_norm_stats = _bc_action_norm_stats(args, config, val_demos)
     if is_main and action_norm_stats is not None:
         _write_action_norm_stats(config.checkpoint_dir, action_norm_stats)
@@ -1593,11 +2123,72 @@ def train_bc(args: argparse.Namespace) -> None:
         keypose_tail=bool(args.keypose_tail),
         awe_waypoints=int(args.awe_waypoints),
         keypose_dims=bool(getattr(args, "keypose_dims", False)),
+        target_tail_steps=int(args.awe_target_tail_steps),
+        target_jitter_steps=tuple(args.awe_target_jitter_steps),
+        goal_key=goal_key,
+        k_stage_norm=k_stage_norm,
+        k_awe=int(getattr(args, "k_awe", 1)),
+        k_stride=int(getattr(args, "k_stride", 2)),
     )
+    val_loader = None
+    pair_of = None
+    probe_batch = None
+    # The goal-control / swap / transmission diagnostics are built around a goal that is constant
+    # within a demo and drawn from a small per-scene set. A per-window k has neither property --
+    # "the opposite k" is not defined and a scene swap table cannot be built -- so they are simply
+    # not constructed for this interface rather than being fed a meaningless substitute.
+    if goal_key is not None and goal_key != K_STAGE_KEY and val_demos and is_main:
+        val_dataset = BCDemoActionDataset(
+            hdf5_path=args.hdf5_path,
+            config=config,
+            prompt=args.prompt,
+            action_norm_stats=action_norm_stats,
+            include_demos=val_demos,
+            action_offset=args.action_offset,
+            goal_key=goal_key,
+            emit_phase=True,
+            stride=2,
+        )
+        val_loader = torch.utils.data.DataLoader(
+            val_dataset, batch_size=16, shuffle=True, num_workers=2, drop_last=True,
+            generator=torch.Generator().manual_seed(7),
+        )
+        # The control goal. A two-valued task made "the opposite goal" unambiguous; a
+        # CONTINUOUS goal has no opposite, so the control is a real goal from the SAME scene --
+        # one the identical observation actually admits, which the multi-goal snapshot protocol
+        # collected precisely so this substitution is exact rather than a random relabel.
+        swap_goals, swap_idx = _scene_swap_table(
+            args.hdf5_path, val_dataset.demo_names, goal_key)
+        swap_src = torch.as_tensor(swap_goals, dtype=torch.float32)
+        swap_dst = torch.as_tensor(swap_goals[swap_idx], dtype=torch.float32)
+
+        def pair_of(g, _src=swap_src, _dst=swap_dst):
+            src, dst = _src.to(g.device), _dst.to(g.device)
+            nearest = torch.cdist(g.float(), src).argmin(dim=1)
+            return dst[nearest].to(g.dtype)
+
+        # One fixed batch, drawn once: the transmission probe has to compare checkpoints, so it
+        # cannot resample its states each time it fires.
+        probe_batch = next(iter(torch.utils.data.DataLoader(
+            val_dataset, batch_size=16, shuffle=True, num_workers=0, drop_last=True,
+            generator=torch.Generator().manual_seed(1234))))
+        n_uniq = len(np.unique(swap_goals, axis=0))
+        logging.info("goal eval: %s val windows over %s demos; %s distinct goals; "
+                     "control = same-scene sibling (median |dg| = %.4f normalised)",
+                     len(val_dataset), len(val_dataset.demo_names), n_uniq,
+                     float(np.median(np.linalg.norm(
+                         swap_goals - swap_goals[swap_idx], axis=1))))
     if is_main:
         logging.info(
-            "BC action_norm=%s action_offset=%s held_out=%s",
-            args.action_norm, args.action_offset, sorted(val_demos)
+            "BC action_norm=%s awe_norm=%s action_offset=%s held_out=%s",
+            args.action_norm, args.awe_norm, args.action_offset, sorted(val_demos)
+        )
+        logging.info(
+            "BC target jitter: %s (tail=%s steps, shifts=%s, bidirectional_suffix=%s)",
+            "ON" if dataset.target_jitter else "OFF",
+            args.awe_target_tail_steps,
+            list(args.awe_target_jitter_steps),
+            os.environ.get("MG_PROXY_BIDIR_SUFFIX", "0") == "1",
         )
         if args.keypose_tail:
             logging.info(
@@ -1643,8 +2234,42 @@ def train_bc(args: argparse.Namespace) -> None:
                     "aug_shift_px": int(args.aug_shift_px),
                     "action_norm": str(args.action_norm),
                     "action_norm_pooled": bool(args.action_norm_pooled),
+                    "awe_norm": str(args.awe_norm),
                     "action_offset": int(args.action_offset),
                     "val_demos": sorted(val_demos),
+                    # Frozen with the checkpoint: serving must reproduce this map exactly or the
+                    # goal token lands somewhere the model never saw.
+                    "goal_cond": str(args.goal_cond),
+                    "goal_key": goal_key,
+                    "goal_dim": int(getattr(config.model, "goal_dim", 0)),
+                    "goal_norm": GOAL_NORM if goal_key != K_STAGE_KEY else k_stage_norm,
+                    "k_stage_norm": k_stage_norm,
+                    "k_awe": int(getattr(args, "k_awe", 1)),
+                    "k_stride": int(getattr(args, "k_stride", 2)),
+                    "goal_dropout": 0.0,
+                    "goal_mode": str(goal_mode),
+                    "goal_row": bool(getattr(config.model, "goal_row", False)),
+                    "goal_row_dim": int(getattr(config.model, "goal_row_dim", 0)),
+                    "goal_row_gain": float(getattr(config.model, "goal_row_gain", 0.0)),
+                    "goal_loss_coef": float(getattr(args, "goal_loss_coef", 0.0)),
+                    # Everything below decides how the checkpoint must be SERVED and steered;
+                    # a proxy whose chunk layout or attention mask is guessed at is a silent null.
+                    "config": str(config.name),
+                    "action_horizon": int(config.model.action_horizon),
+                    "action_dim": int(config.model.action_dim),
+                    "awe_waypoints": int(args.awe_waypoints),
+                    "keypose_tail": bool(args.keypose_tail),
+                    "keypose_dims": bool(getattr(args, "keypose_dims", False)),
+                    "action_rows": int(dataset.action_rows),
+                    "bidirectional_suffix": os.environ.get("MG_PROXY_BIDIR_SUFFIX", "0") == "1",
+                    "awe_target_tail_steps": int(args.awe_target_tail_steps),
+                    "awe_target_jitter_steps": [int(v) for v in args.awe_target_jitter_steps],
+                    "target_jitter": bool(dataset.target_jitter),
+                    "lr": float(config.lr_schedule.peak_lr),
+                    "lr_schedule": str(args.lr_schedule),
+                    "warmup_steps": int(config.lr_schedule.warmup_steps),
+                    "batch_size": int(config.batch_size),
+                    "num_train_steps": int(config.num_train_steps),
                 },
                 indent=2,
                 sort_keys=True,
@@ -1696,7 +2321,9 @@ def train_bc(args: argparse.Namespace) -> None:
             model,
             device_ids=[local_rank] if device.type == "cuda" else None,
             output_device=local_rank if device.type == "cuda" else None,
-            find_unused_parameters=False,
+            # cond_emb is only used by the CFG branch (cond is None here), so a plain DDP
+            # all-reduce trips on a parameter that never receives a gradient.
+            find_unused_parameters=True,
         )
 
     trainable_params = _optimizer_parameters(
@@ -1721,7 +2348,22 @@ def train_bc(args: argparse.Namespace) -> None:
             safetensors.torch.load_model(module, raw_path, device=str(device))
         else:
             logging.warning("No %s; resuming EMA from the EMA weights.", raw_path)
-    lr_schedule = _make_lr_schedule(config)
+    lr_schedule = _make_lr_schedule(config, args.lr_schedule)
+
+    blocks = _row_blocks(
+        config.model.action_horizon,
+        dataset.action_rows,
+        int(args.awe_waypoints),
+        bool(args.keypose_tail),
+    )
+    # Real-radian MAE needs the row's own scale, and only the x0/regress heads predict the chunk
+    # itself -- an epsilon head's residual is noise, which has no radian reading.
+    arm_std = (
+        torch.as_tensor(action_norm_stats["std"][:, :ARM_DIMS], device=device)
+        if action_norm_stats is not None
+        and config.model.prediction_type in ("x0", "regress")
+        else None
+    )
 
     model.train()
     pbar = (
@@ -1737,15 +2379,17 @@ def train_bc(args: argparse.Namespace) -> None:
     data_iter = iter(train_loader)
     while global_step < config.num_train_steps:
         try:
-            input_batch, actions = next(data_iter)
+            input_batch, actions, jitter = next(data_iter)
         except StopIteration:
             epoch += 1
             if sampler is not None:
                 sampler.set_epoch(epoch)
             data_iter = iter(train_loader)
-            input_batch, actions = next(data_iter)
+            input_batch, actions, jitter = next(data_iter)
 
         input_batch = move_to_device(input_batch, device)
+        goal_batch = input_batch.pop("goal", None)
+        input_batch.pop("phase", None)
         observation = _model.Observation.from_dict(input_batch)
         if args.aug_shift_px:
             # After normalization, before the model's own train-time preprocessing.
@@ -1755,9 +2399,21 @@ def train_bc(args: argparse.Namespace) -> None:
         for group in optimizer.param_groups:
             group["lr"] = lr_schedule(global_step)
 
-        losses = model(observation, actions)
-        losses = ensure_tensor_loss(losses, device)
-        loss = losses.mean()
+        goal_loss_value = None
+        if goal_batch is not None and goal_mode == "joint":
+            parts = model(observation, actions, goal_target=goal_batch, return_parts=True)
+            losses = ensure_tensor_loss(parts["action"], device)
+            action_loss = losses.mean()
+            goal_loss = ensure_tensor_loss(parts["goal"], device).mean()
+            # The ACTION term keeps coefficient 1 exactly as in the context model, so the two
+            # runs share one effective action objective and only differ by the added goal term.
+            loss = action_loss + float(args.goal_loss_coef) * goal_loss
+            goal_loss_value = float(goal_loss.detach())
+        else:
+            losses = (model(observation, actions) if goal_batch is None
+                      else model(observation, actions, goal=goal_batch))
+            losses = ensure_tensor_loss(losses, device)
+            loss = losses.mean()
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -1770,42 +2426,129 @@ def train_bc(args: argparse.Namespace) -> None:
             ema.update(module)
         optimizer.zero_grad(set_to_none=True)
 
-        metrics.append(
-            {
-                "loss": float(loss.detach().cpu()),
-                "lr": float(optimizer.param_groups[0]["lr"]),
-                "grad_norm": float(grad_norm.detach().cpu())
-                if isinstance(grad_norm, torch.Tensor)
-                else float(grad_norm),
-            }
-        )
+        # One host transfer per step: every extra .item() is its own device sync.
+        blockwise = _block_metrics(losses.detach(), blocks, arm_std)
+        keys = list(blockwise)
+        packed = torch.stack(
+            [loss.detach(), torch.as_tensor(grad_norm, device=device).detach().float()]
+            + [blockwise[key] for key in keys]
+        ).float().cpu().tolist()
+        step_metrics = {
+            "loss": packed[0],
+            "grad_norm": packed[1],
+            "lr": float(optimizer.param_groups[0]["lr"]),
+        }
+        step_metrics.update(zip(keys, packed[2:]))
+        step_metrics["jitter"] = jitter.numpy()
+        if goal_loss_value is not None:
+            # Logged separately on purpose: `loss` is the optimised total, `action_loss` is the
+            # quantity that must be comparable with the context model's `loss`.
+            step_metrics["goal_loss"] = goal_loss_value
+            step_metrics["action_loss"] = float(action_loss.detach())
+        metrics.append(step_metrics)
         completed_step = global_step + 1
+
+        if (val_loader is not None and args.goal_eval_every > 0
+                and completed_step % args.goal_eval_every == 0):
+            geval = ({} if goal_mode == "joint" else _goal_control_eval(
+                model, val_loader, device,
+                aug_shift_px=0,          # val measures the model, not the augmentation
+                max_batches=int(args.goal_eval_batches),
+                pair_of=pair_of))
+            # The behavioural channel, for BOTH models on the same fixed probe batch: vary g at
+            # fixed states and noise, and read the action response. A channel that never opens
+            # is visible here long before any rollout.
+            extra = {}
+            probe_error = None
+            try:
+                if probe_batch is None:
+                    raise RuntimeError("no probe batch")
+                extra.update(_goal_transmission_probe(
+                    model, probe_batch, device, pair_of=pair_of, arm_std=arm_std,
+                    goal_mode=goal_mode))
+            except Exception as exc:                      # a diagnostic must never kill a run
+                probe_error = repr(exc)
+                logging.warning("transmission probe failed: %s", exc)
+            if goal_mode == "joint":
+                try:
+                    extra.update(_goal_row_eval(
+                        model, val_loader, device, aug_shift_px=0,
+                        max_batches=max(1, int(args.goal_eval_batches) // 2)))
+                except Exception as exc:
+                    logging.warning("goal-row eval failed: %s", exc)
+            if extra or probe_error:
+                logging.info("step=%s %s", completed_step,
+                             " ".join(f"{k}={v:.5g}" for k, v in extra.items()))
+                # Sidecar, because this container's root logger is configured before the script
+                # runs and swallows logging.basicConfig, so an invisible diagnostic would be
+                # indistinguishable from a channel that never opened.
+                if is_main:
+                    rec = {"step": int(completed_step), **extra}
+                    if probe_error:
+                        rec["error"] = probe_error
+                    with open(config.checkpoint_dir / "goal_diag.jsonl", "a") as fh:
+                        fh.write(json.dumps(rec) + "\n")
+                if config.wandb_enabled:
+                    wandb.log({**extra, "global_step": completed_step}, step=completed_step)
+            if geval:
+                hists = geval.pop("_hist", {})
+                logging.info(
+                    "step=%s goal_eval true=%.4f shuffled=%.4f opposite=%.4f "
+                    "(gap_opp=%.4f, rel=%.3f)",
+                    completed_step, geval["goal_eval/true_loss"],
+                    geval["goal_eval/shuffled_loss"], geval["goal_eval/opposite_loss"],
+                    geval["goal_eval/gap_opposite"], geval["goal_eval/rel_gap_opposite"])
+                if config.wandb_enabled:
+                    rec = dict(geval)
+                    rec.update({k: wandb.Histogram(v) for k, v in hists.items()})
+                    rec["global_step"] = completed_step
+                    wandb.log(rec, step=completed_step)
         if is_main and completed_step % config.log_interval == 0 and metrics:
             elapsed = time.time() - start_time
-            avg_loss = sum(item["loss"] for item in metrics) / len(metrics)
-            avg_lr = sum(item["lr"] for item in metrics) / len(metrics)
-            avg_grad_norm = sum(item["grad_norm"] for item in metrics) / len(metrics)
+            scalars = {
+                key: sum(item[key] for item in metrics) / len(metrics)
+                for key in metrics[0]
+                if key != "jitter"
+            }
             logging.info(
-                "step=%s bc_x0_loss=%.4f lr=%.2e grad_norm=%.2f time=%.1fs",
+                "step=%s bc_x0_loss=%.4f lr=%.2e grad_norm=%.2f %s time=%.1fs",
                 completed_step,
-                avg_loss,
-                avg_lr,
-                avg_grad_norm,
+                scalars["loss"],
+                scalars["lr"],
+                scalars["grad_norm"],
+                " ".join(
+                    f"{k.split('/')[-1]}={scalars[k]:.4f}"
+                    for k in sorted(scalars)
+                    if k.startswith("block_loss/")
+                ),
                 elapsed,
             )
             if config.wandb_enabled:
                 step_time = elapsed / config.log_interval
-                wandb.log(
-                    {
-                        "bc_x0_loss": avg_loss,
-                        "learning_rate": avg_lr,
-                        "grad_norm": avg_grad_norm,
-                        "time_per_step": step_time,
-                        "it_per_s": 1.0 / max(step_time, 1e-9),
-                        "global_step": completed_step,
-                    },
-                    step=completed_step,
+                record = {
+                    "bc_x0_loss": scalars["loss"],
+                    "learning_rate": scalars["lr"],
+                    "grad_norm": scalars["grad_norm"],
+                    "time_per_step": step_time,
+                    "it_per_s": 1.0 / max(step_time, 1e-9),
+                    "global_step": completed_step,
+                }
+                record.update(
+                    {key: value for key, value in scalars.items() if "/" in key}
                 )
+                if dataset.target_jitter:
+                    # The histogram IS the liveness proof: a fixed target collapses it to {0}.
+                    drawn = np.concatenate([item["jitter"] for item in metrics])
+                    record.update(
+                        {
+                            "jitter/keypose_offset_steps": wandb.Histogram(drawn[:, 0]),
+                            "jitter/keypose_offset_std": float(drawn[:, 0].std()),
+                            "jitter/waypoint_shift_mean": float(drawn[:, 1].mean()),
+                            "jitter/keypose_reach_steps": float(drawn[:, 2].mean()),
+                            "jitter/unique_offsets": int(np.unique(drawn[:, 0]).size),
+                        }
+                    )
+                wandb.log(record, step=completed_step)
             metrics = []
             start_time = time.time()
 
@@ -1813,6 +2556,11 @@ def train_bc(args: argparse.Namespace) -> None:
         _save_bc_checkpoint(
             model, optimizer, global_step, config, is_main, data_config, ema
         )
+        if is_main and args.rollout_every > 0:
+            if global_step % args.rollout_every == 0 and global_step > 0:
+                _probe_request(config, args, global_step)
+            if global_step % config.log_interval == 0:
+                _probe_drain(config, global_step)
         if pbar is not None:
             pbar.update(1)
             pbar.set_postfix(
@@ -1840,6 +2588,12 @@ def _apply_train_overrides(config: _config.TrainConfig, args: argparse.Namespace
         config = dataclasses.replace(config, num_train_steps=args.train_steps)
     if args.batch_size is not None:
         config = dataclasses.replace(config, batch_size=args.batch_size)
+    if getattr(args, "lr", None) is not None:
+        # Peak drives both schedule shapes; decay_lr is only read by the cosine tail.
+        config = dataclasses.replace(
+            config,
+            lr_schedule=dataclasses.replace(config.lr_schedule, peak_lr=float(args.lr)),
+        )
     if args.checkpoint_base_dir is not None:
         config = dataclasses.replace(config, checkpoint_base_dir=args.checkpoint_base_dir)
     return dataclasses.replace(
@@ -1868,7 +2622,11 @@ def _prepare_checkpoint_dir(config: _config.TrainConfig, is_main: bool) -> bool:
     return resuming
 
 
-def _make_lr_schedule(config: _config.TrainConfig):
+def _make_lr_schedule(config: _config.TrainConfig, shape: str = "cosine"):
+    """Warmup then cosine decay (the shipped shape), or warmup then a flat peak."""
+    if shape not in ("cosine", "constant"):
+        raise ValueError(f"Unknown lr schedule shape {shape!r}.")
+
     def lr_schedule(step: int):
         warmup_steps = config.lr_schedule.warmup_steps
         peak_lr = config.lr_schedule.peak_lr
@@ -1877,6 +2635,8 @@ def _make_lr_schedule(config: _config.TrainConfig):
         if step < warmup_steps:
             init_lr = peak_lr / (warmup_steps + 1)
             return init_lr + (peak_lr - init_lr) * step / warmup_steps
+        if shape == "constant":
+            return peak_lr
         progress = min(1.0, (step - warmup_steps) / max(1, decay_steps - warmup_steps))
         cos = 0.5 * (1 + np.cos(np.pi * progress))
         return end_lr + (peak_lr - end_lr) * cos
@@ -2148,8 +2908,14 @@ def train(args: argparse.Namespace) -> None:
             # stores the raw JSON payload (flat, mean/std alongside the descriptors). Write it
             # directly rather than reshaping into a form only that helper wants.
             config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            # bidirectional_suffix must describe THIS training run, not the cache-generation run
+            # that produced the stats. The cache is built by a separate process whose environment
+            # says nothing about how the reference is trained, and a checkpoint that mis-declares
+            # its own mask gets served under the wrong attention pattern.
+            _stats_out = dict(_ref_norm_stats)
+            _stats_out["bidirectional_suffix"] = os.environ.get("MG_PROXY_BIDIR_SUFFIX", "0") == "1"
             (config.checkpoint_dir / ACTION_NORM_STATS_FILENAME).write_text(
-                json.dumps(_ref_norm_stats, indent=2, sort_keys=True))
+                json.dumps(_stats_out, indent=2, sort_keys=True))
             _copy_action_norm_stats(config, global_step)
         if pbar is not None:
             pbar.update(1)
@@ -2165,6 +2931,11 @@ def train(args: argparse.Namespace) -> None:
     if is_main and config.wandb_enabled:
         wandb.finish()
     cleanup_ddp()
+
+
+def _int_list(text: str) -> tuple[int, ...]:
+    """Parse a comma list of ints; the empty string is the empty tuple (feature off)."""
+    return tuple(int(token) for token in text.split(",") if token.strip())
 
 
 def _add_config_arg(parser: argparse.ArgumentParser) -> None:
@@ -2348,12 +3119,75 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Chunk row 0 is joint_actions[t + offset]. 1 (default) is the "
                            "shipped alignment; 0 makes row 0 the demo's immediate next action, "
                            "which is what setup/07_relabel_replay_gate.py's shim replays.")
+    bc_parser.add_argument("--goal_cond", default="off",
+                           choices=("off", "g_task", "g_demo", "k_stage"),
+                           help="condition on a goal via ONE extra suffix context token. 'off' "
+                                "(default) leaves the architecture and every existing config "
+                                "byte-identical. 'g_task'/'g_demo' are the per-demo 3-D "
+                                "placement goals; 'k_stage' is the PER-WINDOW 5-D task-space "
+                                "stage keypose (EE xyz + gripper yaw + binary gripper) at the "
+                                "terminal event of the segment the window sits in -- the "
+                                "commanded-keypose interface, p(a | o, k).")
+    bc_parser.add_argument("--k_awe", type=int, default=1,
+                           help="AWE waypoints per commanded-gripper phase used to SEGMENT the "
+                                "demo for --goal_cond k_stage. 0 uses the gripper phases "
+                                "themselves; >=1 subdivides each phase and the label becomes "
+                                "the next waypoint still ahead of the window.")
+    bc_parser.add_argument("--k_stride", type=int, default=2,
+                           help="Lattice stride for the AWE dynamic program (see "
+                                "openpi.training.awe_waypoints).")
+    bc_parser.add_argument("--goal_mode", default="context", choices=("context", "joint"),
+                           help="How the goal enters the model. 'context' (default) is the "
+                                "existing goal token: the goal is GIVEN, embedded as one "
+                                "context token, never denoised (Model A). 'joint' trains "
+                                "p(a, g_hat | o): the goal is PREDICTED on its own denoised "
+                                "3-D row and is never fed in (Model B).")
+    bc_parser.add_argument("--goal_loss_coef", type=float, default=1.0,
+                           help="Weight on the goal-row loss in --goal_mode joint. The ACTION "
+                                "term always keeps coefficient 1, so the effective action "
+                                "objective is identical to the context model's.")
+    bc_parser.add_argument("--goal_eval_every", type=int, default=500,
+                           help="steps between validation passes with the goal controls")
+    bc_parser.add_argument("--goal_eval_batches", type=int, default=8,
+                           help="val batches per pass (each scored under 3 goal conditions)")
     bc_parser.add_argument("--val_demos", type=int, default=0,
                            help="Hold out the last N demos by numeric index for the offline gate.")
     bc_parser.add_argument("--prediction_type", default="x0",
                            choices=("x0", "epsilon", "score", "regress"),
                            help="Training head. 'regress' is plain chunked regression (no noising) "
                            "and cannot be served through the score-space path.")
+    bc_parser.add_argument("--awe_norm", default="legacy",
+                           choices=("legacy", "pooled_all"),
+                           help="Scale of the goal rows. 'legacy' whitens them per row, which "
+                           "makes them 1.7-3.3x wider than the action rows, so a uniform steering "
+                           "vector is silently rescaled ~3x on the row being steered. "
+                           "'pooled_all' fits ONE per-dim scale over all rows' deltas and "
+                           "broadcasts it, Cory's shared-scale representation in the [H, D] table "
+                           "the decode side already reads. The encoding stays DELTA either way.")
+    bc_parser.add_argument("--awe_target_tail_steps", type=int, default=0,
+                           help="Re-draw the phase endpoint uniformly over the phase's last N "
+                           "steps on every __getitem__. Fixed targets make p(keypose | obs) a "
+                           "near-delta, and a delta is un-steerable. 16 is Cory's 40 raw frames "
+                           "(0.8 s) at our 20 Hz. 0 = off.")
+    bc_parser.add_argument("--awe_target_jitter_steps", type=_int_list, default=(),
+                           help="Comma list of shift magnitudes for the AWE waypoint frames; each "
+                           "waypoint draws from +-{these} and is clipped into [anchor, endpoint]. "
+                           "'1,2' is Cory's +-3-4 raw frames at our 20 Hz. Empty = off.")
+    bc_parser.add_argument("--lr", type=float, default=None,
+                           help="Override the config's peak learning rate.")
+    bc_parser.add_argument("--lr_schedule", default="cosine",
+                           choices=("cosine", "constant"),
+                           help="Post-warmup shape. 'constant' holds the peak, which is what "
+                           "Cory's budget uses; 'cosine' (default) is the shipped decay.")
+    bc_parser.add_argument("--rollout_every", type=int, default=5000,
+                           help="Steps between periodic probe rollouts (0 = off). Needs "
+                           "--probe_task and a host-side agent_tests/_probe_watcher.py; without "
+                           "one this only drops request files and training is unaffected. Should "
+                           "be a multiple of the config's save_interval.")
+    bc_parser.add_argument("--probe_task", default=None,
+                           help="mujoco_eval task name for the periodic rollout, e.g. square.")
+    bc_parser.add_argument("--probe_seeds", type=_int_list, default=(9001, 9002, 9003),
+                           help="Seeds the probe rollout runs, comma separated.")
     bc_parser.set_defaults(func=train_bc)
     return parser
 

@@ -546,6 +546,60 @@ def _can_frame_context(base_ctx, sig, step, **_):
     return ctx
 
 
+def _sort_can_frame_context(base_ctx, sig, step, **_):
+    """Same ladder as `can`, but the place target is the episode's REQUESTED bin.
+
+    The destination comes from the demo's own `g_task_xyz` attr (passed in as
+    `sort_can_goal`), so a frame's context cannot silently fall back to a fixed bin.
+    """
+    ctx = dict(base_ctx)
+    raw = dict(base_ctx["objects"])
+    goal = np.asarray(base_ctx.get("sort_can_goal", CAN_SEAT), dtype=np.float32)
+    raw["target_bin"] = goal
+    extents = dict(CAN_EXTENTS)
+    extents["target_bin"] = CAN_EXTENTS["bin2_q3"]
+    ctx["objects"] = _objects_ctx(raw, extents)
+    drop = goal + np.array([0.0, 0.0, 0.03], dtype=np.float32)
+    if step < sig["hold"]:
+        upd = dict(stage_label="grasp", grasp_obj="can", payload=None, place_target=None,
+                   target=np.asarray(raw["can"], dtype=np.float32), gripper_intent="close")
+    elif step < sig["rise"]:
+        target = np.array([raw["can"][0], raw["can"][1], sig["rest"] + _LIFT["can"]],
+                          dtype=np.float32)
+        upd = dict(stage_label="lift", grasp_obj="can", payload="can", place_target=None,
+                   target=target, gripper_intent="close")
+    else:
+        upd = dict(stage_label="place", grasp_obj=None, payload="can",
+                   place_target="target_bin", target=drop, place_point=drop,
+                   carry_z=sig["carry_z"], gripper_intent="place")
+        if step >= sig["o1"]:
+            upd.update(released=True, place_released=True)
+    ctx.update(upd)
+    ctx.update(destination="target_bin", placed=frozenset(), contact="pinch", orient="down",
+               place_mode="container", z_table=sig["z_table"])
+    ctx.setdefault("plan_ref", None)
+    return ctx
+
+
+# The tray is the whole of bin2 rather than one quadrant, so the container keepout uses the full
+# interior half-extents. The height matches the quadrant case: the walls are the same geoms.
+TRAY_EXTENTS = (0.19, 0.24, 0.04)
+
+
+def _sort_can_tray_frame_context(base_ctx, sig, step, **kw):
+    """sort_can's ladder with the tray's own container extents.
+
+    The destination already comes from the demo's `g_task_xyz` (passed in as `sort_can_goal`),
+    which for this task is the commanded continuous goal rather than a quadrant seat, so only
+    the place target's extents need substituting.
+    """
+    ctx = _sort_can_frame_context(base_ctx, sig, step, **kw)
+    if "target_bin" in ctx.get("objects", {}):
+        ctx["objects"]["target_bin"] = dict(ctx["objects"]["target_bin"])
+        ctx["objects"]["target_bin"]["extents"] = TRAY_EXTENTS
+    return ctx
+
+
 def _ring_frame(tripod_pos, tripod_quat_xyzw, needle_pos):
     """Return the ring center and approach-signed axis."""
     rot = _rot_xyzw(tripod_quat_xyzw)
@@ -1327,6 +1381,21 @@ MG_TASKS = {
         frame_context=_can_frame_context,
         episode_signals=can_episode_signals,
         stage_order=("grasp", "lift", "place")),
+    "sort_can": OfflineTask(
+        task_id="SortCanTwoBin",
+        hdf5=str(DATA / "sort_can_d0/demo.hdf5"),
+        frame_context=_sort_can_frame_context,
+        episode_signals=can_episode_signals,
+        stage_order=("grasp", "lift", "place")),
+    # Continuous-goal tray variant. The ladder is sort_can's -- same can, same
+    # grasp/lift/place structure -- and its place target already comes from the demo's own
+    # goal attr, so the only difference is the container extents.
+    "sort_can_tray": OfflineTask(
+        task_id="SortCanTray",
+        hdf5=str(DATA / "sort_can_tray_d0/demo.hdf5"),
+        frame_context=_sort_can_tray_frame_context,
+        episode_signals=can_episode_signals,
+        stage_order=("grasp", "lift", "place")),
     "threading": OfflineTask(
         task_id="Threading_D0",
         hdf5=str(DATA / "threading_d0/demo.hdf5"),
@@ -1375,7 +1444,9 @@ MG_TASKS = {
 }
 
 OBJ_LAYOUT = {"stack": STACK_LAYOUT, "stack_three": STACK3_LAYOUT, "square": SQUARE_LAYOUT,
-              "lift": LIFT_LAYOUT, "can": CAN_LAYOUT, "threading": THREADING_LAYOUT,
+              "lift": LIFT_LAYOUT, "can": CAN_LAYOUT, "sort_can": CAN_LAYOUT,
+              "sort_can_tray": CAN_LAYOUT,
+              "threading": THREADING_LAYOUT,
               "coffee": COFFEE_LAYOUT, "mug_cleanup": MUG_LAYOUT,
               "three_piece_assembly": TPA_LAYOUT, "hammer_cleanup": HC_LAYOUT,
               "kitchen": KITCHEN_LAYOUT, "coffee_prep": COFFEE_PREP_LAYOUT}

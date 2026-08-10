@@ -30,21 +30,69 @@ def _goals_at(goals, frame_idx):
 _GHOST_MIN_SEP = 0.08
 
 
+_GHOST_REPORTED = []
+
+
 def _render_ghosts(env, viz, rows, hw):
-    """Render one ghost per goal row: waypoints faint and fading by rank, the keypose strongest."""
+    """Render one ghost per goal row: waypoints cyan, the keypose magenta and strongest.
+
+    Two rules, both about legibility rather than taste:
+
+    * a row within _GHOST_MIN_SEP of the LIVE pose is where the arm already is;
+    * a row within _GHOST_MIN_SEP of a row already kept just thickens that ghost.
+
+    The second matters because AWE waypoints bunch near the goal -- measured on square,
+    separations from the live pose run 0.174, 0.327, 0.424, 0.542, 0.607 with the keypose at
+    0.626, so the last waypoint sits 0.019 rad from the keypose. Selecting backwards keeps the
+    keypose (the phase endpoint) and drops the waypoint duplicating it, rather than the reverse.
+    """
     layers = []
     rows = list(rows)
     now = np.asarray(env.q0(), dtype=np.float64)[:7]
-    for j, q in enumerate(rows):
-        if float(np.abs(np.asarray(q, dtype=np.float64)[:7] - now).max()) < _GHOST_MIN_SEP:
+    qs = [np.asarray(q, dtype=np.float64)[:7] for q in rows]
+    seps = [float(np.abs(q - now).max()) for q in qs]
+
+    keep = []
+    for j in range(len(qs) - 1, -1, -1):
+        if seps[j] < _GHOST_MIN_SEP:
             continue
-        last = j == len(rows) - 1
+        if any(float(np.abs(qs[j] - qs[k]).max()) < _GHOST_MIN_SEP for k in keep):
+            continue
+        keep.append(j)
+    keep.sort()                       # render forward so the keypose composites last, on top
+
+    if not _GHOST_REPORTED:
+        _GHOST_REPORTED.append(1)
+        print(f"[mujoco-eval] ghosts: {len(rows)} goal rows -> {len(keep)} drawn {keep} "
+              f"(min_sep {_GHOST_MIN_SEP}); separations from live pose "
+              f"{[round(s, 3) for s in seps]}", flush=True)
+
+    last_idx = len(rows) - 1
+    labels = []
+    for j in keep:
+        last = j == last_idx
         color = _GHOST_KEYPOSE if last else _GHOST_WAYPOINT
-        # Faint enough to read the real robot through them; nearer waypoints are the brighter.
-        alpha = 0.32 if last else 0.20 * (1.0 - 0.5 * j / max(len(rows) - 1, 1))
-        ghost, mask = viz.ghost_layer(env, q, color, hw=hw)
+        # Flat across waypoints: the old ramp faded toward the goal, so the faintest waypoint sat
+        # under the strongest ghost exactly where they cluster. Colour already separates them.
+        alpha = 0.32 if last else 0.18
+        ghost, mask = viz.ghost_layer(env, rows[j], color, hw=hw)
         layers.append((ghost, mask, alpha))
-    return {"layers": layers}
+        # Label each ghost at the centroid of its own mask, as his AWE renderer does; a stack of
+        # unlabelled arms reads as one shape with no way to tell W2 from W4.
+        if np.any(mask):
+            ys, xs = np.nonzero(mask)
+            labels.append((("KP" if last else f"W{j + 1}"),
+                           (int(np.median(xs)), int(np.median(ys))),
+                           tuple(int(255 * c) for c in color)))
+    return {"layers": layers, "labels": labels}
+
+
+def _ghosts_for(style, env, viz, rows, hw):
+    """Dispatch to our ghost renderer or the parallel port of Cory's."""
+    if style == "cory":
+        from . import ghost_cory
+        return ghost_cory.render_ghosts(env, rows, hw)
+    return _render_ghosts(env, viz, rows, hw)
 
 
 def save_video(env, states, path, fps=20, overlay=None):
@@ -57,6 +105,9 @@ def save_video(env, states, path, fps=20, overlay=None):
       ee_path    [T, 3] executed end-effector path; drawn progressively so the trail grows
       lines      callable(i) -> list[str] status text for frame i
       goals      [(step, [[q7], ...]), ...] proxy goal rows per replan, drawn as ghost poses
+      markers    callable(i) -> [marker dict] planner-side world points for frame i (see
+                 viz.draw_markers); used for keypose visualisation, where the point to show is
+                 the policy's INTENDED endpoint rather than anything present in the scene
     Absent, the video is byte-for-byte what it was before.
     """
     import imageio
@@ -74,12 +125,14 @@ def save_video(env, states, path, fps=20, overlay=None):
                     # replan's set once and reuse it for every frame that replan covers.
                     rows, at = _goals_at(overlay.get("goals"), i)
                     if rows is not None and at != ghost_step:
-                        ghost_cache = _render_ghosts(env, viz, rows, frame.shape[0])
+                        ghost_cache = _ghosts_for(overlay.get("ghost_style"), env, viz,
+                                                  rows, frame.shape[0])
                         ghost_step = at
                     kps = overlay.get("keypoints")
                     goal = overlay.get("subgoal")
                     trail = overlay.get("ee_path")
                     lines = overlay.get("lines")
+                    marks = overlay.get("markers")
                     frame = viz.annotate_rollout_frame(
                         env,
                         keypoints=(kps() if callable(kps) else kps),
@@ -88,6 +141,10 @@ def save_video(env, states, path, fps=20, overlay=None):
                         hw=frame.shape[0],
                         lines=(lines(i) if callable(lines) else (lines or ())),
                         ghosts=ghost_cache.get("layers", ()),
+                        ghost_labels=ghost_cache.get("labels", ()),
+                        markers=(marks(i) if callable(marks) else (marks or ())),
+                        text_bg=overlay.get("text_bg"),
+                        text_scale=overlay.get("text_scale", 1),
                     )
                 except Exception as exc:      # a broken overlay must not cost the whole video
                     if i == 0:
@@ -129,6 +186,9 @@ def steer_fields(steer, stats, plan, env):
     if steer.mode in ("additive", "policy_base", "keypose_fk", "proxy_pair", "vls"):
         out["proxy_embed_s"] = round(float(steer.last_embed_s), 3)
         out["steer_levels"] = steer.level_trace
+        # The shadow goal-row chain under --proxy_aux native; absent otherwise.
+        if getattr(steer, "aux_trace", None):
+            out["aux_levels"] = steer.aux_trace
 
         # policy_base logs per-level call timings but no addend ratio: it blends whole chains
         # rather than adding a score field, so there is nothing to take a ratio of.
@@ -234,7 +294,13 @@ class Recorder:
 
     def replan(self, step, bridge, env, stats, wall_s, movable):
         """Build the shared telemetry record for one replan."""
+        extra = ({"base_levels": stats["base_levels"]}
+                 if stats.get("base_levels") else {})
+        extra.update({k: round(float(stats[k]), 5) for k in
+                      ("exec_dq_median", "exec_dq_frac_at_clip",
+                       "raw_dq_median", "raw_dq_over_clip_frac") if k in stats})
         return {
+            **extra,
             "kind": "replan",
             "step": step,
             "stage_idx": bridge.stage_idx,

@@ -56,6 +56,9 @@ class Stage:
     # constraint is set it becomes J_task, and held_idx are keypoints riding the gripper.
     constraint: Optional[Callable] = None
     path_fns: tuple = ()
+    # The sub-goal's rules kept apart, in the same shape as path_fns. `constraint` sums them for the
+    # cost; advancement reads them one by one, so no rule can be satisfied on another's behalf.
+    subgoal_fns: tuple = ()
     held_idx: tuple = ()
     # pinch: straddle-grasp a free object. press: contact-and-hold an articulated part such as a lid, with
     # no pinch-certification, advancing on contact so the sub-goal drives it.

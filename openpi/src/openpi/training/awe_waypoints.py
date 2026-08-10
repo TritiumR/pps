@@ -94,15 +94,18 @@ def fixed_k_interior(edge_errors, start: int, end: int, k: int):
     return interior, float(previous[end])
 
 
-def waypoint_targets(joint_actions, k: int = 5, stride: int = 2) -> np.ndarray:
-    """Return [T, k+1, D] absolute targets: k AWE waypoints then the phase endpoint.
+def waypoint_target_indices(joint_actions, k: int = 5, stride: int = 2) -> np.ndarray:
+    """Return [T, k+1] FRAME INDICES: k AWE waypoints then the phase endpoint.
+
+    The index twin of `waypoint_targets`. Targets alone cannot be jittered -- a jitter is a shift
+    along the trajectory, so `randomized_target_indices` needs the frames, not the poses.
 
     Normalisation is per-dimension over the whole demo, so the interpolation error metric is not
     dominated by whichever joint happens to have the largest range.
     """
     actions = np.asarray(joint_actions, dtype=np.float32)
-    length, dim = actions.shape
-    out = np.repeat(actions[:, None, :], k + 1, axis=1)
+    length = len(actions)
+    out = np.repeat(np.arange(length, dtype=np.int64)[:, None], k + 1, axis=1)
     if length == 0:
         return out
 
@@ -124,12 +127,71 @@ def waypoint_targets(joint_actions, k: int = 5, stride: int = 2) -> np.ndarray:
         endpoint = len(lattice) - 1
         for position, anchor in enumerate(lattice[:-1]):
             interior, _ = fixed_k_interior(errors, position, endpoint, k)
-            rows = lattice[interior]
-            block = np.concatenate([actions[rows], actions[segment_end][None]], axis=0)
+            block = np.concatenate([lattice[interior], [segment_end]])
             stop = int(lattice[position + 1]) if position + 1 < len(lattice) else segment_end + 1
             out[int(anchor) : stop] = block
         segment_start = int(boundary) + 1
     return out
+
+
+def waypoint_targets(joint_actions, k: int = 5, stride: int = 2) -> np.ndarray:
+    """Return [T, k+1, D] absolute targets: k AWE waypoints then the phase endpoint."""
+    actions = np.asarray(joint_actions, dtype=np.float32)
+    return actions[waypoint_target_indices(actions, k=k, stride=stride)]
+
+
+# 20 Hz scalings of Cory's raw-frame constants (tail 40 frames = 0.8 s, jitter +-3-4 frames).
+DEFAULT_TARGET_TAIL_STEPS = 16
+DEFAULT_TARGET_JITTER_STEPS = (1, 2)
+
+
+def randomized_target_indices(
+    canonical_indices,
+    *,
+    anchor: int,
+    tail_steps: int = DEFAULT_TARGET_TAIL_STEPS,
+    jitter_steps=DEFAULT_TARGET_JITTER_STEPS,
+    rng,
+) -> np.ndarray:
+    """Resample the phase target: endpoint uniform over a tail, waypoints shifted, order kept.
+
+    A port of `randomized_target_indices` from Cory's
+    train_rollout_sort_ball_pps_full_zarr_10hz_parallel_awe_trajectory.py, with the raw-frame
+    constants rescaled to our 20 Hz control rate.
+
+    WHY. With fixed indices p(keypose | obs) is a near-delta, and a delta is un-steerable: the
+    model has never seen the target anywhere else, so displacing it at inference is off-manifold.
+    Re-drawing every __getitem__ makes the keypose a REGION, which is the object a steering
+    vector can move inside.
+
+    `tail_steps <= 1` pins the endpoint and an empty `jitter_steps` pins the waypoints, so either
+    axis can be disabled on its own.
+    """
+    canonical = np.asarray(canonical_indices, dtype=np.int64)
+    if canonical.ndim != 1 or canonical.size == 0:
+        raise ValueError(f"canonical target must be a non-empty 1-D index vector, got {canonical.shape}")
+    if np.any(np.diff(canonical) < 0):
+        raise ValueError("canonical target indices are not ordered")
+    segment_end = int(canonical[-1])
+    if segment_end < int(anchor):
+        raise ValueError("canonical endpoint precedes the training anchor")
+
+    candidate_start = max(int(anchor), segment_end - max(int(tail_steps), 1) + 1)
+    terminal = int(rng.integers(candidate_start, segment_end + 1))
+
+    interior = canonical[:-1]
+    magnitudes = np.asarray(tuple(jitter_steps or ()), dtype=np.int64)
+    if interior.size and magnitudes.size:
+        choices = np.concatenate([-magnitudes, magnitudes])
+        shifts = np.asarray(rng.choice(choices, size=interior.size), dtype=np.int64)
+        interior = interior + shifts
+    interior = np.clip(interior, int(anchor), terminal)
+    interior.sort()
+
+    result = np.concatenate([interior, np.asarray([terminal], dtype=np.int64)])
+    if np.any(np.diff(result) < 0):
+        raise RuntimeError("randomized target indices are not ordered")
+    return result
 
 
 def audit(hdf5_path: str, k: int = 5, stride: int = 2, limit: int | None = None) -> dict:

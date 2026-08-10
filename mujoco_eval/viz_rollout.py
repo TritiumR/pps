@@ -4,7 +4,8 @@ Ported in spirit from ~/hydrax/vlm_mpc/viz_mpc.py (fig_subgoal / fig_spaghetti /
 retargeted at the records mujoco_eval already writes. Every quantity plotted here has been in the
 logs all along with nothing to render it -- these figures need no new instrumentation.
 
-    python -m mujoco_eval.viz_rollout results/stack/_rekep_fixed/101.jsonl -o results/viz/stack
+    python -m mujoco_eval.viz_rollout \
+        results/stack/0807/_rekep_fixed/failure/trace/101_failure.jsonl -o results/viz/stack
 
 Writes: subgoal.png (constraint residual + stage spans), cost.png (cost_min/weighted + ESS),
 traj3d.png (executed EE path in 3D with object positions), spaghetti.png (per-axis EE traces).

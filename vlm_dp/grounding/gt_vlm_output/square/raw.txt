@@ -1,0 +1,93 @@
+# square -- deterministic stand-in for a GPT-4o ReKep response.
+# Format follows rekep/prompts/prompt_template.txt, so _render() parses it exactly as
+# rekep/constraint_generation.py parses a live response. Placeholders in braces are the values only
+# resolvable at runtime: keypoint indices from the live scene and offsets measured from the
+# observed point cloud.
+#
+# Task: "put the square nut on the peg"
+#
+# The task involves four stages:
+# 1. Grasp the nut by its handle.
+# 2. Lift the nut clear of the table.
+# 3. Carry the nut ring above the peg.
+# 4. Lower the nut down the peg and release.
+#
+# Two keypoints ride the nut: the handle (keypoint {h}, where the gripper closes) and the ring
+# (keypoint {n}, the hole that has to swallow the peg). Transport is written on the handle, which
+# is the keypoint the grasp certainly holds; the threading geometry is written on the ring, which
+# is the part that actually has to line up with the peg.
+#
+# All targets are offsets from the peg top (keypoint {p}) -- the one static fixture in this scene.
+# The descent rule is one-sided: once the ring is at or below the seating height, going further
+# down is free, because the peg itself stops the nut.
+
+num_stages = 4
+
+
+### stage 1 sub-goal constraints
+def stage1_subgoal_constraint1(end_effector, keypoints):
+    """Align the end-effector with the nut handle (keypoint {h})."""
+    return np.linalg.norm(end_effector - keypoints[{h}])
+
+### stage 1 path constraints
+# No path constraints needed for grasping.
+
+### stage 2 sub-goal constraints
+def stage2_subgoal_constraint1(end_effector, keypoints):
+    """The nut handle (keypoint {h}) is raised to its carry height above the pick-up pose."""
+    offsetted_point = keypoints[{p}] + np.array({lift_h})
+    return np.linalg.norm(keypoints[{h}] - offsetted_point)
+
+### stage 2 path constraints
+def stage2_path_constraint1(end_effector, keypoints):
+    """The nut (keypoint {h}) must not fall back below the height it was picked up from."""
+    return np.maximum(0.0, keypoints[{p}][..., 2] + ({pick_z}) - keypoints[{h}][..., 2])
+
+def stage2_path_constraint2(end_effector, keypoints):
+    """The robot must still be holding the nut (keypoint {h})."""
+    return get_grasping_cost_by_keypoint_idx({h})
+
+### stage 3 sub-goal constraints
+def stage3_subgoal_constraint1(end_effector, keypoints):
+    """The nut ring (keypoint {n}) hovers above the peg top (keypoint {p})."""
+    offsetted_point = keypoints[{p}] + np.array({carry_n})
+    return np.linalg.norm(keypoints[{n}] - offsetted_point)
+
+### stage 3 path constraints
+def stage3_path_constraint1(end_effector, keypoints):
+    """The nut (keypoint {h}) stays at transport altitude while crossing to the peg."""
+    return np.maximum(0.0, keypoints[{p}][..., 2] + ({carry_z}) - keypoints[{h}][..., 2])
+
+def stage3_path_constraint2(end_effector, keypoints):
+    """The robot must still be holding the nut (keypoint {h})."""
+    return get_grasping_cost_by_keypoint_idx({h})
+
+### stage 4 sub-goal constraints
+def stage4_subgoal_constraint1(end_effector, keypoints):
+    """The nut ring (keypoint {n}) is centred on the peg (keypoint {p})."""
+    return np.linalg.norm(keypoints[{n}][..., :2] - keypoints[{p}][..., :2])
+
+def stage4_subgoal_constraint2(end_effector, keypoints):
+    """The nut ring (keypoint {n}) has slid down the peg to its seating height."""
+    return np.maximum(0.0, keypoints[{n}][..., 2] - keypoints[{p}][..., 2] - ({seat_dz}))
+
+### stage 4 path constraints
+def stage4_path_constraint1(end_effector, keypoints):
+    """The nut ring (keypoint {n}) stays over the peg while it descends."""
+    return np.linalg.norm(keypoints[{n}][..., :2] - keypoints[{p}][..., :2])
+
+def stage4_path_constraint2(end_effector, keypoints):
+    """The robot must still be holding the nut (keypoint {h})."""
+    return get_grasping_cost_by_keypoint_idx({h})
+
+
+"""
+Summarize keypoints to be grasped in all grasping stages.
+For a grasping stage write the keypoint index; for a non-grasping stage write -1.
+"""
+grasp_keypoints = [{h}, -1, -1, -1]
+
+"""
+Summarize at **the end of which stage** the robot should release each keypoint.
+"""
+release_keypoints = [-1, -1, -1, {h}]

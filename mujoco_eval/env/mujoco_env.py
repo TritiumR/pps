@@ -107,9 +107,10 @@ class MuJoCoEnv:
 
     def __init__(self, hdf5, fk_fit, camera="agentview", camera_hw=256,
                  joint_kp=JOINT_KP, joint_output_max=JOINT_OUTPUT_MAX,
-                 visual_only_render=True):
+                 visual_only_render=True, env_kwargs_extra=None):
         import mimicgen
         import robomimic.utils.env_utils as EnvUtils
+        from .. import envs  # noqa: F401  registers this repo's own robosuite envs
         import robomimic.utils.file_utils as FileUtils
         import robomimic.utils.obs_utils as ObsUtils
         from robosuite import load_controller_config
@@ -123,6 +124,10 @@ class MuJoCoEnv:
         ctrl["output_max"] = joint_output_max
         ctrl["output_min"] = -joint_output_max
         env_meta["env_kwargs"]["controller_configs"] = ctrl
+        # Opt-in scene options the recorded dataset predates (e.g. the tray's semantic marker).
+        # Absent, the env is built from the dataset's own kwargs exactly as before.
+        if env_kwargs_extra:
+            env_meta["env_kwargs"].update(env_kwargs_extra)
         self.env = EnvUtils.create_env_from_metadata(
             env_meta=env_meta, render=False, render_offscreen=True, use_image_obs=False)
         with open(fk_fit) as fh:
@@ -174,6 +179,11 @@ class MuJoCoEnv:
         """Return the environment task-success flag."""
         return bool(self.env.is_success()["task"])
 
+
+    @property
+    def raw(self):
+        """The underlying robosuite env, for tasks that carry a per-episode goal."""
+        return self.env.env
 
     @property
     def sim(self):

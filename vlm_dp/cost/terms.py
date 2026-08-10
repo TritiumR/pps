@@ -164,10 +164,26 @@ def _progress(values, geom):
     return torch.clamp(step, min=0.0).sum(dim=1)
 
 
+def _yields_to_constraint(I):
+    """True when a live ReKep sub-goal exists and the attractors should stand down for it.
+
+    reach/terminal_reach have always self-disabled under a constraint: the plan's own sub-goal is
+    meant to own the objective wherever it speaks, and two attractors on one stage would double-
+    charge it. That is right for a controller, and WRONG for an experiment whose whole question is
+    "attractor vs ReKep", because under a grounding that supplies a constraint everywhere the
+    attractor arm silently has no attractor and the comparison is against nothing.
+
+    `attractors_under_constraint` suspends the hand-off so both can be measured on the same
+    grounding. Default False, which is the shipped behaviour exactly.
+    """
+    return (I.context.get("constraint") is not None
+            and not getattr(I.geom, "attractors_under_constraint", False))
+
+
 @register("reach")
 def reach(I):
     """Penalty: mean squared TCP-to-target distance."""
-    if I.context.get("constraint") is not None or I.context.get("payload") is not None:
+    if I.context.get("payload") is not None or _yields_to_constraint(I):
         return _zeros(I)
     d = _flat(((I.ee_pos - _target(I).view(1, 1, 3)) ** 2).sum(dim=-1).sqrt(), I.geom) ** 2
     return _progress(d, I.geom)
@@ -176,7 +192,7 @@ def reach(I):
 @register("terminal_reach")
 def terminal_reach(I):
     """Penalty: terminal squared TCP-to-target distance."""
-    if I.context.get("constraint") is not None or I.context.get("payload") is not None:
+    if I.context.get("payload") is not None or _yields_to_constraint(I):
         return _zeros(I)
     return _flat(((I.ee_pos - _target(I).view(1, 1, 3)) ** 2).sum(dim=-1).sqrt(), I.geom)[:, -1] ** 2
 
@@ -190,9 +206,11 @@ def rekep_subgoal(I):
     v = subgoal(I.ee_pos, _rekep_keypoints(I))
     # ReKep constraints are satisfied at f(x) <= 0, so only POSITIVE values are violations.
     # Summing the raw signed output let a satisfied constraint cancel a violated one, which
-    # rekep_path (immediately below) already avoids with the same clamp. _flat then widens the
-    # zero set to the configured tolerance (a no-op at flat_tol 0).
-    v = _flat(torch.clamp(v, min=0), I.geom)
+    # rekep_path (immediately below) already avoids with the same clamp.
+    v = torch.clamp(v, min=0)
+    # Clamp FIRST, then the optional shaping: _flat's max(0, err - tol) assumes a non-negative
+    # error, and _progress should charge increases in violation, not in signed constraint value.
+    v = _flat(v, I.geom)
     if getattr(I.geom, "potential_shaping", False):
         return _progress(v, I.geom)
     return v.mean(dim=1) if getattr(I.geom, "subgoal_mean", False) else v.sum(dim=1)
@@ -216,22 +234,30 @@ def rekep_keypose(I):
     if subgoal is None:
         return _zeros(I)
     v = subgoal(I.ee_pos, _rekep_keypoints(I))
-    return v[:, -1]
+    # ReKep convention: f <= 0 is satisfied. Without the clamp an over-satisfied keypose pays
+    # negative cost and dominates the softmax.
+    return torch.clamp(v[:, -1], min=0)
 
 
 @register("rekep_path")
 def rekep_path(I):
-    """Constraint approximation: ReKep running path constraints (per-step geometric),
-    summed over H.
+    """Constraint approximation: ReKep running path constraints (per-step geometric).
+
+    Reduced over H by sum (default, back-compatible) or by mean under the geometry flag
+    `rekep_path_mean`. The mean makes it commensurate with the mean-reduced feasibility terms,
+    so one weight means the same thing regardless of horizon length; the sum scales with H and
+    is kept as the default because the shipped configs weight this term at 200.0 against it.
     """
     if I.context.get("constraint") is None or not I.context.get("path_fns", ()):
         return _zeros(I)
     kp = _rekep_keypoints(I)
+    mean_reduce = bool(getattr(I.geom, "rekep_path_mean", False))
     cost = _zeros(I)
     for path_fn in I.context["path_fns"]:
         v = path_fn(I.ee_pos, kp)
         if torch.is_tensor(v) and v.ndim == 2:
-            cost = cost + torch.clamp(v, min=0).sum(dim=1)
+            v = torch.clamp(v, min=0)
+            cost = cost + (v.mean(dim=1) if mean_reduce else v.sum(dim=1))
     return cost
 
 

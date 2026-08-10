@@ -26,12 +26,51 @@ _RHO_SKIP = 1e-3
 TASK_PROMPTS = {
     "stack": "stack the red block on the green block",
     "can": "put the can in the bin",
+    # sort_can is deliberately ABSENT. Its destination is named by a colour that is redrawn every
+    # episode, so any fixed string here would be a wrong instruction half the time, supplied
+    # silently by a default. The caller must pass the episode's own instruction (from
+    # SortCanTwoBin.goal_prompt) via --proxy_prompt; runner.py raises when it does not.
 }
 
 
 def host_to_container(path: str) -> str:
     """Map a host checkpoint path into the container."""
     return container.to_container(path)
+
+
+def norm_stats_mismatch(task_info, ref_info, *, tol=1e-6, max_report=6):
+    """Report where a task and reference proxy disagree on their action normalisation.
+
+    C1b. The old fingerprint compared the NAME ("demo_delta" == "demo_delta") and passed two
+    checkpoints whose stats differ -- ref_square_v2 centres the gripper at 0.0 where the task
+    proxy centres it at 0.5, and its arm scales differ by up to 4%. The name is not the
+    coordinate system; the numbers are. Returns a list of human-readable offences, empty when
+    the two bridges are the same map.
+    """
+    out = []
+    tn, rn = task_info.get("action_norm", "?"), ref_info.get("action_norm", "?")
+    if tn != rn:
+        return [f"action_norm {tn!r} vs {rn!r}"]
+    keys = (("action_mean_rows", "mean"), ("action_std_rows", "scale")) if tn == "demo_delta" else (
+        ("action_q01", "q01"), ("action_q99", "q99"))
+    for key, label in keys:
+        a, b = task_info.get(key), ref_info.get(key)
+        if a is None or b is None:
+            out.append(f"{label}: missing on {'task' if a is None else 'reference'}")
+            continue
+        a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
+        n = tuple(min(i, j) for i, j in zip(a.shape, b.shape))
+        sl = tuple(slice(0, i) for i in n)
+        if a.shape != b.shape:
+            out.append(f"{label}: shape {a.shape} vs {b.shape}")
+        d = np.abs(a[sl] - b[sl])
+        bad = np.argwhere(d > tol)
+        for idx in bad[:max_report]:
+            idx = tuple(int(i) for i in idx)
+            out.append(f"{label}{list(idx)}: {a[sl][idx]:.6g} vs {b[sl][idx]:.6g}")
+        if len(bad) > max_report:
+            out.append(f"{label}: ... and {len(bad) - max_report} more dims")
+    return out
 
 
 def _array_to_b64(array: np.ndarray) -> str:
@@ -119,13 +158,21 @@ class ProxyScoreClient:
             raise RuntimeError(f"Proxy server error: {reply['error']}")
         return reply
 
-    def chain(self, *, seed, num_iterations, joint_pos, gripper_pos, table, wrist):
-        """Run one proxy reverse chain and return clean action predictions."""
-        reply = self._rpc({
+    def chain(self, *, seed, num_iterations, joint_pos, gripper_pos, table, wrist, goal=None):
+        """Run one proxy reverse chain and return clean action predictions.
+
+        `goal` is the already-normalised conditioning vector for a goal-conditioned checkpoint
+        (goal_dim > 0). None -- the default -- leaves the request byte-identical to what every
+        existing arm sends.
+        """
+        req = {
             "cmd": "chain", "seed": int(seed), "num_iterations": int(num_iterations),
             "joint_pos": [float(v) for v in np.asarray(joint_pos).reshape(-1)[:7]],
             "gripper_pos": float(gripper_pos),
-            "table_b64": _array_to_b64(table), "wrist_b64": _array_to_b64(wrist)})
+            "table_b64": _array_to_b64(table), "wrist_b64": _array_to_b64(wrist)}
+        if goal is not None:
+            req["goal"] = [float(v) for v in np.asarray(goal).reshape(-1)]
+        reply = self._rpc(req)
         return _b64_to_array(reply["x0_real_b64"]), float(reply.get("wall_s", np.nan))
 
     def embed(self, *, joint_pos, gripper_pos, table, wrist):
@@ -173,22 +220,30 @@ class ProxySteering:
         self.horizon = int(horizon)
         self.base_seed = int(base_seed)
         self.replan_idx = 0
+        # Offset into the proxy's own seed stream. 0 leaves every existing arm byte-identical;
+        # the supervisor advances it to ask the SAME policy for a fresh draw from its own
+        # distribution at the same observation (steering/supervisor.py).
+        self.retry_salt = 0
         self.last_wall_s = np.nan
         self.last_server_s = np.nan
         self._x0_real = None
         self._q0 = None
 
-    def begin_replan(self, env, num_iterations):
-        """Capture observations and fetch the proxy chain for one replan."""
+    def begin_replan(self, env, num_iterations, goal=None):
+        """Capture observations and fetch the proxy chain for one replan.
+
+        `goal` is the already-normalised conditioning vector for a goal-conditioned proxy. None --
+        the default -- reproduces every existing arm exactly.
+        """
         table = env.rgb("agentview", hw=224)
         wrist = env.rgb("robot0_eye_in_hand", hw=224)
         q0 = env.q0().numpy().astype(np.float32)
         gripper = float(np.clip(env.gripper_q() / _OPEN_APERTURE, 0.0, 1.0))
         t0 = time.perf_counter()
         self._x0_real, self.last_server_s = self.client.chain(
-            seed=self.base_seed * 100003 + self.replan_idx,
+            seed=self.base_seed * 100003 + self.replan_idx + self.retry_salt,
             num_iterations=num_iterations,
-            joint_pos=q0, gripper_pos=gripper, table=table, wrist=wrist)
+            joint_pos=q0, gripper_pos=gripper, table=table, wrist=wrist, goal=goal)
         self.last_wall_s = time.perf_counter() - t0
         self._q0 = q0
         self.replan_idx += 1
@@ -296,8 +351,13 @@ class AdditiveScoreSteering:
     mode = "additive"
 
     def __init__(self, client, *, gamma, policy, horizon, mass_keep=0.9999, score_cap=0, seed=0,
-                 at="candidates", ref="none", ref_client=None, last_level=None):
+                 at="candidates", ref="none", ref_client=None, last_level=None, aux="pad"):
         self.client = client
+        # How the proxy's trailing GOAL rows are supplied; see `_score_native`.
+        self.aux = str(aux)
+        self._shadow = None
+        self._aux_seed = int(seed)
+        self.aux_trace = []
         # PPS's third model. `ref="base"` subtracts the BASE score, which collapses Eq (4) to a
         # convex blend; only a reference PROXY -- same architecture, same score space -- makes
         # base + gamma*(task - ref) unbounded above max(base, task), which is the whole point.
@@ -326,26 +386,21 @@ class AdditiveScoreSteering:
 
         # Both bridges are affine, so the chain rule is one slope d(proxy)/d(planner): flat [D]
         # under droid_quantile, per-row [H, D] under demo_delta.
-        self.action_norm = info.get("action_norm", "droid_quantile")
-        if self.action_norm == "droid_quantile":
-            q01 = np.asarray(info["action_q01"], dtype=np.float32)[:dim]
-            q99 = np.asarray(info["action_q99"], dtype=np.float32)[:dim]
-            self._off = q01
-            self._scale = (q99 - q01 + 1e-6) / 2.0
-            self._bias = -1.0
-        elif self.action_norm == "demo_delta":
-            self._off = np.asarray(info["action_mean_rows"], dtype=np.float32)[:, :dim]
-            self._scale = np.asarray(info["action_std_rows"], dtype=np.float32)[:, :dim] + 1e-6
-            self._bias = 0.0
+        (self.action_norm, self._off, self._scale,
+         self._bias, self._slope) = self._bridge_of(info, dim)
+        # C1b, CRITICAL. The reference proxy is a SEPARATE checkpoint with its own
+        # action_norm_stats, so it needs its own bridge: fed y normalised by the TASK stats and
+        # converted back with the TASK slope, its score is a field over a different variable and
+        # s_task - s_ref is not a difference of anything. Identical stats make this bridge
+        # identical to the task's, so the correction is a no-op exactly where the old code was
+        # already right. See agent_tests/_vfy_ref_bridge.py.
+        if ref_client is not None:
+            (self.ref_action_norm, self._ref_off, self._ref_scale,
+             self._ref_bias, self._ref_slope) = self._bridge_of(ref_client.ready_info, dim)
         else:
-            raise ValueError(f"Additive steering cannot bridge action_norm={self.action_norm!r}.")
-        # Both may be per-row [H, D] with DIFFERENT H: the planner's is sliced to --horizon,
-        # the proxy ships its full action_horizon. Align before dividing.
-        if self._std.ndim == 2 and self._scale.ndim == 2:
-            n = min(self._std.shape[0], self._scale.shape[0])
-            self._slope = self._std[:n] / self._scale[:n]
-        else:
-            self._slope = self._std / self._scale
+            self.ref_action_norm = None
+            self._ref_off = self._ref_scale = self._ref_slope = None
+            self._ref_bias = 0.0
         self._obs = None
         self.last_embed_s = np.nan
         self.level_trace = []
@@ -367,7 +422,49 @@ class AdditiveScoreSteering:
                 joint_pos=q0, gripper_pos=gripper, table=table, wrist=wrist)
         self.last_embed_s = time.perf_counter() - t0
         self.level_trace = []
+        self.aux_trace = []
+        if self.aux == "native":
+            self._init_shadow()
         self.replan_idx += 1
+
+    def _init_shadow(self):
+        """Draw the shadow latent's noise init exactly as the proxy's own sampler does.
+
+        serve_mg_proxy_score.chain() seeds a CPU torch.Generator and draws
+        randn([1, action_horizon, action_dim]); reproducing that draw here is what lets the
+        shadow's goal rows be compared against a native run bit-for-bit.
+        """
+        gen = torch.Generator().manual_seed(self._aux_seed * 100003 + self.replan_idx)
+        dim = self._std.shape[-1]
+        self._shadow = torch.randn((1, self.proxy_horizon, dim),
+                                   generator=gen).numpy().astype(np.float32)
+
+    def _bridge_of(self, info, dim):
+        """Build one proxy's affine bridge from its own ready payload.
+
+        Returns (action_norm, off, scale, bias, slope) where y = (x*std + mean - off)/scale + bias
+        maps the planner's model space into THAT proxy's action space, and slope = d y / d x is the
+        chain-rule factor that pulls its score back into planner space.
+        """
+        action_norm = info.get("action_norm", "droid_quantile")
+        if action_norm == "droid_quantile":
+            q01 = np.asarray(info["action_q01"], dtype=np.float32)[:dim]
+            q99 = np.asarray(info["action_q99"], dtype=np.float32)[:dim]
+            off, scale, bias = q01, (q99 - q01 + 1e-6) / 2.0, -1.0
+        elif action_norm == "demo_delta":
+            off = np.asarray(info["action_mean_rows"], dtype=np.float32)[:, :dim]
+            scale = np.asarray(info["action_std_rows"], dtype=np.float32)[:, :dim] + 1e-6
+            bias = 0.0
+        else:
+            raise ValueError(f"Additive steering cannot bridge action_norm={action_norm!r}.")
+        # Both may be per-row [H, D] with DIFFERENT H: the planner's is sliced to --horizon,
+        # the proxy ships its full action_horizon. Align before dividing.
+        if self._std.ndim == 2 and scale.ndim == 2:
+            n = min(self._std.shape[0], scale.shape[0])
+            slope = self._std[:n] / scale[:n]
+        else:
+            slope = self._std / scale
+        return action_norm, off, scale, bias, slope
 
     def _rows(self, a, n):
         """Align a bridge array to n chunk rows; flat [D] arrays broadcast as they are."""
@@ -383,11 +480,72 @@ class AdditiveScoreSteering:
         n = x.shape[1]
         return (real_delta - self._rows(self._off, n)) / self._rows(self._scale, n) + self._bias
 
+    def _to_ref_space(self, x):
+        """Convert planner model samples into the REFERENCE proxy's action space."""
+        if self._ref_scale is None:
+            raise ValueError("No reference proxy is loaded.")
+        real_delta = x * self._std + self._mean
+        n = x.shape[1]
+        return ((real_delta - self._rows(self._ref_off, n)) / self._rows(self._ref_scale, n)
+                + self._ref_bias)
+
     def _to_planner_space(self, y):
         """Inverse of `_to_proxy_space`; needed to run the proxy's own chain in planner space."""
         n = y.shape[1]
         real_delta = (y - self._bias) * self._rows(self._scale, n) + self._rows(self._off, n)
         return (real_delta - self._mean) / self._std
+
+    def _score_native(self, y_act, x_t, iteration, num_iterations):
+        """Score on a NATIVE 21-row latent instead of padding the goal block.
+
+        The proxy's chunk is [H actions | K AWE waypoints | keypose]. `_pad_to_proxy` fills those
+        trailing GOAL rows by repeating the last ACTION row, which is unlike anything in training
+        (H1) -- so the additive arms were reading the model off-distribution in exactly the block
+        that encodes where the task is going.
+
+        Here a SHADOW latent carries the goal rows on the proxy's own reverse chain: initialised
+        from its own Gaussian noise (`_init_shadow`) and advanced every level by its own DDIM
+        update (`_advance_shadow`), with the shadow's ACTION rows tracking the base's iterate x_t.
+        The candidates are then scored against that same goal block, so every input the model sees
+        is a legitimate 21-row state. Only the first `horizon` score rows leave this method; the
+        goal rows steer nothing and can never be executed.
+        """
+        aux = self._shadow[:, self.horizon:]                     # this level's goal block
+        xt_act = self._to_proxy_space(
+            x_t.detach().cpu().numpy().astype(np.float32)[:, : self.horizon])
+        head = np.concatenate([xt_act, aux], axis=1)             # [1, P, D] shadow input
+        body = np.concatenate(
+            [y_act, np.repeat(aux, y_act.shape[0], axis=0)], axis=1)      # [B, P, D]
+        batch = np.concatenate([head, body], axis=0).astype(np.float32)
+        # Requirement: a valid native-width state at every level, asserted rather than assumed.
+        if batch.shape[1] != self.proxy_horizon or batch.shape[2] != self._std.shape[-1]:
+            raise ValueError(f"native aux built a {list(batch.shape)} batch; "
+                             f"expected [*, {self.proxy_horizon}, {self._std.shape[-1]}]")
+        s_all, server_s = self.client.score_batch(
+            obs=self._obs, iteration=iteration, num_iterations=num_iterations, x=batch)
+        s_all = np.asarray(s_all, dtype=np.float32)
+        self._advance_shadow(head, s_all[:1], iteration, num_iterations)
+        return body, s_all[1:], server_s
+
+    def _advance_shadow(self, y_t, score, iteration, num_iterations):
+        """One DDIM x0-prediction step of the shadow chain -- the server's own chain update.
+
+        Mirrors serve_mg_proxy_score.chain()'s prediction_mode="x0" branch term for term, so a
+        shadow whose action rows equal a native run's reproduces that run's goal rows exactly.
+        """
+        alpha, alpha_prev = ddim_iteration_alphas(
+            iteration=iteration, num_iterations=num_iterations,
+            num_train_timesteps=int(self.client.ready_info.get("ddim_num_train_timesteps", 100)))
+        beta = max(1.0 - float(alpha), 1e-6)
+        x0 = (y_t + beta * score) / math.sqrt(max(float(alpha), 1e-6))
+        eps = -math.sqrt(beta) * score
+        self._shadow = (math.sqrt(max(float(alpha_prev), 0.0)) * x0
+                        + math.sqrt(max(1.0 - float(alpha_prev), 0.0)) * eps).astype(np.float32)
+        self.aux_trace.append({
+            "it": int(iteration), "rows": int(y_t.shape[1]),
+            "aux_rows": int(self.proxy_horizon - self.horizon),
+            "aux_norm": round(float(np.linalg.norm(self._shadow[:, self.horizon:])), 4),
+            "aux_x0_norm": round(float(np.linalg.norm(x0[:, self.horizon:])), 4)})
 
     def policy_pair_step(self, x_t, iteration, num_iterations):
         """One DDIM step under a CONVEX BLEND of two LEARNED score fields.
@@ -481,6 +639,7 @@ class AdditiveScoreSteering:
                                       dtype=x_t.dtype, device=x_t.device),
             "eps": eps, "alpha": float(alpha), "alpha_prev": float(alpha_prev),
             "rows": int(x.shape[1]),
+            "y_t": y,                      # noisy proxy-space iterate this level started from
             "x_prev": torch.as_tensor(out, dtype=x_t.dtype, device=x_t.device)}
         return torch.as_tensor(out, dtype=x_t.dtype, device=x_t.device)
 
@@ -519,16 +678,29 @@ class AdditiveScoreSteering:
         self.policy_step(x_t, iteration, num_iterations)
         return dict(self._last_step)
 
-    def redo_ddim(self, x0_planner, iteration=None):
+    def redo_ddim(self, x0_planner, iteration=None, recompute_eps=False):
         """Re-run the DDIM update from a MODIFIED clean chunk, in planner space.
 
         The guided x0 has to re-enter the chain through the same operator the model's own step
         used, or the guidance is applied in one parameterisation and integrated in another.
+
+        `recompute_eps` re-derives eps from the GUIDED clean chunk,
+        eps' = (y_t - sqrt(abar_t) y0') / sqrt(1 - abar_t), which is the DDIM update proper: a
+        displacement of y0 then moves the iterate by sqrt(abar_prev) - sqrt(abar_t (1 - abar_prev)
+        / (1 - abar_t)) instead of sqrt(abar_prev). Freezing eps applies 2-5x that, front-loaded
+        on the noisiest levels; the recomputed profile tracks his rectified-flow 1/(N-it) to ~0.05
+        over the first two thirds of the chain. It is exactly the identity when y0 is unmodified,
+        so it can never change the pure-policy branch.
         """
         st = self._last_step
         y0 = self._to_proxy_space(
             x0_planner.detach().cpu().numpy().astype(np.float32))
-        eps = st["eps"][:, : y0.shape[1]]
+        if recompute_eps:
+            alpha = max(st["alpha"], 1e-12)
+            eps = ((st["y_t"][:, : y0.shape[1]] - math.sqrt(alpha) * y0)
+                   / math.sqrt(max(1.0 - alpha, 1e-12)))
+        else:
+            eps = st["eps"][:, : y0.shape[1]]
         y_next = (math.sqrt(max(st["alpha_prev"], 0.0)) * y0
                   + math.sqrt(max(1.0 - st["alpha_prev"], 0.0)) * eps)
         out = self._to_planner_space(y_next[:, : st["rows"]])
@@ -600,39 +772,52 @@ class AdditiveScoreSteering:
             idx = order[: min(keep, w.shape[0])]
             x, w = x[idx], w[idx] / max(float(w[idx].sum()), 1e-12)
         y = self._to_proxy_space(x)
-        if y.shape[1] < self.proxy_horizon:
-            # H1. An AWE proxy expects [actions | W1..WK | keypose]. Repeating the last ACTION row
-            # into those goal slots hands the model an input unlike anything in training, and the
-            # score it returns is measured off-distribution. Prefer the proxy's OWN predicted goal
-            # rows when a chain has produced them; fall back to repetition only if none exist.
-            y = self._pad_to_proxy(y)
         t0 = time.perf_counter()
-        s_proxy, server_s = self.client.score_batch(
-            obs=self._obs, iteration=iteration, num_iterations=num_iterations, x=y)
+        if self.aux == "native":
+            y, s_proxy, server_s = self._score_native(y, x_t, iteration, num_iterations)
+        else:
+            if y.shape[1] < self.proxy_horizon:
+                # H1. An AWE proxy expects [actions | W1..WK | keypose]. Repeating the last ACTION
+                # row into those goal slots hands the model an input unlike anything in training,
+                # and the score it returns is measured off-distribution. Prefer the proxy's OWN
+                # predicted goal rows when a chain has produced them; fall back to repetition.
+                y = self._pad_to_proxy(y)
+            s_proxy, server_s = self.client.score_batch(
+                obs=self._obs, iteration=iteration, num_iterations=num_iterations, x=y)
         wall_s = time.perf_counter() - t0
         slope = self._rows(self._slope, x.shape[1])
         if slope.ndim == 1:
             slope = slope[None, :]                 # one flat scale, broadcast over rows
         s_planner = s_proxy[:, : x.shape[1], :] * slope[None]
-        addend = self.gamma * (w[:, None, None] * s_planner).sum(axis=0)
+        task_field = (w[:, None, None] * s_planner).sum(axis=0)
+        addend = self.gamma * task_field
+        ref_field = None
         if self.ref == "proxy":
             # PPS Eq (4) proper: the reference is a proxy distilled from the base, so the
             # difference isolates the task increment while the shared prior cancels. Scored on
             # the SAME y and level as the task proxy, so only the weights differ.
-            # The task proxy may carry a keypose tail the reference does not, so pad or trim y to
+            # Scored at the SAME planner point x, but normalised with the REFERENCE's own stats
+            # and converted back with the REFERENCE's own slope (C1b): both fields then live over
+            # the planner variable, which is what makes their difference meaningful.
+            # The task proxy may carry a keypose tail the reference does not, so pad or trim to
             # the reference's own horizon. The extra row has no reference to cancel against and
             # contributes nothing to the difference.
             hr = self.ref_horizon
-            yr = (y[:, :hr] if y.shape[1] >= hr
-                  else np.concatenate([y, np.zeros((y.shape[0], hr - y.shape[1], y.shape[2]),
-                                                   np.float32)], axis=1))
+            yr = self._to_ref_space(x)
+            yr = (yr[:, :hr] if yr.shape[1] >= hr
+                  else np.concatenate([yr, np.zeros((yr.shape[0], hr - yr.shape[1], yr.shape[2]),
+                                                    np.float32)], axis=1))
             s_ref, _ = self.ref_client.score_batch(
                 obs=self._ref_obs, iteration=iteration, num_iterations=num_iterations, x=yr)
             rows_ref = min(x.shape[1], s_ref.shape[1])
-            r_planner = s_ref[:, :rows_ref, :] * slope[None, :rows_ref]
+            ref_slope = self._rows(self._ref_slope, rows_ref)
+            if ref_slope.ndim == 1:
+                ref_slope = ref_slope[None, :]
+            r_planner = s_ref[:, :rows_ref, :] * ref_slope[None]
             if rows_ref < addend.shape[0]:
                 r_planner = np.pad(r_planner, ((0, 0), (0, addend.shape[0] - rows_ref), (0, 0)))
-            addend = addend - self.gamma * (w[:, None, None] * r_planner).sum(axis=0)
+            ref_field = (w[:, None, None] * r_planner).sum(axis=0)
+            addend = addend - self.gamma * ref_field
         elif self.ref == "base":
             # PPS Eq (4) with v_ref := v_base, i.e. Eq (3): (1-gamma)*base + gamma*task.
             # A convex interpolation, bounded at every gamma -- unlike base + gamma*task,
@@ -655,7 +840,12 @@ class AdditiveScoreSteering:
                 num_train_timesteps=int(self.client.ready_info.get("ddim_num_train_timesteps", 100)))
             _ab = float(_ab)
             _beta = max(1.0 - _ab, 1e-6)
-            _x0 = (y[:, : s_planner.shape[1]] + _beta * s_planner) / math.sqrt(max(_ab, 1e-6))
+            # C3a. `samples` is the PLANNER-space cloud and s_planner is the score w.r.t. the
+            # planner variable, so the iterate in x0 = (x_t + beta*s)/sqrt(alpha) must be the
+            # planner-space x too. Using proxy-space y here silently mixed the two and was only
+            # right when the bridge happened to be the identity (--align_proxy_norm on AND
+            # matching gripper offsets).
+            _x0 = (x[:, : s_planner.shape[1]] + _beta * s_planner) / math.sqrt(max(_ab, 1e-6))
             _cl = samples.detach().cpu().numpy() if hasattr(samples, "detach") else np.asarray(samples)
             _supp = {("supp_" + k): round(v, 3)
                      for k, v in self.support_distance(_cl, _x0[0]).items()}
@@ -666,20 +856,46 @@ class AdditiveScoreSteering:
         # apart, so log the cosine and the task field's own norm.
         b_np = base_score.detach().cpu().numpy().astype(np.float64)[0]
         b_rows = b_np[: addend.shape[0], : addend.shape[1]].reshape(-1)
-        # The addend is gamma*(task - ref); recover the task-side field for the comparison.
-        a_rows = (np.asarray(addend, dtype=np.float64).reshape(-1)
-                  / max(float(self.gamma), 1e-9))
-        task_dir = a_rows + b_rows if self.ref == "base" else a_rows
+        # C3b. The addend is gamma*(task - ref) under ref=proxy, so dividing it by gamma gives the
+        # DIFFERENCE, not the task field; labelling that `cos_task_base` was wrong. Use the task
+        # field the proxy actually returned, and log the composed direction under its own name.
+        _tf = np.asarray(task_field, dtype=np.float64)
+        if addend.shape[0] > _tf.shape[0]:
+            _tf = np.pad(_tf, ((0, addend.shape[0] - _tf.shape[0]), (0, 0)))
+        task_dir = _tf[: addend.shape[0], : addend.shape[1]].reshape(-1)
         denom = np.linalg.norm(task_dir) * np.linalg.norm(b_rows)
         cos = float(task_dir @ b_rows / denom) if denom > 1e-12 else float("nan")
+        a_rows = (np.asarray(addend, dtype=np.float64).reshape(-1)
+                  / max(float(self.gamma), 1e-9))
+        _den_a = np.linalg.norm(a_rows) * np.linalg.norm(b_rows)
+        cos_addend = float(a_rows @ b_rows / _den_a) if _den_a > 1e-12 else float("nan")
+        # PPS Eq (4) assumes the reference is an on-policy distillation of the base, so that
+        # s_base - s_ref cancels and the residual is a pure task increment. That assumption is
+        # never checked; if s_ref points elsewhere the residual carries a spurious -s_ref drag.
+        _ref = {}
+        if ref_field is not None:
+            r_rows = np.asarray(ref_field, dtype=np.float64).reshape(-1)[: b_rows.size]
+            bb = b_rows[: r_rows.size]
+            dn = np.linalg.norm(r_rows) * np.linalg.norm(bb)
+            _ref = {"cos_ref_base": round(float(r_rows @ bb / dn), 4) if dn > 1e-12 else None,
+                    "ref_over_base": round(float(np.linalg.norm(r_rows)
+                                                 / max(np.linalg.norm(bb), 1e-9)), 4)}
         self.level_trace.append({
             "it": int(iteration),
             "n_scored": int(x.shape[0]),
+            # Width the model actually saw, and the width that steered: the guarantee that the
+            # goal rows never reach the planner has to be visible in the trace, not just the code.
+            "rows_in": int(y.shape[1]),
+            "rows_steered": int(addend.shape[0]),
+            "aux_mode": self.aux,
             "base_norm": round(base_norm, 4),
             "add_norm": round(add_norm, 4),
             "task_norm": round(float(np.linalg.norm(task_dir)), 4),
             "cos_task_base": round(cos, 4),
+            # The composed field that is actually added (task, task-ref or task-base over gamma).
+            "cos_addend_base": round(cos_addend, 4),
             "ratio": round(add_norm / max(base_norm, 1e-9), 4),
+            **_ref,
             **_supp,
             "wall_s": round(wall_s, 3),
             "server_s": round(server_s, 3)})

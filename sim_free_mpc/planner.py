@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import math
 from dataclasses import dataclass
 from typing import Any
@@ -1012,6 +1013,7 @@ class SimFreeMPC:
         context: dict[str, Any],
         *,
         alpha_bar: float,
+        final: bool = False,
     ):
         """Optimize clean-action candidates around the scaled noisy action."""
         if x_t.shape[0] != 1:
@@ -1128,12 +1130,51 @@ class SimFreeMPC:
                     self._last_mean_plan = self._score_returned_plan(result, cost_from_positions)
             if population_terms is not None:
                 self.cost.last_terms = population_terms
+        # DDRS: tilt the FINAL clean cloud's own weights by a learned log-ratio, then re-reduce.
+        # Only here, and only on the last level: this is the one population whose distribution
+        # matches the negatives the ratio was fit against. `self.ddrs` is None unless a caller
+        # attaches one, so every existing run takes the untouched path above.
+        self._last_ddrs = None
+        if final and getattr(self, "ddrs", None) is not None and result.weights is not None:
+            from .ddrs import ess as _ess, tilt_weights
+            with torch.no_grad():
+                real = self._decode_samples_for_ddrs(
+                    result.samples, x_t, active_dims, horizon, policy_inputs, context)
+                r = self.ddrs.log_ratio(real, context, context.get("joint_pos"))
+                w_new = tilt_weights(result.weights, r, self.ddrs.gamma)
+                mean_new = (w_new.view(-1, *([1] * (result.samples.ndim - 1)))
+                            * result.samples).sum(dim=0)
+                self._last_ddrs = {
+                    "gamma": float(self.ddrs.gamma),
+                    "r_mean": float(r.mean()), "r_std": float(r.std()),
+                    "ess_before": _ess(result.weights), "ess_after": _ess(w_new),
+                    "argmax_before": int(torch.argmax(result.weights)),
+                    "argmax_after": int(torch.argmax(w_new)),
+                    "mean_shift": float(torch.linalg.vector_norm(mean_new - result.mean)),
+                    "rank_of_base_choice": int(
+                        (r > r[int(torch.argmax(result.weights))]).sum()),
+                }
+                result = dataclasses.replace(result, mean=mean_new, weights=w_new)
         x0_hat = x_t.detach().clone()
         x0_hat[:, :, :active_dims] = self._interpolate_control_points(
             result.mean,
             horizon,
         ).unsqueeze(0)
         return x0_hat, result, active_dims, proposal_std
+
+    def _decode_samples_for_ddrs(self, samples, x_template, active_dims, horizon,
+                                 policy_inputs, context):
+        """Knot samples -> decoded REAL action chunks [K, horizon, D].
+
+        The same two steps `_cost_active_samples` takes before it costs a candidate -- expand the
+        control points, write them into the template, decode -- so the ratio scores exactly the
+        trajectories the cost ranked, not a differently-decoded copy of them.
+        """
+        full = self._interpolate_control_points(samples, horizon)
+        chunk = x_template.detach().repeat(full.shape[0], 1, 1)
+        chunk[:, :, :active_dims] = full
+        decoded = decode_model_action_chunks(self.policy, policy_inputs, chunk, apply_clamp=False)
+        return decoded.real_actions.detach().cpu().numpy()
 
     def step(
         self,
@@ -1383,6 +1424,7 @@ class SimFreeMPC:
             policy_inputs,
             context,
             alpha_bar=alpha_bar,
+            final=(int(iteration) == int(num_iterations) - 1),
         )
 
         alpha = torch.as_tensor(alpha_bar, device=x_t.device, dtype=x_t.dtype)
@@ -1619,6 +1661,7 @@ class SimFreeMPC:
             policy_inputs,
             context,
             alpha_bar=alpha_bar,
+            final=(int(iteration) == int(num_iterations) - 1),
         )
 
         alpha = torch.as_tensor(alpha_bar, device=x_t.device, dtype=x_t.dtype)

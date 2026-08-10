@@ -1,0 +1,122 @@
+# mustard_left_bin -- deterministic stand-in for a GPT-4o ReKep response (RoboLab).
+# Format follows rekep/prompts/prompt_template.txt, so _render() parses it exactly as
+# rekep/constraint_generation.py parses a live response. Placeholders in braces are the values only
+# resolvable at runtime: keypoint indices from the live scene and offsets measured from the
+# observed geometry.
+#
+# FORMAT: `_render` splits functions from a column-0 `def ` to their `    return ` line, so a
+# `return` MUST fit on one line -- a wrapped one truncates the function mid-expression and the
+# file fails to exec. Bind intermediates to names instead.
+#
+# Task: "put the mustard bottle in the left grey bin"
+#
+# The task involves four stages:
+# 1. Grasp the mustard bottle.
+# 2. Lift the mustard bottle clear of the table.
+# 3. Carry the mustard bottle above the LEFT bin.
+# 4. Lower the mustard bottle to the release point over the left bin and let go.
+#
+# The left bin is the STATIC FIXTURE: keypoint {l} sits at the centre of its mouth, and every
+# target the carried bottle must reach is written as an offset from it. Anchoring a target on the
+# bottle's own keypoint would be degenerate -- the target would ride the object it is supposed to
+# move.
+#
+# THE SCENE CONTAINS TWO BINS, and the instruction names one of them. Keypoint {r} is the right
+# bin: it appears only in a path rule that charges the carried bottle for crossing over it, which
+# is what makes "left" a constraint the planner can be scored against rather than a word in a
+# comment.
+#
+# DISCRIMINATION. Every rule below is written on something that changes across sampled proposals:
+# stage 1 speaks about the end-effector, and stages 2-4 speak about keypoints {m} and {t}, which
+# are HELD (they ride the candidate gripper pose, position and orientation both). The grasp-hold
+# path rules are the deliberate exception: they read a constant 0 while the hold is certified and
+# exist to state the invariant, not to rank candidates.
+#
+# The bottle is tall, so its TOP is tracked as well as its middle: a proposal that tips the bottle
+# on the way in is distinguishable from one that carries it upright, which a rule on the centroid
+# alone cannot say.
+
+num_stages = 4
+
+
+### stage 1 sub-goal constraints
+def stage1_subgoal_constraint1(end_effector, keypoints):
+    """Align the end-effector with the body of the mustard bottle (keypoint {m})."""
+    return np.linalg.norm(end_effector - keypoints[{m}])
+
+### stage 1 path constraints
+# No path constraints needed for grasping.
+
+### stage 2 sub-goal constraints
+def stage2_subgoal_constraint1(end_effector, keypoints):
+    """The bottle (keypoint {m}) is raised to its carry height above the pick-up pose."""
+    offsetted_point = keypoints[{l}] + np.array({lift_m})
+    return np.linalg.norm(keypoints[{m}] - offsetted_point)
+
+### stage 2 path constraints
+def stage2_path_constraint1(end_effector, keypoints):
+    """The bottle (keypoint {m}) must not fall back below the height it was picked up from."""
+    return np.maximum(0.0, keypoints[{l}][..., 2] + ({pick_z}) - keypoints[{m}][..., 2])
+
+def stage2_path_constraint2(end_effector, keypoints):
+    """The bottle (keypoint {m}) stays upright: its top (keypoint {t}) stays above its body."""
+    return np.linalg.norm(keypoints[{t}][..., :2] - keypoints[{m}][..., :2])
+
+def stage2_path_constraint3(end_effector, keypoints):
+    """The robot must still be holding the bottle (keypoint {m})."""
+    return get_grasping_cost_by_keypoint_idx({m})
+
+### stage 3 sub-goal constraints
+def stage3_subgoal_constraint1(end_effector, keypoints):
+    """The bottle (keypoint {m}) hovers above the mouth of the left bin (keypoint {l})."""
+    offsetted_point = keypoints[{l}] + np.array({carry_m})
+    return np.linalg.norm(keypoints[{m}] - offsetted_point)
+
+### stage 3 path constraints
+def stage3_path_constraint1(end_effector, keypoints):
+    """The bottle (keypoint {m}) stays at transport altitude, clear of both bin rims."""
+    return np.maximum(0.0, keypoints[{l}][..., 2] + ({carry_z}) - keypoints[{m}][..., 2])
+
+def stage3_path_constraint2(end_effector, keypoints):
+    """The bottle (keypoint {m}) must not be carried over the RIGHT bin (keypoint {r})."""
+    gap = np.linalg.norm(keypoints[{m}][..., :2] - keypoints[{r}][..., :2])
+    return np.maximum(0.0, ({keepout_r}) - gap)
+
+def stage3_path_constraint3(end_effector, keypoints):
+    """The robot must still be holding the bottle (keypoint {m})."""
+    return get_grasping_cost_by_keypoint_idx({m})
+
+### stage 4 sub-goal constraints
+def stage4_subgoal_constraint1(end_effector, keypoints):
+    """The bottle (keypoint {m}) reaches the release point inside the left bin (keypoint {l})."""
+    offsetted_point = keypoints[{l}] + np.array({seat_m})
+    return np.linalg.norm(keypoints[{m}] - offsetted_point)
+
+### stage 4 path constraints
+def stage4_path_constraint1(end_effector, keypoints):
+    """The bottle (keypoint {m}) stays over the mouth of the left bin while it descends."""
+    mouth = keypoints[{l}] + np.array({seat_m})
+    off = np.linalg.norm(keypoints[{m}][..., :2] - mouth[..., :2])
+    return np.maximum(0.0, off - ({mouth_r}))
+
+def stage4_path_constraint2(end_effector, keypoints):
+    """The bottle's top (keypoint {t}) stays over the mouth of the left bin as well."""
+    mouth = keypoints[{l}] + np.array({seat_m})
+    off = np.linalg.norm(keypoints[{t}][..., :2] - mouth[..., :2])
+    return np.maximum(0.0, off - ({mouth_r}))
+
+def stage4_path_constraint3(end_effector, keypoints):
+    """The robot must still be holding the bottle (keypoint {m})."""
+    return get_grasping_cost_by_keypoint_idx({m})
+
+
+"""
+Summarize keypoints to be grasped in all grasping stages.
+For a grasping stage write the keypoint index; for a non-grasping stage write -1.
+"""
+grasp_keypoints = [{m}, -1, -1, -1]
+
+"""
+Summarize at **the end of which stage** the robot should release each keypoint.
+"""
+release_keypoints = [-1, -1, -1, {m}]

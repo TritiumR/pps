@@ -50,21 +50,50 @@ _BODY_ALIASES = {
     "coffee_machine": ("coffee_machine_body",),
 }
 
-_ALL_EXTENTS = {**EXTENTS, **MC_EXTENTS, **HC_EXTENTS, **CP_EXTENTS,
-                # The drawer's sliding front. Tracked as a movable so rollout telemetry records
-                # the articulated state, so it also needs a box for the synthetic cloud.
-                "drawer_link": (0.12, 0.12, 0.04)}
+# The drawer's sliding front. Tracked as a movable so rollout telemetry records the articulated
+# state, so it also needs a box for the synthetic cloud.
+_DRAWER_LINK = {"drawer_link": (0.12, 0.12, 0.04)}
+
+_TASK_EXTENTS = {"mug_cleanup": MC_EXTENTS, "hammer_cleanup": HC_EXTENTS,
+                 "coffee_prep": CP_EXTENTS}
+
+# sort_can_tray's semantic-target marker: an inert disc, so it needs a synthetic cloud for the
+# generator's geometry lookups even though nothing may collide with it.
+_TRAY_MARKER = {"traymarker": (0.020, 0.020, 0.002)}
+
+# The tray body itself (bins arena bin2, divider stripped). Only the semantic-programmability
+# families reference it -- "at least X from the tray centre" needs the tray to be a referent a
+# keypoint can ride -- and its half-extents are the measured interior from envs.sort_can_tray.
+_TRAY_BODY = {"bin2": (0.19, 0.24, 0.05)}
+
+_ALL_EXTENTS = {**EXTENTS, **MC_EXTENTS, **HC_EXTENTS, **CP_EXTENTS, **_DRAWER_LINK,
+                **_TRAY_MARKER, **_TRAY_BODY}
 
 
-def _box_points_fn(world, per_axis=7):
+def extent_table(task_key=None):
+    """Object half-extents for one task, or the merged table when the task is unknown.
+
+    The per-task tables COLLIDE: "drawer" is (0.12, 0.12, 0.13) in mug_cleanup and
+    (0.08, 0.105, 0.05) in hammer_cleanup, and "handle" differs too. Merging them blindly let
+    whichever table came last win for every task -- mug_cleanup's drawer measured 10 cm tall
+    instead of 26 cm, which put its own handle keypoint ABOVE the cabinet top and hid it from any
+    generator that selects the handle by height.
+    """
+    if task_key is None or task_key not in _TASK_EXTENTS:
+        return dict(_ALL_EXTENTS)
+    return {**EXTENTS, **_TASK_EXTENTS[task_key], **_DRAWER_LINK}
+
+
+def _box_points_fn(world, extents=None, per_axis=7):
     """Return points_of(name) -> a box point cloud from the object's live pose and extents."""
     if world is None:
         return None
+    table = _ALL_EXTENTS if extents is None else extents
     grid = np.linspace(-1.0, 1.0, per_axis)
     unit = np.stack(np.meshgrid(grid, grid, grid, indexing="ij"), -1).reshape(-1, 3)
 
     def points_of(name):
-        half = _ALL_EXTENTS.get(name)
+        half = table.get(name)
         if half is None:
             return None
         pos = rot = None
@@ -82,7 +111,7 @@ def _box_points_fn(world, per_axis=7):
     return points_of
 
 
-def load_rekep_context(path, world=None):
+def load_rekep_context(path, world=None, extents=None):
     """Load a written rekep_context.json into the dict `propose_keypoints` would have returned.
 
     The artifact stores each keypoint as {owner, offset_local, world_at_capture} -- i.e. RIGIDLY
@@ -106,11 +135,17 @@ def load_rekep_context(path, world=None):
 
     entries = raw["keypoints"]
     points, owners, rebased = [], [], 0
+    local_ext, local_from = [], []
     for entry in entries:
         if not isinstance(entry, dict):                      # plain [x, y, z] form
             points.append(np.asarray(entry, dtype=np.float64))
             owners.append(None)
+            local_ext.append(None)
+            local_from.append(None)
             continue
+        _le = entry.get("local_extents")
+        local_ext.append(tuple(float(x) for x in _le) if _le else None)
+        local_from.append(entry.get("local_extents_from"))
         owner = entry.get("owner")
         captured = np.asarray(entry["world_at_capture"], dtype=np.float64)
         offset = np.asarray(entry.get("offset_local", (0.0, 0.0, 0.0)), dtype=np.float64)
@@ -134,10 +169,15 @@ def load_rekep_context(path, world=None):
     return {
         "keypoints": keypoints,
         "owners": owners,
+        # Half-extents of the geometry AT each keypoint (see make_context._local_extents_of), the
+        # grasp terms' feasibility radius. None where the context predates the field or the point
+        # sits on nothing.
+        "local_extents": local_ext,
+        "local_extents_from": local_from,
         # masks._masked_points prefers this hook over IsaacLab's scene/prim lookup, which does not
         # exist under MuJoCo. Synthesising the cloud from the live pose + known extents gives the
         # seat/centroid/local-grasp geometry downstream something real to measure.
-        "points_of": _box_points_fn(world),
+        "points_of": _box_points_fn(world, extents),
         "projected": raw.get("projected"),
         "names": raw.get("names"),
         # The ladder the generator walks: stage -> target keypoint, plus intents and payloads.
@@ -226,10 +266,15 @@ class RekepGrounding:
                  kp_source: str = "perception", contact_criterion: str = "feasibility",
                  open_half: float = 0.04, rotate_grasp_offset: bool = False,
                  lift_latch_xy: bool = False, seat_from_plane: bool = False,
-                 context_path: str | None = None, constraints_path: str | None = None):
+                 context_path: str | None = None, constraints_path: str | None = None,
+                 instruction: str | None = None):
         # kp_source="artifact" replays these instead of proposing from a live camera.
         self.context_path = context_path
         self.constraints_path = constraints_path
+        # The task specification, for plans whose content depends on it. sort_can's destination is
+        # named by a colour that is redrawn every episode, so its generator has to be told what was
+        # asked for; every other task's plan is a function of the scene alone and ignores this.
+        self.instruction = instruction
         self.vlm = vlm
         self.task_key = task_key
         self.place_obj = place_obj
@@ -276,7 +321,9 @@ class RekepGrounding:
             # live camera. propose_keypoints needs IsaacLab perception, which does not exist in the
             # MuJoCo eval env, so this is the only path by which manually authored or
             # previously generated ReKep artifacts can reach the planner here.
-            grounded = load_rekep_context(self.context_path, world)
+            grounded = load_rekep_context(self.context_path, world, extent_table(self.task_key))
+            if self.instruction is not None:
+                grounded["instruction"] = self.instruction
         else:
             grounded = rk_grounding.propose_keypoints(
                 env.cam, env.env, config, perception=self.perception)
@@ -334,9 +381,10 @@ class RekepGrounding:
         # falls back to DEFAULT_EXTENT = 0.05 half-width, which exceeds open_half (0.04) -- so
         # _contact_for typed EVERY grasp as a "press" and the arm pressed cubeA (true half-width
         # 0.02) instead of pinching it. gt.EXTENTS carries the real numbers for these tasks.
+        _known = extent_table(self.task_key)
         for _n in scene_objects:
-            if _n in EXTENTS and _n not in extents:
-                extents[_n] = EXTENTS[_n]
+            if _n in _known and _n not in extents:
+                extents[_n] = _known[_n]
         from rekep.keypoint_tracking import KeypointTracker
         tracker = KeypointTracker(world, keypoints)
         if gt_meta is not None:
@@ -352,6 +400,34 @@ class RekepGrounding:
                     _p, _r = world.object_pose(_o)
                     tracker.owners[_i] = _o
                     tracker.registrations[_i] = (_o, _r.T @ (np.asarray(keypoints[_i], dtype=np.float64) - _p))
+        if self.kp_source == "artifact" and grounded.get("owners"):
+            # The context is the AUTHORITY on attachment. make_context attributed every keypoint by
+            # box-surface distance and deliberately left functional offsets unowned (can's drop
+            # point 18 cm above a bin that has no MuJoCo body, square's peg top). KeypointTracker
+            # re-derives ownership with its own nearest-CENTRE rule over the task's movables, which
+            # re-owns those static targets onto the payload -- and since `held_idx` is "every
+            # keypoint owned by the grasped body", a re-owned place target then rides the gripper
+            # and the place constraint is satisfied by construction.
+            _from_ctx = 0
+            for _i, _o in enumerate(grounded["owners"]):
+                if not (0 <= _i < len(tracker.owners)):
+                    continue
+                _kp = np.asarray(keypoints[_i], dtype=np.float64)
+                _pose = None
+                if _o:
+                    try:
+                        _pose = world.object_pose(_o)[:2]
+                    except Exception:                    # owner absent from this scene
+                        _pose = None
+                if _pose is None:
+                    tracker.owners[_i], tracker.registrations[_i] = None, (None, _kp.copy())
+                else:
+                    _p, _r = _pose
+                    tracker.owners[_i] = _o
+                    tracker.registrations[_i] = (_o, np.asarray(_r).T @ (_kp - np.asarray(_p)))
+                    _from_ctx += 1
+            print(f"[rekep] tracker ownership from context: {tracker.owners} "
+                  f"({_from_ctx}/{len(tracker.owners)} attached)", flush=True)
         shim = TorchNumpyShim(dev)
 
 
@@ -368,11 +444,26 @@ class RekepGrounding:
                 if _f.endswith("_constraints.txt") or _f == "metadata.json":
                     os.remove(os.path.join(vlm_dir, _f))
         if self.vlm == "fake":
-            # Route to whichever fake VLM knows this task: vlm_dp.fake_vlm covers the Isaac
-            # tasks, fake_rekep the mujoco ones. Both emit the same artifact layout, so the
-            # loader below does not care which produced it.
+            # Two fake VLMs can know a mujoco task, and they produce DIFFERENT plans:
+            #   vlm_dp.fake_vlm  renders a written plan (grounding/gt_vlm_output/<task>/raw.txt) --
+            #                    a full ReKep response, so every stage carries a subgoal and path
+            #                    constraints exist. That is what the `vlm` stage mode consumes.
+            #   fake_rekep       walks the task's own stage ladder and emits subgoal-only stages
+            #                    with an EMPTY path file, which is all the `template` mode reads.
+            # Both write the same artifact layout, so the loader below does not care which ran;
+            # only the stage mode decides which plan is the right one to ask for.
             from . import fake_rekep
-            gen = fake_rekep if self.task_key in fake_rekep.supported_tasks() else fake_vlm
+            has_plan = self.task_key in getattr(fake_vlm, "_FAKE_VLMS", {})
+            has_ladder = self.task_key in fake_rekep.supported_tasks()
+            if self.stages == "vlm" and has_plan:
+                gen = fake_vlm
+            elif has_ladder:
+                gen = fake_rekep
+            else:
+                gen = fake_vlm
+            print(f"[rekep] fake VLM for {self.task_key!r}: {gen.__name__} "
+                  f"(raw.txt plan={has_plan}, ladder={has_ladder}, stages={self.stages})",
+                  flush=True)
             metadata, _ = gen.generate(self.task_key, vlm_dir, keypoints, grounded, env.env,
                                        self.clearance)
         else:
@@ -487,6 +578,33 @@ class RekepGrounding:
                 if o not in scene_objects:
                     scene_objects.append(o)
 
+        # Keypoint-local grasp geometry from the context artifact.
+        #
+        # The grasp terms need the half-width of what the FINGERS CLOSE ON at the plan's grasp
+        # point, not the bounding box of the body that owns it. Reading the owner box made
+        # mug_cleanup's handle -- a 9 mm bar on a 24 cm drawer front -- measure 120 mm, and the
+        # mug's 9 mm wall measure 46 mm (extents[1], the keepout), which puts straddle's finger
+        # keepout at 58 mm against a 40 mm aperture: unsatisfiable, so the term pushed the hand
+        # away from every object it was meant to bracket.
+        #
+        # A live measurement wins: local_grasp measures the cloud in a ball around the keypoint
+        # (what a real robot does) and gt_meta reads exact part poses. The context is the fallback
+        # for the artifact path, where neither runs.
+        ctx_local = grounded.get("local_extents") or []
+        ctx_local_from = grounded.get("local_extents_from") or []
+        for _name, _gk in grasp_kp_of.items():
+            if _name in grasp_ext_of or not (0 <= _gk < len(ctx_local)):
+                continue
+            _ext = ctx_local[_gk]
+            if _ext is None:
+                continue
+            grasp_ext_of[_name] = float(_ext[0])
+            _src = ctx_local_from[_gk] if _gk < len(ctx_local_from) else None
+            print(f"[rekep-local] {_name}: grasp kp{_gk} local extents="
+                  f"{tuple(round(x, 4) for x in _ext)} from {_src!r} -> grip half-width "
+                  f"{_ext[0] * 1e3:.1f}mm (owner box "
+                  f"{float(extents.get(_name, _DEFAULT_EXTENT)[0]) * 1e3:.1f}mm)", flush=True)
+
         def obj_pos(name):
             """Return the live tracked grasp center for an object."""
             kp = kp_of.get(name)
@@ -523,13 +641,21 @@ class RekepGrounding:
                       flush=True)
 
         def load_stage(idx, held):
-            """Load a stage's subgoal and path constraints."""
+            """Load a stage's subgoal and path constraints.
+
+            Returns the SUMMED subgoal (what the cost scores) plus the per-rule subgoal
+            functions. Advancement gates on the rules individually, so a stage whose sub-goals
+            speak about different things -- the hand's pull arc and the drawer's own travel --
+            cannot complete on the one that is easy to satisfy.
+            """
             grasp_fn = get_callable_grasping_cost_fn(list(held))
-            subgoal = make_torch_constraint(load_torch_constraints(
-                os.path.join(vlm_dir, f"stage{idx + 1}_subgoal_constraints.txt"), grasp_fn, shim))
+            rules = load_torch_constraints(
+                os.path.join(vlm_dir, f"stage{idx + 1}_subgoal_constraints.txt"), grasp_fn, shim)
+            subgoal = make_torch_constraint(rules)
+            subgoal_fns = tuple(make_torch_constraint([c]) for c in rules)
             path_fns = tuple(make_torch_constraint([c]) for c in load_torch_constraints(
                 os.path.join(vlm_dir, f"stage{idx + 1}_path_constraints.txt"), grasp_fn, shim))
-            return subgoal, path_fns
+            return subgoal, path_fns, subgoal_fns
 
         def placed(name, seat_fn):
             """Return a predicate for resting on the measured destination."""
@@ -574,7 +700,7 @@ class RekepGrounding:
         for i in range(metadata["num_stages"]):
             grasp_kp, release_kp = metadata["grasp_keypoints"][i], metadata["release_keypoints"][i]
             held = tuple(j for j, o in enumerate(tracker.owners) if grasped_body is not None and o == grasped_body)
-            subgoal, path_fns = load_stage(i, held)
+            subgoal, path_fns, _ = load_stage(i, held)
             if grasp_kp >= 0:
                 name = name_for(grasp_kp)
                 _alt = masks.object_for_keypoint(grounded, env.env, keypoints[grasp_kp], names=tuple(scene_objects))
@@ -639,29 +765,58 @@ class RekepGrounding:
                          keypoints=(lambda: tracker.get_positions()))
 
     def _contact_for(self, name, extents, local_grip=None):
-        """Choose pinch or press from the measured grasp width."""
-        grip = (float(local_grip) if local_grip is not None
-                else float(extents.get(name, _DEFAULT_EXTENT)[0]))
-        return ("pinch", grip) if grip <= self.open_half else ("press", grip)
+        """Choose pinch or press, and report the half-width the grasp terms should use.
+
+        Two questions, two measurements:
+
+        typing -- can the gripper acquire a CERTIFIABLE hold on the body the plan names? That is
+            the body's own width. A pinch stage advances on the hold sensor, which identifies the
+            held object by proximity to that body's tracked origin (`GTWorld.observe`); a 9 mm
+            handle 16.5 cm out from a 24 cm drawer front is 65 mm past the sensor's 100 mm
+            proximity, so a pinch there could never be confirmed and the stage would never
+            advance. Local geometry alone says "pinch" for such a handle; the robot cannot yet
+            certify it, so the body box still types the contact.
+        slack -- how precisely must the fingers land, and how wide is what they close on? That is
+            the LOCAL width at the plan's grasp keypoint, which is what the terms score.
+
+        Before this split both read the same number, so the drawer handle carried the drawer
+        front's 120 mm half-width into `grasp_slack` and the cost tolerated a 48 mm miss.
+        """
+        body = float(extents.get(name, _DEFAULT_EXTENT)[0])
+        grip = float(local_grip) if local_grip is not None else body
+        return ("pinch" if body <= self.open_half else "press"), grip
 
     def _vlm_stages(self, metadata, tracker, keypoints, name_for, load_stage, objects, env, dev, vlm_dir):
         """Build stages directly from VLM constraints."""
         obj_names = [o.name for o in objects]
-        obj_center = {o.name: o.pos for o in objects}
         obj_ext = {o.name: o.extents for o in objects}
         local_ext = {o.name: o.grasp_extent for o in objects if o.grasp_extent is not None}
 
         def kp_point(k):
             return lambda k=k: tracker.get_positions()[k]
 
-        def subgoal_done(subgoal):
-            """Return a predicate that checks the current subgoal value."""
+        def subgoal_done(subgoal_fns):
+            """Return a predicate that checks EVERY sub-goal rule against the SENSED state.
+
+            The state is the observed end-effector (`env.tcp()`) and the tracked keypoints
+            (`tracker.get_positions()`, recomputed from live owner poses), never the plan-time
+            keypoint array -- so a stage completes only once the world it speaks about has
+            actually moved.
+
+            Each rule is gated on its own: a stage advances when the WORST of them clears eps.
+            Summing instead would let a rule stated on the hand stand in for one stated on the
+            object it is supposed to move, which is how the drawer stages completed while the
+            drawer sat still.
+            """
             eps = self.subgoal_eps
 
             def _d():
+                if not subgoal_fns:
+                    return False
                 ee = torch.as_tensor(env.tcp(), device=dev, dtype=torch.float32).reshape(1, 1, 3)
                 kp = torch.as_tensor(tracker.get_positions(), device=dev, dtype=torch.float32)[:, None, None, :]
-                return float(torch.as_tensor(subgoal(ee, kp)).reshape(-1)[0]) < eps
+                return max(float(torch.as_tensor(fn(ee, kp)).reshape(-1)[0])
+                           for fn in subgoal_fns) < eps
             return _d
 
         def place_target_for(stage_idx, payload_owner):
@@ -673,20 +828,46 @@ class RekepGrounding:
                     return owner
             return None
 
+        def _declared(key, stage_idx, allowed):
+            """A per-stage field the PLAN states outright, or None when it does not state one.
+
+            The plan is the single authority on what it means. Where it declares a field, that
+            declaration is read; the prose fallbacks below exist only for plans written before
+            the fields did, and which path fired is printed rather than left to be inferred.
+            """
+            values = metadata.get(key)
+            if not values or not (0 <= stage_idx < len(values)):
+                return None
+            value = str(values[stage_idx]).strip()
+            if value not in allowed:
+                raise SystemExit(f"[rekep-vlm] plan declares {key}[{stage_idx}]={value!r}; "
+                                 f"expected one of {sorted(allowed)}")
+            return value
+
         def place_mode_for(stage_idx, place_target):
-            """Choose surface or container placement from the subgoal text."""
+            """Surface or container placement: declared by the plan, else read off its text."""
+            declared = _declared("stage_place_mode", stage_idx, {"surface", "container"})
+            if declared is not None:
+                print(f"[rekep-vlm] stage {stage_idx + 1} place_mode={declared} (DECLARED)",
+                      flush=True)
+                return declared
             path = os.path.join(vlm_dir, f"stage{stage_idx + 1}_subgoal_constraints.txt")
             if _places_into(path, place_target):
-                print(f"[rekep-vlm] stage {stage_idx + 1} places into {place_target}, container mode",
-                      flush=True)
+                print(f"[rekep-vlm] stage {stage_idx + 1} places into {place_target}, container mode "
+                      f"(inferred from text: the plan declares no stage_place_mode)", flush=True)
                 return "container"
             return "surface"
 
         def orient_for(stage_idx):
-            """Choose whether the stage may control tool orientation."""
+            """Tool-axis freedom: declared by the plan, else read off its text."""
+            declared = _declared("stage_orient", stage_idx, {"down", "free"})
+            if declared is not None:
+                print(f"[rekep-vlm] stage {stage_idx + 1} orient={declared} (DECLARED)", flush=True)
+                return declared
             path = os.path.join(vlm_dir, f"stage{stage_idx + 1}_subgoal_constraints.txt")
             if _constrains_orientation(path):
-                print(f"[rekep-vlm] stage {stage_idx + 1} constrains orientation, free tool axis", flush=True)
+                print(f"[rekep-vlm] stage {stage_idx + 1} constrains orientation, free tool axis "
+                      f"(inferred from text: the plan declares no stage_orient)", flush=True)
                 return "free"
             return "down"
 
@@ -704,7 +885,7 @@ class RekepGrounding:
         for i in range(metadata["num_stages"]):
             grasp_kp, release_kp = metadata["grasp_keypoints"][i], metadata["release_keypoints"][i]
             held = tuple(j for j, o in enumerate(tracker.owners) if grasped_body is not None and o == grasped_body)
-            subgoal, path_fns = load_stage(i, held)
+            subgoal, path_fns, subgoal_fns = load_stage(i, held)
             if grasp_kp >= 0:
                 name = name_for(grasp_kp)
                 owner = tracker.owners[grasp_kp]
@@ -715,8 +896,16 @@ class RekepGrounding:
                 else:
                     mode, grip = self._contact_for(name, obj_ext, local_grip=local_ext.get(name))
                     press = mode == "press"
-                    print(f"[rekep-vlm] {name}: contact={mode} (grip half-width {grip * 1e3:.0f}mm vs "
-                          f"{self.open_half * 1e3:.0f}mm aperture)", flush=True)
+                    body = float(obj_ext.get(name, _DEFAULT_EXTENT)[0])
+                    # The radius the grasp terms will actually use: `_grasp_frame` reads
+                    # grasp_extent when set and the owner box's KEEPOUT half otherwise.
+                    _r = local_ext.get(name)
+                    _r_txt = (f"{_r * 1e3:.0f}mm keypoint-local" if _r is not None else
+                              f"{float(obj_ext.get(name, _DEFAULT_EXTENT)[1]) * 1e3:.0f}mm "
+                              f"owner-box keepout (no keypoint-local extents in the context)")
+                    print(f"[rekep-vlm] {name}: contact={mode} (body half-width "
+                          f"{body * 1e3:.0f}mm vs {self.open_half * 1e3:.0f}mm aperture; grasp "
+                          f"radius {_r_txt})", flush=True)
                 manipulated.add(name)
 
 
@@ -725,10 +914,15 @@ class RekepGrounding:
                 # below carried one -- so rekep_subgoal/rekep_path scored nothing until the final
                 # stage. `done` is deliberately NOT the subgoal: a grasp advances on the hold
                 # sensor, not on proximity, or it would advance before the gripper closes.
+                # The target IS the plan's grasp keypoint, whatever the contact mode. Pinch stages
+                # used to substitute the owner's centroid, which is the whole partition backwards:
+                # the plan owns WHICH point to grasp and the cost owns how to grasp it. On square
+                # that put the gripper 5.4 cm away from the handle the plan chose, at the centre of
+                # the nut's hole, and every grasp term was then centred there too.
                 stages.append(Stage(name=f"{'press' if press else 'grasp'} {name}", gripper="close", steer_policy=_pol(i),
                                     grasp_obj=name, payload=None, held_idx=held,
-                                    target=(kp_point(grasp_kp) if press else obj_center[name]),
-                                    constraint=subgoal, path_fns=path_fns,
+                                    target=kp_point(grasp_kp),
+                                    constraint=subgoal, path_fns=path_fns, subgoal_fns=subgoal_fns,
                                     contact=("press" if press else "pinch")))
                 grasped_body = owner
                 pressed = press
@@ -738,7 +932,8 @@ class RekepGrounding:
                 manipulated.update({name} | ({place_target} if place_target else set()))
                 stages.append(Stage(name=f"place {name}", gripper="place", grasp_obj=None, payload=name, steer_policy=_pol(i),
                                     place_target=place_target, target=kp_point(release_kp), held_idx=held,
-                                    constraint=subgoal, path_fns=path_fns, done=subgoal_done(subgoal),
+                                    constraint=subgoal, path_fns=path_fns, subgoal_fns=subgoal_fns,
+                                    done=subgoal_done(subgoal_fns),
                                     orient=orient_for(i),
                                     place_mode=place_mode_for(i, place_target),
                                     contact=("press" if pressed else "pinch")))
@@ -751,7 +946,8 @@ class RekepGrounding:
                 stages.append(Stage(name=f"move {i}", gripper=("hold" if grasped_body else "open"), steer_policy=_pol(i),
                                     grasp_obj=None, payload=grasped_body,
                                     target=kp_point(refs[0] if refs else 0), held_idx=held,
-                                    constraint=subgoal, path_fns=path_fns, done=subgoal_done(subgoal),
+                                    constraint=subgoal, path_fns=path_fns, subgoal_fns=subgoal_fns,
+                                    done=subgoal_done(subgoal_fns),
                                     orient=orient_for(i),
                                     contact=("press" if pressed else "pinch")))
 
@@ -766,6 +962,13 @@ class RekepGrounding:
         self._check_keypoint_identity(metadata["num_stages"], vlm_dir, tracker, obj_names)
         print(f"[rekep-vlm] emitted {len(stages)} VLM-driven stages: "
               f"{[s.name for s in stages]}", flush=True)
+        # What the cost actually receives per stage. A stage with constraint=NONE scores zero on
+        # rekep_subgoal/rekep_keypose, and path=0 makes rekep_path inert -- the exact silent
+        # fall-through --ground rekep_vlm exists to avoid, so it is reported rather than assumed.
+        print("[rekep-vlm] live terms: " + " | ".join(
+            f"{i}:{st.name} subgoal={'yes' if st.constraint is not None else 'NONE'} "
+            f"path={len(st.path_fns)} held={list(st.held_idx)}"
+            for i, st in enumerate(stages)), flush=True)
         return stages, manipulated
 
     def _check_keypoint_identity(self, num_stages, vlm_dir, tracker, obj_names):
@@ -824,7 +1027,8 @@ class MGRekepGroundingSource:
 
     _MODE = "template"
 
-    def __init__(self, task, context_path=None, constraints_path=None, vlm="fake"):
+    def __init__(self, task, context_path=None, constraints_path=None, vlm="fake",
+                 instruction=None):
         if task not in TASKS:
             raise ValueError(f"unknown mg task {task!r} (have {sorted(TASKS)})")
         spec = TASKS[task]
@@ -837,7 +1041,8 @@ class MGRekepGroundingSource:
         self._grounding = RekepGrounding(
             task_key=task, place_obj=spec["place_obj"],
             grasp_objs=spec["grasp_objs"], stages=self._MODE, kp_source="artifact", vlm=vlm,
-            context_path=self.context_path, constraints_path=self.constraints_path)
+            context_path=self.context_path, constraints_path=self.constraints_path,
+            instruction=instruction)
 
     @staticmethod
     def _default(task, leaf):
