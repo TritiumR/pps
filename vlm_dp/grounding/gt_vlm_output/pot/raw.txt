@@ -72,7 +72,7 @@ def stage2_subgoal_constraint1(end_effector, keypoints):
 ### stage 3 sub-goal constraints
 def stage3_subgoal_constraint1(end_effector, keypoints):
     """The lid (keypoint {lid}) has reached carry height (vertical shortfall only)."""
-    return np.maximum(0.0, ({lift_z_lid}) - keypoints[{lid}][..., 2])
+    return np.maximum(0.0, ({lift_z_lid}) - keypoints[{lid}][..., 2]) / ({lift_residual_scale})
 
 ### stage 3 path constraints
 def stage3_path_constraint1(end_effector, keypoints):

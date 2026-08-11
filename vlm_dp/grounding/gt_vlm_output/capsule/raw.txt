@@ -6,15 +6,16 @@
 #
 # Task: "open the coffee maker lid and put the pod inside"
 #
-# The task involves six stages:
-# 1. Close the gripper at a waypoint directly below the coffee-maker lid lip.
-# 2. Push upward through the lip so the lid rotates on its hinge.
-# 3. Grasp the pod.
-# 4. Lift the pod clear of the tray.
-# 5. Carry the pod above the bay.
-# 6. Lower the pod onto the bay opening.
+# The task involves seven stages:
+# 1. Move the open gripper to a waypoint outside and below the circular lid.
+# 2. Close the gripper at a waypoint directly below the coffee-maker lid lip.
+# 3. Push upward through the lip so the lid rotates on its hinge.
+# 4. Grasp the pod.
+# 5. Lift the pod clear of the tray.
+# 6. Carry the pod above the bay.
+# 7. Lower the pod onto the bay opening.
 #
-# Stage 4 is an explicit lift, carrying no grasp or release keypoint: its sub-goal constraint
+# Stage 5 is an explicit lift, carrying no grasp or release keypoint: its sub-goal constraint
 # certifies the pod is actually held before transport to the bay begins.
 #
 # BROUGHT TO PARITY WITH THE WEIGHT PLAN (the validated 16/20 reference). Four judgements,
@@ -25,41 +26,68 @@
 #    descent it was supposed to perform. Splitting gives stage 5 an unconditional carry-height
 #    path rule and stage 6 a pure descent -- the same reason weight splits 2-3 from 4.
 #
-#  * CLOSED-FINGER UNDER-LIP PRESS (stages 1 and 2). Stage 1 closes at a declared waypoint 3cm
-#    directly below the observed lid lip. Stage 2 keeps the gripper closed and pushes upward.
+#  * OUTSIDE-BELOW APPROACH AND CLOSED-FINGER PRESS (stages 1-3). Stages 1-2 keep the
+#    gripper closed, local tool +z pointed to world +z, and the TCP below the machine top.
+#    Stage 2 approaches inward to the declared under-lip point. Stage 3 keeps contact and the
+#    gripper closed while pushing upward.
 #    Reaching a point above the lid is NOT completion: the visually tracked hinge-to-lip vector
 #    must rotate to the physical 90-degree stop (85 degrees after sensor tolerance). Thus a hand
 #    that misses the lip cannot open and leave for the pod merely because its TCP rose high enough.
 #
-#  * ONE-SIDED VERTICAL POD LIFT (stage 4). This is the ordinary carried-object lift and reads
+#  * ONE-SIDED VERTICAL POD LIFT (stage 5). This is the ordinary carried-object lift and reads
 #    exactly like weight stages 2/6.
 #
-#  * GATED DESCENT (stage 6). Its second path constraint forbids dropping below the hover height
+#  * GATED DESCENT (stage 7). Its second path constraint forbids dropping below the hover height
 #    while still horizontally far from the bay, relaxing linearly to zero inside 8cm. The pod
 #    then arrives over the bay opening and goes straight down, instead of diving diagonally at
 #    the machine and clipping its rim on the way in.
 #
-#  * PLACE MODE UNCHANGED. Stage 6's sub-goal deliberately avoids the words "into"/"inside"/
+#  * PLACE MODE UNCHANGED. Stage 7's sub-goal deliberately avoids the words "into"/"inside"/
 #    "within": rekep._places_into reads that text to choose container vs surface placement, and
 #    this plan has always compiled as `surface`. Restructuring the plan is not the place to also
 #    flip a cost mode that no run has measured.
 
-num_stages = 6
+num_stages = 7
 
 
 ### stage 1 sub-goal constraints
 def stage1_subgoal_constraint1(end_effector, keypoints):
-    """Bring a gripper tilted toward horizontal to the point directly below the lid lip
-    (keypoint {under_lip}); do not prescribe its Cartesian approach path."""
-    return np.linalg.norm(end_effector - keypoints[{under_lip}])
+    """Bring the closed gripper to a semantic waypoint outside and below the circular lid
+    (keypoint {pre_under}), with local tool +z pointing straight up in world coordinates."""
+    return np.linalg.norm(end_effector - keypoints[{pre_under}]) / ({pre_under_residual_scale})
 
 ### stage 1 path constraints
-# No path constraint: the target itself is below the lid, so the final approach comes from below.
+def stage1_path_constraint1(end_effector, keypoints):
+    """Stay laterally inside the visually observed short-edge width of the coffee maker."""
+    lateral = np.sum((end_effector - np.array({machine_origin})) * np.array({width_axis}), axis=-1)
+    outside = np.maximum(0.0, ({width_lo}) - lateral) + np.maximum(0.0, lateral - ({width_hi}))
+    return outside / ({width_residual_scale})
+
+def stage1_path_constraint2(end_effector, keypoints):
+    """Keep stage-1 TCP below the machine top with execution safety margin."""
+    return np.maximum(0.0, end_effector[..., 2] - ({stage1_tcp_ceiling})) / ({top_residual_scale})
 
 ### stage 2 sub-goal constraints
 def stage2_subgoal_constraint1(end_effector, keypoints):
-    """Keep the closed gripper tilted toward horizontal while pushing upward through the lid
-    lip until the visually tracked hinge-to-lip vector has rotated through the open angle."""
+    """Keep the gripper closed and local tool +z pointed straight up while moving from the
+    outside-below waypoint to the point directly below the lid lip (keypoint {under_lip})."""
+    return np.linalg.norm(end_effector - keypoints[{under_lip}]) / ({under_lip_residual_scale})
+
+### stage 2 path constraints
+def stage2_path_constraint1(end_effector, keypoints):
+    """Do not route around a side wall while entering toward the under-lip point."""
+    lateral = np.sum((end_effector - np.array({machine_origin})) * np.array({width_axis}), axis=-1)
+    outside = np.maximum(0.0, ({width_lo}) - lateral) + np.maximum(0.0, lateral - ({width_hi}))
+    return outside / ({width_residual_scale})
+
+def stage2_path_constraint2(end_effector, keypoints):
+    """Keep stage-2 TCP at or below the observed world-frame 3-D machine top."""
+    return np.maximum(0.0, end_effector[..., 2] - ({stage1_tcp_ceiling})) / ({top_residual_scale})
+
+### stage 3 sub-goal constraints
+def stage3_subgoal_constraint1(end_effector, keypoints):
+    """Keep the same machine-facing horizontal orientation and the gripper closed while pushing
+    upward through the lid lip until its tracked hinge-to-lip vector reaches the open angle."""
     hand_shortfall = np.maximum(0.0, keypoints[{open_goal}][..., 2] - end_effector[..., 2]) / ({open_lift})
     rest_axis = keypoints[{lip_rest}] - keypoints[{hinge}]
     live_axis = keypoints[{lip}] - keypoints[{hinge}]
@@ -70,54 +98,58 @@ def stage2_subgoal_constraint1(end_effector, keypoints):
     angle_shortfall = np.maximum(0.0, ({open_angle_rad}) - angle) / ({angle_residual_scale})
     return hand_shortfall + angle_shortfall
 
-### stage 2 path constraints
-# No xy arc is imposed: contact and the physical hinge determine the lid's rotation.
-
-### stage 3 sub-goal constraints
-def stage3_subgoal_constraint1(end_effector, keypoints):
-    """Align the end-effector with the pod (keypoint {pod})."""
-    return np.linalg.norm(end_effector - keypoints[{pod}])
-
 ### stage 3 path constraints
-# No path constraints needed for grasping.
+def stage3_path_constraint1(end_effector, keypoints):
+    """Keep the upward push inside the coffee maker's short-edge width."""
+    lateral = np.sum((end_effector - np.array({machine_origin})) * np.array({width_axis}), axis=-1)
+    outside = np.maximum(0.0, ({width_lo}) - lateral) + np.maximum(0.0, lateral - ({width_hi}))
+    return outside / ({width_residual_scale})
 
 ### stage 4 sub-goal constraints
 def stage4_subgoal_constraint1(end_effector, keypoints):
-    """The pod (keypoint {pod}) has reached carry height (vertical shortfall only)."""
-    return np.maximum(0.0, ({lift_z_pod}) - keypoints[{pod}][..., 2])
+    """Align the end-effector with the pod (keypoint {pod})."""
+    return np.linalg.norm(end_effector - keypoints[{pod}])
 
 ### stage 4 path constraints
-def stage4_path_constraint1(end_effector, keypoints):
-    """The robot must still be holding the pod (keypoint {pod})."""
-    return get_grasping_cost_by_keypoint_idx({pod})
+# No path constraints needed for grasping.
 
 ### stage 5 sub-goal constraints
 def stage5_subgoal_constraint1(end_effector, keypoints):
-    """The pod (keypoint {pod}) hovers directly above the bay (keypoint {bay})."""
-    offsetted_point = keypoints[{bay}] + np.array({hover_pod})
-    return np.linalg.norm(keypoints[{pod}] - offsetted_point)
+    """The pod (keypoint {pod}) has reached carry height (vertical shortfall only)."""
+    return np.maximum(0.0, ({lift_z_pod}) - keypoints[{pod}][..., 2])
 
 ### stage 5 path constraints
 def stage5_path_constraint1(end_effector, keypoints):
     """The robot must still be holding the pod (keypoint {pod})."""
     return get_grasping_cost_by_keypoint_idx({pod})
 
-def stage5_path_constraint2(end_effector, keypoints):
-    """Keep the pod (keypoint {pod}) clear of the tray while carrying it across."""
-    return np.maximum(0.0, ({carry_z_pod}) - keypoints[{pod}][..., 2])
-
 ### stage 6 sub-goal constraints
 def stage6_subgoal_constraint1(end_effector, keypoints):
-    """The pod (keypoint {pod}) rests at the bay opening (keypoint {bay})."""
-    offsetted_point = keypoints[{bay}] + np.array({off_pod})
+    """The pod (keypoint {pod}) hovers directly above the bay (keypoint {bay})."""
+    offsetted_point = keypoints[{bay}] + np.array({hover_pod})
     return np.linalg.norm(keypoints[{pod}] - offsetted_point)
 
 ### stage 6 path constraints
 def stage6_path_constraint1(end_effector, keypoints):
-    """The robot must still be grasping the pod (keypoint {pod})."""
+    """The robot must still be holding the pod (keypoint {pod})."""
     return get_grasping_cost_by_keypoint_idx({pod})
 
 def stage6_path_constraint2(end_effector, keypoints):
+    """Keep the pod (keypoint {pod}) clear of the tray while carrying it across."""
+    return np.maximum(0.0, ({carry_z_pod}) - keypoints[{pod}][..., 2])
+
+### stage 7 sub-goal constraints
+def stage7_subgoal_constraint1(end_effector, keypoints):
+    """The pod (keypoint {pod}) rests at the bay opening (keypoint {bay})."""
+    offsetted_point = keypoints[{bay}] + np.array({off_pod})
+    return np.linalg.norm(keypoints[{pod}] - offsetted_point)
+
+### stage 7 path constraints
+def stage7_path_constraint1(end_effector, keypoints):
+    """The robot must still be grasping the pod (keypoint {pod})."""
+    return get_grasping_cost_by_keypoint_idx({pod})
+
+def stage7_path_constraint2(end_effector, keypoints):
     """Stay above the hover height until horizontally aligned with the bay opening."""
     place_xy = keypoints[{bay}][..., :2] + np.array({off_pod})[:2]
     xy_off = np.linalg.norm(keypoints[{pod}][..., :2] - place_xy, axis=-1)
@@ -128,40 +160,51 @@ def stage6_path_constraint2(end_effector, keypoints):
 """
 Summarize keypoints to be contacted in all close stages.
 """
-grasp_keypoints = [{under_lip}, -1, {pod}, -1, -1, -1]
+grasp_keypoints = [-1, {under_lip}, -1, {pod}, -1, -1, -1]
 
 """
-No release is authored for the press stroke: stage 2 keeps the fingers closed while pushing.
+No release is authored for the press stroke: stage 3 keeps the fingers closed while pushing.
 The following pod-grasp stage uses the normal closed-empty recovery to reopen before pinching.
 """
-release_keypoints = [-1, -1, -1, -1, -1, {pod}]
+release_keypoints = [-1, -1, -1, -1, -1, -1, {pod}]
 
 """
 Per-stage contact mode. The under-lip waypoint is a closed-finger press, not a pinch.
 """
-contact_modes = ["press", "", "", "", "", ""]
+contact_modes = ["", "press", "", "", "", "", ""]
+
+"""Keep video stages 0-1 closed without falsely declaring a grasp at the empty pre-waypoint."""
+gripper_modes = ["close", "close", "", "", "", "", ""]
 
 
 
 # ---------------------------------------------------------------------------
 # Completion predicates are sensed-state diagnostics built only from tracked keypoints and robot
-# proprioception. Stage 1 records that the closed fingertips reached the under-lip waypoint.
-# Stage 2 records that the visually tracked lid reached the authored open-angle band. Under
-# advance.plan_authoritative, the normalized stage-2 sub-goal is the control transition; the
+# proprioception. Stage 1 records the outside-below staging point, stage 2 records closed
+# fingertips at the under-lip waypoint, and stage 3 records the visually tracked open angle. Under
+# advance.plan_authoritative, the normalized stage-3 sub-goal is the control transition; the
 # predicate remains an independent sustained-history record of the same visually observed event.
 # ---------------------------------------------------------------------------
 
 
 ### stage 1 completion predicate
 def stage1_completion(history, end_effector, keypoints, robot_state, components):
+    """The open gripper reached the semantic waypoint outside and below the circular lid."""
+    outside_below = sustained(
+        lambda ee, kp: np.linalg.norm(ee - kp[{pre_under}]) - 0.012,
+        "outside_below_lid")
+    return bool(outside_below)
+
+### stage 2 completion predicate
+def stage2_completion(history, end_effector, keypoints, robot_state, components):
     """Closed fingertips reached the declared point directly below the lid lip."""
     tips_at_under_lip = sustained(
         lambda ee, kp: np.linalg.norm(ee - kp[{under_lip}]) - grasp_tolerance({under_lip}),
         "tips_at_under_lip")
     return bool(tips_at_under_lip)
 
-### stage 2 completion predicate
-def stage2_completion(history, end_effector, keypoints, robot_state, components):
+### stage 3 completion predicate
+def stage3_completion(history, end_effector, keypoints, robot_state, components):
     """The lid itself, not merely the hand, remained at the roughly 90-degree open stop."""
     rest_axis = keypoints[{lip_rest}] - keypoints[{hinge}]
     live_axis = keypoints[{lip}] - keypoints[{hinge}]
@@ -182,22 +225,22 @@ def stage2_completion(history, end_effector, keypoints, robot_state, components)
         "lid_rotated_90deg")
     return bool(lid_rotated)
 
-### stage 3 completion predicate
-def stage3_completion(history, end_effector, keypoints, robot_state, components):
+### stage 4 completion predicate
+def stage4_completion(history, end_effector, keypoints, robot_state, components):
     """Pod grasped: the fingers are stalled on something, and the pod rides with the hand."""
     pod_in_hand = grasped({pod}, "pod_in_hand", "acquire")
     return bool(pod_in_hand)
 
-### stage 4 completion predicate
-def stage4_completion(history, end_effector, keypoints, robot_state, components):
+### stage 5 completion predicate
+def stage5_completion(history, end_effector, keypoints, robot_state, components):
     """Pod lifted: still owned by the hand, and it has held carry height for the last third of a second."""
     still_held = grasped({pod}, "still_held", "maintain")
     at_carry_height = sustained(
         lambda ee, kp: ({lift_z_pod}) - kp[{pod}][..., 2], "at_carry_height")
     return bool(still_held and at_carry_height)
 
-### stage 5 completion predicate
-def stage5_completion(history, end_effector, keypoints, robot_state, components):
+### stage 6 completion predicate
+def stage6_completion(history, end_effector, keypoints, robot_state, components):
     """Pod over the bay: still owned by the hand, inside the bay region in xy, still clear above it."""
     still_held = grasped({pod}, "still_held", "maintain")
     inside_place_region = sustained(
@@ -208,8 +251,8 @@ def stage5_completion(history, end_effector, keypoints, robot_state, components)
         "still_clear_of_bay")
     return bool(still_held and inside_place_region and still_clear_of_bay)
 
-### stage 6 completion predicate
-def stage6_completion(history, end_effector, keypoints, robot_state, components):
+### stage 7 completion predicate
+def stage7_completion(history, end_effector, keypoints, robot_state, components):
     """Pod placed: down in the bay region, no longer owned by the hand, and no longer moving."""
     hand_let_go = released({pod}, "hand_let_go")
     inside_place_region = sustained(

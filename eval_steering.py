@@ -4469,6 +4469,16 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--task_norm_mode",
+        "--task-norm-mode",
+        choices=("config", "meanstd", "quantile"),
+        default="config",
+        help=(
+            "Action/state normalization mode used by the task proxy. 'config' preserves "
+            "the registered training config; use 'meanstd' for demo mean/std checkpoints."
+        ),
+    )
+    parser.add_argument(
         "--ref_checkpoint_dir",
         type=str,
         default=None,
@@ -5688,6 +5698,19 @@ if "base" in required_policy_roles:
 if "task" in required_policy_roles:
     task_config_name = _config_name_from_checkpoint_dir(task_checkpoint_dir)
     task_config = _config.get_config(task_config_name)
+    if args.task_norm_mode != "config":
+        if not hasattr(task_config.data, "use_quantile_norm"):
+            raise ValueError(
+                f"--task_norm_mode is not supported by data config "
+                f"{type(task_config.data).__name__}."
+            )
+        task_config = dataclasses.replace(
+            task_config,
+            data=dataclasses.replace(
+                task_config.data,
+                use_quantile_norm=args.task_norm_mode == "quantile",
+            ),
+        )
     if args.task_attention != "config":
         if not hasattr(task_config.model, "bidirectional_attention"):
             raise ValueError(
@@ -5711,6 +5734,9 @@ if "task" in required_policy_roles:
         "loading task policy",
         config=task_config_name,
         attention=task_attention,
+        norm_mode=(
+            "quantile" if task_config.data.use_quantile_norm else "meanstd"
+        ),
     )
     task_policy = policy_config.create_trained_policy(
         task_config,
@@ -5718,6 +5744,16 @@ if "task" in required_policy_roles:
         sample_kwargs={"num_steps": args.num_steps} if standalone_role == "task" else None,
         pytorch_device=args.device,
     )
+    expected_task_quantiles = task_config.data.use_quantile_norm
+    actual_task_quantiles = bool(
+        (getattr(task_policy, "_metadata", {}) or {}).get("use_quantile_norm")
+    )
+    if actual_task_quantiles != expected_task_quantiles:
+        raise RuntimeError(
+            "Task policy normalization mode does not match the requested mode: "
+            f"expected use_quantile_norm={expected_task_quantiles}, "
+            f"loaded {actual_task_quantiles}."
+        )
     _report_initialization_stage(args, "task policy ready", config=task_config_name)
 if "ref" in required_policy_roles:
     ref_config_name = _config_name_from_checkpoint_dir(ref_checkpoint_dir)

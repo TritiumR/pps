@@ -734,8 +734,14 @@ class RekepGrounding:
         stages, manipulated, grasped_body = [], {self.place_obj}, None
         placed_names, last_z0 = [], None
         steer_policies = metadata.get("steer_policies") or []
+        gripper_modes = metadata.get("gripper_modes") or []
         def _pol(idx):
             return steer_policies[idx] if idx < len(steer_policies) else None
+        def _gripper(idx, default):
+            mode = gripper_modes[idx] if idx < len(gripper_modes) else None
+            return mode if mode in ("open", "close", "hold") else default
+        def _gripper_auth(idx):
+            return idx < len(gripper_modes) and gripper_modes[idx] in ("open", "close", "hold")
         for i in range(metadata["num_stages"]):
             grasp_kp, release_kp = metadata["grasp_keypoints"][i], metadata["release_keypoints"][i]
             held = tuple(j for j, o in enumerate(tracker.owners) if grasped_body is not None and o == grasped_body)
@@ -1041,6 +1047,14 @@ class RekepGrounding:
 
         def orient_for(stage_idx):
             """Choose whether the stage may control tool orientation."""
+            # A signed approach axis is an explicit orientation instruction.  It must activate
+            # the orientation term even when the prose says "straight up" rather than using the
+            # older keyword vocabulary (tilt/horizontal).
+            axes = metadata.get("approach_axes") or []
+            if stage_idx < len(axes) and axes[stage_idx] is not None:
+                print(f"[rekep-vlm] stage {stage_idx + 1} has authored signed tool axis, "
+                      "tool-axis mode=tilt", flush=True)
+                return "tilt"
             path = os.path.join(vlm_dir, f"stage{stage_idx + 1}_subgoal_constraints.txt")
             if _constrains_orientation(path):
                 with open(path, encoding="utf-8") as f:
@@ -1050,6 +1064,22 @@ class RekepGrounding:
                       f"tool-axis mode={mode}", flush=True)
                 return mode
             return "down"
+
+        def approach_axis_for(stage_idx):
+            """Return the plan-authored signed world direction for local tool +z."""
+            axes = metadata.get("approach_axes") or []
+            axis = axes[stage_idx] if stage_idx < len(axes) else None
+            if axis is None:
+                return None
+            axis = np.asarray(axis, dtype=np.float64)
+            norm = float(np.linalg.norm(axis))
+            if norm < 1e-9:
+                return None
+            return tuple((axis / norm).tolist())
+
+        def approach_axis_scale_for(stage_idx):
+            scales = metadata.get("approach_axis_scales") or []
+            return float(scales[stage_idx]) if stage_idx < len(scales) else 1.0
 
         def self_displace_next(grasp_i, owner):
             """Return whether the next stage displaces the grasped object's keypoint."""
@@ -1078,8 +1108,14 @@ class RekepGrounding:
         # constraint text references at all (the fallback set).
         plan_kps = []
         steer_policies = metadata.get("steer_policies") or []
+        gripper_modes = metadata.get("gripper_modes") or []
         def _pol(idx):
             return steer_policies[idx] if idx < len(steer_policies) else None
+        def _gripper(idx, default):
+            mode = gripper_modes[idx] if idx < len(gripper_modes) else None
+            return mode if mode in ("open", "close", "hold") else default
+        def _gripper_auth(idx):
+            return idx < len(gripper_modes) and gripper_modes[idx] in ("open", "close", "hold")
         for i in range(metadata["num_stages"]):
             grasp_kp, release_kp = metadata["grasp_keypoints"][i], metadata["release_keypoints"][i]
             # held_idx is a claim that these keypoints RIDE THE GRIPPER: the cost terms move them
@@ -1120,11 +1156,14 @@ class RekepGrounding:
                 # end-effector at the grasp keypoint -- and this is where it is used. The advance
                 # rule is untouched by this: a close stage never advances on its sub-goal.
                 stages.append(Stage(name=f"{'press' if press else 'grasp'} {name}", gripper="close", steer_policy=_pol(i),
+                                    gripper_authoritative=_gripper_auth(i),
                                     grasp_obj=name, payload=None, held_idx=held,
                                     target=(kp_point(grasp_kp) if press else obj_center[name]),
                                     constraint=(subgoal if press else None),
                                     path_fns=(path_fns if press else ()),
                                     orient=orient_for(i),
+                                    approach_axis=approach_axis_for(i),
+                                    approach_axis_scale=approach_axis_scale_for(i),
                                     contact=("press" if press else "pinch")))
                 grasped_body = owner
                 pressed = press
@@ -1136,6 +1175,7 @@ class RekepGrounding:
                                     place_target=place_target, target=kp_point(release_kp), held_idx=held,
                                     constraint=subgoal, path_fns=path_fns, done=subgoal_done(subgoal),
                                     orient=orient_for(i),
+                                    approach_axis=approach_axis_for(i),
                                     place_mode=place_mode_for(i, place_target),
                                     contact=("press" if pressed else "pinch")))
                 grasped_body = None
@@ -1150,11 +1190,14 @@ class RekepGrounding:
                 # advance.plan_authoritative the stage advances on its own sub-goal (stage.done()),
                 # because a target read out of prose cannot be compared against a belief the way an
                 # advance test needs (a surface keypoint against an object centre never closes).
-                stages.append(Stage(name=f"move {i}", gripper=("hold" if grasped_body else "open"), steer_policy=_pol(i),
+                stages.append(Stage(name=f"move {i}", gripper=_gripper(i, "hold" if grasped_body else "open"), steer_policy=_pol(i),
+                                    gripper_authoritative=_gripper_auth(i),
                                     grasp_obj=None, payload=grasped_body,
                                     target=kp_point(refs[0] if refs else 0), held_idx=held,
                                     constraint=subgoal, path_fns=path_fns, done=subgoal_done(subgoal),
                                     orient=orient_for(i),
+                                    approach_axis=approach_axis_for(i),
+                                    approach_axis_scale=approach_axis_scale_for(i),
                                     contact=("press" if pressed else "pinch")))
             owner = stages[-1].payload or stages[-1].grasp_obj
             plan_kps.append({

@@ -271,6 +271,13 @@ def test_thin_feature_contact_is_not_confused_with_a_free_close():
     bridge.sensor = sensor_at(0.69)
     assert bridge.sensor.closed_on_air(), "fixture: old fixed threshold must call this air"
     assert bridge._payload_held("cover"), "width-predicted thin-handle contact must certify"
+    preflight_sensor = bridge._preflight_sensor(holding=True, stage=stage)
+    expected = preflight_sensor.q_free - bridge._AP_SLOPE * 0.010
+    assert abs(preflight_sensor.aperture() - expected) < 1e-6
+    bridge.sensor = sensor_at(0.40)
+    assert bridge.sensor.holding(), "fixture: a wide lid-edge obstruction passes the generic sensor"
+    assert not bridge._payload_held("cover"), (
+        "a contact visibly wider than the measured handle must not enter lift")
     bridge.sensor = sensor_at(bridge.sensor.q_free)
     assert bridge.sensor.closed_on_air(), "fixture: a free close must be in the air band"
     assert not bridge._payload_held("cover"), "a true free close must still trigger recovery"
@@ -284,6 +291,48 @@ def test_thin_feature_contact_is_not_confused_with_a_free_close():
     assert bridge.sensor.closed_on_air() and not bridge.sensor.closed()
     assert bridge.sensor.close_age() > bridge._thin_feature_settle_max_steps
     assert not bridge._thin_feature_settling("cover"), "an unsteady contact must eventually reopen"
+
+def test_confirmed_thin_grasp_debounces_lift_fluctuation():
+    """A settled thin grasp must survive transient lift motion, but not a persistent free close."""
+    stage = Stage(name="lift cover", gripper="hold", grasp_obj=None, payload="cover",
+                  target=(lambda: RIM), contact="pinch")
+    env = _Env(q=0.69, tcp=RIM)
+    world = types.SimpleNamespace(held=(lambda: "cover"))
+    bridge = _bare_bridge(world, env, stage)
+    bridge.grounding.objects = [
+        SceneObject(name="cover", pos=(lambda: RIM), extents=CAPSULE_EXT,
+                    grasp_extent=0.005)
+    ]
+    bridge._obj_pos = {"cover": (lambda: RIM)}
+    bridge._extents = {"cover": CAPSULE_EXT}
+    bridge._thin_feature_loss_ratio = 0.8
+    bridge._thin_feature_loss_grace = 2
+    bridge._thin_loss_replans = 0
+    bridge._ground_err_debug = False
+    bridge.grasp_z0 = {}
+    bridge.grasp_confirm = 10
+
+    # Load-induced motion crosses the generic air threshold and breaks settling, while the
+    # aperture remains consistent with the visually measured 10mm handle.
+    sensor = ApertureGraspSensor()
+    for q in [0.69] * 12 + [0.71]:
+        env.q = q
+        sensor.observe(env, True)
+    bridge.sensor = sensor
+    assert sensor.closed_on_air() and not sensor.closed()
+    assert bridge._invariant_violated(stage, {}) is None
+    assert bridge._thin_loss_replans == 0
+
+    # A persistent free close is debounced twice, then correctly declared lost.
+    sensor = ApertureGraspSensor()
+    env.q = sensor.q_free
+    for _ in range(20):
+        sensor.observe(env, True)
+    bridge.sensor = sensor
+    assert bridge._invariant_violated(stage, {}) is None
+    assert bridge._invariant_violated(stage, {}) is None
+    assert bridge._invariant_violated(stage, {}) == "empty hand"
+
 
 def _bare_bridge(world, env, stage):
     """A VlmDpBridge with only the attributes the rules under test read."""
@@ -322,6 +371,10 @@ def _bare_bridge(world, env, stage):
     bridge.close_steps, bridge.settle_steps = 12, 12
     bridge._last_cmd_close = True
     bridge._thin_feature_contact_ratio = 0.5
+    bridge._thin_feature_width_band = 0.08
+    bridge._thin_feature_loss_ratio = 0.8
+    bridge._thin_feature_loss_grace = 2
+    bridge._thin_loss_replans = 0
     bridge._thin_feature_settle_max_steps = 26
     bridge.legacy_sensor = False
     bridge.hold_enter = bridge.hold_exit = None

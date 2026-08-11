@@ -28,9 +28,11 @@ _TEA_MOUTH_CLEAR = 0.05
 # space and do not use the cover's simulator pose or asset geometry.
 _POT_HANDLE_MIN_RISE, _POT_HANDLE_MIN_PTS = 0.008, 12
 _POT_HANDLE_HALF_W_BOUNDS = (0.004, 0.025)
+_POT_HANDLE_Z_INSET = 0.005
 # Semantic pre-grasp waypoint. With simple_auth's 0.12m sub-goal tolerance, 0.20m still
 # guarantees at least 8cm of vertical clearance when the approach stage advances.
 _POT_APPROACH_HEIGHT = 0.20
+_POT_LIFT_RESIDUAL_SCALE = 0.03
 # Authored clear-above/descended band for the visually declared lid-handle feature.
 _POT_LID_CLEAR = 0.05
 
@@ -45,9 +47,22 @@ _CAPSULE_LID_RADIUS = float(_CAPSULE_LID_OPEN_LIFT[2])
 _CAPSULE_HINGE_FROM_LIP_LOCAL = np.array([0.0, _CAPSULE_LID_RADIUS, 0.0])
 _CAPSULE_OPEN_ANGLE_DEG = 85.0  # sensor tolerance around the physical 90-degree stop
 _CAPSULE_ANGLE_RESIDUAL_SCALE = float(np.deg2rad(5.0))
-# Closed-finger pre-contact point directly below the lid lip. Stage 1 closes here; stage 2 then
-# moves upward through the lip so the physical hinge, rather than a hand-authored arc, sets xy.
-_CAPSULE_UNDER_LIP_DROP = 0.03
+# Closed-finger contact point below the lid lip.  A separate semantic waypoint sits outside and
+# farther below the circular lid, so the approach cannot shortcut through the ring from above.
+_CAPSULE_UNDER_LIP_DROP = 0.04
+_CAPSULE_UNDER_LIP_INSET = 0.025
+_CAPSULE_PRE_UNDER_OUT = 0.08
+_CAPSULE_PRE_UNDER_DROP = 0.08
+_CAPSULE_PRE_UNDER_RESIDUAL_SCALE = 0.10
+_CAPSULE_UNDER_LIP_RESIDUAL_SCALE = 0.03
+# Lateral corridor across the visually observed short edge of the coffee-maker body.
+_CAPSULE_WIDTH_PERCENTILES = (5.0, 95.0)
+_CAPSULE_WIDTH_BODY_CLEAR = 0.035
+_CAPSULE_WIDTH_TARGET_ALLOWANCE = 0.005
+_CAPSULE_WIDTH_RESIDUAL_SCALE = 0.03
+_CAPSULE_TOP_PERCENTILE = 95.0
+_CAPSULE_STAGE1_TOP_MARGIN = 0.0
+_CAPSULE_TOP_RESIDUAL_SCALE = 0.01
 # Height band used by the stage-2 sustained-history diagnostic. The control sub-goal below is
 # stricter because it normalizes the remaining push stroke by the full 0.12m travel.
 _CAPSULE_OPEN_CLEAR = 0.05
@@ -143,6 +158,13 @@ def _render(task_key, out_dir, **fields):
                                      for s in modes.strip("[]").split(",")]
         named = [(i + 1, m) for i, m in enumerate(metadata["contact_modes"]) if m]
         print(f"[fake-vlm] {task_key}: plan declares contact modes {named}", flush=True)
+
+    # Optional per-stage gripper intent independent of grasp ownership.  This lets a plan keep
+    # closed fingers while approaching a press contact without falsely claiming an object grasp.
+    gripper_modes = _opt_line("gripper_modes")
+    if gripper_modes is not None:
+        metadata["gripper_modes"] = [s.strip().strip('"\'')
+                                     for s in gripper_modes.strip("[]").split(",")]
 
     # --- write one file per (stage, kind), including the empty ones ---
     # load_stage() reads every stage{N}_path_constraints.txt unconditionally, so a stage with
@@ -265,13 +287,46 @@ def _capsule(out_dir, keypoints, grounded, env, clearance):
     # cloud search it does not depend on which facets the camera happened to see this episode.
     lip_world = _observable(root + _quat_rotate_wxyz(quat, _CAPSULE_LIP_LOCAL), pts["capsule"])
     hinge_world = lip_world + _quat_rotate_wxyz(quat, _CAPSULE_HINGE_FROM_LIP_LOCAL)
-    under_world = lip_world - np.array([0.0, 0.0, _CAPSULE_UNDER_LIP_DROP])
+    inward = hinge_world - lip_world
+    inward[2] = 0.0
+    inward /= max(float(np.linalg.norm(inward)), 1e-9)
+    # The TCP is the fingertip contact point, so put it under the lid surface, slightly
+    # inboard of the rim. The preceding waypoint remains outside/below for collision-free entry.
+    under_world = (lip_world + _CAPSULE_UNDER_LIP_INSET * inward
+                   - np.array([0.0, 0.0, _CAPSULE_UNDER_LIP_DROP]))
+    pre_under_world = (lip_world - _CAPSULE_PRE_UNDER_OUT * inward
+                       - np.array([0.0, 0.0, _CAPSULE_PRE_UNDER_DROP]))
+    # Inward is the machine depth direction; its horizontal normal is the short/width
+    # direction.  Measure its bounds from the segmented machine cloud, shrink them by
+    # the gripper-body radius, and retain a small reachable band around the contact point.
+    width_axis = np.array([-inward[1], inward[0], 0.0], dtype=np.float64)
+    width_axis /= max(float(np.linalg.norm(width_axis)), 1e-9)
+    machine_pts = np.asarray(pts["capsule"], dtype=np.float64)
+    machine_pts = machine_pts[np.isfinite(machine_pts).all(axis=1)]
+    width_proj = (machine_pts - root[None, :]) @ width_axis
+    width_lo, width_hi = np.percentile(width_proj, _CAPSULE_WIDTH_PERCENTILES)
+    # `machine_pts` are depth-deprojected world-frame XYZ samples from the coffee-machine mask.
+    # This is a physical world-Z height estimate, not an image-row or projected-camera bound.
+    machine_top_z = float(np.percentile(machine_pts[:, 2], _CAPSULE_TOP_PERCENTILE))
+    stage1_tcp_ceiling = machine_top_z - _CAPSULE_STAGE1_TOP_MARGIN
+    target_width = float((under_world - root) @ width_axis)
+    corridor_lo = min(float(width_lo + _CAPSULE_WIDTH_BODY_CLEAR),
+                      target_width - _CAPSULE_WIDTH_TARGET_ALLOWANCE)
+    corridor_hi = max(float(width_hi - _CAPSULE_WIDTH_BODY_CLEAR),
+                      target_width + _CAPSULE_WIDTH_TARGET_ALLOWANCE)
+    if corridor_hi <= corridor_lo:
+        raise SystemExit("[fake-vlm] observed coffee-machine width is too narrow for a "
+                         "reachable under-lid corridor")
+    # TCP local +z points from the wrist toward the fingertips. Aim it from the
+    # below-lip waypoint toward the hinge: inward into the machine and slightly up.
+    tool_z_facing = hinge_world - under_world
+    tool_z_facing /= max(float(np.linalg.norm(tool_z_facing)), 1e-9)
     open_world = lip_world + _CAPSULE_LID_OPEN_LIFT
     bay_world = root + _quat_rotate_wxyz(quat, _CAPSULE_BAY_LOCAL)
 
     pod = _nearest_kp_distinct(keypoints, pts["can"].mean(axis=0), set())
     n = len(keypoints)
-    lip, lip_rest, hinge, open_goal, bay, under_lip = range(n, n + 6)
+    lip, lip_rest, hinge, open_goal, bay, under_lip, pre_under = range(n, n + 7)
     # "lid" is seeded into SensedWorld before CoTracker is primed. The live lip therefore follows
     # the observed lid surface, while lip_rest and hinge stay fixed in the calibrated fixture
     # frame. Runtime completion reads their angle; it never reads the simulator joint.
@@ -280,11 +335,12 @@ def _capsule(out_dir, keypoints, grounded, env, clearance):
              (hinge_world, "capsule"),
              (open_world, None),
              (bay_world, "capsule"),
-             (under_world, "capsule", _CAPSULE_LIP_HALF_W)]
+             (under_world, "capsule", _CAPSULE_LIP_HALF_W),
+             (pre_under_world, "capsule", _CAPSULE_LIP_HALF_W)]
 
     kps = np.concatenate([np.asarray(keypoints, dtype=np.float64),
                           np.stack([lip_world, lip_world, hinge_world, open_world,
-                                    bay_world, under_world])], axis=0)
+                                    bay_world, under_world, pre_under_world])], axis=0)
     # Lift target: the pod's pick-up position raised _LIFT_HEIGHT, expressed as an offset from the
     # BAY keypoint because that one is on the machine and does not move. Anchoring to the carried
     # pod's own keypoint would be degenerate (the target would track the pod).
@@ -300,7 +356,15 @@ def _capsule(out_dir, keypoints, grounded, env, clearance):
     carry_z_pod = float(kps[pod][2] + _LIFT_HEIGHT - _CARRY_SLACK)
     hover_z_pod = float(kps[bay][2] + hover_pod[2])
     metadata = _render("capsule", out_dir, lip=lip, lip_rest=lip_rest, hinge=hinge,
-                       under_lip=under_lip, open_goal=open_goal, pod=pod, bay=bay,
+                       under_lip=under_lip, pre_under=pre_under,
+                       under_lip_residual_scale=float(_CAPSULE_UNDER_LIP_RESIDUAL_SCALE),
+                       pre_under_residual_scale=float(_CAPSULE_PRE_UNDER_RESIDUAL_SCALE),
+                       machine_origin=root.tolist(), width_axis=width_axis.tolist(),
+                       width_lo=float(corridor_lo), width_hi=float(corridor_hi),
+                       width_residual_scale=float(_CAPSULE_WIDTH_RESIDUAL_SCALE),
+                       stage1_tcp_ceiling=stage1_tcp_ceiling,
+                       top_residual_scale=float(_CAPSULE_TOP_RESIDUAL_SCALE),
+                       open_goal=open_goal, pod=pod, bay=bay,
                        lift_pod=lift_pod, off_pod=off_pod, hover_pod=hover_pod,
                        lift_z_pod=lift_z_pod, carry_z_pod=carry_z_pod, hover_z_pod=hover_z_pod,
                        open_clear=float(_CAPSULE_OPEN_CLEAR),
@@ -309,6 +373,10 @@ def _capsule(out_dir, keypoints, grounded, env, clearance):
                        angle_residual_scale=float(_CAPSULE_ANGLE_RESIDUAL_SCALE))
     # vlm_dp extension, not part of the ReKep response format the parser understands.
     metadata["steer_policies"] = ["on_failure"] * metadata["num_stages"]
+    # Video stages 0-1 point local tool +z straight upward in world coordinates.  The push stage
+    # then keeps its fixture-facing upward direction while rotating the lid.
+    metadata["approach_axes"] = [[0.0, 0.0, 1.0]] * 2 + [tool_z_facing.tolist()] + [None] * 4
+    metadata["approach_axis_scales"] = [10.0, 10.0, 1.0] + [1.0] * 4
     with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
 
@@ -316,11 +384,16 @@ def _capsule(out_dir, keypoints, grounded, env, clearance):
           f"lip=kp{lip} (declared, {np.round(lip_world, 3)}) "
           f"hinge=kp{hinge} (declared, {np.round(hinge_world, 3)}) "
           f"under_lip=kp{under_lip} (declared, {np.round(under_world, 3)}) "
+          f"pre_under=kp{pre_under} (declared, {np.round(pre_under_world, 3)}) "
+          f"width_corridor=[{corridor_lo:.3f}, {corridor_hi:.3f}]m "
+          f"axis={np.round(width_axis, 3)} "
+          f"machine_top={machine_top_z:.3f}m "
+          f"stage1_tcp_ceiling={stage1_tcp_ceiling:.3f}m "
           f"open_goal=kp{open_goal} (declared, {np.round(open_world, 3)}) "
           f"bay=kp{bay} (declared, {np.round(bay_world, 3)})", flush=True)
     _capsule_lip_diagnostic(env, lip_world, root, quat)
     return metadata, {"lid": lip, "lid_rest": lip_rest, "hinge": hinge,
-                      "under_lip": under_lip, "open_goal": open_goal,
+                      "under_lip": under_lip, "pre_under": pre_under, "open_goal": open_goal,
                       "pod": pod, "bay": bay}, extra
 
 
@@ -464,16 +537,27 @@ def _raised_handle(grounded, cover_pts):
     rise, neg_support, handle = min(candidates, key=lambda item: (item[0], item[1]))
     support = -neg_support
     centre = np.median(handle, axis=0)
+    # Aim slightly into the handle body rather than at its highest visible surface.  This
+    # increases finger overlap while retaining a visual lower bound above the broad lid.
+    raw_z = float(centre[2])
+    centre[2] = max(lid_z + _POT_HANDLE_MIN_RISE,
+                    raw_z - _POT_HANDLE_Z_INSET)
+    z_inset = raw_z - float(centre[2])
     xy = handle[:, :2] - centre[None, :2]
     cov = xy.T @ xy / max(len(xy) - 1, 1)
     _, axes = np.linalg.eigh(cov)
     projected = xy @ axes
-    spans = np.percentile(projected, 95, axis=0) - np.percentile(projected, 5, axis=0)
+    lo, hi = np.percentile(projected, [5, 95], axis=0)
+    spans = hi - lo
+    # The visible handle pixels are often denser at one end, so their median sits near an
+    # edge. Centre the robust oriented bounding box instead; this remains purely visual.
+    box_shift = (0.5 * (lo + hi)) @ axes.T
+    centre[:2] += box_shift
     half_width = float(np.clip(0.5 * spans.min(), *_POT_HANDLE_HALF_W_BOUNDS))
     narrow_axis = axes[:, int(np.argmin(spans))]
     narrow_axis = narrow_axis / max(float(np.linalg.norm(narrow_axis)), 1e-9)
     axis = (float(narrow_axis[0]), float(narrow_axis[1]), 0.0)
-    return centre, half_width, axis, support, rise
+    return centre, half_width, axis, support, rise, float(np.linalg.norm(box_shift)), z_inset
 
 
 def _tea(out_dir, keypoints, grounded, env, clearance):
@@ -570,13 +654,16 @@ def _pot(out_dir, keypoints, grounded, env, clearance):
         if handle is None:
             raise SystemExit("[fake-vlm] no supported raised handle in the visually detected "
                              "pot-lid region; refusing the unsafe rim-keypoint fallback")
-        handle_world, handle_half_w, handle_axis, support, rise = handle
+        (handle_world, handle_half_w, handle_axis, support, rise,
+         center_shift, z_inset) = handle
         roles["cover"] = len(keypoints)
         extra = ((handle_world, "cover", handle_half_w),)
         keypoints = np.concatenate(
             [np.asarray(keypoints, dtype=np.float64), handle_world[None]], axis=0)
         print(f"[fake-vlm] pot handle=kp{roles['cover']} (declared from {support} observed "
               f"ROI points, rise={rise:.3f}, half_width={handle_half_w:.3f}, "
+              f"center_shift={center_shift * 1e3:.0f}mm, "
+              f"z_inset={z_inset * 1e3:.0f}mm, "
               f"narrow_axis={np.round(handle_axis, 3)})", flush=True)
         taken.add(roles["cover"])
         roles["egg"] = _nearest_kp_distinct(keypoints, pts["egg"].mean(axis=0), taken)
@@ -621,6 +708,7 @@ def _pot(out_dir, keypoints, grounded, env, clearance):
                        approach_lid=[0.0, 0.0, _POT_APPROACH_HEIGHT],
                        lid_clear=float(_POT_LID_CLEAR),
                        lift_lid=lift_lid, lift_egg=lift_egg,
+                       lift_residual_scale=float(_POT_LIFT_RESIDUAL_SCALE),
                        hover_lid=hover["lid"], hover_egg=hover["egg"],
                        lift_z_lid=lift_z["lid"], lift_z_egg=lift_z["egg"],
                        carry_z_lid=carry_z["lid"], carry_z_egg=carry_z["egg"],

@@ -216,14 +216,24 @@ def orientation(I):
     down = torch.tensor([0.0, 0.0, -1.0], device=I.ee_quat.device, dtype=I.ee_quat.dtype)
     align = (_axis(I.ee_quat, 2) * down.view(1, 1, 3)).sum(dim=-1)
     if mode == "tilt":
+        facing = I.context.get("approach_axis")
+        if facing is not None:
+            # A stage-authored signed axis is the complete orientation intent. Do not
+            # also apply the generic downward band: Capsule approaches from below.
+            n = torch.as_tensor(facing, device=I.ee_quat.device, dtype=I.ee_quat.dtype)
+            n = n / torch.clamp(torch.linalg.vector_norm(n), min=1e-8)
+            signed = (_axis(I.ee_quat, 2) * n.view(1, 1, 3)).sum(dim=-1)
+            scale = float(I.context.get("approach_axis_scale", 1.0))
+            return scale * (1.0 - signed).pow(2).mean(dim=1)
         # A band, not a target quaternion: azimuth and the Cartesian path stay free,
         # so contact and the articulated mechanism still determine the motion.
         lo = float(getattr(I.geom, "tilt_down_min", 0.0))
         hi = float(getattr(I.geom, "tilt_down_max", 0.5))
-        return (
+        penalty = (
             torch.clamp(lo - align, min=0.0).pow(2)
             + torch.clamp(align - hi, min=0.0).pow(2)
-        ).mean(dim=1)
+        )
+        return penalty.mean(dim=1)
     if mode != "down":
         raise ValueError(
             f"unknown orientation mode {mode!r}; expected down, tilt, or free"
@@ -351,7 +361,14 @@ def close_gripper(I):
     if I.context.get("gripper_intent") == "open":  # reopen recovery owns the channel
         return _zeros(I)
     f = _grasp_frame(I)
-    if f is None or I.real_actions.shape[-1] <= 7:
+    if I.real_actions.shape[-1] <= 7:
+        return _zeros(I)
+    if f is None:
+        # A plan may require closed fingers for a press approach without declaring object
+        # ownership.  In that case there is intentionally no grasp frame or proximity gate.
+        if (I.context.get("gripper_intent") == "close"
+                and I.context.get("gripper_authoritative", False)):
+            return (I.real_actions[..., 7] - 1.0).pow(2).mean(dim=1)
         return _zeros(I)
     _, _, _, _, center, radius = f
     eef = I.context.get("eef_pos")

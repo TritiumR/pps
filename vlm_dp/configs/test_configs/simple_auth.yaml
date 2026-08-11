@@ -62,6 +62,9 @@ cost:
     grasp_standoff: 40.0
     close_gripper: 2.0
     carry_hold: 40.0
+    # Protect the newly acquired grasp during the first second of lift.  This is
+    # a motion prior only; the plan's height residual still owns stage advance.
+    carry_accel: 40.0
     release_gripper: 40.0
     smooth: 50.4
     joint_delta: 35.0
@@ -114,6 +117,9 @@ cost:
     place_release_clearance: 0.012
     clear_max_radius: 0.1
     subgoal_mean: true
+    carry_accel_max: 2.0
+    carry_accel_settle_s: 1.0
+    carry_accel_z_weight: 1.0
 advance:
   flag_fallback: false
   release_debug: true
@@ -121,7 +127,15 @@ advance:
   ground_error_debug: true
   # Thin-handle contact may cross the air threshold before its 12-step settling window closes.
   thin_feature_contact_ratio: 0.5
+  thin_feature_width_band: 0.08    # reject a wide lid-edge stall as a thin-handle grasp
+  thin_feature_loss_ratio: 0.8       # confirmed thin grasp: only near-free close counts as loss
+  thin_feature_loss_grace_replans: 2 # tolerate two transient lift replans before backtracking
   thin_feature_settle_max_steps: 26
+  # A one-step open glitch at grasp->lift is a soft-cost artefact, not release intent.
+  # Suppress it while the payload is sensed held; a persistent open command still passes.
+  gripper_open_debounce: 2
+  # Lift/carry has no release semantics: while hold is physically certified, execute full close.
+  hold_gripper_authoritative: true
   predicate_place_transitions: true   # place stages advance on the completion predicate
   plan_authoritative: true            # every plan-authored stage advances on the plan's evidence
 grounding:

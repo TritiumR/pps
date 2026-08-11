@@ -27,6 +27,8 @@ K, H = 2, 3
 _NEAR = [[0.50, 0.00, 0.30], [0.51, 0.01, 0.29], [0.52, 0.02, 0.28]]
 _FAR = [[0.80, 0.30, 0.34], [0.79, 0.29, 0.33], [0.78, 0.28, 0.32]]
 EE = torch.tensor([_NEAR, _FAR])                                          # [K,H,3]
+LIFT_EE = EE.clone()
+LIFT_EE[:, 2, 2] += 0.03                    # nonzero acceleration for the lift-settle prior
 
 # Deliberately off-axis: an axis-aligned pose would zero `orientation`/`yaw` for the wrong reason.
 _Q = torch.tensor([0.13, 0.96, 0.20, 0.15])
@@ -163,7 +165,8 @@ SCENARIOS = [
     _Scenario(
         "carry_lift", "payload held, no destination yet: the lift column, not the place seat",
         _ctx(payload="pear", target=_LIFT_POINT),
-        _ALWAYS | _LIFT | {"orientation", "carry_hold", "carry_clear"}),
+        _ALWAYS | _LIFT | {"orientation", "carry_hold", "carry_accel", "carry_clear"},
+        ee=LIFT_EE),
     _Scenario(
         "place_surface", "payload over a surface: set-down is on",
         _ctx(payload="pear", place_target="scale", target=_SCALE),
@@ -377,6 +380,10 @@ def test_orientation_stands_down_only_when_the_vlm_rotates():
 
     assert score(q_horizontal) == 0.0, "a horizontal tool axis must lie inside the tilt band"
     assert score(q_down) > 0.0, "vertical-down must be pushed out of the tilt stage"
+    ctx["approach_axis"] = (1.0, 0.0, 0.0)
+    q_reverse = torch.tensor([2 ** -0.5, 0.0, -(2 ** -0.5), 0.0])
+    assert score(q_horizontal) < 1e-10, "the open mouth may face the authored fixture direction"
+    assert score(q_reverse) > 0.0, "the 180-degree reversed horizontal mouth must be rejected"
 
 
 # ------------------------------------------------------------------- the pinch/press contact criterion

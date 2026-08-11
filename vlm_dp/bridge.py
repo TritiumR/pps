@@ -91,6 +91,12 @@ class VlmDpBridge:
         self._reopen_cooldown = int(adv.get("reopen_cooldown_replans", 8))
         self.stall_margin = float(adv.get("stall_margin", 0.15))
         self._thin_feature_contact_ratio = float(adv.get("thin_feature_contact_ratio", 0.5))
+        self._thin_feature_width_band = float(
+            adv.get("thin_feature_width_band", 0.08))
+        # Once a thin grasp is certified, use a looser width band plus a short debounce while
+        # lifting. This rejects a true free close without treating load-induced motion as air.
+        self._thin_feature_loss_ratio = float(adv.get("thin_feature_loss_ratio", 0.8))
+        self._thin_feature_loss_grace = int(adv.get("thin_feature_loss_grace_replans", 2))
         # Optional hold hysteresis, grace, and backtrack limits.
         self.hold_enter = _opt_float(adv.get("hold_enter"))
         self.hold_exit = _opt_float(adv.get("hold_exit"))
@@ -141,6 +147,8 @@ class VlmDpBridge:
         self._ground_err_every = int(adv.get("ground_error_every", 5))
         # Suppress brief open commands while holding; zero disables the filter.
         self._grip_debounce = int(adv.get("gripper_open_debounce", 0))
+        self._hold_gripper_authoritative = bool(
+            adv.get("hold_gripper_authoritative", False))
         # Contact detection from stalled descent.
         self._stall_replans = int(adv.get("stall_replans", 3))
         self._stall_eps = float(adv.get("stall_eps", 0.003))
@@ -381,6 +389,7 @@ class VlmDpBridge:
         self._grasp_probe = np.zeros(3)
         self._grasp_probe_idx = 0
         self._closed_empty = 0
+        self._thin_loss_replans = 0
         # Reset per-stage failure evidence; backtracks re-add their event after entry.
         self.gate_events = {"closed_empty": 0, "backtracks": 0}
         self._stage_env_steps = 0
@@ -596,11 +605,38 @@ class VlmDpBridge:
 
     def filter_plan(self, actions, execute_steps):
         """Suppress brief open commands while a payload is held."""
+        st = self.stage()
+        if getattr(st, "gripper_authoritative", False) and st.gripper == "close":
+            suppressed = []
+            for i in range(min(int(execute_steps), len(actions))):
+                raw = float(actions[i][7])
+                if raw < 1.0:
+                    actions[i][7] = 1.0
+                    suppressed.append((i, raw))
+            self._open_run = 0
+            self._close_val = 1.0
+            return actions, suppressed
         if self._grip_debounce <= 0:
             return actions, []
-        st = self.stage()
         name = st.payload or st.grasp_obj
         held = bool(name) and self._payload_held(name)
+        # Lift/carry has no legitimate release intent.  Do not let the soft
+        # horizon-mean carry cost turn a certified grasp into an empty close.
+        # Place stages are excluded, so their authored release is untouched.
+        if held and st.gripper == "hold" and self._hold_gripper_authoritative:
+            suppressed = []
+            for i in range(min(int(execute_steps), len(actions))):
+                raw = float(actions[i][7])
+                if raw <= 0.5:
+                    actions[i][7] = 1.0
+                    suppressed.append((i, raw))
+            self._open_run = 0
+            self._close_val = 1.0
+            if suppressed:
+                raws = " ".join(f"{i}:{r:.3f}" for i, r in suppressed)
+                print(f"[vlm_dp] gripper_latch stage={self.stage_idx} held={name} "
+                      f"authoritative-hold suppressed {raws}", flush=True)
+            return actions, suppressed
         suppressed, self._open_run, self._close_val = debounce_gripper(
             actions, execute_steps, self._grip_debounce, held, self._open_run, self._close_val)
         if suppressed:
@@ -862,6 +898,17 @@ class VlmDpBridge:
         advanceability preflight substitutes one carrying a REAL HoldLatch over a REAL
         ApertureGraspSensor, so that the preflight exercises this same rule rather than a stub.
         """
+        # A visually measured thin feature has an expected stall aperture above the generic
+        # air threshold.  During acquisition, require that width-specific certificate instead
+        # of accepting any wider obstruction (for Pot this was usually the lid edge).
+        half_w = self._grip_half_width(payload)
+        thin = False
+        if self.sensor is not None and half_w is not None:
+            predicted = self.sensor.q_free - self._AP_SLOPE * (2.0 * half_w)
+            thin = predicted > self.sensor.q_free - self.sensor.stall_margin_enter
+        if thin and self.stage().gripper == "close":
+            return self._thin_feature_held(payload)
+
         world = getattr(self, "_hold_world", None) or self.world
         held = payload_held(payload, self.hold_authority, world, self.sensor,
                             self.env.tcp(), self._pos(payload))
@@ -878,7 +925,7 @@ class VlmDpBridge:
         ext = self._extents.get(payload)
         return float(ext[0]) if ext is not None else None
 
-    def _thin_feature_contact(self, payload):
+    def _thin_feature_contact(self, payload, ratio=None):
         """Return whether aperture, visual width and TCP proximity agree on thin contact."""
         if self.sensor is None or payload is None:
             return False
@@ -889,7 +936,15 @@ class VlmDpBridge:
         air_threshold = self.sensor.q_free - self.sensor.stall_margin_enter
         if predicted <= air_threshold:
             return False
-        ratio = float(getattr(self, "_thin_feature_contact_ratio", 0.5))
+        # Reject contacts substantially wider than the visually measured feature.  The old
+        # one-sided test rejected only a free close, so a 10mm handle could certify while the
+        # fingers were actually stalled wide on the surrounding lid.
+        min_aperture = predicted - float(
+            getattr(self, "_thin_feature_width_band", 0.08))
+        if self.sensor.aperture() <= min_aperture:
+            return False
+        ratio = float(getattr(self, "_thin_feature_contact_ratio", 0.5)
+                      if ratio is None else ratio)
         max_aperture = predicted + ratio * (self.sensor.q_free - predicted)
         if self.sensor.aperture() >= max_aperture:
             return False
@@ -1032,8 +1087,20 @@ class VlmDpBridge:
             # Privileged-signal ablation.
             return None if flags.get(f"grasp_{stage.payload}", False) else "flag dropped"
         if self.sensor.closed_on_air() and not self._thin_feature_held(stage.payload):
+            plausible = self._thin_feature_contact(
+                stage.payload, ratio=getattr(self, "_thin_feature_loss_ratio", 0.8))
+            if plausible:
+                self._thin_loss_replans = 0
+                return None
+            self._thin_loss_replans = getattr(self, "_thin_loss_replans", 0) + 1
+            grace = int(getattr(self, "_thin_feature_loss_grace", 2))
+            if self._thin_loss_replans <= grace:
+                print(f"[vlm_dp] thin-feature hold fluctuation: defer empty-hand backtrack "
+                      f"{self._thin_loss_replans}/{grace}", flush=True)
+                return None
             self._log_grip("empty hand", stage.payload)
             return "empty hand"
+        self._thin_loss_replans = 0
         if self.sensor.holding() and not self._grip_ok(stage.payload):
             self._log_grip("poor grip", stage.payload)
             return "poor grip"
@@ -1138,7 +1205,7 @@ class VlmDpBridge:
             self.stage_idx = int(stage_idx)
             self._pred_hist = self._preflight_history(stage, synth)
             holding = stage.gripper != "place"
-            self.sensor = self._preflight_sensor(holding)
+            self.sensor = self._preflight_sensor(holding, stage)
             # The configured hold authority is left ALONE; only the latch's inputs are synthesized.
             self._hold_world = self._preflight_hold_world(stage)
             self._place_seen = self.stage_replans
@@ -1149,7 +1216,7 @@ class VlmDpBridge:
             (self.stage_idx, self._pred_hist, self.sensor, self._hold_world,
              self._place_seen, self._place_since, self._pred_transition, self._grasp_probe) = saved
 
-    def _preflight_sensor(self, holding):
+    def _preflight_sensor(self, holding, stage=None):
         """Return a REAL ApertureGraspSensor driven into the state the satisfying state implies.
 
         Fingers stalled mid-band on a payload while carrying, an open hand once the object has
@@ -1163,6 +1230,15 @@ class VlmDpBridge:
                                      stall_margin_enter=self.hold_enter,
                                      stall_margin_exit=self.hold_exit)
         stalled = (sensor.q_touch + (sensor.q_free - sensor.stall_margin_enter)) / 2.0
+        if holding and stage is not None:
+            payload = stage.grasp_obj or stage.payload
+            half_w = self._grip_half_width(payload) if payload is not None else None
+            if half_w is not None:
+                predicted = sensor.q_free - self._AP_SLOPE * (2.0 * half_w)
+                if predicted > sensor.q_free - sensor.stall_margin_enter:
+                    # A thin feature's valid contact lies inside the generic air band.
+                    # Synthesize the feature-predicted aperture, not the generic midpoint.
+                    stalled = predicted
         q = stalled if holding else 0.0
         env = types.SimpleNamespace(gripper_q=(lambda q=q: q))
         for _ in range(max(sensor.close_steps, sensor.settle_steps) + 2):

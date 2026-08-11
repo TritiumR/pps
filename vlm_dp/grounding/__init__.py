@@ -40,12 +40,19 @@ class Stage:
     name: str
     target: Callable[[], np.ndarray]          # reference point (gripper proximity and place-release)
     gripper: str                              # close, hold, open or place
+    # Plan-authored hard gripper intent. Used for press approaches that must stay closed but do
+    # not claim ownership of an object.
+    gripper_authoritative: bool = False
     grasp_obj: Optional[str] = None
     payload: Optional[str] = None
     place_target: Optional[str] = None        # object placed onto, collision-excluded during this stage
     done_flag: Optional[str] = None           # env subtask_terms flag gating the advance (task progress)
     done: Callable[[], bool] = lambda: False
     orient: str = "down"
+    # Optional signed world direction for local +z of the task TCP frame.
+    # Unlike a yaw axis this distinguishes facing a fixture from the 180-degree reverse.
+    approach_axis: Optional[tuple] = None
+    approach_axis_scale: float = 1.0
     place_point: Optional[Callable[[], np.ndarray]] = None    # calibrated top-surface seat point
     carry_z: Optional[Callable[[], float]] = None             # carry altitude for the place transit
     advance_on_done: bool = False             # hold stages: advance on done() instead of the height gate
