@@ -1373,8 +1373,8 @@ class BCDemoActionDataset(torch.utils.data.Dataset):
                     self._goal[name] = normalize_goal(
                         _demo_goal(f["data"][name], self.goal_key))
                 if self.emit_phase:
+                    edges = keypose_labels.gripper_edges(np.asarray(joint_actions))
                     cmd = np.asarray(joint_actions[:, keypose_labels.GRIPPER_DIM])
-                    edges = np.flatnonzero(np.diff(cmd) != 0) + 1
                     ph = np.zeros(len(cmd), dtype=np.int64)
                     for k, e in enumerate(edges):
                         ph[e:] = k + 1
@@ -1814,8 +1814,8 @@ def _probe_drain(config: _config.TrainConfig, completed_step: int) -> None:
 
 def _phase_of_window(demo_group, step, action_rows):
     """0 pre-grasp, 1 transport (held), 2 post-release -- from the COMMANDED gripper channel."""
-    ja = np.asarray(demo_group["obs/joint_actions"][:, keypose_labels.GRIPPER_DIM])
-    edges = np.flatnonzero(np.diff(ja) != 0) + 1
+    joint_actions = np.asarray(demo_group["obs/joint_actions"])
+    edges = keypose_labels.gripper_edges(joint_actions)
     return int(np.searchsorted(edges, step, side="right"))
 
 
