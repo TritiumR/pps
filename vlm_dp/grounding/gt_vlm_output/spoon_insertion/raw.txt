@@ -1,0 +1,77 @@
+# spoon_insertion -- deterministic stand-in for a ReKep VLM response.
+#
+# Runtime placeholders are resolved from the observed point clouds.  In particular, the holder
+# mouth and both utensil ends are declared perception keypoints; no simulator pose is embedded in
+# this plan.  The handle is inserted first while the broad spoon head remains above the mouth.
+
+num_stages = 4
+
+
+### stage 1 sub-goal constraints
+def stage1_subgoal_constraint1(end_effector, keypoints):
+    """Align the end-effector with the spoon grasp feature (keypoint {g})."""
+    return np.linalg.norm(end_effector - keypoints[{g}])
+
+### stage 1 path constraints
+# The shared parallel-jaw grasp terms provide the approach and close mechanics.
+
+
+### stage 2 sub-goal constraints
+def stage2_subgoal_constraint1(end_effector, keypoints):
+    """Lift the grasp feature (keypoint {g}) clear of the table."""
+    target = keypoints[{mouth}] + np.array({lift_g})
+    return np.linalg.norm(keypoints[{g}] - target)
+
+### stage 2 path constraints
+def stage2_path_constraint1(end_effector, keypoints):
+    """Keep holding the spoon at keypoint {g}."""
+    return get_grasping_cost_by_keypoint_idx({g})
+
+
+### stage 3 sub-goal constraints
+def stage3_subgoal_constraint1(end_effector, keypoints):
+    """Move the handle end (keypoint {h}) to the hover point above the holder mouth."""
+    target = keypoints[{mouth}] + np.array([0.0, 0.0, {insert_hover}])
+    return np.linalg.norm(keypoints[{h}] - target)
+
+def stage3_subgoal_constraint2(end_effector, keypoints):
+    """Point the handle down: keep the spoon's handle-to-head axis vertical."""
+    axis = keypoints[{b}] - keypoints[{h}]
+    lateral = np.linalg.norm(axis[..., :2], axis=-1)
+    wrong_way = np.maximum(0.0, 0.10 - axis[..., 2])
+    return lateral + wrong_way
+
+### stage 3 path constraints
+def stage3_path_constraint1(end_effector, keypoints):
+    """Keep holding the spoon at keypoint {g}."""
+    return get_grasping_cost_by_keypoint_idx({g})
+
+
+### stage 4 sub-goal constraints
+def stage4_subgoal_constraint1(end_effector, keypoints):
+    """Insert the spoon handle (keypoint {h}) inside the utensil holder at its mouth."""
+    seat = keypoints[{mouth}] + np.array([0.0, 0.0, -{insert_depth}])
+    return np.linalg.norm(keypoints[{h}] - seat)
+
+def stage4_subgoal_constraint2(end_effector, keypoints):
+    """Keep the spoon upright while its handle enters the utensil holder."""
+    axis = keypoints[{b}] - keypoints[{h}]
+    lateral = np.linalg.norm(axis[..., :2], axis=-1)
+    wrong_way = np.maximum(0.0, 0.10 - axis[..., 2])
+    return lateral + wrong_way
+
+### stage 4 path constraints
+def stage4_path_constraint1(end_effector, keypoints):
+    """Keep holding the spoon during the insertion descent."""
+    return get_grasping_cost_by_keypoint_idx({g})
+
+def stage4_path_constraint2(end_effector, keypoints):
+    """Keep the handle inside the measured holder-mouth corridor during descent."""
+    radial = np.linalg.norm(keypoints[{h}][..., :2] - keypoints[{mouth}][..., :2], axis=-1)
+    return np.maximum(0.0, radial - {mouth_radius})
+
+
+grasp_keypoints = [{g}, -1, -1, -1]
+release_keypoints = [-1, -1, -1, {g}]
+stage_place_mode = ["", "", "", "container"]
+stage_orient = ["down", "free", "free", "free"]

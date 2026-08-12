@@ -19,6 +19,7 @@ perception, the hand-written place template) left out.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 
@@ -33,6 +34,61 @@ from vlm_dp.sim_helpers import (DEFAULT_EXTENT, TorchNumpyShim, center_from_poin
 
 from .. import paths
 from ..tasks import scene_objects, spec
+
+
+_INSERT_FIELDS = ("mouth", "insert_depth", "insert_hover", "mouth_radius",
+                  "seat_radius", "insert_capture")
+
+
+def attach_standard_insertion(grounding):
+    """Attach a measured insertion corridor to container-place stages.
+
+    The shared VLM/ReKep compiler deliberately has no RoboLab task table.  A canned/live plan can
+    nevertheless declare a standard insertion receipt through ``render_fields.json``.  This
+    adapter turns those semantic fields into the existing :class:`Stage.insert` contract, using
+    the live tracked mouth keypoint on every call.  There is no simulator-pose fallback.
+    """
+    fields = grounding.plan_fields or {}
+    missing = [name for name in _INSERT_FIELDS if name not in fields]
+    if missing:
+        return grounding
+
+    mouth_idx = int(fields["mouth"])
+    depth = float(fields["insert_depth"])
+    hover = float(fields["insert_hover"])
+    mouth_radius = float(fields["mouth_radius"])
+    seat_radius = float(fields["seat_radius"])
+    capture = float(fields["insert_capture"])
+
+    def geometry():
+        keypoints = np.asarray(grounding.keypoints(), dtype=np.float64)
+        if not 0 <= mouth_idx < len(keypoints):
+            raise RuntimeError(f"insertion mouth kp{mouth_idx} absent from {len(keypoints)} keypoints")
+        mouth = keypoints[mouth_idx]
+        seat = mouth - np.array([0.0, 0.0, depth], dtype=np.float64)
+        return {
+            "axis": np.array([0.0, 0.0, 1.0], dtype=np.float64),
+            "seat": seat,
+            "goal": seat,
+            "height": hover + depth,
+            "r_mouth": mouth_radius,
+            "r_seat": seat_radius,
+            "capture": capture,
+        }
+
+    stages, decorated = [], []
+    for i, stage in enumerate(grounding.stages):
+        if stage.place_mode == "container" and stage.payload is not None:
+            stage = dataclasses.replace(stage, insert=geometry)
+            decorated.append(i + 1)
+        stages.append(stage)
+    if not decorated:
+        raise SystemExit("[robolab-rekep] insertion fields were declared, but no container-place "
+                         "stage consumed them")
+    print(f"[robolab-rekep] measured insertion corridor on stages {decorated}: "
+          f"mouth=kp{mouth_idx} depth={depth:.3f}m radii={seat_radius:.3f}->"
+          f"{mouth_radius:.3f}m capture={capture:.3f}m", flush=True)
+    return dataclasses.replace(grounding, stages=stages)
 
 
 class RoboLabRekepVlmGrounding:
@@ -143,15 +199,46 @@ class RoboLabRekepVlmGrounding:
         print(f"[robolab-rekep] tracker ownership from context: {tracker.owners}", flush=True)
 
         vlm_dir = self._vlm_dir()
-        metadata, roles = fake_vlm.generate(self.task, vlm_dir, keypoints, grounded, env,
-                                            self.clearance)
+        metadata, roles, extra_kps = fake_vlm.generate(
+            self.task, vlm_dir, keypoints, grounded, env, self.clearance)
+        declared_ext = {}
+        if extra_kps:
+            # The Spoon plan declares thin features that the generic keypoint proposer is not
+            # expected to sample: the neck grasp, both utensil ends, and the holder mouth. Append
+            # and rigidly register them exactly as the shared ReKep grounding does.
+            first = len(keypoints)
+            extra_kps = [tuple(e) + (None,) * (3 - len(e)) for e in extra_kps]
+            keypoints = np.concatenate(
+                [keypoints, np.stack([np.asarray(p, dtype=np.float64)
+                                      for p, _, _ in extra_kps])], axis=0)
+            grounded["keypoints"] = keypoints
+            local_extents = list(grounded.get("local_extents") or [None] * first)
+            local_extents.extend(
+                [None if ext is None else [float(ext)] * 3 for _, _, ext in extra_kps])
+            grounded["local_extents"] = local_extents
+            for point, owner, ext in extra_kps:
+                point = np.asarray(point, dtype=np.float64)
+                if owner is None:
+                    tracker.registrations.append((None, point))
+                else:
+                    pos, rot = world.object_pose(owner)
+                    tracker.registrations.append(
+                        (owner, np.asarray(rot).T @ (point - np.asarray(pos))))
+                idx = len(tracker.owners)
+                tracker.owners.append(owner)
+                if ext is not None:
+                    declared_ext[idx] = float(ext)
+            print(f"[robolab-rekep] VLM declared keypoints "
+                  f"{list(range(first, len(keypoints)))} "
+                  f"owners={[owner for _, owner, _ in extra_kps]}", flush=True)
         bad = [i for i in metadata["grasp_keypoints"] + metadata["release_keypoints"]
                if not -1 <= i < len(keypoints)]
         if bad:
             raise SystemExit(f"[robolab-rekep] the plan referenced out-of-range keypoint(s) {bad} "
                              f"(have {len(keypoints)})")
 
-        objects = self._scene_objects(grounded, env, names, keypoints, tracker, metadata, extents)
+        objects = self._scene_objects(
+            grounded, env, names, keypoints, tracker, metadata, extents, declared_ext)
         shim = TorchNumpyShim(dev)
 
         def load_stage(idx, held):
@@ -174,11 +261,19 @@ class RoboLabRekepVlmGrounding:
         stages, manipulated = self._stager._vlm_stages(
             metadata, tracker, keypoints, name_for, load_stage, objects, env, dev, vlm_dir)
         print(f"[robolab-rekep] {self.task}: roles={roles} objects={list(obj_names)}", flush=True)
-        return Grounding(objects=objects, stages=stages, manipulated=frozenset(manipulated),
-                         keypoints=(lambda: tracker.get_positions()))
+        return Grounding(
+            objects=objects, stages=stages, manipulated=frozenset(manipulated),
+            keypoints=(lambda: tracker.get_positions()),
+            keypoint_metadata=(lambda: [
+                {"owner": owner, "registered": tracker.registrations[i] is not None}
+                for i, owner in enumerate(tracker.owners)
+            ]),
+        )
 
-    def _scene_objects(self, grounded, env, names, keypoints, tracker, metadata, extents):
+    def _scene_objects(self, grounded, env, names, keypoints, tracker, metadata, extents,
+                       declared_ext=None):
         """Measure each body's grasp centre, closing axis and graspable span."""
+        declared_ext = declared_ext or {}
         grasp_kp_of, grasped = {}, set()
         for k in metadata["grasp_keypoints"]:
             if 0 <= k < len(tracker.owners) and tracker.owners[k]:
@@ -194,7 +289,9 @@ class RoboLabRekepVlmGrounding:
                 continue
             gk = grasp_kp_of.get(name)
             kp = gk if gk is not None else masks._nearest_kp(keypoints, pts.mean(axis=0))
-            centre = center_from_points(pts, None)
+            # A declared grasp feature is itself the grasp point. Do not silently translate it
+            # back to the owner's whole-body centroid.
+            centre = keypoints[kp] if kp in declared_ext else center_from_points(pts, None)
             kp_of[name], centroid_off[name] = kp, centre - keypoints[kp]
             if name in grasped:
                 grasp_axis[name] = masks.narrow_axis(pts)
@@ -206,7 +303,9 @@ class RoboLabRekepVlmGrounding:
                     t = (pts[:, :2] - centre[:2]) @ long_axis[:2]
                     grasp_region[name] = (long_axis.tolist(),
                                           float(np.percentile(np.abs(t), 80)))
-                if gk is not None and 0 <= gk < len(ctx_local) and ctx_local[gk] is not None:
+                if gk in declared_ext:
+                    grasp_ext[name] = float(declared_ext[gk])
+                elif gk is not None and 0 <= gk < len(ctx_local) and ctx_local[gk] is not None:
                     grasp_ext[name] = float(ctx_local[gk][0])
                 print(f"[robolab-rekep] {name}: axis={grasp_axis[name]} "
                       f"grip_half={grasp_ext.get(name)} region={grasp_region.get(name)}",

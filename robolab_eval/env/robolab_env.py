@@ -56,6 +56,104 @@ _ROOT_BODY = "panda_link0"
 _FALLBACK_GRASP_OFFSET = (0.0, 0.0, 0.0)
 _FALLBACK_TCP_OFFSET = (0.0, 0.0, 0.1716)          # vlm_dp.sim_helpers.ROBOTIQ_GRASP_OFFSET
 
+_SPOON_RUNTIME_CONTACT_SENSORS = frozenset({
+    "gripper__spatula",
+    "gripper__pink_spaghetti_spoon",
+    "gripper__utensil_holder",
+    "pink_spaghetti_spoon__utensil_holder",
+})
+_SPOON_DEMO_CONTACT_SENSORS = _SPOON_RUNTIME_CONTACT_SENSORS | frozenset({
+    # RoboLab's recorder EventTracker queries this on every post-step even
+    # though it is not part of the task-success predicate.
+    "gripper__table",
+    # The demonstration acceptance contract verifies that the distractor was
+    # not retained in the holder, so this is semantically required there.
+    "spatula__utensil_holder",
+})
+
+
+def apply_spoon_contact_sensor_diet(scene_cfg, *, demonstration=False):
+    """Remove pair sensors unused by Spoon control, subtasks, or the success predicate.
+
+    RoboLab creates the complete pairwise contact graph.  Every ContactSensor has a six-step
+    history, so IsaacLab refreshes it every scene update even when lazy sensor updates are on.
+    Runtime retains the four signals used by the controller, grasp subtask, accidental
+    gripper/object contact checks, and exact spoon-in-holder success predicate. Demonstration
+    collection additionally retains the recorder's gripper/table event and the negative-control
+    check that the distractor was not retained in the holder.
+    """
+    required = (_SPOON_DEMO_CONTACT_SENSORS if demonstration
+                else _SPOON_RUNTIME_CONTACT_SENSORS)
+    disabled = []
+    for name, value in vars(scene_cfg).items():
+        class_name = str(getattr(value, "class_type", ""))
+        if "ContactSensor" in class_name and name not in required:
+            setattr(scene_cfg, name, None)
+            disabled.append(name)
+    return disabled
+
+
+def _rekep_camera_bundle(runtime_profile="full"):
+    """Return the policy cameras plus one depth/segmentation ReKep camera.
+
+    RoboLab's normal DROID registration deliberately creates RGB-only policy cameras.  ReKep's
+    front-end needs metric depth to lift keypoints and semantic IDs only to calibrate static
+    fixtures.  This local camera config is therefore an evaluation adapter, not a change to the
+    RoboLab task or its policy observations.  Its pose matches RoboLab's left over-shoulder camera
+    so RGB evidence, depth, and the recorded scene share one physical view.
+    """
+    import isaaclab.sim as sim_utils
+    from isaaclab.sensors import TiledCameraCfg
+    from isaaclab.utils import configclass
+    from robolab.robots.droid import WristCameraCfg
+
+    # GroundedSAM/DINO keypoint grounding was validated at the accepted 1280x720 view.  A first
+    # runtime-profile probe at 224x224 failed closed because the spoon disappeared from the
+    # detector's accepted assignment.  Runtime optimizations must therefore leave this sensor's
+    # evidence unchanged; the profile removes redundant consumers/cameras instead.
+    camera_height, camera_width = (720, 1280)
+
+    @configclass
+    class ReKepCameraCfg:
+        rekep_cam = TiledCameraCfg(
+            prim_path="{ENV_REGEX_NS}/rekep_cam",
+            height=camera_height,
+            width=camera_width,
+            data_types=["rgb", "distance_to_image_plane", "instance_id_segmentation_fast"],
+            colorize_instance_id_segmentation=False,
+            spawn=sim_utils.PinholeCameraCfg(
+                focal_length=2.1,
+                focus_distance=28.0,
+                horizontal_aperture=5.376,
+                vertical_aperture=3.024,
+            ),
+            offset=TiledCameraCfg.OffsetCfg(
+                pos=(0.05, 0.57, 0.66),
+                rot=(-0.393, -0.195, 0.399, 0.805),
+                convention="opengl",
+            ),
+        )
+
+    @configclass
+    class SpoonPolicyCameraCfg:
+        # Exact table-view camera serialized by the established 50-demo dataset.  It is separate
+        # from rekep_cam: the proxy must see its training view while the tracker retains metric
+        # depth and instance IDs at its own calibrated viewpoint.
+        front_wide_camera = TiledCameraCfg(
+            prim_path="{ENV_REGEX_NS}/front_wide_camera", height=224, width=224,
+            data_types=["rgb"],
+            spawn=sim_utils.PinholeCameraCfg(
+                focal_length=18.0, focus_distance=400.0,
+                horizontal_aperture=20.955, vertical_aperture=11.7871875,
+            ),
+            offset=TiledCameraCfg.OffsetCfg(
+                pos=(1.5, 0.0, 1.0), rot=(0.653, 0.271, 0.271, 0.653),
+                convention="opengl",
+            ),
+        )
+
+    return [ReKepCameraCfg, SpoonPolicyCameraCfg, WristCameraCfg]
+
 
 class _RobotData:
     """Expose live robot state through the scene-data interface build_context expects."""
@@ -130,7 +228,8 @@ class RoboLabEnv:
     """
 
     def __init__(self, task, *, device="cuda:0", num_envs=1, seed=0, fk_fit=None,
-                 video_camera="egocentric_mirrored_camera", video_group="viewport_cam"):
+                 video_camera="egocentric_mirrored_camera", video_group="viewport_cam",
+                 perception_camera=False, runtime_profile="full"):
         from robolab.constants import set_output_dir
         from robolab.core.environments.runtime import create_env
         from robolab.core.world.world_state import get_world
@@ -145,8 +244,43 @@ class RoboLabEnv:
         # create_env serialises env_cfg.json into RoboLab's output dir, which defaults inside the
         # RoboLab checkout -- read-only here. Point it at the writable results mount first.
         set_output_dir(str(paths.RESULTS / "_robolab_output"))
-        auto_register_droid_envs(task=gym_id)
-        self.env, self.env_cfg = create_env(gym_id, device=device, seed=seed, num_envs=num_envs)
+        cameras = _rekep_camera_bundle(runtime_profile) if perception_camera else None
+        auto_register_droid_envs(task=gym_id, cameras=cameras)
+        if runtime_profile == "weight":
+            # Match the accepted Weight evaluation surface.  The three-panel policy video never
+            # reads RoboLab's separate 720p viewport, and evaluation already writes its own trace
+            # and MP4, so neither that camera nor the full-state demonstration recorder belongs
+            # on the controller's critical path.  ReKep remains a scene sensor but is read directly
+            # below; removing its observation-manager term avoids a redundant GPU->CPU transfer.
+            from robolab.core.environments.config import parse_env_cfg
+            env_cfg = parse_env_cfg(gym_id, device=device, seed=seed, num_envs=num_envs)
+            self.disabled_contact_sensors = []
+            if task == "spoon_insertion":
+                # RoboLab materializes every pairwise contact relation as a history-bearing
+                # ContactSensor.  SensorBase refreshes every history-bearing sensor inside
+                # scene.update even under lazy_sensor_update, making eleven pair sensors the
+                # dominant per-step cost.  This controller reads only gripper contact with each
+                # movable object, while the unchanged task predicate additionally reads the
+                # spoon/holder pair.  Keep exactly those four physical signals.
+                self.disabled_contact_sensors = apply_spoon_contact_sensor_diet(env_cfg.scene)
+            if hasattr(env_cfg.scene, "egocentric_mirrored_camera"):
+                env_cfg.scene.egocentric_mirrored_camera = None
+            if hasattr(env_cfg.observations, "viewport_cam"):
+                env_cfg.observations.viewport_cam = None
+            image_obs = getattr(env_cfg.observations, "image_obs", None)
+            if image_obs is not None and hasattr(image_obs, "rekep_cam"):
+                image_obs.rekep_cam = None
+            wrist = getattr(env_cfg.scene, "wrist_cam", None)
+            if wrist is not None:
+                wrist.height = 224
+                wrist.width = 224
+            env_cfg.recorders = None
+            self.env, self.env_cfg = create_env(
+                env_cfg, device=device, seed=seed, num_envs=num_envs)
+        else:
+            self.disabled_contact_sensors = []
+            self.env, self.env_cfg = create_env(
+                gym_id, device=device, seed=seed, num_envs=num_envs)
         self.world_state = get_world(self.env)
         self.num_envs = int(num_envs)
         # `device` is the SIM device. The planner and the cost run on the CPU (see the module
@@ -157,6 +291,8 @@ class RoboLabEnv:
         self.dt = float(self.env_cfg.sim.dt) * int(self.env_cfg.decimation)
         self.video_camera = video_camera
         self.video_group = video_group
+        self.runtime_profile = str(runtime_profile)
+        self.cam = self.env.scene["rekep_cam"] if perception_camera else None
 
         self.fk_fit = self._load_fit(fk_fit)
         self.grasp_offset_eef = np.asarray(self.fk_fit["grasp_offset_eef"], dtype=np.float64)
@@ -270,6 +406,61 @@ class RoboLabEnv:
         """Return gripper closure in the ApertureGraspSensor convention (0 open, pi/4 met)."""
         return float(self._robot.joint_pos[0, self._finger_id].detach())
 
+    def rekep_camera_frame(self):
+        """Return one RGB-D camera/projection snapshot for live controller visualization.
+
+        The overlay must use the same camera that produced the keypoints.  Projecting those world
+        points onto RoboLab's unrelated viewport camera was the reason the original raw MP4 could
+        not honestly show perception state.
+        """
+        if self.cam is None:
+            return None
+        data = self.cam.data
+        rgb = data.output["rgb"][0, ..., :3].detach().cpu().numpy().astype(np.uint8)
+        depth = data.output.get("distance_to_image_plane")
+        depth = None if depth is None else depth[0].detach().cpu().numpy().squeeze()
+        return {
+            "rgb": rgb,
+            "depth": depth,
+            "pos_w": data.pos_w[0].detach().cpu().numpy(),
+            "quat_w_ros": data.quat_w_ros[0].detach().cpu().numpy(),
+            "intrinsics": data.intrinsic_matrices[0].detach().cpu().numpy(),
+        }
+
+    def proxy_observation(self):
+        """Return the proxy's exact table/wrist image and proprioception contract."""
+        images = self.policy_camera_frames()
+        return {
+            **images,
+            "joint_pos": self.q0().numpy().astype(np.float32),
+            # Training obs/gripper_pos is normalized [0,1], unlike gripper_q() radians.
+            "gripper_pos": float(np.clip(self.gripper_q() / FREE_CLOSE, 0.0, 1.0)),
+        }
+
+    def policy_camera_frames(self):
+        """Return the two synchronized RGB frames consumed by the Spoon proxy.
+
+        These are intentionally separate from both ``rekep_cam`` (metric perception/debug) and
+        the RoboLab viewport camera (human recording).  Exposing them explicitly prevents a
+        rollout video from implying that the diagonal debug camera was a policy observation.
+        """
+        if self._obs is None:
+            raise RuntimeError("policy camera frames requested before reset")
+        images = self._obs.get("image_obs") or {}
+        missing = [n for n in ("front_wide_camera", "wrist_cam") if n not in images]
+        if missing:
+            raise KeyError(f"proxy policy cameras missing from image_obs: {missing}; "
+                           f"available={sorted(images)}")
+        import cv2
+        def _rgb(name):
+            image = images[name][0].detach().cpu().numpy().astype(np.uint8)[..., :3]
+            if image.shape[:2] != (224, 224):
+                image = cv2.resize(image, (224, 224), interpolation=cv2.INTER_AREA)
+            return np.ascontiguousarray(image)
+        return {
+            "table": _rgb("front_wide_camera"), "wrist": _rgb("wrist_cam"),
+        }
+
     def object_pose(self, name):
         """Return the WORLD pose of a named body as (pos[3], R[3,3])."""
         pos, quat = self.world_state.get_pose(name, is_relative=False, env_id=0)
@@ -318,22 +509,27 @@ class RoboLabEnv:
         group = self._obs.get(self.video_group) or {}
         frame = group.get(self.video_camera)
         if frame is None:
-            return None
+            snapshot = self.rekep_camera_frame()
+            return None if snapshot is None else snapshot["rgb"]
         return frame[0].detach().cpu().numpy()
 
     # --- actuation ---------------------------------------------------------------------
 
-    def apply_arm(self, q_target, grip_close):
+    def apply_arm(self, q_target, grip_command):
         """Execute one control step toward an absolute joint target.
 
         RoboLab's `body` action term is a JointPositionAction with `use_default_offset=False`, so
-        the first seven entries are ABSOLUTE joint radians in panda_joint1..7 order; the eighth is
-        the binary gripper, where any value above 0.5 commands close.
+        the first seven entries are ABSOLUTE joint radians in panda_joint1..7 order.  Dimension 7
+        is passed through as a clipped [0,1] command.  On ordinary RoboLab tasks their binary action
+        manager thresholds it; InsertSpaghettiSpoonTask opts into the continuous manager, where the
+        exact value maps linearly to [0, pi/4].  Thresholding here would silently destroy that task's
+        controller contract.
         """
         tgt = np.asarray(q_target, dtype=np.float64).reshape(-1)[:7]
+        grip = float(np.clip(float(grip_command), 0.0, 1.0))
         action = torch.zeros(self.num_envs, 8, dtype=torch.float32, device=self.env.device)
         action[:, :7] = torch.as_tensor(tgt, dtype=torch.float32, device=self.env.device)
-        action[:, 7] = 1.0 if grip_close else 0.0
+        action[:, 7] = grip
         obs, _reward, terminated, _truncated, _info = self.env.step(action)
         self._obs = obs
         self._terminated = self._terminated or bool(terminated[0].item())

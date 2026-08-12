@@ -5,6 +5,7 @@ import base64
 import io
 import json
 import math
+import os
 import subprocess
 import time
 
@@ -88,8 +89,9 @@ class ProxyScoreClient:
 
     def __init__(self, checkpoint, prompt, config="score_task_capsule", device="cpu",
                  threads=8, container=container.NAME, ready_timeout_s=900,
-                 prediction_mode="config", kv_cache=False, fp16=False):
-        self.checkpoint = host_to_container(checkpoint)
+                 prediction_mode="config", kv_cache=False, fp16=False,
+                 local_process=False, checkpoint_is_container=False):
+        self.checkpoint = str(checkpoint) if checkpoint_is_container else host_to_container(checkpoint)
         self.prompt = prompt
         self.config = config
         self.prediction_mode = prediction_mode
@@ -100,14 +102,18 @@ class ProxyScoreClient:
         self.threads = threads
         self.container = container
         self.ready_timeout_s = ready_timeout_s
+        self.local_process = bool(local_process)
         self.ready_info = None
         self._proc = None
 
     def start(self):
         server_device = "cpu" if self.device == "cpu" else "cuda"
+        openpi_root = str(paths.REPO / "openpi") if self.local_process else _CONTAINER_OPENPI
+        pythonpath = (f"{openpi_root}/src:{paths.REPO}" if self.local_process
+                      else _CONTAINER_PYTHONPATH)
         inner = (
-            f"cd {_CONTAINER_OPENPI} && "
-            f"PYTHONPATH={_CONTAINER_PYTHONPATH} PYTHONUNBUFFERED=1 "
+            f"cd {openpi_root} && "
+            f"PYTHONPATH={pythonpath} PYTHONUNBUFFERED=1 "
             f"exec {container.PYTHON} scripts/serve_mg_proxy_score.py "
             f"--config {self.config} --checkpoint {self.checkpoint} "
             f"--prediction_mode {self.prediction_mode} "
@@ -117,14 +123,19 @@ class ProxyScoreClient:
             f"--prompt \"{self.prompt}\""
         )
         cuda = "" if self.device == "cpu" else self.device_visible()
-        cmd = ["docker", "exec", "-i", "-e", f"CUDA_VISIBLE_DEVICES={cuda}",
-
-
-               "-e", "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
-               self.container, "bash", "-c", inner]
+        if self.local_process:
+            cmd = ["bash", "-c", inner]
+            proc_env = dict(os.environ, CUDA_VISIBLE_DEVICES=cuda,
+                            PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True")
+        else:
+            cmd = ["docker", "exec", "-i", "-e", f"CUDA_VISIBLE_DEVICES={cuda}",
+                   "-e", "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+                   self.container, "bash", "-c", inner]
+            proc_env = None
         self._proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, bufsize=1)
+            stderr=None if self.local_process else subprocess.DEVNULL,
+            text=True, bufsize=1, env=proc_env)
         self.ready_info = self._read_reply(timeout_s=self.ready_timeout_s)
         if self.ready_info.get("kind") != "ready":
             raise RuntimeError(f"Proxy server failed to start: {self.ready_info}")

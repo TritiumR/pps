@@ -957,6 +957,88 @@ def _mustard_left_bin(out_dir, keypoints, grounded, env, clearance):
                    f"mouth_r={mouth_r:.3f} keepout_r={keepout_r:.3f}")
 
 
+def _spoon_insertion(out_dir, keypoints, grounded, env, clearance):
+    """Insert the spaghetti-spoon handle into the tracked utensil-holder mouth.
+
+    Four feature points are declared from perceived clouds instead of assuming the proposer sampled
+    the thin handle end or the hollow mouth: a pinch point near the head, both spoon ends, and the
+    holder mouth.  The shared ReKep tracker registers each point to its perceived owner.
+    """
+    del clearance
+    keypoints = np.asarray(keypoints, dtype=np.float64)
+    spoon_name, holder_name = "pink_spaghetti_spoon", "utensil_holder"
+    spoon = _cloud(grounded, env, spoon_name)
+    holder = _cloud(grounded, env, holder_name)
+    if spoon is None or spoon.shape[0] < 40:
+        raise SystemExit("[fake-vlm] spoon_insertion: no usable perceived spoon cloud")
+    if holder is None or holder.shape[0] < 40:
+        raise SystemExit("[fake-vlm] spoon_insertion: no usable perceived holder cloud")
+
+    xy = spoon[:, :2]
+    centre_xy = np.median(xy, axis=0)
+    _, _, vh = np.linalg.svd(xy - centre_xy, full_matrices=False)
+    axis = vh[0] / max(float(np.linalg.norm(vh[0])), 1e-9)
+    side = np.array([-axis[1], axis[0]])
+    along = (xy - centre_xy) @ axis
+    lo, hi = np.percentile(along, [4, 96])
+
+    def endpoint(value):
+        band = max(0.015, 0.10 * float(hi - lo))
+        pts = spoon[np.abs(along - value) <= band]
+        middle = np.median(pts[:, :2], axis=0)
+        width = float(np.percentile(np.abs((pts[:, :2] - middle) @ side), 90))
+        return np.median(pts, axis=0), width
+
+    end_lo, width_lo = endpoint(lo)
+    end_hi, width_hi = endpoint(hi)
+    handle, head = ((end_lo, end_hi) if width_lo <= width_hi else (end_hi, end_lo))
+
+    # Pinch the neck just behind the broad head, with a local width carried alongside the declared
+    # feature so the grasp preflight and cost never size this feature as the whole 33cm utensil.
+    grasp_probe = head + 0.25 * (handle - head)
+    distance = np.linalg.norm(spoon - grasp_probe, axis=1)
+    local = spoon[np.argsort(distance)[:max(40, min(250, len(spoon)))]]
+    grasp = np.median(local, axis=0)
+    local_mid = np.median(local[:, :2], axis=0)
+    grasp_half = float(np.percentile(np.abs((local[:, :2] - local_mid) @ side), 90))
+    grasp_half = float(np.clip(grasp_half, 0.006, 0.030))
+
+    mouth = _top(holder)
+    outer = _mouth_radius(holder, fallback=0.055)
+    mouth_radius = float(np.clip(0.65 * outer, 0.030, 0.055))
+    seat_radius = float(min(0.025, 0.75 * mouth_radius))
+    insert_depth, hover, capture = 0.075, 0.12, 0.10
+
+    g, h, b, m = len(keypoints), len(keypoints) + 1, len(keypoints) + 2, len(keypoints) + 3
+    metadata = _render(
+        "spoon_insertion", out_dir, g=g, h=h, b=b, mouth=m,
+        lift_g=(grasp + np.array([0.0, 0.0, _LIFT_HEIGHT]) - mouth).tolist(),
+        insert_hover=hover, insert_depth=insert_depth, mouth_radius=mouth_radius,
+        seat_radius=seat_radius, insert_capture=capture,
+    )
+    metadata["task_spec"] = {
+        "instruction": grounded.get("instruction"), "payload": spoon_name,
+        "destination": holder_name, "mode": "handle-first insertion",
+    }
+    metadata["resolved"] = {
+        "grasp_world": np.round(grasp, 6).tolist(),
+        "handle_world": np.round(handle, 6).tolist(),
+        "head_world": np.round(head, 6).tolist(),
+        "mouth_world": np.round(mouth, 6).tolist(),
+        "grasp_half_width": round(grasp_half, 6),
+        "endpoint_half_widths": [round(width_lo, 6), round(width_hi, 6)],
+    }
+    metadata, roles = _finish(
+        out_dir, metadata,
+        {spoon_name: g, "spoon_handle": h, "spoon_head": b, holder_name: m},
+        f"spoon_insertion roles grasp=kp{g} handle=kp{h} head=kp{b} mouth=kp{m} "
+        f"grasp_half={grasp_half:.3f}m mouth_r={mouth_radius:.3f}m",
+    )
+    extras = ((grasp, spoon_name, grasp_half), (handle, spoon_name),
+              (head, spoon_name), (mouth, holder_name))
+    return metadata, roles, extras
+
+
 # --- Two-bin sorting (sort_can) --------------------------------------------------------------
 #
 # The only mujoco task whose destination is not fixed by the scene: two walled quadrants are
@@ -1255,7 +1337,8 @@ _FAKE_VLMS = {"weight": _weight, "capsule": _capsule, "tea": _tea, "pot": _pot,
               "sort_can_tray_region": _sort_can_tray_region,
               "sort_can_tray_relational": _sort_can_tray_relational,
               "sort_can_tray_constrained": _sort_can_tray_constrained,
-              "banana_in_bowl": _banana_in_bowl, "mustard_left_bin": _mustard_left_bin}
+              "banana_in_bowl": _banana_in_bowl, "mustard_left_bin": _mustard_left_bin,
+              "spoon_insertion": _spoon_insertion}
 
 
 def generate(task_key, out_dir, keypoints, grounded, env, clearance=0.015):

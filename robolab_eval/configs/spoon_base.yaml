@@ -1,0 +1,110 @@
+# Single-spoon VLM+ReKep+MBD receipt.
+#
+# Robot/scene terms and rates are the established RoboLab `vlm_only_exact` contract.  The only
+# added task family mechanics are the two already-shared insertion-corridor terms.  Their geometry
+# is supplied at runtime by Stage.insert from the VLM plan's tracked holder-mouth keypoint.
+cost:
+  terms:
+    rekep_keypose: 25.0
+    rekep_path: 25.0
+    rekep_subgoal: 0.0
+    insert_funnel: 40.0
+    descend_gate: 40.0
+    smooth: 5.04
+    joint_delta: 3.5
+    gripper_smooth: 0.5
+    consistency: 5.0
+    not_hold: 8.0
+    floor: 40.0
+    collision: 20.0
+    clear: 0.1
+    carry_clear: 40.0
+    close_gripper: 2.0
+    release_gripper: 40.0
+    carry_hold: 40.0
+    tip_z: 80.0
+    straddle: 30.0
+    center_region: 120.0
+    aperture_region: 80.0
+    grasp_axis: 15.0
+    yaw: 5.0
+    grasp_standoff: 40.0
+  geometry:
+    ee_r: 0.035
+    coll_clear: 0.02
+    finger_r: 0.012
+    open_half: 0.0425
+    tool_back: 0.06
+    tcp_to_tip: 0.0
+    center_scale: 0.12
+    grasp_dead_zone: proportional
+    close_z_scale: 0.025
+    preshape_z: 0.025
+    release_step_motion_cap: 0.008
+    retreat_margin: 0.02
+    retreat_clear: 0.04
+    rise_first_span: 0.05
+    rise_first_step: 0.02
+    not_hold_sigma: 0.05
+    carry_clear_include_placed: true
+    carry_clear_margin: 0.005
+    preshape_xy_tol: 0.02
+    corridor_margin: 0.01
+    grasp_approach_cap: 0.016
+    grasp_brake_slope: 0.50
+    place_approach_cap: 0.024
+    place_brake_slope: 0.50
+    grasp_descend_closing_only: true
+    approach_hover: 0.08
+    approach_xy_tol: 0.02
+    close_xy_floor: 0.008
+    aperture_margin: 0.006
+    release_xy: 0.06
+    release_z: 0.02
+    place_approach_margin: 0.01
+    release_commit_aniso: true
+    commit_measured_gate: true
+    release_commit_band: 3.0
+    place_descend_radius: 0.08
+    place_release_clearance: 0.012
+    clear_max_radius: 0.10
+    rekep_path_mean: true
+    insert_gate_band: 1.0
+    insert_descend_step: 0.02
+    insert_floor_span: 0.05
+
+advance:
+  mode: subgoal
+  flag_fallback: false
+  release_debug: true
+  grasp_advance_on_hold: true
+  ground_error_debug: false
+  plan_authoritative: true
+  advance_preflight: true
+
+grounding:
+  kp_source: perception
+  rotate_grasp_offset: true
+  support_extents: false
+  seat_from_plane: false
+  lift_latch_xy: false
+  local_grasp: true
+  local_grasp_radius: 0.03
+  subgoal_eps: 0.06
+
+steering:
+  dwell_k: 2.0
+
+planner:
+  # Accepted Weight-parity MBD surface, converted by physical time for RoboLab's 15 Hz loop.
+  # H15 is one second, four B-spline control points span that second, and replanning occurs every
+  # four control rows (0.2667 s). The Robotiq continuous gripper remains task-native.
+  noise: 0.4
+  temperature: 0.1
+  delta_clip: 0.05
+  cost_executable_actions: true
+  replan_period_s: 0.26666666666666666
+  interpolate: 'on'
+  interpolation_method: bspline
+  interpolate_frequency: 4.0
+  interpolate_high_frequency: 15.0

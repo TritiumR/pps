@@ -40,6 +40,47 @@ TASKS = {
                     "grey_bin_right": (0.10, 0.13, 0.05),
                     "table": (0.40, 0.40, 0.02)},
     },
+    "spoon_insertion": {
+        "gym_id": "InsertSpaghettiSpoonTask",
+        "prompt": "Insert the spaghetti spoon into the utensil holder.",
+        # The spatula is not manipulated, but it remains a named/tracked obstacle.  Omitting it
+        # would give the Spoon controller a less complete scene than the Weight/Capsule perception
+        # stack, where named distractors remain available to the clearance terms.
+        # The holder looks like a fixture but is a dynamic rigid body in this scene: contact can
+        # tip and translate it.  It must therefore be segmented and tracked just like the two
+        # utensils; freezing its reset-time instance mask would make the insertion mouth stale.
+        "movable": ("pink_spaghetti_spoon", "spatula", "utensil_holder"),
+        "fixtures": ("table",),
+        "grasp_objs": ("pink_spaghetti_spoon",),
+        "place_obj": "utensil_holder",
+        "max_steps": 1350,             # task episode_length_s=90 at the 15 Hz control rate
+        "continuous_gripper": True,
+        "vocab": {
+            "pink_spaghetti_spoon": (
+                "pink spaghetti spoon . pink pasta server . pink slotted serving spoon"
+            ),
+            "spatula": "grey spatula . metal spatula . turner",
+            "utensil_holder": (
+                "wooden utensil holder . wooden utensil crock . cylindrical utensil container"
+            ),
+        },
+        # Standard fields consumed by the generic insertion decorator in grounding/rekep.py.  The
+        # live mouth position comes from a tracked keypoint; these are semantic dimensions of the
+        # requested insertion, not simulator poses.  They are rendered into the plan receipt.
+        "insertion": {
+            "depth": 0.075,
+            "hover": 0.12,
+            "capture": 0.10,
+            "seat_radius": 0.025,
+        },
+        # Conservative fallbacks only.  The perception rung replaces these with measured clouds.
+        "extents": {
+            "pink_spaghetti_spoon": (0.014, 0.165, 0.014),
+            "spatula": (0.018, 0.165, 0.018),
+            "utensil_holder": (0.070, 0.070, 0.095),
+            "table": (0.40, 0.40, 0.02),
+        },
+    },
 }
 
 

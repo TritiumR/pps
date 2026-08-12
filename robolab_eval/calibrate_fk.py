@@ -93,7 +93,7 @@ def _pad_box(env, close):
     root = re.sub(r"env_[^/]+", "env_0", str(env.env.scene["robot"].cfg.prim_path))
     root = f"{root}/Gripper/Robotiq_2F_85"
     for _ in range(_SETTLE_STEPS * 2):
-        env.apply_arm(env.q0().numpy(), grip_close=close)
+        env.apply_arm(env.q0().numpy(), grip_command=float(close))
     eef_pos, eef_quat = env.eef_pose()
     rot = quat_wxyz_to_R(eef_quat)
     lo_all, hi_all, faces = [], [], []
@@ -123,7 +123,7 @@ def _sample_poses(env, n, grasp_offset, seed=0):
     for i in range(n):
         target = home if i == 0 else home + rng.uniform(-_PERTURB, _PERTURB, size=7)
         for _ in range(_SETTLE_STEPS):
-            env.apply_arm(target, grip_close=False)
+            env.apply_arm(target, grip_command=0.0)
         eef_pos, eef_quat = env.eef_pose()
         samples.append({
             "q": env.q0().numpy().astype(np.float64),

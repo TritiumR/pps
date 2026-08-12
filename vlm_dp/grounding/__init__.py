@@ -88,6 +88,8 @@ class Grounding:
     stages: list[Stage]
     manipulated: frozenset[str] = frozenset()      # excluded from scene-disturbance reporting
     keypoints: Optional[Callable[[], np.ndarray]] = None   # live tracked keypoints [N,3] (ReKep grounding)
+    # Optional drawable provenance aligned one-to-one with keypoints.
+    keypoint_metadata: Optional[Callable[[], list[dict]]] = None
     # VLM-authored per-stage completion predicates (vlm_dp.grounding.predicates), when the plan
     # carries them. Read by the advance path only under the bridge's opt-in keys
     # (predicate_place_transitions / plan_authoritative); otherwise shadow logging only. None means
