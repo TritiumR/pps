@@ -5496,6 +5496,28 @@ _CONFIGS = [
         batch_size=32,
     ),
     TrainConfig(
+        # Tea-task twin of score_task_weight, for loading tea task-proxy checkpoints.
+        name="score_task_tea",
+        model=proxy_score_config.ProxyScoreConfig(
+            action_horizon=15,
+            action_dim=8,
+            action_expert_variant="gemma_12m",
+            dino_model_name="facebook/dinov3-vits16-pretrain-lvd1689m",
+            ddim_num_train_timesteps=100,
+            prediction_type="epsilon",
+        ),
+        data=ProxyLeRobotDROIDJointPosDataConfig(
+            repo_id="local/isaaclab_tea_score",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="local/isaaclab_tea_score"),
+            norm_stats_dir="checkpoints/pytorch/pi05_droid_jointpos/assets/droid",
+            use_quantile_norm=True,
+        ),
+        num_train_steps=30_000,
+        save_interval=1_000,
+        batch_size=32,
+    ),
+    TrainConfig(
         name="score_ref_weight",
         model=proxy_score_config.ProxyScoreConfig(
             action_horizon=15,
@@ -5509,6 +5531,30 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             assets=AssetsConfig(asset_id="local/isaaclab_weight_score"),
             # Task, ref, and base scores must use one normalized action space.
+            norm_stats_dir="checkpoints/pytorch/pi05_droid_jointpos/assets/droid",
+            use_quantile_norm=True,
+        ),
+        num_train_steps=30_000,
+        save_interval=1_000,
+        batch_size=32,
+    ),
+    # Diagnostic twin of score_ref_weight read as an epsilon predictor: |ref| is flat across
+    # denoise steps where a score-scaled field climbs ~1/sqrt(beta), so load a ref checkpoint here
+    # to test whether it was trained on epsilon and only mislabelled.
+    TrainConfig(
+        name="score_ref_weight_eps",
+        model=proxy_score_config.ProxyScoreConfig(
+            action_horizon=15,
+            action_dim=8,
+            action_expert_variant="gemma_12m",
+            dino_model_name="facebook/dinov3-vits16-pretrain-lvd1689m",
+            ddim_num_train_timesteps=100,
+            prediction_type="epsilon",
+        ),
+        data=ProxyLeRobotDROIDJointPosDataConfig(
+            repo_id="local/isaaclab_weight_score",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="local/isaaclab_weight_score"),
             norm_stats_dir="checkpoints/pytorch/pi05_droid_jointpos/assets/droid",
             use_quantile_norm=True,
         ),
@@ -7150,6 +7196,54 @@ _CONFIGS = [
             action_dim=8,
             action_expert_variant="gemma_12m",
             dino_model_name="facebook/dinov3-vits16-pretrain-lvd1689m",
+            ddim_num_train_timesteps=100,
+            prediction_type="epsilon",
+        ),
+        data=ProxyLeRobotDROIDJointPosDataConfig(
+            repo_id="local/isaaclab_capsule_score",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="local/isaaclab_capsule_score"),
+            norm_stats_dir="checkpoints/pytorch/pi05_droid_jointpos/assets/droid",
+            use_quantile_norm=True,
+        ),
+        num_train_steps=30_000,
+        save_interval=1_000,
+        batch_size=32,
+    ),
+    # score_task_capsule twin for the low-data demo-BC proxy, DINO frozen: train-bc sees ~2k
+    # frames, so the 21.6M-param encoder is the overfitting surface. Same state dict.
+    TrainConfig(
+        name="score_task_stack_bc",
+        model=proxy_score_config.ProxyScoreConfig(
+            action_horizon=15,
+            action_dim=8,
+            action_expert_variant="gemma_12m",
+            dino_model_name="facebook/dinov3-vits16-pretrain-lvd1689m",
+            freeze_dino_encoder=True,
+            ddim_num_train_timesteps=100,
+            prediction_type="epsilon",
+        ),
+        data=ProxyLeRobotDROIDJointPosDataConfig(
+            repo_id="local/isaaclab_capsule_score",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="local/isaaclab_capsule_score"),
+            norm_stats_dir="checkpoints/pytorch/pi05_droid_jointpos/assets/droid",
+            use_quantile_norm=True,
+        ),
+        num_train_steps=30_000,
+        save_interval=1_000,
+        batch_size=32,
+    ),
+    # score_task_stack_bc with the visual encoder TRAINED, matching the PPS paper's proxy
+    # recipe (~33M trainable). The frozen twin underfits: train MAE == held-out MAE.
+    TrainConfig(
+        name="score_task_stack_bc_unfrozen",
+        model=proxy_score_config.ProxyScoreConfig(
+            action_horizon=15,
+            action_dim=8,
+            action_expert_variant="gemma_12m",
+            dino_model_name="facebook/dinov3-vits16-pretrain-lvd1689m",
+            freeze_dino_encoder=False,
             ddim_num_train_timesteps=100,
             prediction_type="epsilon",
         ),

@@ -1,0 +1,202 @@
+# tea -- deterministic stand-in for a GPT-4o ReKep response.
+# Format follows rekep/prompts/prompt_template.txt, so _render() parses it exactly as
+# rekep/constraint_generation.py parses a live response. Placeholders in braces are the values only
+# resolvable at runtime: keypoint indices from the live scene and offsets measured from the
+# observed point cloud.
+#
+# Task: "pour the tea from the teapot into the cup"
+#
+# The task involves four stages:
+# 1. Grasp the teapot.
+# 2. Lift the teapot clear of the table.
+# 3. Carry the teapot mouth above the cup.
+# 4. Pour: drop the mouth below the handle.
+#
+# Stage 2 is an explicit lift: it carries no grasp or release keypoint, so its sub-goal
+# constraint is what certifies the hold before any transport begins. Without it the plan
+# advances on grasp proximity alone and discovers mid-carry that the hand is empty.
+#
+# BROUGHT TO PARITY WITH THE WEIGHT PLAN (the validated 16/20 reference). Three judgements,
+# stated here because they are choices and not mechanical ports:
+#
+#  * ONE-SIDED VERTICAL LIFT (stage 2). Was a 3-D distance to a lift point anchored on the cup
+#    keypoint. With subgoal_eps 0.12 a 3-D ball completes the lift at ~+3cm of rise whenever the
+#    hand happens to be xy-centred on the lift column, so "lifted" could mean "barely off the
+#    table". The sub-goal is now the vertical shortfall of the HANDLE keypoint against
+#    {lift_z_teapot} and nothing else, exactly as weight stages 2/6 read. It also stops
+#    penalising an overshoot, which for a teapot on a lever arm is common.
+#
+#  * CARRY-HEIGHT PATH RULE (stage 3). Stage 3 IS already the hover -- its sub-goal puts the
+#    mouth 10cm above the cup rim, which is the hover point weight synthesizes explicitly -- so
+#    no transport/hover split is added here; only the missing path rule is. It is stated on the
+#    HANDLE keypoint, not the mouth: the handle is the grasped feature and the thing whose
+#    height the hand controls directly, while the mouth is the far end of a lever arm that dips
+#    as the pot swings. Forbidding the handle to drop below {carry_z_teapot} is the statement
+#    "do not drag the pot back across the table on the way to the cup".
+#
+#  * NO PLACE, NO GATED DESCENT. The teapot is never released: the task ends with the pot held
+#    over the cup and tipped. There is no destination to descend onto, so the descent gate the
+#    weight plan puts on its lower stages has nothing to gate here and is deliberately absent.
+#    release_keypoints is all -1 for the same reason.
+
+num_stages = 4
+
+
+### stage 1 sub-goal constraints
+def stage1_subgoal_constraint1(end_effector, keypoints):
+    """Align the end-effector with the teapot handle (keypoint {h})."""
+    return np.linalg.norm(end_effector - keypoints[{h}])
+
+### stage 1 path constraints
+# No path constraints needed for grasping.
+
+### stage 2 sub-goal constraints
+def stage2_subgoal_constraint1(end_effector, keypoints):
+    """The teapot handle (keypoint {h}) has reached carry height (vertical shortfall only)."""
+    return np.maximum(0.0, ({lift_z_teapot}) - keypoints[{h}][..., 2])
+
+### stage 2 path constraints
+def stage2_path_constraint1(end_effector, keypoints):
+    """The robot must still be grasping the teapot (keypoint {h})."""
+    return get_grasping_cost_by_keypoint_idx({h})
+
+### stage 3 sub-goal constraints
+def stage3_subgoal_constraint1(end_effector, keypoints):
+    """The teapot mouth (keypoint {m}) is 10cm above the cup rim (keypoint {c})."""
+    offsetted_point = keypoints[{c}] + np.array({cup_off}) + np.array([0.0, 0.0, 0.10])
+    return np.linalg.norm(keypoints[{m}] - offsetted_point)
+
+### stage 3 path constraints
+def stage3_path_constraint1(end_effector, keypoints):
+    """The robot must still be grasping the teapot (keypoint {h})."""
+    return get_grasping_cost_by_keypoint_idx({h})
+
+def stage3_path_constraint2(end_effector, keypoints):
+    """Keep the teapot handle (keypoint {h}) clear of the table while carrying it across."""
+    return np.maximum(0.0, ({carry_z_teapot}) - keypoints[{h}][..., 2])
+
+### stage 4 sub-goal constraints
+def stage4_subgoal_constraint1(end_effector, keypoints):
+    """The teapot mouth (keypoint {m}) is just above the cup rim (keypoint {c})."""
+    offsetted_point = keypoints[{c}] + np.array({cup_off}) + np.array([0.0, 0.0, 0.04])
+    return np.linalg.norm(keypoints[{m}] - offsetted_point)
+
+def stage4_subgoal_constraint2(end_effector, keypoints):
+    """The mouth (keypoint {m}) drops below the handle (keypoint {h}) by the pour lever arm."""
+    return np.maximum(0.0, keypoints[{m}][..., 2] - keypoints[{h}][..., 2] - ({pour_margin}))
+
+### stage 4 path constraints
+def stage4_path_constraint1(end_effector, keypoints):
+    """The robot must still be grasping the teapot (keypoint {h})."""
+    return get_grasping_cost_by_keypoint_idx({h})
+
+
+"""
+Summarize keypoints to be grasped in all grasping stages.
+For a grasping stage write the keypoint index; for a non-grasping stage write -1.
+"""
+grasp_keypoints = [{h}, -1, -1, -1]
+
+"""
+Summarize at **the end of which stage** the robot should release each keypoint.
+"""
+release_keypoints = [-1, -1, -1, -1]
+
+
+
+# ---------------------------------------------------------------------------
+# Completion predicates (vlm_dp extension to the ReKep response format).
+#
+# Written in the PRIMITIVE VOCABULARY the runtime provides (vlm_dp/grounding/predicates.py ::
+# PredicateRuntime), exactly as the weight, pot and capsule plans are. This plan states WHICH
+# event each stage names; the primitive states HOW that event is sensed.
+#
+#   EVENTS: grasped(kp, name, "acquire"|"maintain"), released(kp, name), stationary(kp, name),
+#   sustained(cost_fn, name). Each fills `components` with its named boolean and the margin_*
+#   floats behind it.
+#
+# TWO KEYPOINTS, TWO JOBS. This is the plan where OWNERSHIP and GEOMETRY are asked of different
+# keypoints, and the split is deliberate:
+#
+#   * OWNERSHIP is always asked of the HANDLE, {h}: grasped({h}, ..., "maintain"). The handle is
+#     the feature the fingers are on, so it is the only keypoint whose motion relative to the
+#     hand says anything about whether the pot is still held. Asking it of the mouth would test
+#     the far end of a lever arm, which swings relative to the hand even when the grip is
+#     perfect.
+#   * GEOMETRY is always asked of the MOUTH, {m}: where the tea comes out is what "over the cup"
+#     and "poured" are about. Both are the plan's own lambdas inside sustained().
+#
+# NO pouring() PRIMITIVE. The pour (stage 4) is this task's characteristic event, and it stays
+# ordinary plan geometry: "the mouth has been carried BELOW the handle by the lever arm, while
+# still over the cup and still held". That is a one-sided vertical between two keypoints, which
+# sustained() already expresses; a pouring() primitive would move a fact about THIS teapot's
+# lever arm into a library shared by every task. Quiescence is deliberately absent -- a pour
+# happens while the pot is moving.
+#
+#   TOLERANCES.
+#     target_region_radius({c})  the cup's placement region, for "over the cup" in stages 3 and 4.
+#
+#   AND ONE THAT IS DELIBERATELY NOT A PRIMITIVE. Stage 3's clearance band is `{mouth_clear}`, a
+#   RENDERED FIELD authored in fake_vlm, not clearance_margin({m}). clearance_margin is defined
+#   only for a keypoint on a body the plan CARRIES, and whether the mouth's keypoint registers to
+#   the teapot or to the table under it is decided at runtime by keypoint registration -- the
+#   spout tip is a SNAPPED proposed keypoint, not a declared feature, so its owner is a fact
+#   about this episode's segmentation rather than about the plan. A clearance the plan cannot be
+#   sure the primitive is allowed to answer is the plan's own to state. (The handle is not in
+#   doubt: name_for({h}) is what the grounding resolves the grasp role from, and the grasp
+#   preflight names it.)
+#
+#   DIAGNOSTIC KEYS. Every boolean these stages used to publish keeps its name and its meaning:
+#   closed_on_object, rides_with_hand, at_hand, still_held, at_carry_height, inside_cup_region,
+#   still_clear_of_cup, mouth_below_handle, over_the_cup, and the margins margin_aperture /
+#   margin_slip_ratio / margin_hand_disp_m / margin_reach_m. Stage 1 additionally publishes an
+#   overall teapot_in_hand, which is the conjunction it used to return unnamed. Four margins are
+#   RENAMED because sustained() reports one uniform quantity -- the worst COST in the window,
+#   negative when satisfied -- where the old blocks reported differently-signed ad-hoc numbers:
+#     margin_height_shortfall_m -> margin_at_carry_height     (same value)
+#     margin_xy_off_m           -> margin_inside_cup_region (stage 3) / margin_over_the_cup
+#                                  (stage 4)   (now offset MINUS the radius)
+#     margin_clearance_m        -> margin_still_clear_of_cup  (now negated: cost, not clearance)
+#     margin_pour_tilt_m        -> margin_mouth_below_handle  (same value)
+#
+# Interface: stage<N>_completion(history, end_effector, keypoints, robot_state, components)
+# -> bool, filling `components` with named booleans plus margin_* floats. See
+# vlm_dp/grounding/predicates.py for the full contract.
+# ---------------------------------------------------------------------------
+
+
+### stage 1 completion predicate
+def stage1_completion(history, end_effector, keypoints, robot_state, components):
+    """Teapot grasped: the fingers are stalled on something, and the handle rides with the hand."""
+    teapot_in_hand = grasped({h}, "teapot_in_hand", "acquire")
+    return bool(teapot_in_hand)
+
+### stage 2 completion predicate
+def stage2_completion(history, end_effector, keypoints, robot_state, components):
+    """Teapot lifted: still owned by the hand, and the handle has held carry height for five frames."""
+    still_held = grasped({h}, "still_held", "maintain")
+    at_carry_height = sustained(
+        lambda ee, kp: ({lift_z_teapot}) - kp[{h}][..., 2], "at_carry_height")
+    return bool(still_held and at_carry_height)
+
+### stage 3 completion predicate
+def stage3_completion(history, end_effector, keypoints, robot_state, components):
+    """Mouth over the cup: pot still owned by the hand, mouth inside the cup region, still clear above it."""
+    still_held = grasped({h}, "still_held", "maintain")
+    inside_cup_region = sustained(
+        lambda ee, kp: np.linalg.norm(kp[{m}][..., :2] - (kp[{c}][..., :2] + np.array({cup_off})[:2]),
+                                      axis=-1) - target_region_radius({c}), "inside_cup_region")
+    still_clear_of_cup = sustained(
+        lambda ee, kp: (({hover_z_mouth}) - ({mouth_clear})) - kp[{m}][..., 2], "still_clear_of_cup")
+    return bool(still_held and inside_cup_region and still_clear_of_cup)
+
+### stage 4 completion predicate
+def stage4_completion(history, end_effector, keypoints, robot_state, components):
+    """Poured: the mouth has been held below the handle by the lever arm, over the cup, still gripped."""
+    still_held = grasped({h}, "still_held", "maintain")
+    mouth_below_handle = sustained(
+        lambda ee, kp: kp[{m}][..., 2] - kp[{h}][..., 2] - ({pour_margin}), "mouth_below_handle")
+    over_the_cup = sustained(
+        lambda ee, kp: np.linalg.norm(kp[{m}][..., :2] - (kp[{c}][..., :2] + np.array({cup_off})[:2]),
+                                      axis=-1) - target_region_radius({c}), "over_the_cup")
+    return bool(still_held and mouth_below_handle and over_the_cup)

@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 from torch import nn
 import torch.nn.functional as F  # noqa: N812
+from transformers.cache_utils import DynamicCache
 
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.expert_pytorch import DINOExpertModel
@@ -50,9 +51,31 @@ def squaredcos_cap_v2_alpha_bar(t: torch.Tensor | float) -> torch.Tensor | float
     return torch.cos((t + 0.008) / 1.008 * math.pi / 2.0) ** 2
 
 
+_ALPHAS_CUMPROD_CACHE: dict[tuple[int, torch.device, torch.dtype], torch.Tensor] = {}
+
+
+def _alphas_cumprod_key(num_train_timesteps, device, dtype):
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    return int(num_train_timesteps), device, dtype
+
+
 def ddim_alphas_cumprod(num_train_timesteps: int, *, device, dtype) -> torch.Tensor:
+    """Cosine alpha_bar schedule, memoized per (steps, device, dtype).
+
+    The build is a Python loop of ~8 * num_train_timesteps tiny device-side ops; on a shared
+    GPU that is ~350 ms, and inference calls it twice per DDIM level. The schedule is a pure
+    function of the key and every caller only reads/indexes it, so it is cached (treat the
+    returned tensor as read-only). Values are bitwise identical to rebuilding.
+    """
     if num_train_timesteps <= 1:
         raise ValueError("num_train_timesteps must be greater than 1.")
+
+    key = _alphas_cumprod_key(num_train_timesteps, device, dtype)
+    cached = _ALPHAS_CUMPROD_CACHE.get(key)
+    if cached is not None:
+        return cached
 
     alpha_cumprod = torch.ones((), device=device, dtype=dtype)
     alphas = []
@@ -63,7 +86,9 @@ def ddim_alphas_cumprod(num_train_timesteps: int, *, device, dtype) -> torch.Ten
         beta = torch.clamp(beta, max=0.999)
         alpha_cumprod = alpha_cumprod * (1.0 - beta)
         alphas.append(alpha_cumprod)
-    return torch.stack(alphas)
+    out = torch.stack(alphas)
+    _ALPHAS_CUMPROD_CACHE[key] = out
+    return out
 
 
 def ddim_iteration_alphas(
@@ -102,6 +127,40 @@ def ddim_iteration_alphas(
     return alpha_t, alpha_prev, time_cond
 
 
+def make_att_2d_masks(
+    pad_masks: torch.Tensor,
+    att_masks: torch.Tensor,
+) -> torch.Tensor:
+    """Build pi0-style block attention from padding and block-boundary masks."""
+    if pad_masks.ndim != 2:
+        raise ValueError(f"pad_masks must be rank 2, got {pad_masks.ndim}.")
+    if att_masks.ndim != 2:
+        raise ValueError(f"att_masks must be rank 2, got {att_masks.ndim}.")
+    if pad_masks.shape != att_masks.shape:
+        raise ValueError(
+            "pad_masks and att_masks must have the same shape, got "
+            f"{tuple(pad_masks.shape)} and {tuple(att_masks.shape)}."
+        )
+
+    block_ids = torch.cumsum(att_masks.to(torch.int32), dim=1)
+    block_mask = block_ids[:, None, :] <= block_ids[:, :, None]
+    valid = pad_masks.to(torch.bool)
+    return block_mask & valid[:, None, :] & valid[:, :, None]
+
+
+def _expand_prefix_kv(cache: DynamicCache, bsize: int) -> DynamicCache:
+    """Batch-1 prefix cache -> a fresh view-backed cache for `bsize` rows (never mutated)."""
+    legacy = cache.to_legacy_cache()
+    if legacy[0][0].shape[0] != 1:
+        raise ValueError("prefix_kv must be built at batch 1.")
+    return DynamicCache.from_legacy_cache(
+        tuple(
+            (k.expand(bsize, -1, -1, -1), v.expand(bsize, -1, -1, -1))
+            for k, v in legacy
+        )
+    )
+
+
 class ProxyScorePytorch(nn.Module):
     """Image/state-conditioned score proxy for DDIM/MBD score-space PPS steering."""
 
@@ -117,6 +176,7 @@ class ProxyScorePytorch(nn.Module):
             precision=config.dtype,
             freeze_dino_encoder=getattr(config, "freeze_dino_encoder", False),
         )
+        self.bidirectional_attention = getattr(config, "bidirectional_attention", False)
 
         action_dim = config.action_dim
         self.action_in_proj = nn.Linear(action_dim, action_expert_config.width)
@@ -257,6 +317,76 @@ class ProxyScorePytorch(nn.Module):
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
         return embs, pad_masks, att_masks, None
 
+    @staticmethod
+    def _prepare_attention_masks_4d(att_2d_masks: torch.Tensor) -> torch.Tensor:
+        att_2d_masks_4d = att_2d_masks[:, None, :, :]
+        return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
+
+    def build_attention_mask(
+        self,
+        pad_masks: torch.Tensor,
+        att_masks: torch.Tensor,
+        *,
+        n_query: int | None = None,
+    ) -> torch.Tensor:
+        """Use the legacy causal mask or the checkpoint-compatible block mask."""
+        if not self.bidirectional_attention:
+            return pad_masks
+        attention_mask = self._prepare_attention_masks_4d(
+            make_att_2d_masks(pad_masks, att_masks)
+        )
+        if n_query is not None:
+            attention_mask = attention_mask[:, :, -int(n_query) :, :]
+        return attention_mask
+
+    def build_expert_masks(
+        self,
+        prefix_pad_masks: torch.Tensor,
+        prefix_att_masks: torch.Tensor,
+        suffix_pad_masks: torch.Tensor,
+        suffix_att_masks: torch.Tensor,
+        *,
+        n_query: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat(
+            [prefix_att_masks.to(torch.int32), suffix_att_masks.to(torch.int32)],
+            dim=1,
+        )
+        return (
+            self.build_attention_mask(pad_masks, att_masks, n_query=n_query),
+            pad_masks,
+        )
+
+    @torch.no_grad()
+    def prefix_kv_cache(self, prefix_embs, prefix_pad_masks, *, dtype=None) -> DynamicCache:
+        """Per-layer K/V of the image prefix, using the configured attention mask.
+
+        Inference reuses one prefix across every DDIM level and every candidate, so caching it
+        turns each later call into a 16-token forward. Build at batch 1 and expand. `dtype`
+        must match the precision the consumer runs at, or the concat with the suffix K/V
+        promotes the whole attention back to the wider type.
+        """
+        position_ids = (torch.cumsum(prefix_pad_masks, dim=1) - 1).to(dtype=torch.long)
+        attention_mask = self.build_attention_mask(
+            prefix_pad_masks,
+            torch.zeros_like(prefix_pad_masks),
+        )
+        cache = DynamicCache()
+        self.expert_model.forward(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=cache,
+            inputs_embeds=prefix_embs,
+            use_cache=True,
+            adarms_cond=None,
+        )
+        if dtype is None:
+            return cache
+        return DynamicCache.from_legacy_cache(
+            tuple((k.to(dtype), v.to(dtype)) for k, v in cache.to_legacy_cache())
+        )
+
     def _run_diffusion_head(
         self,
         prefix_embs,
@@ -264,15 +394,39 @@ class ProxyScorePytorch(nn.Module):
         suffix_embs,
         suffix_pad_masks,
         adarms_cond,
+        prefix_kv: DynamicCache | None = None,
+        prefix_att_masks=None,
+        suffix_att_masks=None,
     ) -> torch.Tensor:
-        embs = torch.cat([prefix_embs, suffix_embs], dim=1)
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
-        position_ids = position_ids.to(dtype=torch.long)
+        if prefix_kv is None:
+            embs = torch.cat([prefix_embs, suffix_embs], dim=1)
+            pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+            position_ids = torch.cumsum(pad_masks, dim=1) - 1
+            position_ids = position_ids.to(dtype=torch.long)
+            past_key_values = None
+        else:
+            # Cached prefix: only the suffix tokens are fed; the mask still spans past+current
+            # and the positions are the suffix slice of the full-sequence positions.
+            embs = suffix_embs
+            pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+            position_ids = torch.cumsum(pad_masks, dim=1) - 1
+            position_ids = position_ids[:, -suffix_embs.shape[1] :].to(dtype=torch.long)
+            past_key_values = _expand_prefix_kv(prefix_kv, suffix_embs.shape[0])
+        attention_mask = pad_masks
+        if prefix_att_masks is None and self.bidirectional_attention:
+            prefix_att_masks = torch.zeros_like(prefix_pad_masks)
+        if prefix_att_masks is not None and suffix_att_masks is not None:
+            attention_mask, pad_masks = self.build_expert_masks(
+                prefix_pad_masks,
+                prefix_att_masks,
+                suffix_pad_masks,
+                suffix_att_masks,
+                n_query=embs.shape[1] if prefix_kv is not None else None,
+            )
         hidden_states, _ = self.expert_model.forward(
-            attention_mask=pad_masks,
+            attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=None,
+            past_key_values=past_key_values,
             inputs_embeds=embs,
             use_cache=False,
             adarms_cond=adarms_cond,
@@ -288,8 +442,10 @@ class ProxyScorePytorch(nn.Module):
         prefix_pad_masks,
         x_t,
         time_cond,
+        prefix_kv: DynamicCache | None = None,
+        prefix_att_masks=None,
     ) -> torch.Tensor:
-        suffix_embs, suffix_pad_masks, _, adarms_cond = self.embed_suffix(
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
             state,
             x_t,
             time_cond,
@@ -300,6 +456,9 @@ class ProxyScorePytorch(nn.Module):
             suffix_embs,
             suffix_pad_masks,
             adarms_cond,
+            prefix_kv=prefix_kv,
+            prefix_att_masks=prefix_att_masks,
+            suffix_att_masks=suffix_att_masks,
         )
 
     def predict_score_from_prefix(
@@ -309,18 +468,34 @@ class ProxyScorePytorch(nn.Module):
         prefix_pad_masks,
         x_t,
         time_cond,
+        prefix_kv: DynamicCache | None = None,
+        prefix_att_masks=None,
     ) -> torch.Tensor:
+        # Forwarded only when set, so subclasses overriding the hook keep their signature.
+        extra = {"prefix_kv": prefix_kv} if prefix_kv is not None else {}
+        if prefix_att_masks is not None:
+            extra["prefix_att_masks"] = prefix_att_masks
         output = self._predict_model_output_from_prefix(
             state,
             prefix_embs,
             prefix_pad_masks,
             x_t,
             time_cond,
+            **extra,
         )
         if self.config.prediction_type == "score":
             return output
+        if self.config.prediction_type == "regress":
+            raise ValueError(
+                "prediction_type 'regress' has no score: the head is not noise-conditioned."
+            )
 
         alpha = self._alpha_from_time(time_cond, x_t.device, x_t.dtype)
+        if self.config.prediction_type == "x0":
+            # score s.t. Tweedie x0 = (x_t + beta * score) / sqrt(alpha) recovers the output.
+            beta = torch.clamp(1.0 - alpha, min=1e-6)
+            sqrt_alpha = torch.sqrt(torch.clamp(alpha, min=1e-6))
+            return (sqrt_alpha[:, None, None] * output - x_t) / beta[:, None, None]
         sqrt_beta = torch.sqrt(torch.clamp(1.0 - alpha, min=1e-6))
         return -output / sqrt_beta[:, None, None]
 
@@ -354,6 +529,14 @@ class ProxyScorePytorch(nn.Module):
                 dtype=actions.dtype,
             )
             time = time.to(device=actions.device, dtype=actions.dtype)
+        elif self.config.prediction_type == "regress":
+            # Plain chunked regression: L2 on the clean chunk, no noising. The action/time
+            # tokens are zeroed, so the chunk is predicted from the image/state prefix alone.
+            x_t = torch.zeros_like(actions)
+            time = torch.zeros(
+                actions.shape[0], device=actions.device, dtype=actions.dtype
+            )
+            target = actions
         else:
             if noise is None:
                 noise = self.sample_noise(actions.shape, actions.device)
@@ -377,11 +560,15 @@ class ProxyScorePytorch(nn.Module):
             x_t = sqrt_alpha[:, None, None] * actions + sqrt_beta[:, None, None] * noise
             if self.config.prediction_type == "epsilon":
                 target = noise
+            elif self.config.prediction_type == "x0":
+                target = actions
             else:
                 target = -noise / sqrt_beta[:, None, None]
                 loss_weight = beta[:, None, None]
 
-        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks
+        )
         grouped_labels = x_t.ndim == 4
         if grouped_labels:
             if target.ndim != 4 or time.ndim != 2:
@@ -392,11 +579,13 @@ class ProxyScorePytorch(nn.Module):
             batch_size, labels_per_observation = x_t.shape[:2]
             if prefix_embs.shape[0] != batch_size:
                 raise ValueError("Observation batch does not match grouped score targets.")
-            # The expensive visual prefix is computed once per observation. Repeating
-            # the resulting embeddings preserves gradients from every score label
-            # without rerunning DINO for each reverse-diffusion state.
+            # Repeat the once-computed visual prefix: preserves gradients from every score label
+            # without rerunning DINO per reverse-diffusion state.
             prefix_embs = prefix_embs.repeat_interleave(labels_per_observation, dim=0)
             prefix_pad_masks = prefix_pad_masks.repeat_interleave(
+                labels_per_observation, dim=0
+            )
+            prefix_att_masks = prefix_att_masks.repeat_interleave(
                 labels_per_observation, dim=0
             )
             state = state.repeat_interleave(labels_per_observation, dim=0)
@@ -408,7 +597,14 @@ class ProxyScorePytorch(nn.Module):
             if direct_score_target or self.config.prediction_type == "score"
             else self._predict_model_output_from_prefix
         )
-        pred = predict(state, prefix_embs, prefix_pad_masks, x_t, time)
+        pred = predict(
+            state,
+            prefix_embs,
+            prefix_pad_masks,
+            x_t,
+            time,
+            prefix_att_masks=prefix_att_masks,
+        )
         loss = F.mse_loss(pred, target, reduction="none")
         if loss_weight is not None:
             loss = loss * loss_weight
@@ -434,7 +630,19 @@ class ProxyScorePytorch(nn.Module):
         images, img_masks, state = self._preprocess_observation(
             observation, train=False
         )
-        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks
+        )
+        if self.config.prediction_type == "regress":
+            # One forward: the head emits the chunk directly (no reverse chain).
+            return self._predict_model_output_from_prefix(
+                state,
+                prefix_embs,
+                prefix_pad_masks,
+                torch.zeros_like(noise),
+                torch.zeros(bsize, device=device, dtype=noise.dtype),
+                prefix_att_masks=prefix_att_masks,
+            )
         x_t = noise
         for iteration in range(int(num_steps)):
             alpha, alpha_prev, time_cond = ddim_iteration_alphas(
@@ -451,6 +659,7 @@ class ProxyScorePytorch(nn.Module):
                 prefix_pad_masks,
                 x_t,
                 expanded_time,
+                prefix_att_masks=prefix_att_masks,
             )
             beta = torch.clamp(1.0 - alpha, min=1e-6)
             sqrt_alpha = torch.sqrt(torch.clamp(alpha, min=1e-6))
@@ -458,6 +667,9 @@ class ProxyScorePytorch(nn.Module):
             if self.config.prediction_type == "epsilon":
                 eps_hat = output
                 x0_hat = (x_t - sqrt_beta * eps_hat) / sqrt_alpha
+            elif self.config.prediction_type == "x0":
+                x0_hat = output
+                eps_hat = (x_t - sqrt_alpha * x0_hat) / sqrt_beta
             else:
                 score = output
                 x0_hat = (x_t + beta * score) / sqrt_alpha

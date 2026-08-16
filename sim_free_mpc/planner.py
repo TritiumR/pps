@@ -22,6 +22,54 @@ from .fk import PandaFK, quat_mul_wxyz, transform_points_wxyz
 from .truncated_sampler import sample_truncated_model_action_chunks
 
 
+def task_tilt_penalty(
+    samples: torch.Tensor,
+    target: torch.Tensor,
+    weight: float,
+    dims: int | None = None,
+    dim_weights=None,
+) -> torch.Tensor:
+    """Per-candidate Gaussian tilt toward a clean-action target chunk.
+
+    Adds weight * sum(err^2) to the sampler cost, so the softmax becomes an FK/SVDD-style
+    reweighting of the base's own proposals rather than a score-space addend. The SUM over chunk
+    coordinates, not the mean, is the true Gaussian log-density scale.
+
+    dims restricts the tilt to the first N coordinates: the near-binary gripper coordinate
+    otherwise dominates the distance at high lam. dim_weights scales each coordinate instead,
+    and overrides dims when given.
+    """
+    horizon = min(samples.shape[1], target.shape[0])   # --kp appends rows the target lacks
+    if dim_weights is not None:
+        w = torch.as_tensor(dim_weights, device=samples.device, dtype=samples.dtype)
+        n_dims = min(w.shape[0], samples.shape[2])
+        aligned = target.to(device=samples.device, dtype=samples.dtype)[:horizon, :n_dims]
+        err = samples[:, :horizon, :n_dims] - aligned.unsqueeze(0)
+        return weight * (err.pow(2) * w[:n_dims].view(1, 1, -1)).sum(dim=(1, 2))
+    n_dims = samples.shape[2] if dims is None else min(int(dims), samples.shape[2])
+    aligned = target.to(device=samples.device, dtype=samples.dtype)[:horizon, :n_dims]
+    err = samples[:, :horizon, :n_dims] - aligned.unsqueeze(0)
+    return weight * err.pow(2).sum(dim=(1, 2))
+
+
+def task_tilt_weight(
+    lam: float,
+    temperature: float,
+    noise: float,
+    alpha_bar: float,
+    eps: float = 1e-6,
+) -> float:
+    """SNR-tempered tilt weight: lam * T * abar / (2 * noise^2 * beta).
+
+    The abar factor mutes the tilt at high noise, where the proxy's implied
+    clean target carries 1/sqrt(abar)-amplified error; near the end of the
+    denoise trajectory the weight grows like 1/beta (DAS-style late ramp).
+    """
+    beta = max(1.0 - float(alpha_bar), eps)
+    sigma_sq = float(noise) ** 2 * beta
+    return float(lam) * float(temperature) * float(alpha_bar) / max(2.0 * sigma_sq, eps)
+
+
 @dataclass(frozen=True)
 class SimFreeMPCConfig:
     task_name: str = "auto"
@@ -34,6 +82,10 @@ class SimFreeMPCConfig:
     action_dims: int = 8
     flow_eps: float = 1e-3
     joint_delta_clip: float = 0.25
+    # Cost candidates as they would actually execute (joint limits + per-step delta
+    # clamp) instead of pre-clamp. Off by default: it changes the optimisation
+    # landscape, so arms with and without it are not comparable.
+    cost_executable_actions: bool = False
     ddim_num_train_timesteps: int = 100
     interpolate: bool = False
     control_frequency: float = 40.0
@@ -43,6 +95,31 @@ class SimFreeMPCConfig:
     optimize_space: str = "action"
     sampler: str = "base"
     grad_calc: str = "mbd"
+    logit_norm: str = "raw"  # "raw" | "std" (DIAL-style scale-free softmax logits)
+    # Restrict the softmax to candidates within this many temperature units of the best before the
+    # weighted mean, so averaging happens INSIDE a mode rather than across two. inf = old behaviour.
+    mode_window: float = float("inf")
+    # Score the plan the sampler RETURNS, not the population it drew: sum_i w_i * term(sample_i)
+    # equals term(sum_i w_i * sample_i) only for a linear cost, and ours is not. Measured gap on a
+    # departure: 2.5e-6 across the population against 0.06 on the executed path. Off by default.
+    eval_mean_plan: bool = False
+    ancestral_eta: float = 0.0  # >0: marginal re-noising between denoise levels
+    # What the softmax ranks on. "total" is the plain sum (deployed); "roles" splits it into
+    # feasibility + task + prior_weight * prior. The prior exists to keep a weak sampler out of
+    # trouble, not to judge a trajectory, yet near contact it charges a demonstration +12..22
+    # against a ~1.5 task separation, so it decides selection alone. prior_weight=1.0 == "total".
+    rank_mode: str = "total"          # "total" | "roles"
+    # prior_weight applies at LOW noise, where candidates are plausible and the prior mostly blocks
+    # demo-shaped motion; prior_weight_high at HIGH noise, where candidates are decoded noise and the
+    # prior is the only thing rejecting them. A constant is wrong at both ends in opposite
+    # directions, and alpha is the natural interpolant: the fraction of clean signal in x_t.
+    prior_weight: float = 1.0
+    prior_weight_high: float = 1.0
+    prior_weight_schedule: str = "flat"   # "flat" (constant prior_weight) | "alpha"
+    # Optional hard gate: candidates whose feasibility exceeds (best feasibility + this margin) are
+    # excluded from the softmax. 0 disables it, leaving feasibility to compete on magnitude as today.
+    # If nothing passes the gate the whole population is kept, so the sampler can never be starved.
+    feasibility_gate: float = 0.0
 
 
 class SimFreeMPC:
@@ -52,6 +129,7 @@ class SimFreeMPC:
         self.policy = policy
         self.config = config
         self.fk = PandaFK()
+        self._inject_share_trace: list[float] = []   # per-denoise-level; see begin_inference
         self.sampler = DIALSampler(
             DIALSamplerConfig(
                 num_samples=config.num_samples,
@@ -61,6 +139,8 @@ class SimFreeMPC:
                 beta_opt_iter=config.beta_opt_iter,
                 beta_horizon=config.beta_horizon,
                 action_dims=config.action_dims,
+                logit_norm=config.logit_norm,
+                mode_window=config.mode_window,
             )
         )
         self._warm_action: torch.Tensor | None = None
@@ -115,8 +195,29 @@ class SimFreeMPC:
         self._warm_action = None
         self._warm_state = None
 
+    def _add_inject_trace_diagnostics(self, diagnostics: dict) -> None:
+        """Summarise the per-level injection shares of this denoise chain.
+
+        `inject_weight_share` alone is the LAST level's value, which the frontload schedule and the
+        Tweedie collapse (x0 -> x_t as alpha -> 1) both drive to ~0 no matter what injection did.
+        The max and the first-level value are the honest reads: the first three levels carry 78% of
+        the injection authority.
+        """
+        trace = getattr(self, "_inject_share_trace", None)
+        if not trace:
+            return
+        diagnostics["inject_share_first"] = float(trace[0])
+        diagnostics["inject_share_max"] = float(max(trace))
+        diagnostics["inject_share_mean"] = float(sum(trace) / len(trace))
+        diagnostics["inject_share_levels"] = int(len(trace))
+
+    def begin_inference(self) -> None:
+        """Start a fresh denoise chain: clear per-level traces the diagnostics summarise."""
+        self._inject_share_trace = []
+
     def reset_episode(self) -> None:
         """Reset planner state that must not leak across environment episodes."""
+        self.begin_inference()
         self.reset_action_warm()
         reset_cost = getattr(self.cost, "reset", None)
         if callable(reset_cost):
@@ -196,11 +297,9 @@ class SimFreeMPC:
         ):
             return deltas
 
-        # Express interpolation as y = mapping @ control_points. Rewriting each
-        # control point as p_0 plus cumulative knot deltas gives an exact
-        # component-wise gain from bounded knot deltas to adjacent output steps.
-        # This handles both linear interpolation and the larger endpoint slope of
-        # a clamped cubic B-spline without relying on a frequency-ratio heuristic.
+        # y = mapping @ control_points; rewriting each control point as p_0 plus cumulative knot
+        # deltas gives an exact gain from bounded knot deltas to adjacent output steps, for linear
+        # and clamped-cubic alike, with no frequency-ratio heuristic.
         control_basis = torch.eye(proposal_horizon, device=device, dtype=dtype)
         mapping = self._interpolate_control_points(control_basis, output_horizon)
         cumulative_delta_coeffs = mapping[:, 1:].flip(1).cumsum(1).flip(1)
@@ -224,7 +323,13 @@ class SimFreeMPC:
         output_horizon: int,
     ) -> None:
         if self.config.sampler == "base":
-            self.sampler.proposal_fn = None
+            inject = (context or {}).get("inject")
+            rho = float((inject or {}).get("rho", 0.0))
+            if inject is not None and rho > 0.0 and inject.get("x0") is not None:
+                self.sampler.proposal_fn = self._make_inject_proposal(inject["x0"], rho)
+            else:
+                self.sampler.proposal_fn = None
+                self._last_inject_slice = None
             return
 
         current_joint_pos = context.get("joint_pos")
@@ -252,6 +357,65 @@ class SimFreeMPC:
             )
 
         self.sampler.proposal_fn = proposal_fn
+
+    def _make_inject_proposal(self, x0_expert: torch.Tensor, rho: float):
+        """Mixture proposal: a fraction rho of candidates centred on the expert's clean action.
+
+        The expert extends the candidate SUPPORT; the cost still weights every candidate, so an
+        implausible proposal simply loses the softmax. Row 0 stays the current mean.
+
+        Returns the per-sample log importance ratio alongside the samples. Without it the estimator's
+        target silently becomes exp(-J)*q_mix, i.e. rho would grant the expert region prior mass the base
+        never assigned it. Both components share the scale, so the ratio collapses to
+        -log[(1-rho) + rho*exp(d_b - d_c)] with no normalizing constants.
+        """
+        expert = torch.as_tensor(x0_expert).detach()
+        if expert.ndim == 3:
+            expert = expert[0]
+
+        def proposal_fn(mean, noise_scale, num_samples, generator):
+            scale = torch.as_tensor(noise_scale, device=mean.device, dtype=mean.dtype)
+            if scale.ndim == 0:
+                scale_view = scale.view(1, 1, 1)
+            elif scale.ndim == 1:
+                scale_view = scale.view(1, mean.shape[0], 1)
+            else:
+                scale_view = scale.unsqueeze(0)
+            noise = torch.randn(
+                (num_samples, *mean.shape),
+                device=mean.device,
+                dtype=mean.dtype,
+                generator=generator,
+            )
+            samples = mean.unsqueeze(0) + noise * scale_view
+            samples[0] = mean
+            n_inj = min(max(int(round(rho * num_samples)), 0), num_samples - 1)
+            if n_inj == 0:
+                self._last_inject_slice = None
+                return samples, None
+            centre = self._control_point_resample(
+                expert.to(device=mean.device, dtype=mean.dtype)[:, : mean.shape[-1]],
+                mean.shape[0],
+            )
+            lo = num_samples - n_inj
+            samples[lo:] = centre.unsqueeze(0) + noise[lo:] * scale_view
+            self._last_inject_slice = (lo, num_samples)
+
+            # Importance correction, evaluated for EVERY row: a Gaussian-branch sample can also land
+            # near the expert centre, so the ratio is a property of the point, not of which branch
+            # drew it. rho_eff is the realized share after integer rounding.
+            rho_eff = n_inj / float(num_samples)
+            inv_two_var = 1.0 / (2.0 * torch.clamp(scale_view, min=1e-6) ** 2)
+            d_base = ((samples - mean.unsqueeze(0)) ** 2 * inv_two_var).flatten(1).sum(-1)
+            d_expert = ((samples - centre.unsqueeze(0)) ** 2 * inv_two_var).flatten(1).sum(-1)
+            log_importance = -torch.logaddexp(
+                torch.log(torch.as_tensor(1.0 - rho_eff, device=mean.device, dtype=mean.dtype)
+                          .clamp_min(1e-30)),
+                torch.log(torch.as_tensor(rho_eff, device=mean.device, dtype=mean.dtype)) + d_base - d_expert,
+            )
+            return samples, log_importance
+
+        return proposal_fn
 
     @staticmethod
     def _linear_resample(sequence: torch.Tensor, output_horizon: int) -> torch.Tensor:
@@ -493,12 +657,28 @@ class SimFreeMPC:
     ) -> torch.Tensor:
         full = x_template.detach().repeat(samples.shape[0], 1, 1)
         full[:, :, :active_dims] = samples
-        decoded = decode_model_action_chunks(
-            self.policy,
-            policy_inputs,
-            full,
-            apply_clamp=False,
-        )
+        # Candidates are costed WITHOUT the execution clamp by default, so a plan can be scored
+        # on motion that is truncated before env.step -- measured: executed within-chunk joint
+        # deltas sit at the clamp value on the median step, so the clamp is saturating and the
+        # scored trajectory routinely is not the executed one. cost_executable_actions=True
+        # scores exactly what would be executed. Opt-in: it changes the optimisation landscape,
+        # so runs with and without it are not comparable.
+        if self.config.cost_executable_actions and self.config.joint_delta_clip > 0.0:
+            decoded = decode_model_action_chunks(
+                self.policy,
+                policy_inputs,
+                full,
+                apply_clamp=True,
+                current_joint_pos=context.get("joint_pos"),
+                max_joint_delta=self.config.joint_delta_clip,
+            )
+        else:
+            decoded = decode_model_action_chunks(
+                self.policy,
+                policy_inputs,
+                full,
+                apply_clamp=False,
+            )
         real = decoded.real_actions
         joints = real[..., :7]
         fk = self.fk.forward(joints)
@@ -529,8 +709,54 @@ class SimFreeMPC:
             "grasp_flow_loose",
             "capsule_flow",
         ):
-            return self.cost(real_actions=real, tcp_pos=ee_pos, tcp_quat=ee_quat, context=context)
-        return self.cost(real_actions=real, ee_pos=ee_pos, ee_quat=ee_quat, context=context)
+            total = self.cost(real_actions=real, tcp_pos=ee_pos, tcp_quat=ee_quat, context=context)
+        else:
+            total = self.cost(real_actions=real, ee_pos=ee_pos, ee_quat=ee_quat, context=context)
+        return self._ranking_scalar(total)
+
+    def _prior_weight_now(self) -> float:
+        """Prior weight for the level being ranked.
+
+        "flat" is the constant prior_weight (and reproduces rank_mode="total" at 1.0). "alpha"
+        interpolates prior_weight_high (high noise, candidates are garbage, keep the filter) to
+        prior_weight (low noise, candidates are plausible, the prior only blocks) linearly in
+        alpha_bar. Without a recorded alpha it falls back to flat rather than guessing.
+        """
+        low = float(self.config.prior_weight)
+        if self.config.prior_weight_schedule != "alpha":
+            return low
+        alpha = getattr(self, "_rank_alpha", None)
+        if alpha is None:
+            return low
+        high = float(self.config.prior_weight_high)
+        a = min(max(float(alpha), 0.0), 1.0)
+        return high * (1.0 - a) + low * a
+
+    def _ranking_scalar(self, total: torch.Tensor) -> torch.Tensor:
+        """What the softmax orders candidates by. `total` (the true cost) is preserved for logging.
+
+        Under rank_mode="roles" the execution/search prior is down-weighted so it shapes rather than
+        decides, and an optional hard gate drops candidates that are physically far worse than the
+        best available. Only a cost exposing the TERM_ROLES split can do this; anything else falls
+        back to the plain total rather than silently ranking on a partial sum.
+        """
+        self._last_cost_total = total.detach()
+        if self.config.rank_mode == "total":
+            return total
+        parts = [getattr(self.cost, f"last_cost_{r}", None) for r in ("feasibility", "task", "prior")]
+        if any(p is None or p.shape != total.shape for p in parts):
+            return total
+        feasibility, task, prior = (p.to(device=total.device, dtype=total.dtype) for p in parts)
+        ranked = feasibility + task + self._prior_weight_now() * prior
+        gate = float(self.config.feasibility_gate)
+        if gate > 0.0:
+            keep = feasibility <= feasibility.min() + gate
+            if bool(keep.any()):        # never starve the sampler: an all-fail gate keeps everyone
+                # A large FINITE penalty, not inf: the diagnostics form sum(cost * weight), and
+                # inf * 0 is NaN, so an excluded candidate would poison cost_weighted.
+                excluded = ranked.max().detach() + 1.0e4
+                ranked = torch.where(keep, ranked, excluded.expand_as(ranked))
+        return ranked
 
     def _backprop_clean_score(
         self,
@@ -587,6 +813,35 @@ class SimFreeMPC:
         ).detach()
         return score
 
+    def _score_returned_plan(self, result, cost_fn) -> dict[str, float]:
+        """Cost of the plan the sampler RETURNS, beside the population statistics already logged.
+
+        terms_best and terms_weighted are both statistics of the sampled population -- the value at
+        the argmin candidate and the softmax-weighted mean of the values. Neither is the cost of
+        sum_i w_i * sample_i, which is what actually executes, and for a non-convex term the two can
+        disagree without limit: candidates passing either side of a seated object each score zero on
+        a footprint keepout while their mean drives straight through it. Reading best-vs-weighted
+        cannot see that, because it never evaluates the mean.
+
+        Returned keys are prefixed ``mean_plan_``; ``mean_plan_cost_excess`` is the headline --
+        cost(mean) - sum_i w_i cost(sample_i), positive whenever the executed plan is worse than the
+        population it was averaged from.
+        """
+        out: dict[str, float] = {}
+        j = cost_fn(result.mean.unsqueeze(0))
+        out["mean_plan_cost"] = float(j.reshape(-1)[0])
+        weighted = float(torch.sum(result.costs * result.weights).detach().cpu())
+        out["mean_plan_cost_population_weighted"] = weighted
+        out["mean_plan_cost_min"] = float(result.costs.min().detach().cpu())
+        out["mean_plan_cost_excess"] = out["mean_plan_cost"] - weighted
+        terms = getattr(self.cost, "last_terms", None)
+        if terms:
+            for name, values in terms.items():
+                flat = values.reshape(-1)
+                if flat.numel() >= 1:
+                    out[f"mean_plan_term_{name}"] = float(flat[0].detach().cpu())
+        return out
+
     def _last_cost_term_diagnostics(self, result) -> dict[str, Any]:
         cost = getattr(self, "cost", None)
         terms = getattr(cost, "last_terms", None)
@@ -603,6 +858,30 @@ class SimFreeMPC:
             values = values.to(device=result.weights.device, dtype=result.weights.dtype)
             diagnostics[f"term_{name}_best"] = float(values[best_idx].detach().cpu())
             diagnostics[f"term_{name}_weighted"] = float(torch.sum(values * result.weights).detach().cpu())
+        # The same total, split so selection can gate on feasibility, rank on task progress and
+        # only tie-break on the prior. Under rank_mode="roles" result.costs is the ranking scalar,
+        # so the true total is logged beside it and stays comparable across arms.
+        diagnostics["rank_mode"] = self.config.rank_mode
+        if self.config.rank_mode != "total":
+            diagnostics["prior_weight"] = self._prior_weight_now()
+            diagnostics["prior_weight_schedule"] = self.config.prior_weight_schedule
+            true_total = getattr(self, "_last_cost_total", None)
+            if true_total is not None and true_total.shape == result.costs.shape:
+                true_total = true_total.to(device=result.weights.device, dtype=result.weights.dtype)
+                diagnostics["cost_true_total_best"] = float(true_total[best_idx].detach().cpu())
+                diagnostics["cost_true_total_min"] = float(true_total.min().detach().cpu())
+                diagnostics["cost_true_total_weighted"] = float(
+                    torch.sum(true_total * result.weights).detach().cpu())
+        for role in ("feasibility", "task", "prior"):
+            values = getattr(cost, f"last_cost_{role}", None)
+            if values is None or values.ndim != 1 or values.shape[0] != result.costs.shape[0]:
+                continue
+            values = values.to(device=result.weights.device, dtype=result.weights.dtype)
+            diagnostics[f"cost_{role}_best"] = float(values[best_idx].detach().cpu())
+            diagnostics[f"cost_{role}_min"] = float(values.min().detach().cpu())
+            diagnostics[f"cost_{role}_weighted"] = float(
+                torch.sum(values * result.weights).detach().cpu()
+            )
         debug_values = getattr(cost, "last_debug", None)
         if debug_values:
             for name, values in debug_values.items():
@@ -712,6 +991,12 @@ class SimFreeMPC:
                 }
             )
         diagnostics.update(self._last_cost_term_diagnostics(result))
+        # Here rather than per update-mode branch, which already missed mbd_score_action_prox once.
+        # Consumed, not just read, so another mode cannot report a stale plan's cost as its own.
+        mean_plan = getattr(self, "_last_mean_plan", None)
+        self._last_mean_plan = None
+        if mean_plan:
+            diagnostics.update(mean_plan)
         return diagnostics
 
     def _optimize_action_prox_chunk(
@@ -736,10 +1021,17 @@ class SimFreeMPC:
             device=x_t.device,
             dtype=x_t.dtype,
         ).sqrt()
-        proposal_center = self._control_point_resample(
+        resampled = self._control_point_resample(
             x_t.detach()[0, :, :active_dims],
             opt_horizon,
-        ) / torch.clamp(sqrt_alpha, min=self.config.flow_eps)
+        )
+        # Base sampler has no per-step truncation: the priority (vlm_dp) cost needs the unscaled
+        # center, since scaled (z_t / sqrt(alpha_bar)) blows up at high noise. The truncated sampler
+        # clamps decoded joint deltas, so it keeps the scaled center everywhere.
+        if self.config.cost_style == "priority" and self.config.sampler == "base":
+            proposal_center = resampled
+        else:
+            proposal_center = resampled / torch.clamp(sqrt_alpha, min=self.config.flow_eps)
         self._configure_sampler_proposal(
             policy_inputs,
             context,
@@ -749,21 +1041,80 @@ class SimFreeMPC:
             max(1.0 - float(alpha_bar), 0.0)
         )
 
-        def cost_from_positions(samples: torch.Tensor) -> torch.Tensor:
+        def cost_from_positions(
+            samples: torch.Tensor,
+            include_tilt: bool = True,
+        ) -> torch.Tensor:
             full_horizon_samples = self._interpolate_control_points(samples, horizon)
-            return self._cost_active_samples(
+            cost = self._cost_active_samples(
                 full_horizon_samples,
                 x_t,
                 active_dims,
                 policy_inputs,
                 context,
             )
+            tilt = context.get("task_tilt")
+            if tilt is not None and include_tilt:
+                lam = float(tilt["weight"]) * float(tilt.get("authority", 1.0))
+                if lam > 0.0:
+                    pen = task_tilt_penalty(
+                        full_horizon_samples,
+                        tilt["target"],
+                        1.0,
+                        dims=tilt.get("dims"),
+                        dim_weights=tilt.get("dim_weights"),
+                    )
+                    flat = pen.reshape(-1)
+                    if tilt.get("discrimination"):
+                        # Implicit gate: expert weight only where the expert actually separates
+                        # the candidate population (no information -> no authority).
+                        qs = torch.quantile(flat, torch.tensor(
+                            [0.1, 0.5, 0.9], device=flat.device, dtype=flat.dtype))
+                        rel = float((qs[2] - qs[0]) / (qs[1].abs() + 1e-8))
+                        lam = lam * (rel / (1.0 + rel))
+                    ess_cap = tilt.get("ess_cap")
+                    if ess_cap:
+                        # Closed-form ESS guard: bound the tilt's logit dispersion to ~ess_cap
+                        # temperature units so the tilt cannot collapse the softmax population.
+                        std = float(flat.std())
+                        if std > 1e-9:
+                            lam = min(lam, float(ess_cap) * float(self.config.temperature) / std)
+                    cost = cost + lam * pen
+                    self._last_tilt_lambda = lam
+            return cost
 
+        self._last_tilt_lambda = None
+        self._last_inject_slice = None
+        self._last_inject_share = None
         result = self.sampler.optimize_with_noise_scale(
             proposal_center,
             cost_from_positions,
             noise_scale=proposal_std,
         )
+        if self._last_inject_slice is not None and result.weights is not None:
+            # Share of softmax weight won by expert candidates: the direct read on whether injection
+            # contributes at this noise level (and hence on the rho schedule).
+            lo, hi = self._last_inject_slice
+            self._last_inject_share = float(result.weights[lo:hi].sum())
+            # Runs per denoise level, but diagnostics emit once per inference, so a bare value
+            # reports only the last level -- where rho is ~1e-4 and reads ~0 whatever injection did.
+            # Keep the trace: the early levels carry 78% of the injection authority.
+            self._inject_share_trace.append(self._last_inject_share)
+        self._last_tilt_base_cost = None
+        self._last_mean_plan = None
+        if context.get("task_tilt") is not None or self.config.eval_mean_plan:
+            # Both re-enter the cost on a batch of one, overwriting cost.last_terms, after which
+            # the per-term diagnostics silently drop every row. Snapshot first.
+            population_terms = getattr(self.cost, "last_terms", None)
+            with torch.no_grad():
+                if context.get("task_tilt") is not None:
+                    # Thin-product diagnostic: the UNTILTED cost of the tilted winner.
+                    base_j = cost_from_positions(result.mean.unsqueeze(0), include_tilt=False)
+                    self._last_tilt_base_cost = float(base_j.reshape(-1)[0])
+                if self.config.eval_mean_plan:
+                    self._last_mean_plan = self._score_returned_plan(result, cost_from_positions)
+            if population_terms is not None:
+                self.cost.last_terms = population_terms
         x0_hat = x_t.detach().clone()
         x0_hat[:, :, :active_dims] = self._interpolate_control_points(
             result.mean,
@@ -832,6 +1183,7 @@ class SimFreeMPC:
             num_iterations=num_iterations,
             num_train_timesteps=self.config.ddim_num_train_timesteps,
         )
+        self._rank_alpha = float(alpha_bar)      # read by _ranking_scalar for the prior schedule
         x0_hat, result, active_dims, clean_std = self._optimize_ddim_clean_chunk(
             x_t,
             policy_inputs,
@@ -925,6 +1277,7 @@ class SimFreeMPC:
             num_iterations=num_iterations,
             num_train_timesteps=self.config.ddim_num_train_timesteps,
         )
+        self._rank_alpha = float(alpha_bar)      # read by _ranking_scalar for the prior schedule
         x0_hat, result, active_dims, clean_std = self._optimize_ddim_clean_chunk(
             x_t,
             policy_inputs,
@@ -1030,6 +1383,29 @@ class SimFreeMPC:
         score = torch.zeros_like(x_t)
         score[:, :, :active_dims] = score_numerator / beta
 
+        # Additive score-space steering seam: the hook sees this level's candidate
+        # population and returns an (already scaled) score-field addend, blended
+        # into the numerator so the DDIM update and the logged score agree.
+        addend_fn = context.get("score_addend")
+        steer_addend = None
+        if addend_fn is not None:
+            steer_addend = addend_fn(
+                samples=self._interpolate_control_points(result.samples, x_t.shape[1]),
+                weights=result.weights,
+                x_t=x_t,
+                base_score=score,
+                iteration=iteration,
+                num_iterations=num_iterations,
+                alpha_bar=float(alpha_bar),
+            )
+        if steer_addend is not None:
+            addend = torch.as_tensor(
+                steer_addend, device=x_t.device, dtype=x_t.dtype)
+            if addend.ndim == 2:
+                addend = addend.unsqueeze(0)
+            score_numerator = score_numerator + beta * addend[:, :, :active_dims]
+            score[:, :, :active_dims] = score_numerator / beta
+
         alpha_step = torch.clamp(
             alpha / torch.clamp(alpha_prev, min=self.config.flow_eps),
             min=self.config.flow_eps,
@@ -1040,6 +1416,9 @@ class SimFreeMPC:
 
         next_x = x_t.detach().clone()
         next_x[:, :, :active_dims] = active_prev
+        next_x = self._ancestral_noise(
+            next_x, active_dims, iteration=iteration,
+            num_iterations=num_iterations, alpha_bar_prev=alpha_bar_prev)
 
         diagnostics = self._diagnostics(result=result, target=x0_hat, x_t=x_t, score=score)
         diagnostics.update(
@@ -1055,8 +1434,20 @@ class SimFreeMPC:
                 "clean_sample_std": float(proposal_std),
                 "score_scale": float(score_scale),
                 "mbd_step_delta_norm": float(torch.linalg.vector_norm((next_x - x_t).detach()).cpu()),
+                "ancestral_eta": float(self.config.ancestral_eta),
+                "logit_norm": self.config.logit_norm,
             }
         )
+        if steer_addend is not None:
+            diagnostics["score_addend_norm"] = float(
+                torch.linalg.vector_norm(
+                    torch.as_tensor(steer_addend, dtype=x_t.dtype)).cpu())
+        inject = context.get("inject")
+        if inject is not None:
+            diagnostics["inject_rho"] = float(inject.get("rho", 0.0))
+            if getattr(self, "_last_inject_share", None) is not None:
+                diagnostics["inject_weight_share"] = self._last_inject_share
+            self._add_inject_trace_diagnostics(diagnostics)
         return next_x, diagnostics
 
     def step_mbd_score_action_warm(
@@ -1113,6 +1504,7 @@ class SimFreeMPC:
             num_iterations=num_iterations,
             num_train_timesteps=self.config.ddim_num_train_timesteps,
         )
+        self._rank_alpha = float(alpha_bar)      # read by _ranking_scalar for the prior schedule
         x0_hat, result, active_dims, clean_std = self._optimize_ddim_clean_chunk(
             x_t,
             policy_inputs,
@@ -1235,6 +1627,20 @@ class SimFreeMPC:
                 "clean_sample_std": float(proposal_std),
             }
         )
+        tilt = context.get("task_tilt")
+        if tilt is not None:
+            diagnostics["task_tilt_weight"] = float(tilt["weight"])
+            diagnostics["task_tilt_authority"] = float(tilt.get("authority", 1.0))
+            if getattr(self, "_last_tilt_lambda", None) is not None:
+                diagnostics["task_tilt_lambda_eff"] = self._last_tilt_lambda
+            if getattr(self, "_last_tilt_base_cost", None) is not None:
+                diagnostics["task_tilt_base_cost_mean"] = self._last_tilt_base_cost
+        inject = context.get("inject")
+        if inject is not None:
+            diagnostics["inject_rho"] = float(inject.get("rho", 0.0))
+            if getattr(self, "_last_inject_share", None) is not None:
+                diagnostics["inject_weight_share"] = self._last_inject_share
+            self._add_inject_trace_diagnostics(diagnostics)
         return score, numerator, diagnostics
 
     def estimate_mbd_score_action_warm(
@@ -1277,6 +1683,34 @@ class SimFreeMPC:
         diagnostics["update_mode"] = "estimate_mbd_score_action_warm"
         return score, numerator, diagnostics
 
+    def _ancestral_noise(
+        self,
+        x_prev: torch.Tensor,
+        active_dims: int,
+        *,
+        iteration: int,
+        num_iterations: int,
+        alpha_bar_prev: float,
+    ) -> torch.Tensor:
+        """Marginal re-noising between denoise levels (opt-in via ancestral_eta).
+
+        If x0_hat samples the level's smoothed posterior, adding
+        eta*sqrt(1-abar_prev)*z distributes x_{k-1} as the forward marginal at
+        the destination level (MBD's Monte-Carlo ancestral scheme; eta=0 is the
+        current deterministic chain). Never applied at the final level, and only
+        to the active dims. One draw per level per chain.
+        """
+        eta = float(self.config.ancestral_eta)
+        if eta <= 0.0 or iteration + 1 >= num_iterations:
+            return x_prev
+        sigma = eta * math.sqrt(max(1.0 - float(alpha_bar_prev), 0.0))
+        if sigma <= 0.0:
+            return x_prev
+        noised = x_prev.clone()
+        active = x_prev[:, :, :active_dims]
+        noised[:, :, :active_dims] = active + sigma * torch.randn_like(active)
+        return noised
+
     def step_from_mbd_residual(
         self,
         x_t: torch.Tensor,
@@ -1313,15 +1747,22 @@ class SimFreeMPC:
             min=self.config.flow_eps,
         )
 
+        if isinstance(residual_scale, torch.Tensor):
+            # Per-channel gamma: broadcast over the active action dims.
+            res_scale = residual_scale.to(device=x_t.device, dtype=x_t.dtype)[..., :active_dims]
+        else:
+            res_scale = float(residual_scale)
         active_x = x_t.detach()[:, :, :active_dims]
         active_prev = (
             active_x
             + float(base_scale) * base_numerator[:, :, :active_dims]
-            + float(residual_scale) * beta * residual_score[:, :, :active_dims]
+            + res_scale * beta * residual_score[:, :, :active_dims]
         ) / torch.sqrt(alpha_step)
         next_x = x_t.detach().clone()
         next_x[:, :, :active_dims] = active_prev
-        return next_x
+        return self._ancestral_noise(
+            next_x, active_dims, iteration=iteration,
+            num_iterations=num_iterations, alpha_bar_prev=alpha_bar_prev)
 
     def step_from_score(
         self,
@@ -1380,4 +1821,6 @@ class SimFreeMPC:
             )
 
         next_x[:, :, :active_dims] = active_prev
-        return next_x
+        return self._ancestral_noise(
+            next_x, active_dims, iteration=iteration,
+            num_iterations=num_iterations, alpha_bar_prev=alpha_bar_prev)

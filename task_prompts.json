@@ -3,26 +3,91 @@
     "task_id": "Isaac-Pot-Droid-Visuomotor-v0",
     "prompt": "remove the lid of the pot and put egg in it",
     "task_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_pot_pi05_jointpos/task/24000",
-    "ref_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_pot_pi05_jointpos/reference/20000"
+    "ref_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_pot_pi05_jointpos/reference/20000",
+    "grasp_obj": "egg",
+    "place_obj": "pot",
+    "objects": {
+      "pot": "cooking pot",
+      "cover": "pot lid",
+      "egg": "egg"
+    },
+    "fixtures": [],
+    "grasp_objs": [
+      "egg",
+      "cover"
+    ]
   },
   "weight": {
     "task_id": "Isaac-Weight-Droid-Visuomotor-v0",
     "prompt": "put pear and apple on the scale",
+    "grasp_obj": "pear",
+    "place_obj": "scale",
     "task_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_weight_pi05_jointpos/task/24000",
     "ref_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_weight_pi05_jointpos/reference/20000",
+    "objects": {
+      "pear": "yellow pear",
+      "apple": "red apple",
+      "mango": "red green mango",
+      "cabbage": "green cabbage",
+      "board": "wooden cutting board",
+      "scale": "kitchen scale"
+    },
+    "fixtures": [
+      "scale"
+    ],
+    "grasp_objs": [
+      "pear",
+      "apple"
+    ],
     "score_task_checkpoint_dir": "openpi/checkpoints/score_task_weight/task_eps/30000",
-    "score_ref_checkpoint_dir": "openpi/checkpoints/score_ref_weight/ref/30000"
+    "score_ref_checkpoint_dir": "openpi/checkpoints/score_ref_weight/ref/30000",
+    "support": "board"
   },
   "tea": {
     "task_id": "Isaac-Tea-Droid-Visuomotor-v0",
     "prompt": "pour the tea from the teapot into the cup",
+    "grasp_obj": "teapot",
+    "place_obj": "teacup",
     "task_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_tea_pi05_jointpos/task/32000",
-    "ref_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_tea_pi05_jointpos/reference/20000"
+    "score_task_checkpoint_dir": "openpi/checkpoints/score_task_tea/task_eps/30000",
+    "ref_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_tea_pi05_jointpos/reference/20000",
+    "objects": {
+      "teapot": "teapot . green teapot . jade teapot . pot with a spout",
+      "teacup": "teacup . green teacup",
+      "teatable": "wooden table . long low table",
+      "bookcase": "bookshelf",
+      "robot": "white robot arm"
+    },
+    "fixtures": [],
+    "grasp_objs": [
+      "teapot"
+    ],
+    "support": "teatable"
   },
   "capsule": {
     "task_id": "Isaac-Capsule-Droid-Visuomotor-v0",
     "prompt": "open the coffee maker lid and put the pod inside",
     "task_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_capsule_pi05_jointpos/task/32000",
-    "ref_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_capsule_pi05_jointpos/reference/20000"
+    "ref_checkpoint_dir": "openpi/checkpoints/proxy_isaaclab_droid_capsule_pi05_jointpos/reference/20000",
+    "grasp_obj": "can",
+    "place_obj": "capsule",
+    "grasp_objs": [
+      "can"
+    ],
+    "objects": {
+      "can": "can . coffee pod . coffee capsule . small jar",
+      "capsule": "capsule coffee maker",
+      "coffeemaker": "coffee machine . espresso machine",
+      "robot": "white robot arm"
+    },
+    "fixtures": [
+      "capsule"
+    ]
+  },
+  "utensil": {
+    "task_id": "Isaac-Utensil-Droid-Visuomotor-v0",
+    "prompt": "put the knife in the holder",
+    "grasp_obj": "knife",
+    "place_obj": "holder"
   }
 }

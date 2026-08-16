@@ -52,6 +52,9 @@ ROBOT_TABLE_INIT_ROT = (
 TEA_OBJECT_RESET_CENTER = (3.0, 5.5, 0.86)
 TEA_OBJECT_X_RANGE = 0.17
 TEA_OBJECT_Y_RANGE = 0.4
+# Must exceed the pour predicate's xy_threshold (0.10) with margin, or the teapot mouth is over the
+# cup at spawn and the task is satisfiable without transporting anything.
+TEA_OBJECT_MIN_SEPARATION = 0.3
 
 
 @configclass
@@ -83,7 +86,18 @@ class EventCfg(BaseEventCfg):
                 "pitch": (0.0, 0.0),
                 "yaw": (np.pi / 2.0 - 0.5, np.pi / 2.0 + 0.5),
             },
-            "min_separation": 0.3,
+            "min_separation": TEA_OBJECT_MIN_SEPARATION,
+        },
+    )
+
+    # Declared AFTER randomize_tea_objects so it validates the poses the episode actually uses:
+    # a degenerate spawn makes task_done_tea true at spawn, so a tip-in-place scores as a pour.
+    assert_tea_object_separation = EventTerm(
+        func=tea_events.assert_min_separation,
+        mode="reset",
+        params={
+            "asset_cfgs": [SceneEntityCfg("teapot"), SceneEntityCfg("teacup")],
+            "min_separation": TEA_OBJECT_MIN_SEPARATION,
         },
     )
 

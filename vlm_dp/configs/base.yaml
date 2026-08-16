@@ -1,0 +1,52 @@
+# base -- the default cost for the vlm_dp bridge (--vlm_cost_config default).
+#
+# Only `cost:` is read: term weights + gripper/collision geometry. Copy for a variant
+# rather than editing in place.
+
+cost:
+  terms:
+    # -- attractors
+    reach: 25.0
+    terminal_reach: 40.0
+    rekep_subgoal: 25.0
+    rekep_path: 200.0
+    # -- regularizers
+    smooth: 7.8                  # = grasp_flow's 0.08 x (H-1)x7 (hers SUMS over joints x ...
+    joint_delta: 5.25            # = grasp_flow's local 0.05 x Hx7 (same sum-vs-mean unit ...
+    # -- grasp / pinch
+    orientation: 8.0             # grasp_flow's orient weight
+    # -- regularizers
+    consistency: 30.0
+    # -- grasp / pinch
+    straddle: 30.0
+    # -- keepout
+    collision: 20.0
+    floor: 40.0
+    # -- grasp / pinch
+    tip_z: 80.0
+    yaw: 5.0
+    center_region: 120.0
+    aperture_region: 80.0
+    close_gripper: 2.0
+    # -- lift / carry
+    carry_hold: 40.0             # pins the gripper closed while carrying (matches grasp-flow ...
+    # -- place
+    place_descent: 130.0         # grasp_flow's place_reach 12 + place_xy 120 aggregate
+    place_terminal: 60.0         # grasp_flow's place_terminal (end-of-chunk seat pull)
+    # -- regularizers
+    gripper_smooth: 0.5          # keeps the executed gripper channel steady (this harness has ...
+  geometry:
+    ee_r: 0.035
+    coll_clear: 0.02
+    finger_r: 0.012
+    open_half: 0.04
+    tool_back: 0.06
+    tcp_to_tip: 0.0
+    center_scale: 0.40           # grasp_flow's value; 0.12 was tuned for the vlm_base driver ...
+    close_z_scale: 0.025
+    aperture_margin: 0.006
+    release_xy: 0.06
+    release_z: 0.035
+    place_descend_radius: 0.18
+    place_seat_radius: 0.1
+    place_carry_clear: 0.1

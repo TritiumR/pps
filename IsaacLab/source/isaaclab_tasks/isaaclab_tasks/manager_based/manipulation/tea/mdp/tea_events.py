@@ -609,26 +609,30 @@ def sample_object_poses(
         pose_range.get(key, (0.0, 0.0))
         for key in ["x", "y", "z", "roll", "pitch", "yaw"]
     ]
-    pose_list = []
 
-    for i in range(num_objects):
-        for j in range(max_sample_tries):
-            sample = [random.uniform(range[0], range[1]) for range in range_list]
+    # Rejection-sample the WHOLE configuration, not each object in turn: the per-object loop
+    # accepted the first draw unconditionally, and a mid-range first object leaves no satisfiable
+    # position for the second (~23% of draws).
+    for _attempt in range(max_sample_tries):
+        pose_list = []
+        for _i in range(num_objects):
+            sample = [random.uniform(lo, hi) for lo, hi in range_list]
+            if pose_list and any(
+                math.dist(sample[:3], pose[:3]) <= min_separation for pose in pose_list
+            ):
+                break                      # this configuration is dead; redraw all of it
+            pose_list.append(sample)
+        if len(pose_list) == num_objects:
+            return pose_list
 
-            # Accept pose if it is the first one, or if reached max num tries
-            if len(pose_list) == 0 or j == max_sample_tries - 1:
-                pose_list.append(sample)
-                break
-
-            # Check if pose of object is sufficiently far away from all other objects
-            separation_check = [
-                math.dist(sample[:3], pose[:3]) > min_separation for pose in pose_list
-            ]
-            if False not in separation_check:
-                pose_list.append(sample)
-                break
-
-    return pose_list
+    raise RuntimeError(
+        f"sample_object_poses: could not place {num_objects} objects at least {min_separation} m "
+        f"apart in {max_sample_tries} full-configuration draws. pose_range {pose_range} is too small "
+        "for that separation -- widen the range or lower min_separation. Silently accepting a "
+        "violating pose would yield a degenerate scene whose success predicate is trivially "
+        "satisfiable (measured on tea: teapot and teacup 3 cm apart made the pour predicate true at "
+        "spawn, and that seed produced the only 'success' on record)."
+    )
 
 
 def randomize_object_pose(
@@ -926,3 +930,36 @@ def randomize_camera_offset(
         env_ids=env_ids.tolist(),
         convention="world",
     )
+
+
+def assert_min_separation(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    asset_cfgs: list[SceneEntityCfg],
+    min_separation: float,
+):
+    """Reset-time invariant: the named assets must spawn at least min_separation apart (xy).
+
+    A separate guard from sample_object_poses' own check because a degenerate scene can arise from
+    more than an exhausted sampler -- randomize_object_pose returns silently when env_ids is None, and
+    reset_scene_to_default can restore the USD poses. Whatever the cause, a scene where the teapot and
+    teacup overlap makes the pour predicate true at spawn, so it must never pass unnoticed.
+    """
+    if env_ids is None:
+        return
+    if isinstance(env_ids, slice):
+        env_ids = torch.arange(env.scene.num_envs, device=env.device, dtype=torch.long)[env_ids]
+    for cur_env in env_ids.tolist():
+        pos = []
+        for cfg in asset_cfgs:
+            p = env.scene[cfg.name].data.root_pos_w[cur_env, :3]
+            pos.append(p - env.scene.env_origins[cur_env, 0:3])
+        for a in range(len(pos)):
+            for b in range(a + 1, len(pos)):
+                d = float(torch.linalg.vector_norm(pos[a][:2] - pos[b][:2]))
+                if d < min_separation:
+                    raise RuntimeError(
+                        f"degenerate spawn in env {cur_env}: {asset_cfgs[a].name} and "
+                        f"{asset_cfgs[b].name} are {d:.3f} m apart in xy, below the required "
+                        f"{min_separation:.3f} m. The success predicate would be satisfiable without "
+                        "performing the task; refusing to run this episode.")
