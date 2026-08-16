@@ -92,6 +92,46 @@ def test_grouped_score_labels_reuse_visual_prefix_and_match_flat_loss():
     flat_loss.mean().backward()
     torch.testing.assert_close(grouped_model.prefix_scale.grad, flat_model.prefix_scale.grad)
 
+def test_grouped_clean_actions_online_noise_match_flat_loss():
+    torch.manual_seed(3)
+    batch_size, chunks_per_observation = 2, 4
+    state = torch.randn(batch_size, 2)
+    actions = torch.randn(batch_size, chunks_per_observation, 3, 2)
+    noise = torch.randn_like(actions)
+    alpha = torch.linspace(0.1, 0.8, batch_size * chunks_per_observation)
+    time = torch.linspace(0.0, 1.0, batch_size * chunks_per_observation)
+
+    grouped_model = _TinyProxyScore()
+    grouped_model.config.prediction_type = "epsilon"
+    grouped_model._sample_train_alpha = lambda *args: (alpha, time)
+    grouped_observation = SimpleNamespace(state=state)
+    grouped_loss = grouped_model(
+        grouped_observation,
+        actions,
+        noise=noise,
+    )
+
+    flat_model = _TinyProxyScore()
+    flat_model.config.prediction_type = "epsilon"
+    flat_model.load_state_dict(grouped_model.state_dict())
+    flat_model._sample_train_alpha = lambda *args: (alpha, time)
+    flat_observation = SimpleNamespace(
+        state=state.repeat_interleave(chunks_per_observation, dim=0)
+    )
+    flat_loss = flat_model(
+        flat_observation,
+        actions.flatten(0, 1),
+        noise=noise.flatten(0, 1),
+    )
+
+    assert grouped_model.prefix_batch_sizes == [batch_size]
+    assert flat_model.prefix_batch_sizes == [batch_size * chunks_per_observation]
+    torch.testing.assert_close(grouped_loss.flatten(0, 1), flat_loss)
+
+    grouped_loss.mean().backward()
+    flat_loss.mean().backward()
+    torch.testing.assert_close(grouped_model.prefix_scale.grad, flat_model.prefix_scale.grad)
+
 
 def test_expert_demo_score_loss_is_weighted_by_noise_variance():
     model = _TinyProxyScore()
@@ -166,6 +206,25 @@ def test_epsilon_prediction_drives_ddim_sampling_directly():
     eps_pred = noise + model.prefix_scale
     expected = (noise - sqrt_beta * eps_pred) / sqrt_alpha
     torch.testing.assert_close(actions, expected)
+
+
+def test_direct_epsilon_target_compares_raw_output_not_converted_score():
+    model = _TinyProxyScore()
+    model.config.prediction_type = "epsilon"
+    actions = torch.randn(2, 3, 2)
+    epsilon_target = torch.randn_like(actions)
+    time = torch.tensor([0.2, 0.8])
+    observation = SimpleNamespace(state=torch.zeros(2, 2))
+
+    loss = model(
+        observation,
+        actions,
+        time=time,
+        model_output_target=epsilon_target,
+    )
+
+    raw_output = actions + model.prefix_scale + time[:, None, None]
+    torch.testing.assert_close(loss, (raw_output - epsilon_target).square())
 
 
 def test_block_attention_matches_image_state_action_layout():
@@ -259,3 +318,45 @@ def test_diffusion_head_passes_selected_mask_to_expert():
         model.expert_model.attention_mask,
         torch.cat([prefix_pad, suffix_pad], dim=1),
     )
+
+
+def test_grouped_epsilon_actions_reuse_visual_prefix_and_match_flat_loss():
+    torch.manual_seed(13)
+    batch_size, targets_per_observation = 2, 4
+    state = torch.randn(batch_size, 2)
+    actions = torch.randn(batch_size, targets_per_observation, 3, 2)
+    noise = torch.randn_like(actions)
+    alpha = torch.rand(batch_size, targets_per_observation) * 0.8 + 0.1
+
+    grouped_model = _TinyProxyScore()
+    grouped_model.config.prediction_type = "epsilon"
+    grouped_model._alpha_from_time = lambda time, *_: time
+    grouped_observation = SimpleNamespace(state=state)
+    grouped_loss = grouped_model(
+        grouped_observation,
+        actions,
+        noise=noise,
+        time=alpha,
+    )
+
+    flat_model = _TinyProxyScore()
+    flat_model.load_state_dict(grouped_model.state_dict())
+    flat_model.config.prediction_type = "epsilon"
+    flat_model._alpha_from_time = lambda time, *_: time
+    flat_observation = SimpleNamespace(
+        state=state.repeat_interleave(targets_per_observation, dim=0)
+    )
+    flat_loss = flat_model(
+        flat_observation,
+        actions.flatten(0, 1),
+        noise=noise.flatten(0, 1),
+        time=alpha.flatten(),
+    )
+
+    assert grouped_model.prefix_batch_sizes == [batch_size]
+    assert flat_model.prefix_batch_sizes == [batch_size * targets_per_observation]
+    torch.testing.assert_close(grouped_loss.flatten(0, 1), flat_loss)
+
+    grouped_loss.mean().backward()
+    flat_loss.mean().backward()
+    torch.testing.assert_close(grouped_model.prefix_scale.grad, flat_model.prefix_scale.grad)

@@ -703,6 +703,9 @@ import copy
 import re
 
 from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
+from openpi.models_pytorch.proxy_score_pytorch import (
+    ddim_iteration_alphas as proxy_ddim_iteration_alphas,
+)
 from sim_free_mpc import AccelActionMPC, AccelMPCConfig, SimFreeMPC, SimFreeMPCConfig
 from sim_free_mpc.action_space import (
     DemoDeltaDecodePolicy,
@@ -713,6 +716,12 @@ from sim_free_mpc.action_space import (
 from sim_free_mpc.ddim import ddim_iteration_alphas
 from sim_free_mpc.planner import task_tilt_weight
 from sim_free_mpc.score_steering import combine_scores, steer_scale_for_stage
+from tools.runtime_ref_cache import (
+    ACTION_PROX_NOISE_SCHEDULE,
+    RuntimeRefCacheCollector,
+    file_sha256 as _ref_cache_file_sha256,
+    norm_stats_fingerprint as _ref_cache_norm_stats_fingerprint,
+)
 
 
 DEFAULT_BASE_CHECKPOINT_DIR = "openpi/checkpoints/pytorch/pi05_droid_jointpos"
@@ -739,6 +748,25 @@ def _seed_runtime(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def _capture_rng_state() -> dict[str, Any]:
+    """Snapshot every RNG touched by policy/MPC inference."""
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.random.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def _restore_rng_state(state: dict[str, Any]) -> None:
+    """Restore an inference RNG snapshot without advancing the rollout stream."""
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.random.set_rng_state(state["torch"])
+    if state["cuda"] is not None:
+        torch.cuda.set_rng_state_all(state["cuda"])
 
 
 def _enable_deterministic_runtime(seed: int) -> None:
@@ -1619,6 +1647,10 @@ def _pixel_consumers(args) -> list[str]:
         consumers.append(f"--vlm_cost {args.vlm_cost} (ReKep keypoint proposal reads table_cam)")
     if getattr(args, "mpc_debug_video_overlay", False):
         consumers.append("--mpc_debug_video_overlay")
+    if getattr(args, "policy_chunk_video_overlay", False):
+        consumers.append("--policy_chunk_video_overlay")
+    if int(getattr(args, "diffusion_chunk_video_step", -1)) >= 0:
+        consumers.append("--diffusion_chunk_video_step")
     return consumers
 
 
@@ -1758,6 +1790,7 @@ def infer_actions_with_mpc(
     mpc_context=None,
     warm_shift_steps=0,
     base_decode_policy=None,
+    initial_noise=None,
 ):
     global _LAST_INFERENCE_RUNTIME
     standalone_role = _standalone_policy_role(args)
@@ -1801,6 +1834,8 @@ def infer_actions_with_mpc(
     if _uses_vlm_mpc_base(args) and mpc_planner is None:
         raise ValueError("VLM/MPC base mode requires a SimFreeMPC planner.")
     if not _uses_vlm_mpc_base(args):
+        if initial_noise is not None:
+            raise ValueError("Explicit initial noise is currently supported only by VLM/MPC inference.")
         return infer_actions(base_policy, task_policy, ref_policy, raw_obs, args)
     if mpc_planner is None:
         return infer_actions(base_policy, task_policy, ref_policy, raw_obs, args)
@@ -1814,6 +1849,7 @@ def infer_actions_with_mpc(
         mpc_context=mpc_context,
         warm_shift_steps=warm_shift_steps,
         base_decode_policy=base_decode_policy,
+        initial_noise=initial_noise,
     )
 
 
@@ -1828,6 +1864,7 @@ def _infer_actions_eager(
     mpc_context=None,
     warm_shift_steps=0,
     base_decode_policy=None,
+    initial_noise=None,
 ):
     global _LAST_INFERENCE_RUNTIME
     base_obs, base_inputs = _obs_to_input_checked(base_policy, raw_obs, "base")
@@ -1873,7 +1910,17 @@ def _infer_actions_eager(
         base_model.config.action_horizon,
         base_action_dim,
     )
-    noise = base_model.sample_noise(actions_shape, device)
+    if initial_noise is None:
+        noise = base_model.sample_noise(actions_shape, device)
+    else:
+        noise = torch.as_tensor(
+            initial_noise,
+            device=device,
+            dtype=torch.float32,
+        )
+        if tuple(noise.shape) != tuple(actions_shape):
+            raise ValueError(f"initial_noise must have shape {actions_shape}, got {tuple(noise.shape)}.")
+        noise = noise.detach().clone()
 
     if use_vlm_mpc_base:
         state = None
@@ -1979,6 +2026,22 @@ def _infer_actions_eager(
         "action_warm_started": bool(action_warm_started),
         "action_warm_shift_steps": int(warm_shift_steps) if action_warm_started else 0,
     }
+    capture_denoise_trace = bool(getattr(args, "_capture_denoise_trace", False))
+    denoise_trace_value = getattr(args, "_capture_denoise_value", "state")
+    denoise_model_trace = []
+    denoise_time_trace = []
+
+    def record_denoise_state(state_t, time_t, *, x0_t=None):
+        if not capture_denoise_trace:
+            return
+        if denoise_trace_value == "x0":
+            if x0_t is None:
+                raise RuntimeError("x0 trace requested but this denoise path did not expose x0.")
+            trace_t = x0_t
+        else:
+            trace_t = state_t
+        denoise_model_trace.append(trace_t.detach().clone())
+        denoise_time_trace.append(float(torch.as_tensor(time_t).detach().cpu()))
 
     def record_mpc_stats(stats):
         if args.mpc_update == "mbd_score_action_warm":
@@ -2227,6 +2290,13 @@ def _infer_actions_eager(
                     flush=True,
                 )
             mpc_denoise_iteration += 1
+            record_denoise_state(
+                x_t,
+                _proxy_score_time_cond(
+                    args, mpc_denoise_iteration - 1, x_t.device, x_t.dtype
+                ),
+                x0_t=getattr(mpc_planner, "_last_x0_hat", None),
+            )
             denoise_time += dt
             continue
 
@@ -2430,6 +2500,18 @@ def _infer_actions_eager(
 
             active_dims = int(geom_stats.get("active_dims", task_score.shape[-1]))
             score_update_mode = _score_update_mode_for_mpc_update(args.mpc_update)
+            score_alpha, _ = ddim_iteration_alphas(
+                iteration=mpc_denoise_iteration,
+                num_iterations=mpc_denoise_iterations,
+                num_train_timesteps=args.mpc_ddim_train_timesteps,
+            )
+            score_alpha_t = torch.as_tensor(
+                score_alpha, device=x_t.device, dtype=x_t.dtype
+            )
+            score_beta_t = torch.clamp(1.0 - score_alpha_t, min=1e-6)
+            combined_x0 = (
+                x_t + score_beta_t * combined_score
+            ) / torch.sqrt(torch.clamp(score_alpha_t, min=1e-6))
             if score_update_mode == "mbd_score":
                 x_t = mpc_planner.step_from_mbd_residual(
                     x_t,
@@ -2597,6 +2679,7 @@ def _infer_actions_eager(
                     flush=True,
                 )
             mpc_denoise_iteration += 1
+            record_denoise_state(x_t, score_time[0], x0_t=combined_x0)
             denoise_time += dt
             continue
 
@@ -2731,6 +2814,7 @@ def _infer_actions_eager(
             v_t = base_v_t
 
         x_t = x_t + dt * v_t
+        record_denoise_state(x_t, denoise_time)
         if need_compare:
             teacher_path_x_t = teacher_path_x_t + dt * teacher_base_v_t
         denoise_time += dt
@@ -2768,6 +2852,38 @@ def _infer_actions_eager(
             .cpu()
             .numpy()
         )
+    if capture_denoise_trace:
+        if not denoise_model_trace:
+            raise RuntimeError("Denoise trace capture was requested but no reverse step ran.")
+        trace_latents = torch.cat(denoise_model_trace, dim=0)
+        if base_decode_policy is None:
+            trace_chunks = []
+            for latent in trace_latents:
+                trace_chunks.append(
+                    torch.as_tensor(
+                        base_policy.output_to_actions(base_inputs, latent.unsqueeze(0)),
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                )
+            trace_actions = torch.stack(trace_chunks, dim=0)
+        else:
+            trace_actions = decode_model_action_chunks(
+                base_decode_policy,
+                base_inputs,
+                trace_latents,
+                apply_clamp=False,
+            ).real_actions
+        if use_vlm_mpc_base:
+            trace_actions = clamp_real_action_chunk(
+                trace_actions,
+                current_joint_pos=raw_obs.get("observation/joint_position"),
+                max_joint_delta=max_joint_delta,
+            )
+        runtime_stats["denoise_action_trace"] = (
+            trace_actions[..., :8].detach().cpu().numpy()
+        )
+        runtime_stats["denoise_time_trace"] = denoise_time_trace
     compare_stats = {}
     if need_compare:
         compare_stats["shared_flow_path"] = {
@@ -2782,6 +2898,445 @@ def _infer_actions_eager(
         }
     _LAST_INFERENCE_RUNTIME = runtime_stats
     return actions, compare_stats
+
+
+def _infer_task_denoise_trace(
+    task_policy,
+    raw_obs,
+    noise,
+    *,
+    num_steps,
+    current_joint_pos,
+    max_joint_delta,
+    trace_value="state",
+):
+    """Run the Task checkpoint's native DDIM chain and decode every reverse step."""
+    task_obs, task_inputs = _obs_to_input_checked(task_policy, raw_obs, "task")
+    model = task_policy._model
+    if not _is_score_proxy(model):
+        raise ValueError("Diffusion visualization requires a ProxyScore Task checkpoint.")
+    prepared = _prepare_proxy_steering(model, task_obs)
+    x_t = noise.detach().clone().to(
+        device=task_policy._pytorch_device,
+        dtype=torch.float32,
+    )
+    model_trace = []
+    time_trace = []
+    for iteration in range(int(num_steps)):
+        alpha, alpha_prev, time_cond = proxy_ddim_iteration_alphas(
+            iteration=iteration,
+            num_iterations=int(num_steps),
+            num_train_timesteps=int(model.config.ddim_num_train_timesteps),
+            device=x_t.device,
+            dtype=x_t.dtype,
+        )
+        score = _predict_proxy_score(
+            prepared,
+            model,
+            x_t,
+            time_cond.expand(x_t.shape[0]),
+        )
+        beta = torch.clamp(1.0 - alpha, min=1e-6)
+        sqrt_alpha = torch.sqrt(torch.clamp(alpha, min=1e-6))
+        sqrt_beta = torch.sqrt(beta)
+        x0_hat = (x_t + beta * score) / sqrt_alpha
+        eps_hat = -sqrt_beta * score
+        x_t = (
+            torch.sqrt(torch.clamp(alpha_prev, min=0.0)) * x0_hat
+            + torch.sqrt(torch.clamp(1.0 - alpha_prev, min=0.0)) * eps_hat
+        )
+        model_trace.append(
+            (x0_hat if trace_value == "x0" else x_t).detach().clone()
+        )
+        time_trace.append(float(time_cond.detach().cpu()))
+
+    latents = torch.cat(model_trace, dim=0)
+    trace_actions = decode_model_action_chunks(
+        task_policy,
+        task_inputs,
+        latents,
+        apply_clamp=False,
+    ).real_actions
+    trace_actions = clamp_real_action_chunk(
+        trace_actions,
+        current_joint_pos=current_joint_pos,
+        max_joint_delta=max_joint_delta,
+    )
+    final_actions = decode_model_action_chunks(
+        task_policy,
+        task_inputs,
+        x_t,
+        apply_clamp=False,
+    ).real_actions
+    final_actions = clamp_real_action_chunk(
+        final_actions,
+        current_joint_pos=current_joint_pos,
+        max_joint_delta=max_joint_delta,
+    )
+    trace = trace_actions[..., :8].detach().cpu().numpy()
+    return final_actions[0, ..., :8].detach().cpu().numpy(), trace, time_trace
+
+
+def _infer_flow_policy_quintet(
+    base_policy,
+    task_policy,
+    ref_policy,
+    raw_obs,
+    args,
+):
+    """Trace Base, Ref, Task, Task-Ref, and Steer flow chains from shared noise."""
+    global _LAST_INFERENCE_RUNTIME
+
+    if task_policy is None or ref_policy is None:
+        raise ValueError("Flow quintet visualization requires Task and Ref policies.")
+    base_model = base_policy._model
+    task_model = task_policy._model
+    ref_model = ref_policy._model
+    if base_model.config.model_type not in (_model.ModelType.PI0, _model.ModelType.PI05):
+        raise ValueError("Flow quintet visualization requires a PI0/PI05 Base checkpoint.")
+    if task_model.config.model_type != _model.ModelType.PROXY:
+        raise ValueError("Flow quintet visualization requires a flow-matching PROXY Task checkpoint.")
+    if ref_model.config.model_type != _model.ModelType.PROXY:
+        raise ValueError("Flow quintet visualization requires a flow-matching PROXY Ref checkpoint.")
+
+    base_obs, base_inputs = _obs_to_input_checked(base_policy, raw_obs, "base")
+    task_obs, task_inputs = _obs_to_input_checked(task_policy, raw_obs, "task")
+    ref_obs, ref_inputs = _obs_to_input_checked(ref_policy, raw_obs, "ref")
+    proxy_dim = int(task_model.config.action_dim)
+    if proxy_dim != int(ref_model.config.action_dim):
+        raise ValueError("Task and Ref flow proxies must have the same action dimension.")
+
+    base_images, base_img_masks, lang_tokens, lang_masks, base_state = (
+        base_model._preprocess_observation(base_obs, train=False)
+    )
+    base_prefix_embs, base_prefix_pad_masks, base_prefix_att_masks = (
+        base_model.embed_prefix(base_images, base_img_masks, lang_tokens, lang_masks)
+    )
+    base_prefix_att_2d_masks = make_att_2d_masks(
+        base_prefix_pad_masks, base_prefix_att_masks
+    )
+    base_prefix_position_ids = torch.cumsum(base_prefix_pad_masks, dim=1) - 1
+    base_prefix_att_2d_masks_4d = base_model._prepare_attention_masks_4d(
+        base_prefix_att_2d_masks
+    )
+    base_model.paligemma_with_expert.paligemma.language_model.config._attn_implementation = (
+        "eager"
+    )
+    _, base_past_key_values = base_model.paligemma_with_expert.forward(
+        attention_mask=base_prefix_att_2d_masks_4d,
+        position_ids=base_prefix_position_ids,
+        past_key_values=None,
+        inputs_embeds=[base_prefix_embs, None],
+        use_cache=True,
+    )
+
+    prepared_task = _prepare_proxy_steering(task_model, task_obs)
+    prepared_ref = _prepare_proxy_steering(ref_model, ref_obs)
+    if (
+        getattr(task_model.config, "freeze_dino_encoder", False)
+        and getattr(ref_model.config, "freeze_dino_encoder", False)
+        and getattr(task_model.config, "dino_model_name", None)
+        == getattr(ref_model.config, "dino_model_name", None)
+        and prepared_task["kind"] == "sequence"
+        and prepared_ref["kind"] == "sequence"
+    ):
+        prepared_ref["prefix_embs"] = prepared_task["prefix_embs"]
+        prepared_ref["prefix_pad_masks"] = prepared_task["prefix_pad_masks"]
+
+    noise_shape = (
+        1,
+        int(base_model.config.action_horizon),
+        int(base_model.config.action_dim),
+    )
+    shared_noise = base_model.sample_noise(noise_shape, base_obs.state.device)
+    paths = {
+        "base": shared_noise.detach().clone(),
+        "ref": shared_noise[:, :, :proxy_dim].detach().clone(),
+        "task": shared_noise[:, :, :proxy_dim].detach().clone(),
+        "task-ref": shared_noise[:, :, :proxy_dim].detach().clone(),
+        "steer": shared_noise.detach().clone(),
+    }
+    traces = {name: [] for name in paths}
+    times = {name: [] for name in paths}
+    dt = torch.tensor(
+        -1.0 / int(args.num_steps),
+        device=shared_noise.device,
+        dtype=torch.float32,
+    )
+    denoise_time = torch.tensor(1.0, device=shared_noise.device, dtype=torch.float32)
+    trace_value = getattr(args, "diffusion_chunk_video_value", "state")
+
+    def decode(policy, inputs, latent):
+        return np.asarray(
+            policy.output_to_actions(inputs, latent), dtype=np.float32
+        )[..., :8]
+
+    def single_chunk(chunk):
+        """Normalize decoded output to one [horizon, action_dim] chunk."""
+        return chunk[0] if chunk.ndim == 3 else chunk
+
+    for _ in range(int(args.num_steps)):
+        expanded_time = denoise_time.expand(shared_noise.shape[0])
+
+        base_v = base_model.denoise_step(
+            base_state,
+            base_prefix_pad_masks,
+            base_past_key_values,
+            paths["base"],
+            expanded_time,
+        )
+        base_x0 = paths["base"] - denoise_time * base_v
+        paths["base"] = paths["base"] + dt * base_v
+
+        ref_v = _predict_proxy_flow(
+            prepared_ref, ref_model, paths["ref"], expanded_time
+        )
+        ref_x0 = paths["ref"] - denoise_time * ref_v
+        paths["ref"] = paths["ref"] + dt * ref_v
+
+        task_v = _predict_proxy_flow(
+            prepared_task, task_model, paths["task"], expanded_time
+        )
+        task_x0 = paths["task"] - denoise_time * task_v
+        paths["task"] = paths["task"] + dt * task_v
+
+        residual_task_v = _predict_proxy_flow(
+            prepared_task, task_model, paths["task-ref"], expanded_time
+        )
+        residual_ref_v = _predict_proxy_flow(
+            prepared_ref, ref_model, paths["task-ref"], expanded_time
+        )
+        residual_v = residual_task_v - residual_ref_v
+        residual_x0 = paths["task-ref"] - denoise_time * residual_v
+        paths["task-ref"] = paths["task-ref"] + dt * residual_v
+
+        steer_base_v = base_model.denoise_step(
+            base_state,
+            base_prefix_pad_masks,
+            base_past_key_values,
+            paths["steer"],
+            expanded_time,
+        )
+        steer_task_v = _predict_proxy_flow(
+            prepared_task, task_model, paths["steer"], expanded_time
+        )
+        steer_ref_v = _predict_proxy_flow(
+            prepared_ref, ref_model, paths["steer"], expanded_time
+        )
+        steer_v = steer_base_v.clone()
+        steer_v[:, :, :proxy_dim] += float(args.steer_scale) * (
+            steer_task_v - steer_ref_v
+        )
+        steer_x0 = paths["steer"] - denoise_time * steer_v
+        paths["steer"] = paths["steer"] + dt * steer_v
+
+        visual_latents = (
+            {
+                "base": base_x0,
+                "ref": ref_x0,
+                "task": task_x0,
+                "task-ref": residual_x0,
+                "steer": steer_x0,
+            }
+            if trace_value == "x0"
+            else paths
+        )
+        decoded = {
+            "base": decode(base_policy, base_inputs, visual_latents["base"]),
+            "ref": decode(ref_policy, ref_inputs, visual_latents["ref"]),
+            "task": decode(task_policy, task_inputs, visual_latents["task"]),
+            # Task and Ref share normalization; use Task's inverse transform for
+            # the standalone residual-flow chain.
+            "task-ref": decode(task_policy, task_inputs, visual_latents["task-ref"]),
+            "steer": decode(base_policy, base_inputs, visual_latents["steer"]),
+        }
+        for name, chunk in decoded.items():
+            traces[name].append(chunk[0] if chunk.ndim == 3 else chunk)
+            times[name].append(float(denoise_time.detach().cpu()))
+        denoise_time = denoise_time + dt
+
+    trace_arrays = {
+        name: np.asarray(chunks, dtype=np.float32) for name, chunks in traces.items()
+    }
+    final_chunks = {
+        "base": single_chunk(decode(base_policy, base_inputs, paths["base"])),
+        "ref": single_chunk(decode(ref_policy, ref_inputs, paths["ref"])),
+        "task": single_chunk(decode(task_policy, task_inputs, paths["task"])),
+        "task-ref": single_chunk(decode(task_policy, task_inputs, paths["task-ref"])),
+        "steer": single_chunk(decode(base_policy, base_inputs, paths["steer"])),
+    }
+    trace_arrays["times"] = times
+    trace_arrays["value"] = trace_value
+    _LAST_INFERENCE_RUNTIME = {
+        "base_source": "pi_checkpoint",
+        "used_base_model_velocity": True,
+        "steering_mode": "flow_base_plus_task_minus_ref",
+        "denoise_time_trace": times["steer"],
+        "denoise_action_trace": trace_arrays["steer"],
+        "mpc_last": None,
+        "mpc_trace": [],
+    }
+    return final_chunks["steer"], {}, final_chunks, trace_arrays
+
+
+def _infer_policy_chunk_triplet(
+    base_policy,
+    task_policy,
+    ref_policy,
+    raw_obs,
+    args,
+    *,
+    mpc_planner,
+    mpc_context,
+    warm_shift_steps,
+    base_decode_policy,
+    capture_denoise_trace=False,
+):
+    """Decode Base, Task, and Steer from one observation and one initial latent.
+
+    Base and Steer also see the same post-latent RNG stream, so their MBD candidate
+    populations match. Only the returned Steer chunk is later sent to the environment.
+    """
+    global _LAST_INFERENCE_RUNTIME
+
+    if task_policy is None:
+        raise ValueError("The policy-chunk overlay requires a loaded Task policy.")
+
+    base_model = base_policy._model
+    noise_shape = (
+        1,
+        int(base_model.config.action_horizon),
+        int(base_model.config.action_dim),
+    )
+    shared_noise = base_model.sample_noise(noise_shape, base_policy._pytorch_device)
+    fork_rng = _capture_rng_state()
+
+    base_args = copy.copy(args)
+    base_args.full_steer = False
+    base_args.task_steer = False
+    base_args.vlm_base = True
+    base_args.no_steer = False
+    base_args.only_steer = False
+    base_args.compare_difference = False
+    base_args.inject_proxy = 0.0
+    base_args.task_tilt = 0.0
+    base_args.mpc_debug = False
+    base_args.mpc_debug_stdout = False
+    base_args.writeup_debug = False
+    base_args.policy_chunk_video_overlay = False
+    base_args._capture_denoise_trace = bool(capture_denoise_trace)
+    base_args._capture_denoise_value = args.diffusion_chunk_video_value
+
+    base_actions, _ = infer_actions_with_mpc(
+        base_policy,
+        task_policy,
+        ref_policy,
+        copy.deepcopy(raw_obs),
+        base_args,
+        mpc_planner=mpc_planner,
+        mpc_context=copy.deepcopy(mpc_context),
+        warm_shift_steps=warm_shift_steps,
+        base_decode_policy=base_decode_policy,
+        initial_noise=shared_noise,
+    )
+    base_runtime = _LAST_INFERENCE_RUNTIME
+
+    _restore_rng_state(fork_rng)
+    steer_args = copy.copy(args)
+    steer_args._capture_denoise_trace = bool(capture_denoise_trace)
+    steer_args._capture_denoise_value = args.diffusion_chunk_video_value
+    steer_actions, compare_stats = infer_actions_with_mpc(
+        base_policy,
+        task_policy,
+        ref_policy,
+        copy.deepcopy(raw_obs),
+        steer_args,
+        mpc_planner=mpc_planner,
+        mpc_context=mpc_context,
+        warm_shift_steps=warm_shift_steps,
+        base_decode_policy=base_decode_policy,
+        initial_noise=shared_noise,
+    )
+    steer_runtime = _LAST_INFERENCE_RUNTIME
+    post_steer_rng = _capture_rng_state()
+
+    try:
+        task_dim = int(task_policy._model.config.action_dim)
+        if task_dim > shared_noise.shape[-1]:
+            raise ValueError(
+                f"Task action dim {task_dim} exceeds Base latent dim {shared_noise.shape[-1]}."
+            )
+        max_joint_delta = (
+            None
+            if args.sampler == "truncated"
+            else args.mpc_joint_delta_clip if args.mpc_joint_delta_clip > 0.0 else None
+        )
+        task_noise = shared_noise[:, :, :task_dim]
+        if capture_denoise_trace:
+            task_actions, task_trace, task_times = _infer_task_denoise_trace(
+                task_policy,
+                copy.deepcopy(raw_obs),
+                task_noise,
+                num_steps=args.num_steps,
+                current_joint_pos=raw_obs.get("observation/joint_position"),
+                max_joint_delta=max_joint_delta,
+                trace_value=args.diffusion_chunk_video_value,
+            )
+        else:
+            task_noise_np = task_noise[0].detach().cpu().numpy()
+            _validate_policy_environment_inputs(task_policy, raw_obs, "task")
+            task_outputs = task_policy.infer(
+                copy.deepcopy(raw_obs), noise=task_noise_np
+            )
+            task_actions = np.asarray(task_outputs["actions"], dtype=np.float32)
+            task_actions = (
+                clamp_real_action_chunk(
+                    torch.as_tensor(task_actions, dtype=torch.float32),
+                    current_joint_pos=raw_obs.get("observation/joint_position"),
+                    max_joint_delta=max_joint_delta,
+                )
+                .cpu()
+                .numpy()
+            )
+    finally:
+        _restore_rng_state(post_steer_rng)
+        _LAST_INFERENCE_RUNTIME = steer_runtime
+
+    chunks = {
+        "base": np.asarray(base_actions, dtype=np.float32)[..., :8].copy(),
+        "task": np.asarray(task_actions, dtype=np.float32)[..., :8].copy(),
+        "steer": np.asarray(steer_actions, dtype=np.float32)[..., :8].copy(),
+    }
+    denoise_traces = None
+    if capture_denoise_trace:
+        denoise_traces = {
+            "base": np.asarray(base_runtime["denoise_action_trace"], dtype=np.float32),
+            "task": np.asarray(task_trace, dtype=np.float32),
+            "steer": np.asarray(steer_runtime["denoise_action_trace"], dtype=np.float32),
+            "times": {
+                "base": list(base_runtime["denoise_time_trace"]),
+                "task": list(task_times),
+                "steer": list(steer_runtime["denoise_time_trace"]),
+            },
+            "value": args.diffusion_chunk_video_value,
+        }
+        for policy_name in ("base", "task", "steer"):
+            trace = denoise_traces[policy_name]
+            if trace.shape[0] != int(args.num_steps):
+                raise RuntimeError(
+                    f"{policy_name} produced {trace.shape[0]} denoise states; "
+                    f"expected {args.num_steps}."
+                )
+            if args.diffusion_chunk_video_value == "state":
+                final_error = float(
+                    np.max(np.abs(trace[-1] - chunks[policy_name]))
+                )
+                if final_error > 1e-5:
+                    raise RuntimeError(
+                        f"{policy_name} trace does not end at its returned action chunk "
+                        f"(max abs error {final_error:.3g})."
+                    )
+    return steer_actions, compare_stats, chunks, denoise_traces
 
 
 # ============================================================ environment observation extraction
@@ -3504,6 +4059,233 @@ def _project_world_points_to_camera(points_w: torch.Tensor, camera) -> np.ndarra
     return pixels.detach().cpu().numpy()
 
 
+def _project_wrist_relative_motion(
+    points_w: torch.Tensor,
+    camera,
+    *,
+    image_width: int,
+    image_height: int,
+    anchor_depth_m: float = 0.5,
+) -> np.ndarray:
+    """Project world-space motion after anchoring its start inside the wrist view.
+
+    A wrist camera cannot physically see the future position of its own optical rig;
+    the exact EEF projection is therefore often behind the camera. Keep the motion in
+    the current camera frame, but translate its start to a virtual point in front of the
+    camera. This preserves the three policies' relative metric displacement and
+    perspective while making the comparison visible.
+    """
+    data = camera.data
+    cam_pos = data.pos_w[:1].to(device=points_w.device, dtype=points_w.dtype)
+    cam_quat = data.quat_w_ros[:1].to(device=points_w.device, dtype=points_w.dtype)
+    intr = data.intrinsic_matrices[0].to(device=points_w.device, dtype=points_w.dtype)
+    points_cam = _quat_apply_inverse_wxyz(cam_quat, points_w - cam_pos).reshape(-1, 3)
+    motion_cam = points_cam - points_cam[:1]
+
+    depth = torch.as_tensor(anchor_depth_m, device=points_w.device, dtype=points_w.dtype)
+    anchor_u = torch.as_tensor(
+        0.5 * image_width, device=points_w.device, dtype=points_w.dtype
+    )
+    anchor_v = torch.as_tensor(
+        0.72 * image_height, device=points_w.device, dtype=points_w.dtype
+    )
+    anchor_cam = torch.stack(
+        (
+            (anchor_u - intr[0, 2]) * depth / intr[0, 0],
+            (anchor_v - intr[1, 2]) * depth / intr[1, 1],
+            depth,
+        )
+    )
+    virtual_points = motion_cam + anchor_cam
+    z = virtual_points[:, 2]
+    pixels = torch.full(
+        (virtual_points.shape[0], 2),
+        float("nan"),
+        device=points_w.device,
+        dtype=points_w.dtype,
+    )
+    valid = z > 1e-4
+    if valid.any():
+        pixels[valid, 0] = (
+            intr[0, 0] * virtual_points[valid, 0] / z[valid] + intr[0, 2]
+        )
+        pixels[valid, 1] = (
+            intr[1, 1] * virtual_points[valid, 1] / z[valid] + intr[1, 2]
+        )
+    return pixels.detach().cpu().numpy()
+
+
+def _build_policy_chunk_video_overlay(
+    chunks: dict[str, np.ndarray],
+    mpc_planner,
+    mpc_context: dict[str, Any],
+    *,
+    execute_steps: int,
+) -> dict[str, Any]:
+    """Convert executable joint chunks into current-EEF-prefixed world trajectories."""
+    root_pos = mpc_context.get("robot_root_pos")
+    root_quat = mpc_context.get("robot_root_quat")
+    reference = root_pos if torch.is_tensor(root_pos) else root_quat
+    device = reference.device if torch.is_tensor(reference) else torch.device("cpu")
+    trajectories = {}
+    with torch.no_grad():
+        for name, chunk in chunks.items():
+            action_tensor = torch.as_tensor(
+                np.asarray(chunk), device=device, dtype=torch.float32
+            )
+            if action_tensor.ndim != 2 or action_tensor.shape[-1] < 7:
+                raise ValueError(
+                    f"{name} policy chunk must be [H,D>=7], got {tuple(action_tensor.shape)}."
+                )
+            ee_pos = mpc_planner.fk.forward(action_tensor[:, :7]).ee_pos
+            if root_pos is not None and root_quat is not None:
+                root_pos_t = torch.as_tensor(
+                    root_pos, device=device, dtype=ee_pos.dtype
+                ).reshape(3)
+                root_quat_t = torch.as_tensor(
+                    root_quat, device=device, dtype=ee_pos.dtype
+                ).reshape(4)
+                ee_pos = root_pos_t + _quat_apply_wxyz(
+                    root_quat_t.expand(ee_pos.shape[0], 4),
+                    ee_pos,
+                )
+            current_eef = mpc_context.get("eef_pos")
+            if current_eef is not None:
+                current_eef_t = torch.as_tensor(
+                    current_eef, device=device, dtype=ee_pos.dtype
+                ).reshape(-1)[:3]
+                ee_pos = torch.cat((current_eef_t[None], ee_pos), dim=0)
+            trajectories[name] = ee_pos.detach()
+    return {
+        "trajectories": trajectories,
+        "chunks": chunks,
+        "execute_steps": int(execute_steps),
+    }
+
+
+def _draw_policy_chunk_video_overlay(
+    image: np.ndarray,
+    env,
+    camera_name: str,
+    overlay: dict[str, Any],
+    *,
+    draw_text: bool,
+) -> np.ndarray:
+    try:
+        camera = env.scene[camera_name]
+    except Exception:
+        return image
+
+    out = image.copy()
+    height, width = out.shape[:2]
+    colors = {
+        "base": (255, 90, 60),   # blue in BGR
+        "task": (0, 165, 255),   # orange in BGR
+        "steer": (60, 220, 60),  # green in BGR
+    }
+    labels = {"base": "BASE", "task": "TASK", "steer": "STEER"}
+    execute_steps = int(overlay.get("execute_steps", 0))
+    wrist_relative = camera_name == "wrist_cam"
+
+    for name in ("base", "task", "steer"):
+        points = overlay.get("trajectories", {}).get(name)
+        if points is None:
+            continue
+        pixels = (
+            _project_wrist_relative_motion(
+                points,
+                camera,
+                image_width=width,
+                image_height=height,
+            )
+            if wrist_relative
+            else _project_world_points_to_camera(points, camera)
+        )
+        color = colors[name]
+        last_visible = None
+        if wrist_relative and len(pixels) and np.isfinite(pixels[0]).all():
+            start = tuple(np.round(pixels[0]).astype(int))
+            cv2.circle(out, start, 4, color, -1, lineType=cv2.LINE_AA)
+        for point_idx in range(1, len(pixels)):
+            p0, p1 = pixels[point_idx - 1], pixels[point_idx]
+            if not (np.isfinite(p0).all() and np.isfinite(p1).all()):
+                continue
+            a = tuple(np.round(np.clip(p0, (-4 * width, -4 * height), (5 * width, 5 * height))).astype(int))
+            b = tuple(np.round(np.clip(p1, (-4 * width, -4 * height), (5 * width, 5 * height))).astype(int))
+            thickness = 4 if point_idx <= execute_steps else 2
+            cv2.line(out, a, b, color, thickness, cv2.LINE_AA)
+            if 0 <= b[0] < width and 0 <= b[1] < height:
+                cv2.circle(out, b, 3, color, -1, lineType=cv2.LINE_AA)
+                last_visible = b
+        if last_visible is not None:
+            cv2.putText(
+                out,
+                labels[name],
+                (last_visible[0] + 4, last_visible[1] - 4),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.38,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+
+    if wrist_relative:
+        label_at = (9, height - 12)
+        cv2.putText(
+            out, "WRIST-RELATIVE MOTION", label_at, cv2.FONT_HERSHEY_SIMPLEX,
+            0.45, (0, 0, 0), 4, cv2.LINE_AA,
+        )
+        cv2.putText(
+            out, "WRIST-RELATIVE MOTION", label_at, cv2.FONT_HERSHEY_SIMPLEX,
+            0.45, (255, 255, 255), 1, cv2.LINE_AA,
+        )
+
+    if draw_text:
+        rows = []
+        grip_means = {}
+        for name in ("base", "task", "steer"):
+            chunk = np.asarray(overlay.get("chunks", {}).get(name))
+            if chunk.ndim != 2 or chunk.shape[-1] <= 7:
+                continue
+            grip = chunk[:execute_steps, 7]
+            if not len(grip):
+                continue
+            grip_mean = float(grip.mean())
+            grip_means[name] = grip_mean
+            tendency = "".join("C" if value > 0.5 else "O" for value in grip)
+            rows.append(
+                (name, f"{labels[name]:5s} grip next{len(grip)}={tendency}  mean={grip_mean:.2f}")
+            )
+        if rows:
+            font_scale = 0.58
+            font_thickness = 2
+            line_height = 26
+            text_width = max(
+                cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)[0][0]
+                for _, text in rows
+            )
+            box_bottom = 10 + line_height * len(rows)
+            cv2.rectangle(out, (4, 4), (14 + text_width, box_bottom), (0, 0, 0), -1)
+            for row_idx, (name, text) in enumerate(rows):
+                cv2.putText(
+                    out, text, (9, 24 + line_height * row_idx), cv2.FONT_HERSHEY_SIMPLEX,
+                    font_scale, colors[name], font_thickness, cv2.LINE_AA,
+                )
+            base_mean = grip_means.get("base")
+            task_mean = grip_means.get("task")
+            gripper_agree = base_mean is not None and task_mean is not None and (
+                (base_mean > 0.5 and task_mean > 0.5)
+                or (base_mean < 0.5 and task_mean < 0.5)
+            )
+            if gripper_agree:
+                agree_at = (9, box_bottom + 27)
+                cv2.putText(out, "gripper agree", agree_at, cv2.FONT_HERSHEY_SIMPLEX,
+                            0.65, (0, 0, 0), 5, cv2.LINE_AA)
+                cv2.putText(out, "gripper agree", agree_at, cv2.FONT_HERSHEY_SIMPLEX,
+                            0.65, (255, 255, 255), 2, cv2.LINE_AA)
+    return out
+
+
 def _draw_projected_debug_axes(image: np.ndarray, env, camera_name: str, axes: dict[str, torch.Tensor]) -> np.ndarray:
     if not axes:
         return image
@@ -3847,6 +4629,316 @@ def _transcode_h264(video_path, label="video"):
             pass
 
 
+def _refresh_diffusion_ghost_camera(env):
+    if hasattr(env.sim, "forward"):
+        env.sim.forward()
+    env.sim.render()
+    env.scene.update(0.0)
+
+
+def _diffusion_camera_frame(camera):
+    rgb = camera.data.output["rgb"][0, ..., :3].detach().cpu().numpy().astype(np.uint8)
+    seg = camera.data.output["instance_id_segmentation_fast"]
+    if seg.ndim == 4 and seg.shape[-1] == 1:
+        seg = seg.squeeze(-1)
+    seg = seg[0].detach().cpu().numpy().astype(np.int32)
+
+    info = getattr(camera.data, "info", None)
+    env_info = info[0] if isinstance(info, (list, tuple)) else info
+    labels = ((env_info or {}).get("instance_id_segmentation_fast", {}) or {}).get(
+        "idToLabels", {}
+    )
+    robot_ids = []
+    for instance_id, label in labels.items():
+        if "robot" not in str(label).lower():
+            continue
+        try:
+            robot_ids.append(int(instance_id))
+        except (TypeError, ValueError):
+            continue
+    if not robot_ids:
+        raise RuntimeError(
+            "table_cam instance segmentation contains no semantic label matching 'robot'."
+        )
+    # Isaac camera output is RGB; OpenCV's writer and drawing primitives use BGR.
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), np.isin(seg, robot_ids)
+
+
+def _diffusion_waypoint_indices(action_chunk, count):
+    horizon = int(action_chunk.shape[0])
+    count = max(1, min(int(count), horizon))
+    uniform = np.rint(np.linspace(0, horizon - 1, count)).astype(np.int64).tolist()
+    gripper = np.asarray(action_chunk[:, 7] > 0.5, dtype=np.int8)
+    transitions = (np.flatnonzero(gripper[1:] != gripper[:-1]) + 1).tolist()
+    required = [0, horizon - 1, *transitions]
+    selected = []
+    for index in required + uniform:
+        index = int(index)
+        if index not in selected:
+            selected.append(index)
+    if len(selected) > count:
+        required_set = set(required)
+        keep = [index for index in selected if index in required_set]
+        for index in uniform:
+            if len(keep) >= count:
+                break
+            if index not in keep:
+                keep.append(index)
+        selected = keep[:count]
+    return sorted(selected)
+
+
+def _diffusion_gripper_mask(env, camera, robot_mask):
+    """Restrict a robot instance mask to the hand/finger region."""
+    robot = env.scene["robot"]
+    body_names = list(
+        getattr(robot.data, "body_names", ()) or getattr(robot, "body_names", ())
+    )
+    gripper_ids = [
+        index
+        for index, name in enumerate(body_names)
+        if "hand" in name.lower() or "finger" in name.lower()
+    ]
+    if not gripper_ids:
+        return np.zeros_like(robot_mask, dtype=bool)
+
+    body_pos = robot.data.body_pos_w[0, gripper_ids, :]
+    pixels = _project_world_points_to_camera(body_pos, camera)
+    region = np.zeros(robot_mask.shape, dtype=np.uint8)
+    projected = []
+    for body_id, pixel in zip(gripper_ids, pixels, strict=True):
+        if not np.all(np.isfinite(pixel)):
+            continue
+        point = tuple(np.rint(pixel).astype(np.int32))
+        projected.append(point)
+        name = body_names[body_id].lower()
+        radius = 24 if "hand" in name else 16
+        cv2.circle(region, point, radius, 255, -1, cv2.LINE_AA)
+    # Join the finger centers so the palm/finger bases remain one visible region even
+    # when the robot asset has no separately named hand body.
+    if len(projected) >= 2:
+        for start in projected[:-1]:
+            cv2.line(region, start, projected[-1], 255, 20, cv2.LINE_AA)
+    return robot_mask & (region > 0)
+
+
+def _render_diffusion_action_chunk(
+    env,
+    base_frame,
+    action_chunk,
+    *,
+    color,
+    waypoint_count,
+):
+    robot = env.scene["robot"]
+    camera = env.scene["table_cam"]
+    joint_names = list(
+        getattr(robot.data, "joint_names", ()) or getattr(robot, "joint_names", ())
+    )
+    arm_ids = []
+    for joint_index in range(1, 8):
+        name = f"panda_joint{joint_index}"
+        if name not in joint_names:
+            raise RuntimeError(f"Cannot render ghost: {name} missing from {joint_names}.")
+        arm_ids.append(joint_names.index(name))
+    if "finger_joint" not in joint_names:
+        raise RuntimeError(f"Cannot render ghost: finger_joint missing from {joint_names}.")
+    gripper_id = joint_names.index("finger_joint")
+    try:
+        gripper_term = env.action_manager.get_term("gripper_action")
+        gripper_open = float(gripper_term._open_command.reshape(-1)[0].item())
+        gripper_closed = float(gripper_term._close_command.reshape(-1)[0].item())
+    except Exception:
+        gripper_open = 0.0
+        gripper_closed = np.pi / 4.0
+
+    saved_pos = robot.data.joint_pos.detach().clone()
+    saved_vel = robot.data.joint_vel.detach().clone()
+    saved_target = getattr(robot.data, "joint_pos_target", None)
+    saved_target = None if saved_target is None else saved_target.detach().clone()
+    result = np.asarray(base_frame, dtype=np.float32).copy()
+    indices = _diffusion_waypoint_indices(action_chunk, waypoint_count)
+    try:
+        for order, waypoint in enumerate(indices):
+            joint_pos = saved_pos.clone()
+            action = np.asarray(action_chunk[waypoint], dtype=np.float32)
+            joint_pos[0, arm_ids] = torch.as_tensor(
+                action[:7], device=joint_pos.device, dtype=joint_pos.dtype
+            )
+            # Use the same binary targets as the environment's gripper action term.
+            joint_pos[0, gripper_id] = (
+                gripper_closed if float(action[7]) > 0.5 else gripper_open
+            )
+            robot.write_joint_state_to_sim(joint_pos, torch.zeros_like(saved_vel))
+            if hasattr(robot, "set_joint_position_target"):
+                robot.set_joint_position_target(joint_pos)
+            _refresh_diffusion_ghost_camera(env)
+            ghost_frame, robot_mask = _diffusion_camera_frame(camera)
+            gripper_mask = _diffusion_gripper_mask(env, camera, robot_mask)
+
+            tint = np.asarray(color, dtype=np.float32).reshape(1, 1, 3)
+            ghost = 0.62 * ghost_frame.astype(np.float32) + 0.38 * tint
+            alpha = 0.16 + 0.20 * (order + 1) / max(len(indices), 1)
+            result[robot_mask] = (
+                (1.0 - alpha) * result[robot_mask] + alpha * ghost[robot_mask]
+            )
+            # Make the gripper substantially more saturated and opaque than the arm,
+            # so finger intent remains readable when several waypoint ghosts overlap.
+            gripper_ghost = 0.25 * ghost_frame.astype(np.float32) + 0.75 * tint
+            gripper_alpha = min(0.82, alpha + 0.34)
+            result[gripper_mask] = (
+                (1.0 - gripper_alpha) * result[gripper_mask]
+                + gripper_alpha * gripper_ghost[gripper_mask]
+            )
+    finally:
+        robot.write_joint_state_to_sim(saved_pos, saved_vel)
+        if hasattr(robot, "set_joint_position_target"):
+            robot.set_joint_position_target(
+                saved_pos if saved_target is None else saved_target
+            )
+        _refresh_diffusion_ghost_camera(env)
+    return np.clip(result, 0.0, 255.0).astype(np.uint8), indices
+
+
+def _diffusion_policy_panel(
+    scene,
+    *,
+    policy_name,
+    color,
+    diffusion_index,
+    diffusion_count,
+    time_value,
+    action_chunk,
+    waypoint_indices,
+    trace_value,
+):
+    scene = cv2.resize(scene, (640, 360), interpolation=cv2.INTER_AREA)
+    panel = np.zeros((480, 640, 3), dtype=np.uint8)
+    panel[120:] = scene
+    cv2.rectangle(panel, (0, 0), (639, 7), color, -1)
+    cv2.putText(
+        panel,
+        policy_name.upper(),
+        (18, 39),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.88,
+        color,
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        panel,
+        f"{'x0 estimate' if trace_value == 'x0' else 'env denoise'} "
+        f"{diffusion_index + 1}/{diffusion_count}   t={time_value:.3f}",
+        (18, 72),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        (235, 235, 235),
+        2,
+        cv2.LINE_AA,
+    )
+    gripper_mean = float(np.mean(action_chunk[:, 7]))
+    tendency = "CLOSE" if gripper_mean > 0.5 else "OPEN"
+    cv2.putText(
+        panel,
+        f"gripper {tendency}  mean={gripper_mean:.2f}   poses={len(waypoint_indices)}/{len(action_chunk)}",
+        (18, 103),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.56,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.rectangle(panel, (0, 0), (639, 479), (70, 70, 70), 1)
+    return panel
+
+
+def _save_diffusion_chunk_video(
+    env,
+    traces,
+    video_path,
+    *,
+    seed,
+    env_step,
+    fps,
+    waypoint_count,
+):
+    if "task-ref" in traces:
+        policy_colors = {
+            "base": (255, 150, 40),
+            "ref": (220, 90, 220),
+            "task": (45, 145, 255),
+            "task-ref": (40, 220, 220),
+            "steer": (80, 225, 100),
+        }
+    else:
+        policy_colors = {
+            "base": (255, 150, 40),
+            "task": (45, 145, 255),
+            "steer": (80, 225, 100),
+        }
+    lengths = {name: int(np.asarray(traces[name]).shape[0]) for name in policy_colors}
+    if len(set(lengths.values())) != 1:
+        raise ValueError(f"Denoise trace lengths differ: {lengths}.")
+    diffusion_count = next(iter(lengths.values()))
+    trace_value = str(traces.get("value", "state"))
+    _refresh_diffusion_ghost_camera(env)
+    base_frame, _ = _diffusion_camera_frame(env.scene["table_cam"])
+
+    writer = cv2.VideoWriter(
+        video_path,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(fps),
+        (640 * len(policy_colors), 480),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Could not open diffusion video writer: {video_path}")
+    try:
+        for diffusion_index in range(diffusion_count):
+            panels = []
+            for policy_name in policy_colors:
+                action_chunk = np.asarray(
+                    traces[policy_name][diffusion_index], dtype=np.float32
+                )
+                ghost_scene, waypoint_indices = _render_diffusion_action_chunk(
+                    env,
+                    base_frame,
+                    action_chunk,
+                    color=policy_colors[policy_name],
+                    waypoint_count=waypoint_count,
+                )
+                panels.append(
+                    _diffusion_policy_panel(
+                        ghost_scene,
+                        policy_name=policy_name,
+                        color=policy_colors[policy_name],
+                        diffusion_index=diffusion_index,
+                        diffusion_count=diffusion_count,
+                        time_value=float(traces["times"][policy_name][diffusion_index]),
+                        action_chunk=action_chunk,
+                        waypoint_indices=waypoint_indices,
+                        trace_value=trace_value,
+                    )
+                )
+            frame = np.concatenate(panels, axis=1)
+            cv2.putText(
+                frame,
+                f"seed {seed}  env step {env_step}",
+                (frame.shape[1] - 290, 111),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (210, 210, 210),
+                1,
+                cv2.LINE_AA,
+            )
+            writer.write(frame)
+    finally:
+        writer.release()
+    _transcode_h264(video_path, "diffusion action-chunk video")
+    print(f"Diffusion action-chunk video: {video_path}", flush=True)
+    return video_path
+
+
 def _mux_audio_into_video(tmp_video_path, final_video_path, audio_path, label):
     if audio_path is None or not os.path.exists(audio_path):
         os.replace(tmp_video_path, final_video_path)
@@ -3972,12 +5064,46 @@ def _build_rollout_frame(obs, use_thermal_overlay=False, debug_overlay=None):
                 table_image = _draw_vlm_overlay(table_image, env, "table_cam", vlm)
             except Exception as exc:
                 print(f"[vlm_dp] overlay draw failed: {exc}", flush=True)
+        policy_chunks = debug_overlay.get("policy_chunks")
+        if policy_chunks is not None:
+            try:
+                table_image = _draw_policy_chunk_video_overlay(
+                    table_image, env, "table_cam", policy_chunks, draw_text=True
+                )
+                if wrist_image is not None:
+                    wrist_image = _draw_policy_chunk_video_overlay(
+                        wrist_image, env, "wrist_cam", policy_chunks, draw_text=False
+                    )
+            except Exception as exc:
+                print(f"[policy_chunk_video_overlay] draw failed: {exc}", flush=True)
 
     frame = (
         table_image
         if wrist_image is None
         else np.concatenate((table_image, wrist_image), axis=1)
     )
+    vlm_viz = None if debug_overlay is None else debug_overlay.get("vlm")
+    base_stage = vlm_viz.get("stage") if isinstance(vlm_viz, dict) else None
+    if base_stage:
+        stage_text = f"BASE STAGE  {base_stage}"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.65
+        font_thickness = 2
+        (text_width, text_height), baseline = cv2.getTextSize(
+            stage_text, font, font_scale, font_thickness
+        )
+        text_at = (frame.shape[1] - text_width - 14, 12 + text_height)
+        cv2.rectangle(
+            frame,
+            (text_at[0] - 7, 5),
+            (frame.shape[1] - 6, text_at[1] + baseline + 7),
+            (0, 0, 0),
+            -1,
+        )
+        cv2.putText(
+            frame, stage_text, text_at, font, font_scale,
+            (0, 255, 255), font_thickness, cv2.LINE_AA,
+        )
     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
     if _has_sound_observation(obs):
@@ -4483,6 +5609,67 @@ def parse_args():
         type=str,
         default=None,
         help="Reference proxy checkpoint directory. Defaults to the matching task_prompts.json entry.",
+    )
+    parser.add_argument(
+        "--ref_attention",
+        "--ref-attention",
+        choices=("config", "causal", "bidirectional"),
+        default="config",
+        help=(
+            "Attention mask used by the reference proxy. 'config' uses the registered model "
+            "config; use an explicit mode for checkpoint compatibility."
+        ),
+    )
+    parser.add_argument(
+        "--ref_prediction_type",
+        "--ref-prediction-type",
+        choices=("config", "score", "epsilon", "x0"),
+        default="config",
+        help=(
+            "Output parameterization used by the reference proxy. This must match its training "
+            "target; old ref_eps checkpoints require 'epsilon'."
+        ),
+    )
+    parser.add_argument(
+        "--ref_cache_output",
+        "--ref-cache-output",
+        type=str,
+        default=None,
+        help="Write exact live Base/MPC epsilon trajectories to this NPZ shard.",
+    )
+    parser.add_argument(
+        "--ref_cache_trajectories_per_observation",
+        "--ref-cache-trajectories-per-observation",
+        type=int,
+        default=8,
+        help="Independent Gaussian reverse trajectories collected per live observation.",
+    )
+    parser.add_argument(
+        "--ref_cache_max_observations",
+        "--ref-cache-max-observations",
+        type=int,
+        default=64,
+        help="Maximum unique observations collected by this worker.",
+    )
+    parser.add_argument(
+        "--ref_cache_label_seed",
+        "--ref-cache-label-seed",
+        type=int,
+        default=20260815,
+        help="Independent seed for cache initial/candidate noise; does not alter rollout RNG.",
+    )
+    parser.add_argument(
+        "--ref_cache_config",
+        "--ref-cache-config",
+        type=str,
+        default="score_ref_weight_demo_meanstd",
+        help="Training config recorded in cache metadata.",
+    )
+    parser.add_argument(
+        "--ref_cache_only",
+        "--ref-cache-only",
+        action="store_true",
+        help="Stop the rollout/job as soon as ref_cache_max_observations is reached.",
     )
     standalone_group = parser.add_mutually_exclusive_group()
     standalone_group.add_argument(
@@ -5065,6 +6252,53 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--policy_chunk_video_overlay",
+        "--policy-chunk-video-overlay",
+        dest="policy_chunk_video_overlay",
+        action="store_true",
+        help=(
+            "At every steering replan, independently decode Base, Task, and Steer from the "
+            "same observation and initial noise. Draw their FK action-chunk trajectories and "
+            "first executed gripper commands on the rollout video, and save all three chunks "
+            "to writeup_debug.jsonl. Only Steer is executed."
+        ),
+    )
+    parser.add_argument(
+        "--diffusion_chunk_video_step",
+        "--diffusion-chunk-video-step",
+        type=int,
+        default=-1,
+        help=(
+            "At this exact environment step, force a replan and save a 10-frame Base/Task/Steer "
+            "reverse-diffusion video. Each frame overlays full robot+gripper ghosts for the "
+            "decoded action chunk. Negative disables it."
+        ),
+    )
+    parser.add_argument(
+        "--diffusion_chunk_video_fps",
+        type=float,
+        default=2.0,
+        help="Playback FPS for --diffusion_chunk_video_step (default: 2, so 10 frames last 5s).",
+    )
+    parser.add_argument(
+        "--diffusion_chunk_video_value",
+        choices=("state", "x0"),
+        default="state",
+        help=(
+            "Visualize each reverse step's updated latent state or its clean-action "
+            "endpoint estimate x0. Flow uses x0=x_t-t*v_t; score/DDIM uses Tweedie's x0."
+        ),
+    )
+    parser.add_argument(
+        "--diffusion_chunk_video_waypoints",
+        type=int,
+        default=8,
+        help=(
+            "Number of full-robot poses sampled across each action chunk for semitransparent "
+            "ghost rendering. Gripper transition poses are retained when possible."
+        ),
+    )
+    parser.add_argument(
         "--dry_run",
         action="store_true",
         help="Run one warmup inference, print base-source and shape diagnostics, then exit.",
@@ -5321,6 +6555,39 @@ if args.worker_id < 0 and args.workers == 1 and not any(
 ):
     args.device = f"cuda:{configured_gpu_ids[0]}"
 _apply_task_prompt_defaults(args, parser)
+if args.ref_cache_only and args.ref_cache_output is None:
+    parser.error("--ref_cache_only requires --ref_cache_output.")
+if args.ref_cache_output is not None:
+    if args.worker_id >= 0:
+        cache_path = pathlib.Path(args.ref_cache_output)
+        suffix = cache_path.suffix or ".npz"
+        args.ref_cache_output = str(
+            cache_path.with_name(f"{cache_path.stem}.worker{args.worker_id:02d}{suffix}")
+        )
+    cache_requirements = {
+        "--vlm_base": bool(args.vlm_base),
+        "--no_steer": bool(args.no_steer),
+        "--base_decode_only": bool(args.base_decode_only),
+        "--base_norm_stats_from_task": bool(args.base_norm_stats_from_task),
+        "--base_action_space demo_delta": args.base_action_space == "demo_delta",
+        "--mpc_update mbd_score_action_prox": args.mpc_update == "mbd_score_action_prox",
+        "--mpc_cost priority": args.mpc_cost == "priority",
+        "--mpc_optimize_space action": args.mpc_optimize_space == "action",
+        "--sampler base": args.sampler == "base",
+        "--cost_executable_actions": bool(args.cost_executable_actions),
+        "--num_steps 10": int(args.num_steps) == 10,
+        "--mpc_ddim_train_timesteps 100": int(args.mpc_ddim_train_timesteps) == 100,
+    }
+    missing = [flag for flag, enabled in cache_requirements.items() if not enabled]
+    if missing:
+        parser.error(
+            "--ref_cache_output is an exact-teacher mode and requires: " + ", ".join(missing)
+        )
+    if args.ref_cache_trajectories_per_observation <= 0:
+        parser.error("--ref_cache_trajectories_per_observation must be positive.")
+    if args.ref_cache_max_observations <= 0:
+        parser.error("--ref_cache_max_observations must be positive.")
+
 if args.determine:
     _enable_deterministic_runtime(args.seed_start)
     deterministic_render_arg = "--/isaaclab/render/deterministic=true"
@@ -5366,6 +6633,45 @@ if score_steering_mode in ("full", "task"):
         )
 if score_steering_mode == "base" and (args.only_steer or args.compare_difference):
     parser.error("--vlm_base is base-only and cannot be combined with --only_steer or --compare_difference.")
+triplet_video_debug = (
+    args.policy_chunk_video_overlay or args.diffusion_chunk_video_step >= 0
+)
+if triplet_video_debug:
+    flow_video_debug = args.diffusion_chunk_video_step >= 0 and score_steering_mode is None
+    if flow_video_debug:
+        if args.policy_chunk_video_overlay:
+            parser.error("Flow quintet diagnostics currently support diffusion video only.")
+    else:
+        if score_steering_mode != "task":
+            parser.error("Base/Task/Steer video diagnostics require --task_steer.")
+        if args.mpc_update != "mbd_score_action_prox":
+            parser.error(
+                "Base/Task/Steer video diagnostics require "
+                "--mpc_update mbd_score_action_prox."
+            )
+        if args.mpc_optimize_space != "action":
+            parser.error("Base/Task/Steer video diagnostics require --mpc_optimize_space action.")
+        if int(args.fk_fork) != 1:
+            parser.error("Base/Task/Steer video diagnostics require --fk_fork 1.")
+        if float(args.inject_proxy) != 0.0 or float(args.task_tilt) != 0.0:
+            parser.error(
+                "Base/Task/Steer video diagnostics require --inject_proxy 0 "
+                "and --task_tilt 0 so Base/Task/Steer have an unambiguous shared-noise comparison."
+            )
+if args.diffusion_chunk_video_step >= 0:
+    if args.num_steps != 10 or args.ddim_final_level:
+        parser.error(
+            "--diffusion_chunk_video_step requires --num_steps 10 without "
+            "--ddim_final_level, producing exactly 10 frames."
+        )
+    if args.render == "none":
+        parser.error("--diffusion_chunk_video_step requires a rendered table camera.")
+    if args.diffusion_chunk_video_step >= args.task_num_steps:
+        parser.error("--diffusion_chunk_video_step must be smaller than --task_num_steps.")
+    if args.diffusion_chunk_video_fps <= 0.0:
+        parser.error("--diffusion_chunk_video_fps must be positive.")
+    if args.diffusion_chunk_video_waypoints <= 0:
+        parser.error("--diffusion_chunk_video_waypoints must be positive.")
 if args.sampler == "truncated":
     if not _uses_vlm_mpc_base(args):
         parser.error("--sampler truncated requires a VLM/MPC base mode.")
@@ -5530,7 +6836,11 @@ _report_initialization_stage(args, "parsing environment config", environment=env
 env_cfg = parse_env_cfg(env_name, device=args.device, num_envs=1)
 _report_initialization_stage(args, "environment config ready", environment=env_name)
 
-if args.vlm_cost.startswith("rekep") or args.vlm_state == "real":
+if (
+    args.vlm_cost.startswith("rekep")
+    or args.vlm_state == "real"
+    or args.diffusion_chunk_video_step >= 0
+):
     # The ReKep keypoint proposal and the SensedWorld perception read depth (+ instance seg for
     # fixture calibration) from table_cam; the annotators must be added to the cfg before
     # gym.make. RGB-only otherwise (byte-identical). startswith("rekep") covers the _vlm variants too.
@@ -5680,20 +6990,39 @@ if "base" in required_policy_roles:
         base_config_name = _config_name_from_checkpoint_dir(base_checkpoint_dir)
         base_policy_checkpoint_dir = base_checkpoint_dir
     base_config = _config.get_config(base_config_name)
+    base_norm_mode_override = (
+        args.task_norm_mode == "quantile"
+        if args.base_norm_stats_from_task and args.task_norm_mode != "config"
+        else None
+    )
     _report_initialization_stage(
         args,
         "loading base policy",
         config=base_config_name,
         decode_only=args.base_decode_only,
         norm_stats=base_norm_stats_source or "base checkpoint",
+        norm_mode=(
+            "config"
+            if base_norm_mode_override is None
+            else "quantile" if base_norm_mode_override else "meanstd"
+        ),
     )
     base_policy = policy_config.create_trained_policy(
         base_config,
         base_policy_checkpoint_dir,
         norm_stats=base_norm_stats,
+        use_quantile_norm=base_norm_mode_override,
         pytorch_device=args.device,
         load_weights=not args.base_decode_only,
     )
+    if base_norm_mode_override is not None:
+        actual_base_quantile_norm = bool(base_policy._metadata["use_quantile_norm"])
+        if actual_base_quantile_norm != base_norm_mode_override:
+            raise RuntimeError(
+                "Base policy normalization override was not applied: "
+                f"requested={'quantile' if base_norm_mode_override else 'meanstd'}, "
+                f"actual={'quantile' if actual_base_quantile_norm else 'meanstd'}."
+            )
     _report_initialization_stage(args, "base policy ready", config=base_config_name)
 if "task" in required_policy_roles:
     task_config_name = _config_name_from_checkpoint_dir(task_checkpoint_dir)
@@ -5741,7 +7070,11 @@ if "task" in required_policy_roles:
     task_policy = policy_config.create_trained_policy(
         task_config,
         task_checkpoint_dir,
-        sample_kwargs={"num_steps": args.num_steps} if standalone_role == "task" else None,
+        sample_kwargs={"num_steps": args.num_steps}
+        if standalone_role == "task"
+        or args.policy_chunk_video_overlay
+        or args.diffusion_chunk_video_step >= 0
+        else None,
         pytorch_device=args.device,
     )
     expected_task_quantiles = task_config.data.use_quantile_norm
@@ -5758,11 +7091,52 @@ if "task" in required_policy_roles:
 if "ref" in required_policy_roles:
     ref_config_name = _config_name_from_checkpoint_dir(ref_checkpoint_dir)
     ref_config = _config.get_config(ref_config_name)
-    _report_initialization_stage(args, "loading ref policy", config=ref_config_name)
+    if args.ref_attention != "config":
+        if not hasattr(ref_config.model, "bidirectional_attention"):
+            raise ValueError(
+                "--ref_attention is only supported for ProxyScore ref models; "
+                f"config {ref_config_name!r} uses {type(ref_config.model).__name__}."
+            )
+        ref_config = dataclasses.replace(
+            ref_config,
+            model=dataclasses.replace(
+                ref_config.model,
+                bidirectional_attention=args.ref_attention == "bidirectional",
+            ),
+        )
+    if args.ref_prediction_type != "config":
+        if not hasattr(ref_config.model, "prediction_type"):
+            raise ValueError(
+                "--ref_prediction_type is only supported for ProxyScore ref models; "
+                f"config {ref_config_name!r} uses {type(ref_config.model).__name__}."
+            )
+        ref_config = dataclasses.replace(
+            ref_config,
+            model=dataclasses.replace(
+                ref_config.model,
+                prediction_type=args.ref_prediction_type,
+            ),
+        )
+    ref_attention = (
+        "bidirectional"
+        if getattr(ref_config.model, "bidirectional_attention", False)
+        else "causal"
+    )
+    ref_prediction_type = getattr(ref_config.model, "prediction_type", "n/a")
+    _report_initialization_stage(
+        args,
+        "loading ref policy",
+        config=ref_config_name,
+        attention=ref_attention,
+        prediction_type=ref_prediction_type,
+        rollout="ddim" if standalone_role == "ref" else "score-query-only",
+    )
     ref_policy = policy_config.create_trained_policy(
         ref_config,
         ref_checkpoint_dir,
-        sample_kwargs={"num_steps": args.num_steps} if standalone_role == "ref" else None,
+        sample_kwargs={"num_steps": args.num_steps}
+        if standalone_role == "ref"
+        else None,
         pytorch_device=args.device,
     )
     _report_initialization_stage(args, "ref policy ready", config=ref_config_name)
@@ -6016,6 +7390,83 @@ if standalone_role is None:
         action_dim=min(proxy_action_dims) if proxy_action_dims else 8,
     )
     _assert_score_space_compatibility(base_policy, task_policy, ref_policy, args)
+
+ref_cache_collector = None
+ref_cache_input_policy = None
+if args.ref_cache_output is not None:
+    _ref_cache_train_config = _config.get_config(args.ref_cache_config)
+    if (
+        getattr(_ref_cache_train_config.model, "prediction_type", None) != "epsilon"
+        or not bool(getattr(_ref_cache_train_config.model, "bidirectional_attention", False))
+        or bool(getattr(_ref_cache_train_config.data, "use_quantile_norm", True))
+    ):
+        raise ValueError(
+            "--ref_cache_config must be bidirectional epsilon with mean/std normalization."
+        )
+    ref_cache_input_policy = policy_config.create_trained_policy(
+        _ref_cache_train_config,
+        task_checkpoint_dir,
+        norm_stats=base_norm_stats,
+        use_quantile_norm=False,
+        pytorch_device=args.device,
+        load_weights=False,
+    )
+    _ref_input_norm_stats, _ref_input_uses_quantiles = _policy_input_norm_stats(
+        ref_cache_input_policy
+    )
+    if _ref_input_uses_quantiles:
+        raise RuntimeError("Ref-cache observation policy did not apply mean/std normalization.")
+    _base_model_config = base_policy._model.config
+    _ref_cache_metadata = {
+        "config": args.ref_cache_config,
+        "base_config": base_config_name,
+        "base_checkpoint_dir": str(base_policy_checkpoint_dir),
+        "base_action_stats": str(args.base_action_stats),
+        "base_action_stats_sha256": _ref_cache_file_sha256(args.base_action_stats),
+        "hdf5_path": None,
+        "task": _task_name_for_mpc(args.task),
+        "vlm_cost_config": str(args.vlm_cost_config),
+        "teacher_code_sha256": _ref_cache_file_sha256(__file__),
+        "prompt": args.prompt,
+        "prediction_type": "epsilon",
+        "target_transform": "epsilon=-sqrt(1-alpha_bar_t)*mpc_score",
+        "score_model_action_dim": 8,
+        "score_model_action_horizon": int(_base_model_config.action_horizon),
+        "norm_stats_fingerprint": _ref_cache_norm_stats_fingerprint(_ref_input_norm_stats),
+        "use_quantile_norm": False,
+        "subtask_mode": "runtime_live_vlm_context",
+        "mpc": {
+            "num_samples": int(args.mpc_num_samples),
+            "iterations": int(args.mpc_iterations),
+            "noise": float(args.mpc_noise),
+            "temperature": float(args.mpc_temperature),
+            "joint_delta_clip": float(args.mpc_joint_delta_clip),
+            "cost_style": args.mpc_cost,
+            "interpolate": bool(args.interpolate),
+            "sampler": args.sampler,
+            "optimize_space": args.mpc_optimize_space,
+            "proposal_center": "current_noisy_action",
+            "noise_schedule": ACTION_PROX_NOISE_SCHEDULE,
+            "cost_executable_actions": bool(args.cost_executable_actions),
+        },
+    }
+    ref_cache_collector = RuntimeRefCacheCollector(
+        output_path=args.ref_cache_output,
+        trajectories_per_observation=args.ref_cache_trajectories_per_observation,
+        max_observations=args.ref_cache_max_observations,
+        num_steps=args.num_steps,
+        ddim_num_train_timesteps=args.mpc_ddim_train_timesteps,
+        stored_action_dim=8,
+        label_seed=args.ref_cache_label_seed + max(args.worker_id, 0) * 10_000_019,
+        metadata=_ref_cache_metadata,
+    )
+    print(
+        "Runtime ref-cache enabled: "
+        f"output={args.ref_cache_output}, K={args.ref_cache_trajectories_per_observation}, "
+        f"max_observations={args.ref_cache_max_observations}",
+        flush=True,
+    )
+
 
 steps_per_inference = int(args.steps_per_inference)
 print(
@@ -6430,6 +7881,9 @@ for rollout_idx, seed in enumerate(eval_seeds):
     action_start_step = -steps_per_inference
     actions = None
     latch_raw = {}
+    policy_chunk_plans = None
+    policy_chunk_overlay = None
+    diffusion_chunk_video_path = None
     for step_idx in tqdm(
         range(args.task_num_steps),
         desc="Policy Control Loop",
@@ -6440,6 +7894,7 @@ for rollout_idx, seed in enumerate(eval_seeds):
                 actions is None
                 or force_replan
                 or step_idx - action_start_step >= steps_per_inference
+                or step_idx == args.diffusion_chunk_video_step
             ):
                 # print('predict_action')
                 # run inference
@@ -6460,6 +7915,12 @@ for rollout_idx, seed in enumerate(eval_seeds):
                         )
                     )
 
+                    capture_diffusion = (
+                        step_idx == args.diffusion_chunk_video_step
+                    )
+                    if not args.policy_chunk_video_overlay:
+                        policy_chunk_plans = None
+                        policy_chunk_overlay = None
                     fk_m = int(getattr(args, "fk_fork", 1))
                     fk_active = fk_m > 1 and (
                         bool(getattr(args, "fk_always", False))
@@ -6499,17 +7960,103 @@ for rollout_idx, seed in enumerate(eval_seeds):
                         if len(finite) > 1:
                             compare_stats["fk_cost_spread"] = max(finite) - min(finite)
                     else:
-                        actions, compare_stats = infer_actions_with_mpc(
-                            base_policy,
-                            task_policy,
-                            ref_policy,
-                            copy.deepcopy(obs),
-                            args,
-                            mpc_planner=mpc_planner,
-                            mpc_context=mpc_context,
-                            warm_shift_steps=warm_shift_steps,
-                            base_decode_policy=base_decode_policy,
+                        if args.policy_chunk_video_overlay or capture_diffusion:
+                            if capture_diffusion and not _uses_vlm_mpc_base(args):
+                                (
+                                    actions,
+                                    compare_stats,
+                                    policy_chunk_plans,
+                                    diffusion_traces,
+                                ) = _infer_flow_policy_quintet(
+                                    base_policy,
+                                    task_policy,
+                                    ref_policy,
+                                    copy.deepcopy(obs),
+                                    args,
+                                )
+                            else:
+                                (
+                                    actions,
+                                    compare_stats,
+                                    policy_chunk_plans,
+                                    diffusion_traces,
+                                ) = _infer_policy_chunk_triplet(
+                                    base_policy,
+                                    task_policy,
+                                    ref_policy,
+                                    copy.deepcopy(obs),
+                                    args,
+                                    mpc_planner=mpc_planner,
+                                    mpc_context=mpc_context,
+                                    warm_shift_steps=warm_shift_steps,
+                                    base_decode_policy=base_decode_policy,
+                                    capture_denoise_trace=capture_diffusion,
+                                )
+                            if args.policy_chunk_video_overlay:
+                                policy_chunk_overlay = _build_policy_chunk_video_overlay(
+                                    policy_chunk_plans,
+                                    mpc_planner,
+                                    mpc_context,
+                                    execute_steps=steps_per_inference,
+                                )
+                            if capture_diffusion:
+                                diffusion_chunk_video_path = _save_diffusion_chunk_video(
+                                    env,
+                                    diffusion_traces,
+                                    os.path.join(
+                                        experiment_output_path,
+                                        f"{seed}_envstep{step_idx}_base_task_steer_diffusion.mp4",
+                                    ),
+                                    seed=seed,
+                                    env_step=step_idx,
+                                    fps=args.diffusion_chunk_video_fps,
+                                    waypoint_count=args.diffusion_chunk_video_waypoints,
+                                )
+                        else:
+                            actions, compare_stats = infer_actions_with_mpc(
+                                base_policy,
+                                task_policy,
+                                ref_policy,
+                                copy.deepcopy(obs),
+                                args,
+                                mpc_planner=mpc_planner,
+                                mpc_context=mpc_context,
+                                warm_shift_steps=warm_shift_steps,
+                                base_decode_policy=base_decode_policy,
+                            )
+                    if ref_cache_collector is not None and not ref_cache_collector.full:
+                        _, _ref_cache_planner_inputs = _obs_to_input_checked(
+                            base_policy, copy.deepcopy(obs), "base-ref-cache"
                         )
+                        _, _ref_cache_observation_inputs = _obs_to_input_checked(
+                            ref_cache_input_policy, copy.deepcopy(obs), "ref-cache-observation"
+                        )
+                        ref_cache_collector.collect(
+                            planner=mpc_planner,
+                            base_model=base_policy._model,
+                            model_inputs=_ref_cache_planner_inputs,
+                            observation_inputs=_ref_cache_observation_inputs,
+                            context=mpc_context,
+                            seed=seed,
+                            env_step=step_idx,
+                        )
+                        print(
+                            "ref_cache_progress "
+                            f"{ref_cache_collector.num_observations}/"
+                            f"{ref_cache_collector.max_observations} "
+                            f"seed={seed} step={step_idx}",
+                            flush=True,
+                        )
+                        if ref_cache_collector.full or (
+                            ref_cache_collector.num_observations % 32 == 0
+                        ):
+                            ref_cache_collector.save()
+                    if (
+                        ref_cache_collector is not None
+                        and ref_cache_collector.full
+                        and args.ref_cache_only
+                    ):
+                        break
                     if args.writeup_debug:
                         _writeup_plan_raw = (
                             actions[..., :8].detach().cpu().clone()
@@ -6604,6 +8151,8 @@ for rollout_idx, seed in enumerate(eval_seeds):
                                            if torch.is_tensor(actions)
                                            else np.asarray(actions)[..., :8]),
                             latch_suppressed=latch_raw,
+                            **({"policy_chunks": policy_chunk_plans}
+                               if policy_chunk_plans is not None else {}),
                             **({"pred_shadow": _writeup_pred}
                                if _writeup_pred is not None else {}),
                         )
@@ -6812,6 +8361,9 @@ for rollout_idx, seed in enumerate(eval_seeds):
                     debug_overlay["vlm"] = vlm_bridge.viz()
                 except Exception as exc:
                     print(f"[vlm_dp] viz overlay failed: {exc}", flush=True)
+            if record_frame and policy_chunk_overlay is not None:
+                debug_overlay = debug_overlay or {"env": env, "axes": {}}
+                debug_overlay["policy_chunks"] = policy_chunk_overlay
             if record_frame:
                 vis_image = _build_rollout_frame(
                     obs,
@@ -6973,6 +8525,7 @@ for rollout_idx, seed in enumerate(eval_seeds):
         subtasks=current_subtasks,
         success=success,
         video_path=video_path,
+        diffusion_video_path=diffusion_chunk_video_path,
         **_profile_extra,
     )
     _write_writeup_debug_log(
@@ -6986,6 +8539,7 @@ for rollout_idx, seed in enumerate(eval_seeds):
         subtasks=current_subtasks,
         success=success,
         video_path=video_path,
+        diffusion_video_path=diffusion_chunk_video_path,
     )
     _emit_worker_progress(
         args,
@@ -7013,6 +8567,10 @@ for rollout_idx, seed in enumerate(eval_seeds):
             "steps": step_idx,
             "video": video_name,
             "thermal_video": thermal_video_name,
+            "diffusion_video": (
+                None if diffusion_chunk_video_path is None
+                else os.path.basename(diffusion_chunk_video_path)
+            ),
             "inference_calls": episode_inference_calls,
             "average_inference_ms": avg_infer_ms,
         }
@@ -7053,6 +8611,12 @@ for rollout_idx, seed in enumerate(eval_seeds):
 
         total_comparison_observation_steps += episode_comparison_observation_steps
         episode_comparison_summaries.append(episode_summary)
+
+    if ref_cache_collector is not None:
+        ref_cache_collector.save()
+        if ref_cache_collector.full and args.ref_cache_only:
+            break
+
 
 env.close()
 if dataset_file is not None:

@@ -1007,7 +1007,7 @@ class SimFreeMPC:
         *,
         alpha_bar: float,
     ):
-        """Optimize clean-action candidates around the scaled noisy action."""
+        """Optimize clean-action candidates around the configured noisy-action center."""
         if x_t.shape[0] != 1:
             raise ValueError("MBD action-space sampler currently expects batch size 1.")
         if self.config.optimize_space != "action":
@@ -1371,6 +1371,9 @@ class SimFreeMPC:
             context,
             alpha_bar=alpha_bar,
         )
+        # Expose the clean-action estimate for diagnostic visualization. This is
+        # detached and never read by the planner's update path.
+        self._last_x0_hat = x0_hat.detach().clone()
 
         alpha = torch.as_tensor(alpha_bar, device=x_t.device, dtype=x_t.dtype)
         alpha_prev = torch.as_tensor(alpha_bar_prev, device=x_t.device, dtype=x_t.dtype)
@@ -1622,7 +1625,11 @@ class SimFreeMPC:
                 "alpha_bar": float(alpha_bar),
                 "alpha_bar_prev": float(alpha_bar_prev),
                 "active_dims": int(active_dims),
-                "proposal_center": "noisy_action_div_sqrt_alpha",
+                "proposal_center": (
+                    "current_noisy_action"
+                    if self.config.cost_style == "priority" and self.config.sampler == "base"
+                    else "noisy_action_div_sqrt_alpha"
+                ),
                 "proposal_noise_scale": float(proposal_std),
                 "clean_sample_std": float(proposal_std),
             }

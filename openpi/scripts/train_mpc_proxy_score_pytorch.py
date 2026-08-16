@@ -48,6 +48,7 @@ import datetime
 import hashlib
 import json
 import logging
+import math
 import os
 import pathlib
 import random
@@ -81,6 +82,13 @@ from openpi.training import checkpoints as _checkpoints
 from openpi.shared import normalize as _normalize
 from sim_free_mpc import SimFreeMPC, SimFreeMPCConfig
 from sim_free_mpc.ddim import ddim_iteration_alphas
+from tools.ref_observation_split import split_observations, write_split_manifest
+from tools.ref_action_dataset import MPCActionChunkDataset
+from tools.ref_batching import (
+    resolve_ref_batch_layout,
+    sample_cached_label_indices,
+    sample_trajectory_indices,
+)
 
 from train_proxy_score_pytorch import (
     cleanup_ddp,
@@ -104,8 +112,8 @@ DEFAULT_BASE_CHECKPOINT_DIR = os.path.join(
     "pi05_droid_jointpos",
 )
 DEFAULT_PROMPT = "put pear and apple on the scale"
-CACHE_FORMAT_VERSION = 3
-CACHE_LABEL_TYPE = "mpc_score_action_prox_reverse_trajectory"
+CACHE_FORMAT_VERSION = 5
+CACHE_LABEL_TYPE = "mpc_epsilon_action_prox_reverse_trajectory"
 CACHE_STATE_SOURCE = "action_prox_reverse_trajectory_from_gaussian"
 ACTION_PROX_NOISE_SCHEDULE = "mpc_noise_times_sqrt_one_minus_alpha_bar"
 OBSERVATION_CACHE_FORMAT_VERSION = 1
@@ -129,6 +137,14 @@ def _norm_stats_fingerprint(norm_stats: dict[str, Any] | None) -> str | None:
             digest.update(str(arr.shape).encode("utf-8"))
             digest.update(str(arr.dtype).encode("utf-8"))
             digest.update(np.ascontiguousarray(arr).tobytes())
+    return digest.hexdigest()
+
+
+def _file_sha256(path: str | pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with pathlib.Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
     return digest.hexdigest()
 
 
@@ -497,6 +513,10 @@ def generate_cache(args: argparse.Namespace) -> None:
     config = _config.get_config(args.config)
     if not isinstance(config.model, openpi.models.proxy_score_config.ProxyScoreConfig):
         raise ValueError(f"{args.config!r} must use ProxyScoreConfig.")
+    if config.model.prediction_type != "epsilon":
+        raise ValueError(
+            f"{args.config!r} must use prediction_type='epsilon' for ref distillation."
+        )
 
     device_name = args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu"
     device = torch.device(device_name)
@@ -508,6 +528,21 @@ def generate_cache(args: argparse.Namespace) -> None:
         pathlib.Path(args.base_checkpoint_dir) / "assets",
         base_data_config.asset_id,
     )
+    action_stats = load_action_norm_stats(args.base_action_stats)
+    if action_stats is None:
+        raise FileNotFoundError(f"Base demo action stats not found: {args.base_action_stats}")
+    base_action_norm = base_norm_stats.get("actions")
+    if base_action_norm is None:
+        raise ValueError("Base/task norm stats do not contain actions.")
+    for field in ("mean", "std"):
+        embedded = np.asarray(getattr(base_action_norm, field), dtype=np.float32)
+        standalone = np.asarray(action_stats[field], dtype=np.float32)
+        if embedded.shape != standalone.shape or not np.allclose(
+            embedded, standalone, rtol=0.0, atol=1e-7
+        ):
+            raise ValueError(
+                f"{field} mismatch between task checkpoint stats and --base_action_stats."
+            )
     score_data_config, input_transform = _build_data_pipeline(config)
     if _norm_stats_fingerprint(base_norm_stats) != _norm_stats_fingerprint(score_data_config.norm_stats):
         raise ValueError(
@@ -532,6 +567,7 @@ def generate_cache(args: argparse.Namespace) -> None:
             beta_opt_iter=args.mpc_beta_opt_iter,
             beta_horizon=args.mpc_beta_horizon,
             action_dims=config.model.action_dim,
+            cost_executable_actions=bool(args.cost_executable_actions),
             joint_delta_clip=args.mpc_joint_delta_clip,
             logit_norm=args.mpc_logit_norm,
             ancestral_eta=args.mpc_ancestral_eta,
@@ -575,9 +611,18 @@ def generate_cache(args: argparse.Namespace) -> None:
         seed=args.seed,
     )
     indices = _shard_indices(indices, args.obs_shard, args.obs_num_shards)
-    logging.info("shard %s/%s: %s trajectories", args.obs_shard, args.obs_num_shards, len(indices))
     if not indices:
         raise ValueError("No valid HDF5 windows found for MPC score label generation.")
+    num_observations = len(indices)
+    trajectories_per_observation = int(args.trajectories_per_observation)
+    if trajectories_per_observation <= 0:
+        raise ValueError("--trajectories_per_observation must be positive.")
+    indices = [index for index in indices for _ in range(trajectories_per_observation)]
+    logging.info(
+        "shard %s/%s: observations=%s trajectories=%s K=%s",
+        args.obs_shard, args.obs_num_shards, num_observations, len(indices),
+        trajectories_per_observation,
+    )
     stage_tracker = None
     if args.mpc_cost == "priority" and task_module is None:
         from vlm_dp.offline_context import MonotoneStages
@@ -680,7 +725,15 @@ def generate_cache(args: argparse.Namespace) -> None:
                         )
                     )
                     diffusion_states.append(x_t[0].detach().cpu().numpy().astype(np.float32))
-                    target_scores.append(score[0].detach().cpu().numpy().astype(np.float32))
+                    alpha_bar, _ = ddim_iteration_alphas(
+                        iteration=iteration,
+                        num_iterations=num_iterations,
+                        num_train_timesteps=config.model.ddim_num_train_timesteps,
+                    )
+                    epsilon = -math.sqrt(max(1.0 - alpha_bar, 1e-6)) * score
+                    target_scores.append(
+                        epsilon[0].detach().cpu().numpy().astype(np.float32)
+                    )
                     min_costs.append(float(diagnostics.get("cost_min", np.nan)))
                     score_norms.append(float(diagnostics.get("score_norm", np.nan)))
 
@@ -709,17 +762,32 @@ def generate_cache(args: argparse.Namespace) -> None:
         "initial_state_distribution": "standard_gaussian",
         "trajectory_update": "mbd_score",
         "num_trajectories": len(indices),
+        "num_observations": int(num_observations),
+        "trajectories_per_observation": int(trajectories_per_observation),
         "labels_per_trajectory": int(num_iterations),
         "config": args.config,
         "base_config": args.base_config,
         "base_checkpoint_dir": str(args.base_checkpoint_dir),
+        "base_action_stats": str(args.base_action_stats),
+        "base_action_stats_sha256": _file_sha256(args.base_action_stats),
         "hdf5_path": str(args.hdf5_path),
+        "obs_shard": int(args.obs_shard),
+        "obs_num_shards": int(args.obs_num_shards),
+        "seed": int(args.seed),
+        "label_seed": int(args.seed if args.label_seed is None else args.label_seed),
         "task": args.task,
         "task_module": str(args.task_module) if args.task_module else None,
         "vlm_cost_config": args.vlm_cost_config,
+        "teacher_code_sha256": {
+            "cache_generator": _file_sha256(__file__),
+            "planner": _file_sha256(pathlib.Path(_REPO_DIR) / "sim_free_mpc/planner.py"),
+            "cost_config": _file_sha256(pathlib.Path(_REPO_DIR) / args.vlm_cost_config),
+        },
         "prompt": args.prompt,
         "num_steps": int(args.num_steps),
         "num_iterations": int(num_iterations),
+        "prediction_type": "epsilon",
+        "target_transform": "epsilon=-sqrt(1-alpha_bar_t)*mpc_score",
         "ddim_num_train_timesteps": int(config.model.ddim_num_train_timesteps),
         "score_model_action_dim": int(config.model.action_dim),
         "score_model_action_horizon": int(config.model.action_horizon),
@@ -730,7 +798,8 @@ def generate_cache(args: argparse.Namespace) -> None:
         "mpc": {
             "num_samples": int(args.mpc_num_samples),
             "iterations": int(args.mpc_iterations),
-            "proposal_center": "noisy_action_div_sqrt_alpha",
+            "proposal_center": "current_noisy_action" if args.mpc_cost == "priority" else "noisy_action_div_sqrt_alpha",
+            "sampler": "base",
             "noise_schedule": ACTION_PROX_NOISE_SCHEDULE,
             "noise": float(args.mpc_noise),
             "temperature": float(args.mpc_temperature),
@@ -739,6 +808,7 @@ def generate_cache(args: argparse.Namespace) -> None:
             "joint_delta_clip": float(args.mpc_joint_delta_clip),
             "cost_style": args.mpc_cost,
             "interpolate": bool(args.mpc_interpolate),
+            "cost_executable_actions": bool(args.cost_executable_actions),
         },
     }
     cache_path = pathlib.Path(args.cache_path)
@@ -751,7 +821,7 @@ def generate_cache(args: argparse.Namespace) -> None:
         iteration=np.asarray(iterations, dtype=np.int64),
         time=np.asarray(times, dtype=np.float32),
         x_t=np.asarray(diffusion_states, dtype=np.float32),
-        score=np.asarray(target_scores, dtype=np.float32),
+        epsilon=np.asarray(target_scores, dtype=np.float32),
         cost_min=np.asarray(min_costs, dtype=np.float32),
         score_norm=np.asarray(score_norms, dtype=np.float32),
         metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
@@ -777,7 +847,7 @@ class MPCScoreDataset(torch.utils.data.Dataset):
         self.trajectory_ids = self.cache["trajectory_id"].astype(np.int64)
         self.iterations = self.cache["iteration"].astype(np.int64)
         self.diffusion_states = self.cache["x_t"].astype(np.float32)
-        self.target_scores = self.cache["score"].astype(np.float32)
+        self.target_scores = self.cache["epsilon"].astype(np.float32)
         self.times = self.cache["time"].astype(np.float32)
         self.prompt = prompt
         self.config = config
@@ -791,6 +861,12 @@ class MPCScoreDataset(torch.utils.data.Dataset):
             )
         if metadata.get("label_type") != CACHE_LABEL_TYPE:
             raise ValueError("MPC score cache does not contain action-prox reverse trajectories.")
+        if metadata.get("prediction_type") != "epsilon" or config.model.prediction_type != "epsilon":
+            raise ValueError("MPC ref cache and model must both use epsilon prediction.")
+        if bool(metadata.get("use_quantile_norm")):
+            raise ValueError("New Base/ref cache must use demo mean/std, not quantile normalization.")
+        if not bool(config.model.bidirectional_attention):
+            raise ValueError("New ref training config must use bidirectional attention.")
         if metadata.get("state_source") != CACHE_STATE_SOURCE:
             raise ValueError("MPC score cache x_t states were not sampled from base reverse denoising.")
         if metadata.get("initial_state_distribution") != "standard_gaussian":
@@ -798,9 +874,15 @@ class MPCScoreDataset(torch.utils.data.Dataset):
         if metadata.get("trajectory_update") != "mbd_score":
             raise ValueError("MPC score cache does not use the online MBD reverse update.")
         mpc_metadata = metadata.get("mpc", {})
-        if mpc_metadata.get("proposal_center") != "noisy_action_div_sqrt_alpha":
+        if mpc_metadata.get("sampler") != "base":
+            raise ValueError("MPC ref cache must use the Base sampler.")
+        if mpc_metadata.get("cost_style") != "priority":
+            raise ValueError("MPC ref cache must use the priority cost.")
+        if not bool(mpc_metadata.get("cost_executable_actions")):
+            raise ValueError("MPC ref cache must score executable actions.")
+        if mpc_metadata.get("proposal_center") != "current_noisy_action":
             raise ValueError(
-                "MPC score cache does not use z_t / sqrt(alpha_bar) as the "
+                "MPC score cache does not use x_t as the priority/base-sampler "
                 "action-prox proposal center."
             )
         if mpc_metadata.get("noise_schedule") != ACTION_PROX_NOISE_SCHEDULE:
@@ -848,6 +930,14 @@ class MPCScoreDataset(torch.utils.data.Dataset):
         num_trajectories = int(metadata.get("num_trajectories", -1))
         if labels_per_trajectory <= 0 or num_trajectories <= 0:
             raise ValueError("MPC score cache has invalid reverse-trajectory metadata.")
+        num_observations = int(metadata.get("num_observations", -1))
+        trajectories_per_observation = int(metadata.get("trajectories_per_observation", -1))
+        if num_observations <= 0 or trajectories_per_observation <= 0:
+            raise ValueError("MPC score cache has invalid observation/K metadata.")
+        if num_trajectories != num_observations * trajectories_per_observation:
+            raise ValueError("MPC score cache trajectory count does not equal observations * K.")
+        if labels_per_trajectory != int(metadata.get("num_steps", -1)) + 1:
+            raise ValueError("MPC score cache must save 11 levels for 10 updates.")
         if labels_per_trajectory != int(metadata.get("num_iterations", -1)):
             raise ValueError("MPC score cache trajectory length does not match num_iterations.")
         if size != labels_per_trajectory * num_trajectories:
@@ -882,28 +972,23 @@ class MPCScoreDataset(torch.utils.data.Dataset):
 
         self.labels_per_trajectory = labels_per_trajectory
         self.num_trajectories = num_trajectories
+        self.num_observations = num_observations
+        self.trajectories_per_observation = trajectories_per_observation
+        self.labels_per_observation = labels_per_trajectory * trajectories_per_observation
         self.trajectory_demo_names = demo_grid[:, 0]
         self.trajectory_step_indices = step_grid[:, 0]
-        observation_keys: dict[tuple[str, int], int] = {}
-        observation_indices = []
-        unique_demo_names = []
-        unique_step_indices = []
-        for demo_name, step_idx in zip(
-            self.trajectory_demo_names,
-            self.trajectory_step_indices,
-            strict=True,
+        trajectory_index_grid = np.arange(num_trajectories).reshape(num_observations, trajectories_per_observation)
+        obs_demo_grid = self.trajectory_demo_names.reshape(num_observations, trajectories_per_observation)
+        obs_step_grid = self.trajectory_step_indices.reshape(num_observations, trajectories_per_observation)
+        if (
+            np.any(obs_demo_grid != obs_demo_grid[:, :1])
+            or np.any(obs_step_grid != obs_step_grid[:, :1])
         ):
-            key = (str(demo_name), int(step_idx))
-            observation_idx = observation_keys.get(key)
-            if observation_idx is None:
-                observation_idx = len(unique_demo_names)
-                observation_keys[key] = observation_idx
-                unique_demo_names.append(key[0])
-                unique_step_indices.append(key[1])
-            observation_indices.append(observation_idx)
-        self.trajectory_observation_indices = np.asarray(observation_indices, dtype=np.int64)
-        self.unique_demo_names = np.asarray(unique_demo_names)
-        self.unique_step_indices = np.asarray(unique_step_indices, dtype=np.int64)
+            raise ValueError("K trajectories for one observation are not contiguous or share different observations.")
+        self.observation_trajectory_indices = trajectory_index_grid
+        self.unique_demo_names = obs_demo_grid[:, 0]
+        self.unique_step_indices = obs_step_grid[:, 0]
+        self.trajectory_observation_indices = np.repeat(np.arange(num_observations), trajectories_per_observation)
 
         if observation_cache_path is None:
             observation_cache_path = f"{cache_path}.observations"
@@ -918,14 +1003,13 @@ class MPCScoreDataset(torch.utils.data.Dataset):
         self._load_observation_cache()
 
     def __len__(self) -> int:
-        return self.num_trajectories
+        return self.num_observations
 
     @property
     def num_labels(self) -> int:
         return int(self.diffusion_states.shape[0])
 
     def _observation_cache_metadata(self) -> dict[str, Any]:
-        hdf5_stat = pathlib.Path(self.hdf5_path).stat()
         digest = hashlib.sha256()
         for demo_name, step_idx in zip(
             self.unique_demo_names,
@@ -934,6 +1018,20 @@ class MPCScoreDataset(torch.utils.data.Dataset):
         ):
             digest.update(str(demo_name).encode("utf-8"))
             digest.update(np.asarray(step_idx, dtype=np.int64).tobytes())
+
+        if self.metadata.get("observation_source") == "eval_steering_live_model_inputs":
+            return {
+                "format_version": int(self.metadata["observation_cache_format_version"]),
+                "source": "eval_steering_live_model_inputs",
+                "num_observations": int(len(self.unique_demo_names)),
+                "prompt": self.prompt,
+                "norm_stats_fingerprint": _norm_stats_fingerprint(self.data_config.norm_stats),
+                "use_quantile_norm": bool(self.data_config.use_quantile_norm),
+                "image_keys": list(OBSERVATION_IMAGE_KEYS),
+                "image_shape": [224, 224, 3],
+            }
+
+        hdf5_stat = pathlib.Path(self.hdf5_path).stat()
         return {
             "format_version": OBSERVATION_CACHE_FORMAT_VERSION,
             "hdf5_size": int(hdf5_stat.st_size),
@@ -1057,7 +1155,7 @@ class MPCScoreDataset(torch.utils.data.Dataset):
         )
 
     def __getitem__(self, idx: int):
-        observation_idx = int(self.trajectory_observation_indices[idx])
+        observation_idx = int(idx)
         inputs = {
             "image": {
                 image_key: torch.from_numpy(self.cached_images[observation_idx, image_idx])
@@ -1074,8 +1172,8 @@ class MPCScoreDataset(torch.utils.data.Dataset):
             "tokenized_prompt": torch.from_numpy(self.cached_tokenized_prompt),
             "tokenized_prompt_mask": torch.from_numpy(self.cached_tokenized_prompt_mask),
         }
-        label_start = idx * self.labels_per_trajectory
-        label_end = label_start + self.labels_per_trajectory
+        label_start = idx * self.labels_per_observation
+        label_end = label_start + self.labels_per_observation
         return (
             inputs,
             torch.from_numpy(self.diffusion_states[label_start:label_end]),
@@ -1400,24 +1498,65 @@ def train_bc(args: argparse.Namespace) -> None:
     elif config.wandb_enabled:
         wandb.init(mode="disabled")
 
-    val_demos = _held_out_demos(args.hdf5_path, args.val_demos)
-    action_norm_stats = _bc_action_norm_stats(args, config, val_demos)
-    if is_main and action_norm_stats is not None:
-        _write_action_norm_stats(config.checkpoint_dir, action_norm_stats)
-    if use_ddp:
-        torch.distributed.barrier()
-
-    dataset = BCDemoActionDataset(
-        hdf5_path=args.hdf5_path,
-        config=config,
-        prompt=args.prompt,
-        demo_stride=args.demo_stride,
-        demo_offset=args.demo_offset,
-        stride=args.stride,
-        action_norm_stats=action_norm_stats,
-        exclude_demos=val_demos,
-        action_offset=args.action_offset,
-    )
+    cache_mode = bool(args.cache_path)
+    batch_layout = None
+    if cache_mode:
+        if config.model.prediction_type != "epsilon":
+            raise ValueError("Teacher action-chunk B must use standard epsilon training.")
+        val_demos = set()
+        action_norm_stats = None
+        grouped_dataset = MPCScoreDataset(
+            hdf5_path=args.hdf5_path,
+            cache_path=args.cache_path,
+            config=config,
+            prompt=args.prompt,
+            observation_cache_path=args.observation_cache_path,
+            build_observation_cache=False,
+        )
+        dataset = MPCActionChunkDataset(grouped_dataset)
+        train_obs, val_obs, split_manifest = split_observations(
+            dataset.unique_demo_names,
+            dataset.unique_step_indices,
+            val_fraction=args.val_fraction,
+            seed=args.split_seed,
+        )
+        train_dataset = torch.utils.data.Subset(dataset, train_obs.tolist())
+        batch_layout = resolve_ref_batch_layout(
+            global_target_batch=config.batch_size,
+            trajectories_per_observation=dataset.trajectories_per_observation,
+            world_size=world_size,
+            targets_per_observation=args.targets_per_observation,
+        )
+        if is_main:
+            write_split_manifest(
+                config.checkpoint_dir / "observation_split.json", split_manifest
+            )
+            logging.info(
+                "Teacher action split: train_obs=%s val_obs=%s train_chunks=%s",
+                len(train_obs), len(val_obs),
+                len(train_dataset) * dataset.trajectories_per_observation,
+            )
+    else:
+        if args.targets_per_observation is not None:
+            raise ValueError("--targets_per_observation requires --cache_path.")
+        val_demos = _held_out_demos(args.hdf5_path, args.val_demos)
+        action_norm_stats = _bc_action_norm_stats(args, config, val_demos)
+        if is_main and action_norm_stats is not None:
+            _write_action_norm_stats(config.checkpoint_dir, action_norm_stats)
+        if use_ddp:
+            torch.distributed.barrier()
+        dataset = BCDemoActionDataset(
+            hdf5_path=args.hdf5_path,
+            config=config,
+            prompt=args.prompt,
+            demo_stride=args.demo_stride,
+            demo_offset=args.demo_offset,
+            stride=args.stride,
+            action_norm_stats=action_norm_stats,
+            exclude_demos=val_demos,
+            action_offset=args.action_offset,
+        )
+        train_dataset = dataset
     if is_main:
         logging.info(
             "BC action_norm=%s action_offset=%s held_out=%s",
@@ -1446,15 +1585,27 @@ def train_bc(args: argparse.Namespace) -> None:
         (config.checkpoint_dir / "bc_metadata.json").write_text(
             json.dumps(
                 {
-                    "mode": "demo_bc_x0",
+                    "mode": "teacher_action_chunk_epsilon" if cache_mode else "demo_bc_x0",
                     "prediction_type": config.model.prediction_type,
                     "hdf5_path": str(args.hdf5_path),
+                    "cache_path": str(args.cache_path) if cache_mode else None,
+                    "num_train_chunks": (
+                        len(train_dataset) * dataset.trajectories_per_observation
+                        if cache_mode else len(train_dataset)
+                    ),
+                    "grouped_batch": dataclasses.asdict(batch_layout) if cache_mode else None,
+                    "val_fraction": float(args.val_fraction),
+                    "split_seed": int(args.split_seed),
                     "prompt": args.prompt,
                     "demo_stride": int(args.demo_stride),
                     "demo_offset": int(args.demo_offset),
                     "stride": int(args.stride),
                     "num_demos": len(dataset.demo_names),
-                    "num_windows": len(dataset),
+                    "num_windows": (
+                        len(dataset) * dataset.trajectories_per_observation
+                        if cache_mode else len(dataset)
+                    ),
+                    "num_observations": len(dataset) if cache_mode else None,
                     "demo_names": list(dataset.demo_names),
                     "freeze_dino_encoder": bool(config.model.freeze_dino_encoder),
                     "action_expert_variant": str(config.model.action_expert_variant),
@@ -1469,30 +1620,47 @@ def train_bc(args: argparse.Namespace) -> None:
                 sort_keys=True,
             )
         )
-    # Uneven split keeps the global batch exact under DDP (e.g. 32 -> 11/11/10 on 3 ranks).
-    per_rank_batch = [
-        config.batch_size // world_size + (1 if r < config.batch_size % world_size else 0)
-        for r in range(world_size)
-    ]
-    local_batch = per_rank_batch[rank]
+    if cache_mode:
+        assert batch_layout is not None
+        local_batch = batch_layout.local_observation_batch
+        per_rank_batch = [local_batch] * world_size
+    else:
+        # Non-cache demo BC keeps its historical flat-example batching.
+        per_rank_batch = [
+            config.batch_size // world_size
+            + (1 if r < config.batch_size % world_size else 0)
+            for r in range(world_size)
+        ]
+        local_batch = per_rank_batch[rank]
     if local_batch <= 0:
         raise ValueError(f"batch_size={config.batch_size} too small for world_size={world_size}.")
     if is_main:
-        logging.info("BC batch: global=%s per_rank=%s", config.batch_size, per_rank_batch)
+        if cache_mode:
+            logging.info(
+                "Teacher action grouped batch: target_batch=%s observations=%s "
+                "targets_per_observation=%s observations_per_rank=%s",
+                batch_layout.global_target_batch,
+                batch_layout.global_observation_batch,
+                batch_layout.targets_per_observation,
+                batch_layout.local_observation_batch,
+            )
+        else:
+            logging.info("BC batch: global=%s per_rank=%s", config.batch_size, per_rank_batch)
         if config.wandb_enabled and wandb.run is not None:
             wandb.config.update(
                 {"global_batch_size": config.batch_size,
                  "per_rank_batch_sizes": per_rank_batch,
-                 "world_size": world_size},
+                 "world_size": world_size,
+                 "grouped_batch": dataclasses.asdict(batch_layout) if cache_mode else None},
                 allow_val_change=True,
             )
     sampler = (
-        torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True, drop_last=True)
+        torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=True, drop_last=True)
         if use_ddp
         else None
     )
     train_loader = torch.utils.data.DataLoader(
-        dataset,
+        train_dataset,
         batch_size=local_batch,
         shuffle=sampler is None,
         sampler=sampler,
@@ -1563,6 +1731,16 @@ def train_bc(args: argparse.Namespace) -> None:
                 sampler.set_epoch(epoch)
             data_iter = iter(train_loader)
             input_batch, actions = next(data_iter)
+
+        if cache_mode:
+            assert batch_layout is not None
+            trajectory_indices = sample_trajectory_indices(
+                actions.shape[0],
+                batch_layout.trajectories_per_observation,
+                batch_layout.targets_per_observation,
+            )
+            observation_indices = torch.arange(actions.shape[0])[:, None]
+            actions = actions[observation_indices, trajectory_indices]
 
         input_batch = move_to_device(input_batch, device)
         observation = _model.Observation.from_dict(input_batch)
@@ -1759,44 +1937,66 @@ def train(args: argparse.Namespace) -> None:
         )
     if is_main:
         logging.info(
-            "Loaded grouped reverse cache: trajectories=%s labels=%s labels_per_trajectory=%s "
-            "unique_observations=%s",
+            "Loaded grouped reverse cache: observations=%s trajectories=%s K=%s "
+            "labels=%s labels_per_observation=%s",
+            dataset.num_observations,
             dataset.metadata["num_trajectories"],
+            dataset.trajectories_per_observation,
             dataset.num_labels,
-            dataset.metadata["labels_per_trajectory"],
-            len(dataset.unique_demo_names),
+            dataset.labels_per_observation,
         )
-    if config.batch_size % world_size != 0:
-        raise ValueError(
-            f"batch_size={config.batch_size} must be divisible by world_size={world_size}."
+    train_indices, val_indices, split_manifest = split_observations(
+        dataset.unique_demo_names,
+        dataset.unique_step_indices,
+        val_fraction=args.val_fraction,
+        seed=args.split_seed,
+    )
+    train_dataset = torch.utils.data.Subset(dataset, train_indices.tolist())
+    if is_main:
+        write_split_manifest(config.checkpoint_dir / "observation_split.json", split_manifest)
+        logging.info(
+            "Observation split: train=%s val=%s seed=%s",
+            len(train_indices), len(val_indices), args.split_seed,
         )
-    requested_local_label_batch = config.batch_size // world_size
-    labels_per_trajectory = dataset.labels_per_trajectory
-    local_observation_batch = max(
-        1,
-        (requested_local_label_batch + labels_per_trajectory // 2)
-        // labels_per_trajectory,
+    batch_layout = resolve_ref_batch_layout(
+        global_target_batch=config.batch_size,
+        trajectories_per_observation=dataset.trajectories_per_observation,
+        world_size=world_size,
+        targets_per_observation=args.targets_per_observation,
     )
-    effective_global_label_batch = (
-        local_observation_batch * labels_per_trajectory * world_size
-    )
-    if len(dataset) < local_observation_batch * world_size:
+    local_observation_batch = batch_layout.local_observation_batch
+    if len(train_dataset) < batch_layout.global_observation_batch:
         raise ValueError(
-            f"MPC score cache has {len(dataset)} trajectories, fewer than the "
-            f"global observation batch={local_observation_batch * world_size}."
+            f"MPC score cache has {len(train_dataset)} training observations, fewer than the "
+            f"global observation batch={batch_layout.global_observation_batch}."
         )
     if is_main:
         logging.info(
-            "Grouped batch: requested_labels=%s effective_labels=%s observations=%s "
-            "labels_per_observation=%s observations_per_rank=%s",
-            config.batch_size,
-            effective_global_label_batch,
-            local_observation_batch * world_size,
-            labels_per_trajectory,
-            local_observation_batch,
+            "Score-cache grouped batch: target_batch=%s observations=%s "
+            "targets_per_observation=%s sampling=one_level_per_distinct_trajectory "
+            "observations_per_rank=%s",
+            batch_layout.global_target_batch,
+            batch_layout.global_observation_batch,
+            batch_layout.targets_per_observation,
+            batch_layout.local_observation_batch,
+        )
+        (config.checkpoint_dir / "train_metadata.json").write_text(
+            json.dumps(
+                {
+                    "mode": "cached_teacher_epsilon",
+                    "batching": dataclasses.asdict(batch_layout),
+                    "sampling": "one_random_level_per_distinct_trajectory",
+                    "cache_path": str(args.cache_path),
+                    "train_steps": int(config.num_train_steps),
+                    "seed": int(config.seed),
+                    "split_seed": int(args.split_seed),
+                },
+                indent=2,
+                sort_keys=True,
+            )
         )
     sampler = (
-        torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True, drop_last=True)
+        torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=True, drop_last=True)
         if use_ddp
         else None
     )
@@ -1810,7 +2010,7 @@ def train(args: argparse.Namespace) -> None:
             args.num_workers,
         )
     train_loader = torch.utils.data.DataLoader(
-        dataset,
+        train_dataset,
         batch_size=local_observation_batch,
         shuffle=sampler is None,
         sampler=sampler,
@@ -1876,6 +2076,17 @@ def train(args: argparse.Namespace) -> None:
             data_iter = iter(train_loader)
             input_batch, x_t, score_target, time_cond = next(data_iter)
 
+        label_indices = sample_cached_label_indices(
+            x_t.shape[0],
+            dataset.trajectories_per_observation,
+            dataset.labels_per_trajectory,
+            batch_layout.targets_per_observation,
+        )
+        observation_indices = torch.arange(x_t.shape[0])[:, None]
+        x_t = x_t[observation_indices, label_indices]
+        score_target = score_target[observation_indices, label_indices]
+        time_cond = time_cond[observation_indices, label_indices]
+
         # Keep cached images as compact uint8 tensors through the worker/pinned-memory
         # path. Conversion to float, channel permutation, and augmentations happen as
         # one batched operation on the GPU.
@@ -1892,7 +2103,7 @@ def train(args: argparse.Namespace) -> None:
             observation,
             x_t,
             time=time_cond,
-            score_target=score_target,
+            model_output_target=score_target,
         )
         losses = ensure_tensor_loss(losses, device)
         loss = losses.mean()
@@ -1972,6 +2183,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config_arg(cache_parser)
     cache_parser.add_argument("--hdf5_path", required=True)
     cache_parser.add_argument("--cache_path", required=True)
+    cache_parser.add_argument("--base_action_stats", required=True)
     cache_parser.add_argument("--base_config", default=DEFAULT_BASE_CONFIG)
     cache_parser.add_argument("--base_checkpoint_dir", default=DEFAULT_BASE_CHECKPOINT_DIR)
     cache_parser.add_argument("--prompt", default=DEFAULT_PROMPT)
@@ -1989,7 +2201,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--max_trajectories",
         type=int,
         default=None,
-        help="Maximum number of observation-conditioned reverse trajectories.",
+        help="Maximum number of unique observations before K-fold trajectory expansion.",
+    )
+    cache_parser.add_argument(
+        "--trajectories_per_observation",
+        type=int,
+        default=1,
+        help="Independent Gaussian reverse trajectories generated for every observation.",
     )
     cache_parser.add_argument("--stride", type=int, default=4)
     cache_parser.add_argument("--num_steps", type=int, default=10)
@@ -2001,6 +2219,7 @@ def build_parser() -> argparse.ArgumentParser:
     cache_parser.add_argument("--mpc_beta_opt_iter", type=float, default=1.0)
     cache_parser.add_argument("--mpc_beta_horizon", type=float, default=1.0)
     cache_parser.add_argument("--mpc_joint_delta_clip", type=float, default=0.15)
+    cache_parser.add_argument("--cost_executable_actions", action="store_true")
     cache_parser.add_argument("--mpc_logit_norm", choices=("raw", "std"), default="raw")
     cache_parser.add_argument("--obs_shard", type=int, default=0)
     cache_parser.add_argument("--label_seed", type=int, default=None,
@@ -2054,6 +2273,15 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--num_workers", type=int, default=2)
     train_parser.add_argument("--train_steps", type=int, default=None)
     train_parser.add_argument("--batch_size", type=int, default=None)
+    train_parser.add_argument(
+        "--targets_per_observation",
+        type=int,
+        default=None,
+        help="Grouped cache targets per observation (default: K). For K=8 and "
+             "--batch_size 32, both A/B use 4 observations x 8 targets.",
+    )
+    train_parser.add_argument("--val_fraction", type=float, default=0.1)
+    train_parser.add_argument("--split_seed", type=int, default=42)
     train_parser.add_argument("--checkpoint_base_dir", default=None)
     train_parser.add_argument("--init_from", default=None,
                               help="Checkpoint dir (or model.safetensors) to initialize the model "
@@ -2067,6 +2295,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_config_arg(bc_parser)
     bc_parser.add_argument("--hdf5_path", required=True)
+    bc_parser.add_argument(
+        "--cache_path",
+        default=None,
+        help="v5 epsilon cache; when set, train on each trajectory's final teacher chunk.",
+    )
+    bc_parser.add_argument("--observation_cache_path", default=None)
+    bc_parser.add_argument("--val_fraction", type=float, default=0.1)
+    bc_parser.add_argument("--split_seed", type=int, default=42)
     bc_parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     bc_parser.add_argument(
         "--config_name",
@@ -2085,6 +2321,13 @@ def build_parser() -> argparse.ArgumentParser:
     bc_parser.add_argument("--num_workers", type=int, default=2)
     bc_parser.add_argument("--train_steps", type=int, default=None)
     bc_parser.add_argument("--batch_size", type=int, default=None)
+    bc_parser.add_argument(
+        "--targets_per_observation",
+        type=int,
+        default=None,
+        help="With --cache_path, grouped targets per observation (default: K). "
+             "Must match A for a controlled comparison.",
+    )
     bc_parser.add_argument("--checkpoint_base_dir", default=None)
     bc_parser.add_argument("--init_from", default=None,
                            help="Checkpoint dir (or model.safetensors) to initialize from.")

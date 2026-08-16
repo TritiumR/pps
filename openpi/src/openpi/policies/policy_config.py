@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 import os
 import pathlib
@@ -80,6 +81,7 @@ def create_trained_policy(
     sample_kwargs: dict[str, Any] | None = None,
     default_prompt: str | None = None,
     norm_stats: dict[str, transforms.NormStats] | None = None,
+    use_quantile_norm: bool | None = None,
     pytorch_device: str | None = None,
     load_weights: bool = True,
 ) -> _policy.Policy:
@@ -95,6 +97,7 @@ def create_trained_policy(
             data if it doesn't already exist.
         norm_stats: The norm stats to use for the policy. If not provided, the norm stats will be loaded
             from the checkpoint directory.
+        use_quantile_norm: Override the data config normalization mode when provided.
         pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda", "cuda:0").
                       If None and is_pytorch=True, will use "cuda" if available, otherwise "cpu".
         load_weights: If False, skip instantiating and loading the network and return a
@@ -134,6 +137,8 @@ def create_trained_policy(
             _model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16)
         )
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
+    if use_quantile_norm is not None:
+        data_config = dataclasses.replace(data_config, use_quantile_norm=use_quantile_norm)
     norm_stats_source = "provided"
     if norm_stats is None:
         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure

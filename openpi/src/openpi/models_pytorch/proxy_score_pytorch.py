@@ -506,6 +506,7 @@ class ProxyScorePytorch(nn.Module):
         noise=None,
         time=None,
         score_target=None,
+        model_output_target=None,
         *,
         mode="train",
         **_,
@@ -516,15 +517,20 @@ class ProxyScorePytorch(nn.Module):
             raise ValueError("actions must be provided for score training.")
 
         actions = actions[..., : self.config.action_dim]
+        grouped_actions = actions.ndim == 4
         images, img_masks, state = self._preprocess_observation(observation, train=True)
         loss_weight = None
+        if score_target is not None and model_output_target is not None:
+            raise ValueError("Pass only one of score_target or model_output_target.")
         direct_score_target = score_target is not None
+        direct_model_output_target = model_output_target is not None
 
-        if score_target is not None:
+        if direct_score_target or direct_model_output_target:
             if time is None:
-                raise ValueError("time must be provided when training from direct score targets.")
+                raise ValueError("time must be provided when training from direct targets.")
             x_t = actions
-            target = score_target[..., : self.config.action_dim].to(
+            direct_target = score_target if direct_score_target else model_output_target
+            target = direct_target[..., : self.config.action_dim].to(
                 device=actions.device,
                 dtype=actions.dtype,
             )
@@ -533,38 +539,59 @@ class ProxyScorePytorch(nn.Module):
             # Plain chunked regression: L2 on the clean chunk, no noising. The action/time
             # tokens are zeroed, so the chunk is predicted from the image/state prefix alone.
             x_t = torch.zeros_like(actions)
+            target_batch_shape = (
+                actions.shape[:2] if grouped_actions else actions.shape[:1]
+            )
             time = torch.zeros(
-                actions.shape[0], device=actions.device, dtype=actions.dtype
+                target_batch_shape,
+                device=actions.device,
+                dtype=actions.dtype,
             )
             target = actions
         else:
             if noise is None:
                 noise = self.sample_noise(actions.shape, actions.device)
             else:
-                noise = noise[:, :, : self.config.action_dim]
+                noise = noise[..., : self.config.action_dim]
+            target_batch_shape = actions.shape[:2] if grouped_actions else actions.shape[:1]
             if time is None:
+                num_targets = actions.shape[0] * (actions.shape[1] if grouped_actions else 1)
                 alpha, time = self._sample_train_alpha(
-                    actions.shape[0],
+                    num_targets,
                     actions.device,
                     actions.dtype,
                 )
+                alpha = alpha.reshape(target_batch_shape)
+                time = time.reshape(target_batch_shape)
             else:
                 alpha = self._alpha_from_time(time, actions.device, actions.dtype)
 
             alpha = alpha.to(device=actions.device, dtype=actions.dtype)
             time = time.to(device=actions.device, dtype=actions.dtype)
+            if tuple(time.shape) != tuple(target_batch_shape):
+                raise ValueError(
+                    f"Diffusion time shape {tuple(time.shape)} does not match grouped "
+                    f"target shape {tuple(target_batch_shape)}."
+                )
             beta = torch.clamp(1.0 - alpha, min=1e-6)
             sqrt_alpha = torch.sqrt(torch.clamp(alpha, min=1e-6))
             sqrt_beta = torch.sqrt(beta)
+            expansion = (1,) * (actions.ndim - alpha.ndim)
+            sqrt_alpha_expanded = sqrt_alpha.reshape(*sqrt_alpha.shape, *expansion)
+            sqrt_beta_expanded = sqrt_beta.reshape(*sqrt_beta.shape, *expansion)
+            beta_expanded = beta.reshape(*beta.shape, *expansion)
 
-            x_t = sqrt_alpha[:, None, None] * actions + sqrt_beta[:, None, None] * noise
+            x_t = (
+                sqrt_alpha_expanded * actions
+                + sqrt_beta_expanded * noise
+            )
             if self.config.prediction_type == "epsilon":
                 target = noise
             elif self.config.prediction_type == "x0":
                 target = actions
             else:
-                target = -noise / sqrt_beta[:, None, None]
-                loss_weight = beta[:, None, None]
+                target = -noise / sqrt_beta_expanded
+                loss_weight = beta_expanded
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks
@@ -591,10 +618,12 @@ class ProxyScorePytorch(nn.Module):
             state = state.repeat_interleave(labels_per_observation, dim=0)
             x_t = x_t.flatten(0, 1)
             target = target.flatten(0, 1)
+            if loss_weight is not None:
+                loss_weight = loss_weight.flatten(0, 1)
             time = time.flatten(0, 1)
         predict = (
             self.predict_score_from_prefix
-            if direct_score_target or self.config.prediction_type == "score"
+            if direct_score_target
             else self._predict_model_output_from_prefix
         )
         pred = predict(
@@ -664,6 +693,7 @@ class ProxyScorePytorch(nn.Module):
             beta = torch.clamp(1.0 - alpha, min=1e-6)
             sqrt_alpha = torch.sqrt(torch.clamp(alpha, min=1e-6))
             sqrt_beta = torch.sqrt(beta)
+
             if self.config.prediction_type == "epsilon":
                 eps_hat = output
                 x0_hat = (x_t - sqrt_beta * eps_hat) / sqrt_alpha

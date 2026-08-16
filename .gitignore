@@ -3,6 +3,7 @@ logs
 wandb
 outputs
 data
+.local_data/
 /IsaacLab/
 /checkpoints/
 .codex/

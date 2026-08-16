@@ -5585,6 +5585,35 @@ _CONFIGS = [
         batch_size=32,
     ),
     TrainConfig(
+        # Ref/action-chunk A/B config matched to the verified demo-mean/std task policy.
+        # The checkpoint path deliberately mirrors eval's --base_norm_stats_from_task source.
+        name="score_ref_weight_demo_meanstd",
+        model=proxy_score_config.ProxyScoreConfig(
+            action_horizon=15,
+            action_dim=8,
+            action_expert_variant="gemma_12m",
+            dino_model_name="facebook/dinov3-vits16-pretrain-lvd1689m",
+            ddim_num_train_timesteps=100,
+            prediction_type="epsilon",
+            bidirectional_attention=True,
+        ),
+        data=ProxyLeRobotDROIDJointPosDataConfig(
+            repo_id="local/isaaclab_weight_score",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="cn356/isaaclab_weight"),
+            norm_stats_dir=(
+                "checkpoints/score_task_weight/"
+                "task_eps_bidir_openpi_image_only_demo_meanstd/30000/"
+                "assets/cn356/isaaclab_weight"
+            ),
+            use_quantile_norm=False,
+        ),
+        num_train_steps=30_000,
+        save_interval=1_000,
+        batch_size=32,
+    ),
+
+    TrainConfig(
         name="proxy_isaaclab_droid_weight_pi05_jointpos_vits16plus_40m",
         model=proxy_config.ProxyConfig(
             action_horizon=15,
