@@ -1372,6 +1372,19 @@ _CONFIGS = [
             ),
         ),
     ),
+    # Weight-task evaluation view of the frozen pi0.5 base. The network weights are
+    # unchanged; only the policy transform uses the demo mean/std action space shared
+    # by score_task_weight_demo_meanstd.
+    TrainConfig(
+        name="pi05_droid_jointpos_weight_demo_meanstd",
+        model=pi0_config.Pi0Config(action_horizon=15, pi05=True),
+        data=ProxyLeRobotDROIDJointPosDataConfig(
+            repo_id="cn356/isaaclab_weight",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="cn356/isaaclab_weight"),
+            use_quantile_norm=False,
+        ),
+    ),
     ##########################################################
     # Custom PI0.5-DROID-Jointpos finetune configs           #
     ##########################################################
