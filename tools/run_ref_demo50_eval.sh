@@ -20,6 +20,7 @@ common=(
     --num_steps 10
     --mpc_ddim_train_timesteps 100
     --mpc_joint_delta_clip 0.05
+    --sampler base
     --task_num_steps 800
     --steps_per_inference 4
     --headless
@@ -73,7 +74,6 @@ run_pair fullsteer \
     --mpc_update mbd_score_action_prox \
     --mpc_cost priority \
     --mpc_optimize_space action \
-    --sampler base \
     --mpc_num_samples 4096 \
     --mpc_iterations 1 \
     --mpc_noise 0.4 \
