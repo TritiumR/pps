@@ -1713,8 +1713,10 @@ def train_bc(args: argparse.Namespace) -> None:
     lr_schedule = _make_lr_schedule(config)
 
     model.train()
+    metric_name = "teacher_action_epsilon_loss" if cache_mode else "bc_x0_loss"
+    progress_desc = "Teacher action epsilon" if cache_mode else "Demo BC x0"
     pbar = (
-        tqdm.tqdm(total=config.num_train_steps, initial=global_step, desc="Demo BC x0")
+        tqdm.tqdm(total=config.num_train_steps, initial=global_step, desc=progress_desc)
         if is_main
         else None
     )
@@ -1785,8 +1787,9 @@ def train_bc(args: argparse.Namespace) -> None:
             avg_lr = sum(item["lr"] for item in metrics) / len(metrics)
             avg_grad_norm = sum(item["grad_norm"] for item in metrics) / len(metrics)
             logging.info(
-                "step=%s bc_x0_loss=%.4f lr=%.2e grad_norm=%.2f time=%.1fs",
+                "step=%s %s=%.4f lr=%.2e grad_norm=%.2f time=%.1fs",
                 completed_step,
+                metric_name,
                 avg_loss,
                 avg_lr,
                 avg_grad_norm,
@@ -1796,7 +1799,7 @@ def train_bc(args: argparse.Namespace) -> None:
                 step_time = elapsed / config.log_interval
                 wandb.log(
                     {
-                        "bc_x0_loss": avg_loss,
+                        metric_name: avg_loss,
                         "learning_rate": avg_lr,
                         "grad_norm": avg_grad_norm,
                         "time_per_step": step_time,
@@ -1816,7 +1819,7 @@ def train_bc(args: argparse.Namespace) -> None:
             pbar.update(1)
             pbar.set_postfix(
                 {
-                    "bc_x0_loss": f"{loss.item():.4f}",
+                    metric_name: f"{loss.item():.4f}",
                     "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
                 }
             )
