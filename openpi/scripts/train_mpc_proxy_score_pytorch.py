@@ -320,12 +320,23 @@ def _demo_sample(
     # executes (setup/07_relabel_replay_gate.py, 19/20 on square).
     action_start = step_idx + action_offset
     action_end = action_start + action_horizon
+    actions = np.asarray(demo["obs/joint_actions"][action_start:action_end], dtype=np.float32)
+    if len(actions) < action_horizon:
+        all_actions = demo["obs/joint_actions"]
+        if len(actions):
+            pad_value = actions[-1]
+        elif len(all_actions):
+            pad_value = np.asarray(all_actions[-1], dtype=np.float32)
+        else:
+            raise ValueError("Demo has no joint actions.")
+        padding = np.repeat(pad_value[None], action_horizon - len(actions), axis=0)
+        actions = np.concatenate([actions, padding], axis=0)
     return {
         "exterior_image_1_left": demo["obs/table_cam"][step_idx],
         "wrist_image_left": demo["obs/wrist_cam"][step_idx],
         "joint_position": np.asarray(demo["obs/joint_pos"][step_idx][:7], dtype=np.float32),
         "gripper_position": np.asarray(demo["obs/gripper_pos"][step_idx][:1], dtype=np.float32),
-        "actions": np.asarray(demo["obs/joint_actions"][action_start:action_end], dtype=np.float32),
+        "actions": actions,
         "prompt": prompt,
     }
 
@@ -474,10 +485,9 @@ def _sample_indices(
         for demo_name in sorted(f["data"].keys()):
             demo = f["data"][demo_name]
             length = len(demo["obs/joint_actions"])
-            num_windows = length - action_horizon
-            if num_windows <= 0:
+            if length <= 0:
                 continue
-            all_indices.extend((demo_name, step) for step in range(0, num_windows, stride))
+            all_indices.extend((demo_name, step) for step in range(0, length, stride))
     rng.shuffle(all_indices)
     if max_trajectories is not None:
         all_indices = all_indices[:max_trajectories]
