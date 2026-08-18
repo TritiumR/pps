@@ -2,7 +2,16 @@
 
 import numpy as np
 
-from vlm_dp.offline_context import infer_stage, priority_context, WEIGHT_EXTENTS
+from vlm_dp.offline_context import (
+    _on_place,
+    _weight_constraints,
+    _weight_stage,
+    check_representable,
+    infer_stage,
+    priority_context,
+    weight_frame_context,
+    WEIGHT_EXTENTS,
+)
 
 
 def _objects(pear, apple, scale=(0.66, 1.44, 0.20)):
@@ -80,3 +89,77 @@ if __name__ == "__main__":
         if name.startswith("test_"):
             fn()
             print(f"PASS {name}")
+
+
+
+def _weight_sig():
+    return {
+        "bounds": (10, 20, 30, 40, 50, 60, 70, 80),
+        "initial": {
+            "pear": np.array([0.2, 1.4, 0.23]),
+            "apple": np.array([0.1, 1.3, 0.24]),
+            "scale": np.array([0.66, 1.38, 0.20]),
+        },
+        "place": {
+            "pear": np.array([0.66, 1.33, 0.29]),
+            "apple": np.array([0.66, 1.33, 0.287]),
+        },
+        "held_offset": {"pear": np.zeros(3), "apple": np.zeros(3)},
+        "eef": np.zeros((90, 3), dtype=np.float32),
+        "z_table": 0.17,
+    }
+
+
+def test_weight_eight_stage_boundaries():
+    sig = _weight_sig()
+    assert [_weight_stage(sig, i) for i in (0, 10, 20, 30, 40, 50, 60, 70, 89)] == [0, 1, 2, 3, 4, 5, 6, 7, 7]
+
+
+def test_weight_constraints_match_rendered_formulas():
+    import torch
+
+    sig = _weight_sig()
+    kp = torch.tensor([[0.2, 1.4, 0.30], [0.1, 1.3, 0.24], [0.66, 1.38, 0.20]])[:, None, None, :]
+    ee = torch.zeros(1, 1, 3)
+    lift, lift_paths = _weight_constraints(sig, 1)
+    assert torch.allclose(lift(ee, kp), torch.tensor([[0.08]]))
+    assert torch.allclose(lift_paths[0](ee, kp), torch.zeros(1, 1))
+
+    carry, carry_paths = _weight_constraints(sig, 2)
+    hover = torch.tensor(sig["place"]["pear"] + [0.0, 0.0, 0.10])
+    expected = torch.linalg.vector_norm(kp[0, 0, 0] - hover)
+    assert torch.allclose(carry(ee, kp).reshape(()), expected.float(), atol=1e-6)
+    assert torch.allclose(carry_paths[1](ee, kp), torch.tensor([[0.05]]), atol=1e-6)
+
+    place, place_paths = _weight_constraints(sig, 3)
+    expected = torch.linalg.vector_norm(kp[0, 0, 0] - torch.tensor(sig["place"]["pear"]))
+    assert torch.allclose(place(ee, kp).reshape(()), expected.float(), atol=1e-6)
+    assert len(place_paths) == 2
+
+
+def test_weight_context_has_all_active_simple_auth_fields():
+    sig = _weight_sig()
+    raw = _objects((0.64, 1.34, 0.30), (0.1, 1.3, 0.24), (0.66, 1.38, 0.20))
+    raw.update({"board": {"pos": np.array([0.2, 1.3, 0.2])}})
+    base = {"objects": raw, "eef_pos": np.array([0.64, 1.34, 0.34]), "joint_pos": np.zeros(13)}
+    ctx = weight_frame_context(base, sig, 35)
+    assert ctx["stage_label"] == "place"
+    assert ctx["payload"] == "pear" and ctx["place_target"] == "scale"
+    for key in ("constraint", "path_fns", "keypoints", "held_idx", "held_offset",
+                "payload_age_s", "eef_hist"):
+        assert key in ctx
+
+
+def test_scale_placement_uses_eval_y_offset_and_threshold():
+    objects = _objects((0.66, 1.33, 0.28), (0.1, 1.3, 0.24), (0.66, 1.38, 0.20))
+    assert _on_place(objects, "pear", "scale")
+    objects["pear"]["pos"] = np.array([0.66, 1.451, 0.28])
+    assert not _on_place(objects, "pear", "scale")
+
+
+def test_current_simple_auth_is_representable():
+    import pathlib
+    import yaml
+
+    cfg_path = pathlib.Path(__file__).parents[1] / "configs/test_configs/simple_auth.yaml"
+    check_representable(yaml.safe_load(cfg_path.read_text()))

@@ -9,6 +9,7 @@ import torch
 
 from vlm_dp.cost import guard_cost
 from vlm_dp.cost.base_cost import CompositeCost
+from vlm_dp.sim_helpers import make_torch_constraint
 
 
 WEIGHT_EXTENTS = {
@@ -24,25 +25,30 @@ DEFAULT_EXTENT = (0.03, 0.03, 0.03)
 WEIGHT_ROLES = {"grasp_objs": ("pear", "apple"), "place_obj": "scale"}
 
 
-_ON_XY, _ON_Z, _HELD_MARGIN = 0.09, 0.04, 0.04
-
-
+_PLACE_SUCCESS_XY = 0.12
+_SCALE_SUCCESS_XY_OFFSET = np.array([0.0, -0.05], dtype=np.float64)
+_LIFT_HEIGHT = 0.15
+_SUBGOAL_EPS = 0.12
+_CARRY_HOVER = 0.10
+_CARRY_SLACK = 0.03
+_PLACE_CLEARANCE = 0.015
+_SCALE_TOP_Z_OFFSET = 0.05238
+# Mean visual half-heights across the same 20 current eval perception caches.
+_VISUAL_HALF_HEIGHT = {"pear": 0.02385910, "apple": 0.02211143}
+# Mean narrow axis across the 20 current eval perception caches; apple is round in 19/20.
+_GRASP_AXES = {"pear": (0.6803071, -0.7329272, 0.0), "apple": None}
+_HELD_MARGIN = 0.04
 _PLACE_APPROACH_XY = 0.18
 
 
 _UNREPRESENTABLE_TERMS = {
-    "rekep_subgoal": "no VLM constraint offline",
-    "rekep_path": "no VLM path functions offline",
     "release_retreat": "no sensed 'released' offline",
     "place_approach_rate": "needs the stall-release bridge's 'overshoot_on'",
     "consistency": "no previous-chunk plan_ref offline",
-    "grasp_axis": "no per-object grasp axis offline",
 }
 
 _UNREPRESENTABLE_GEOM = {
     "release_on_stall": "reads bridge 'seat_contact'",
-    "release_on_subgoal": "reads the VLM constraint",
-    "release_step_motion_cap": "reads bridge 'eef_step_motion'",
 }
 
 
@@ -78,7 +84,8 @@ def _on_place(objects, name, place_obj):
     o, p = _pos(objects, name), _pos(objects, place_obj)
     if o is None or p is None:
         return False
-    return (float(np.linalg.norm(o[:2] - p[:2])) < _ON_XY) and (o[2] > p[2] + _ON_Z)
+    reference = p[:2] + (_SCALE_SUCCESS_XY_OFFSET if place_obj == "scale" else 0.0)
+    return float(np.linalg.norm(o[:2] - reference)) < _PLACE_SUCCESS_XY
 
 
 _HOLD_BAND = (0.05, 0.60)
@@ -198,6 +205,184 @@ def priority_context(base_ctx, gripper_closed, roles=WEIGHT_ROLES, extents=None,
                for n, o in base_ctx.get("objects", {}).items()]
     ctx["z_table"] = min(bottoms) if bottoms else None
     ctx.setdefault("plan_ref", None)
+    return ctx
+
+
+def _first_true(mask, start, default):
+    idx = np.flatnonzero(np.asarray(mask)[int(start):])
+    return int(start + idx[0]) if idx.size else int(default)
+
+
+def _local_offset(eef_pos, eef_quat, point):
+    return _rot_wxyz(eef_quat).T @ (np.asarray(point) - np.asarray(eef_pos))
+
+
+def weight_episode_signals(demo):
+    """Build one fixed eight-stage ReKep plan from a successful weight demo.
+
+    Gripper transitions delimit grasp/release events. Lift->carry uses the active plan's
+    one-sided lift residual and subgoal epsilon. Carry->place uses the environment/eval
+    placement reference (scale root + [0, -0.05]) and its 12 cm XY threshold. These signals
+    only select the stage; they do not change CompositeCost or any simple_auth weight.
+    """
+    tr = _grip_transitions(demo)
+    if len(tr) != 4:
+        raise ValueError(f"weight demo has {len(tr)} gripper transitions, expected 4 "
+                         "(grasp pear, release pear, grasp apple, release apple)")
+    c1, o1, c2, o2 = (int(x) for x in tr)
+    eef = np.asarray(demo["obs/eef_pos"], dtype=np.float64)
+    eef_q = np.asarray(demo["obs/eef_quat"], dtype=np.float64)
+    pear = np.asarray(demo["states/rigid_object/pear/root_pose"][:, :3], dtype=np.float64)
+    apple = np.asarray(demo["states/rigid_object/apple/root_pose"][:, :3], dtype=np.float64)
+    scale = np.asarray(demo["states/rigid_object/scale/root_pose"][:, :3], dtype=np.float64)
+
+    # Frame zero precedes rigid-body settling in these demos. The last second before the first
+    # close is the fixed scene geometry seen by an eval teacher when it builds its plan.
+    stable = slice(max(0, c1 - 15), c1)
+    initial = {
+        "pear": np.median(pear[stable], axis=0),
+        "apple": np.median(apple[stable], axis=0),
+        "scale": np.median(scale[stable], axis=0),
+    }
+    lift_rise = _LIFT_HEIGHT - _SUBGOAL_EPS
+    pear_lift = _first_true(pear[:, 2] >= initial["pear"][2] + lift_rise, c1, o1)
+    apple_lift = _first_true(apple[:, 2] >= initial["apple"][2] + lift_rise, c2, o2)
+    scale_ref = scale[:, :2] + _SCALE_SUCCESS_XY_OFFSET
+    pear_near = _first_true(np.linalg.norm(pear[:, :2] - scale_ref, axis=1)
+                            < _PLACE_SUCCESS_XY, pear_lift, o1)
+    apple_near = _first_true(np.linalg.norm(apple[:, :2] - scale_ref, axis=1)
+                             < _PLACE_SUCCESS_XY, apple_lift, o2)
+
+    scale0 = initial["scale"].copy()
+    place = {
+        name: scale0 + np.array([0.0, -0.05,
+                                 _SCALE_TOP_Z_OFFSET + _VISUAL_HALF_HEIGHT[name]
+                                 + _PLACE_CLEARANCE])
+        for name in ("pear", "apple")
+    }
+    return {
+        "bounds": (c1, pear_lift, pear_near, o1, c2, apple_lift, apple_near, o2),
+        "initial": initial,
+        "place": place,
+        "held_offset": {
+            "pear": _local_offset(eef[c1], eef_q[c1], pear[c1]),
+            "apple": _local_offset(eef[c2], eef_q[c2], apple[c2]),
+        },
+        "eef": eef.astype(np.float32),
+        "z_table": min(float(initial["pear"][2]) - WEIGHT_EXTENTS["pear"][2],
+                         float(initial["apple"][2]) - WEIGHT_EXTENTS["apple"][2],
+                         float(scale0[2]) - WEIGHT_EXTENTS["scale"][2]),
+    }
+
+
+def _weight_stage(sig, step):
+    c1, lift1, near1, o1, c2, lift2, near2, _o2 = sig["bounds"]
+    if step < c1:
+        return 0
+    if step < lift1:
+        return 1
+    if step < near1:
+        return 2
+    if step < o1:
+        return 3
+    if step < c2:
+        return 4
+    if step < lift2:
+        return 5
+    if step < near2:
+        return 6
+    return 7
+
+
+def _weight_constraints(sig, stage):
+    """Return the analytic subgoal/path functions rendered by fake_vlm weight."""
+    obj_idx = 0 if stage < 4 else 1
+    name = "pear" if obj_idx == 0 else "apple"
+    scale_idx = 2
+    initial = sig["initial"]
+    place_off = np.asarray(sig["place"][name] - initial["scale"], dtype=np.float32)
+    hover_off = place_off + np.array([0.0, 0.0, _CARRY_HOVER], dtype=np.float32)
+    lift_z = float(initial[name][2] + _LIFT_HEIGHT)
+    carry_z = float(initial[name][2] + _LIFT_HEIGHT - _CARRY_SLACK)
+    hover_z = float(initial["scale"][2] + hover_off[2])
+
+    if stage in (1, 5):
+        sub = lambda _ee, kp, i=obj_idx, z=lift_z: torch.clamp(z - kp[i][..., 2], min=0.0)
+        paths = (lambda _ee, _kp: 0.0,)
+    elif stage in (2, 6):
+        sub = lambda _ee, kp, i=obj_idx, s=scale_idx, off=hover_off: torch.linalg.vector_norm(
+            kp[i] - (kp[s] + torch.as_tensor(off, device=kp.device, dtype=kp.dtype)), dim=-1)
+        paths = (
+            lambda _ee, _kp: 0.0,
+            lambda _ee, kp, i=obj_idx, z=carry_z: torch.clamp(z - kp[i][..., 2], min=0.0),
+        )
+    elif stage in (3, 7):
+        sub = lambda _ee, kp, i=obj_idx, s=scale_idx, off=place_off: torch.linalg.vector_norm(
+            kp[i] - (kp[s] + torch.as_tensor(off, device=kp.device, dtype=kp.dtype)), dim=-1)
+
+        def gated_descent(_ee, kp, i=obj_idx, s=scale_idx, off=place_off, z=hover_z):
+            off_t = torch.as_tensor(off, device=kp.device, dtype=kp.dtype)
+            xy = torch.linalg.vector_norm(kp[i][..., :2] - (kp[s][..., :2] + off_t[:2]), dim=-1)
+            low = torch.clamp(z - kp[i][..., 2], min=0.0)
+            return low * torch.clamp(xy / 0.08, max=1.0)
+
+        paths = (lambda _ee, _kp: 0.0, gated_descent)
+    else:
+        return None, ()
+    return make_torch_constraint([sub]), tuple(make_torch_constraint([p]) for p in paths)
+
+
+def weight_frame_context(base_ctx, sig, step):
+    """Build the complete simple_auth cost context for one demo frame."""
+    stage = _weight_stage(sig, int(step))
+    raw = base_ctx.get("objects", {})
+    objects = {}
+    for name, obj in raw.items():
+        objects[name] = {
+            "pos": torch.as_tensor(np.asarray(obj["pos"], dtype=np.float32)),
+            "extents": WEIGHT_EXTENTS.get(name, DEFAULT_EXTENT),
+            "axis": _GRASP_AXES.get(name),
+            "grasp_extent": None,
+            "grasp_region": None,
+        }
+
+    name = "pear" if stage < 4 else "apple"
+    grasp = stage in (0, 4)
+    place = stage in (3, 7)
+    payload = None if grasp else name
+    obj_idx = 0 if name == "pear" else 1
+    keypoints = np.stack([_pos(raw, "pear"), _pos(raw, "apple"), _pos(raw, "scale")]).astype(np.float32)
+    constraint, path_fns = _weight_constraints(sig, stage)
+    placed = frozenset({"pear"} if stage >= 4 else ())
+    if stage == 7 and int(step) >= sig["bounds"][-1] and _on_place(raw, "apple", "scale"):
+        placed = frozenset({"pear", "apple"})
+
+    ctx = dict(base_ctx)
+    ctx["objects"] = objects
+    ctx.update(
+        grasp_obj=name if grasp else None,
+        payload=payload,
+        place_target="scale" if place else None,
+        destination="scale",
+        placed=placed,
+        contact="pinch",
+        orient="down",
+        place_mode="surface",
+        gripper_intent="close" if grasp else ("place" if place else "hold"),
+        target=np.asarray(_pos(raw, name), dtype=np.float32),
+        z_table=sig["z_table"],
+        plan_ref=None,
+        stage_label=("grasp", "lift", "carry", "place")[stage % 4],
+    )
+    if constraint is not None:
+        ctx.update(keypoints=keypoints, constraint=constraint, path_fns=path_fns,
+                   held_idx=(obj_idx,),
+                   held_offset=np.asarray(sig["held_offset"][name], dtype=np.float32)[None])
+    start = sig["bounds"][0 if name == "pear" else 4]
+    if payload is not None:
+        ctx["payload_age_s"] = max(0.0, (int(step) - int(start)) / 15.0)
+        if int(step) > 0:
+            ctx["eef_hist"] = sig["eef"][max(0, int(step) - 2):int(step)]
     return ctx
 
 
@@ -413,11 +598,9 @@ def capsule_flow_context(base_ctx, demo, step, sig, *, heuristic=True):
     return ctx
 
 
-def _weight_frame_context(base_ctx, sig, step, *, gripper_closed, finger_angle, tracker, demo_key):
+def _weight_frame_context(base_ctx, sig, step, **_):
     """Build the weight-task context for one frame."""
-    del sig
-    return priority_context(base_ctx, gripper_closed, finger_angle=finger_angle,
-                            tracker=tracker, demo_key=demo_key, step=step)
+    return weight_frame_context(base_ctx, sig, step)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -437,7 +620,7 @@ TASKS = {
         task_id="Isaac-Weight-Droid-Visuomotor-v0",
         hdf5="/workspace/pps/data/weight/generated_dataset.hdf5",
         frame_context=_weight_frame_context,
-        make_tracker=MonotoneStages,
+        episode_signals=weight_episode_signals,
         rollout_dir="results/Isaac-Weight-Droid-Visuomotor-v0/q_base_rd_n20"),
     "tea": OfflineTask(
         task_id="Isaac-Tea-Droid-Visuomotor-v0",

@@ -633,11 +633,8 @@ def generate_cache(args: argparse.Namespace) -> None:
         args.obs_shard, args.obs_num_shards, num_observations, len(indices),
         trajectories_per_observation,
     )
-    stage_tracker = None
-    if args.mpc_cost == "priority" and task_module is None:
-        from vlm_dp.offline_context import MonotoneStages
-        stage_tracker = MonotoneStages()
     external_signals: dict[str, Any] = {}
+    weight_signals: dict[str, dict[str, Any]] = {}
     capsule_signals: dict[str, dict[str, Any]] = {}
     if args.task == "capsule":
         # Registry ladder (vlm_dp.offline_context): per-demo latched events feed the
@@ -694,17 +691,11 @@ def generate_cache(args: argparse.Namespace) -> None:
                     heuristic=args.subtask_mode == "heuristic",
                 )
             if args.mpc_cost == "priority" and task_module is None:
-                from vlm_dp.offline_context import priority_context
-                # The demos record obs/gripper_pos as zeros; the commanded channel plus the finger
-                # angle (joint_pos[7], the aperture signal) decide holding, as at eval. The
-                # monotone tracker encodes that success demos progress forward through stages.
-                cmd = demo.get("obs/joint_actions")
-                closed = bool(cmd is not None and float(cmd[step_idx][7]) > 0.5)
-                jp = demo.get("obs/joint_pos")
-                finger = float(jp[step_idx][7]) if jp is not None and jp.shape[-1] > 7 else None
-                context = priority_context(context, gripper_closed=closed, finger_angle=finger,
-                                           tracker=stage_tracker,
-                                           demo_key=demo_name, step=step_idx)
+                from vlm_dp.offline_context import weight_episode_signals, weight_frame_context
+                sig = weight_signals.get(demo_name)
+                if sig is None:
+                    sig = weight_signals[demo_name] = weight_episode_signals(demo)
+                context = weight_frame_context(context, sig, step_idx)
             if args.task == "capsule":
                 sig = capsule_signals.get(demo_name)
                 if sig is None:
@@ -791,6 +782,7 @@ def generate_cache(args: argparse.Namespace) -> None:
         "teacher_code_sha256": {
             "cache_generator": _file_sha256(__file__),
             "planner": _file_sha256(pathlib.Path(_REPO_DIR) / "sim_free_mpc/planner.py"),
+            "offline_context": _file_sha256(pathlib.Path(_REPO_DIR) / "vlm_dp/offline_context.py"),
             "cost_config": _file_sha256(pathlib.Path(_REPO_DIR) / args.vlm_cost_config),
         },
         "prompt": args.prompt,
