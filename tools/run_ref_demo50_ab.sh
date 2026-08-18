@@ -89,6 +89,7 @@ CUDA_VISIBLE_DEVICES=1,3,5 "${PYTHON}" -m torch.distributed.run \
     --observation_cache_path "${OBS_CACHE}" \
     --batch_size 192 \
     --targets_per_observation 8 \
+    --prediction_type epsilon \
     --train_steps 30000 \
     --num_workers 0 \
     --no_wandb \
