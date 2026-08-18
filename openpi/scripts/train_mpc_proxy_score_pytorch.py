@@ -1476,13 +1476,13 @@ def _write_action_norm_stats(checkpoint_dir: pathlib.Path, stats) -> None:
 
 
 def train_bc(args: argparse.Namespace) -> None:
-    """Diffusion-BC on demo actions with an x0 head (the demo-content A/B of `train`)."""
+    """Standard epsilon diffusion training on clean action chunks."""
     config = _apply_train_overrides(_config.get_config(args.config), args)
     if getattr(args, "wandb_project", None):
         config = dataclasses.replace(config, project_name=args.wandb_project)
     if not isinstance(config.model, openpi.models.proxy_score_config.ProxyScoreConfig):
         raise ValueError(f"{args.config!r} must use ProxyScoreConfig.")
-    # x0 head: predict the clean chunk; serve with --prediction_mode x0.
+    # B re-noises each clean teacher chunk online and predicts the sampled epsilon.
     model_overrides = {"prediction_type": args.prediction_type}
     if getattr(args, "action_expert_variant", None):
         model_overrides["action_expert_variant"] = args.action_expert_variant
@@ -2300,8 +2300,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     bc_parser = subparsers.add_parser(
         "train-bc",
-        help="Diffusion-BC on demo action chunks with an x0 head (no MPC label cache); "
-             "serve the result with serve_mg_proxy_score.py --prediction_mode x0.",
+        help="Standard epsilon diffusion training on clean action chunks.",
     )
     _add_config_arg(bc_parser)
     bc_parser.add_argument("--hdf5_path", required=True)

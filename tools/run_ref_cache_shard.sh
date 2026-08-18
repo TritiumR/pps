@@ -16,7 +16,7 @@ GLOBAL_SHARD=$((SHARD_OFFSET + LOCAL_RANK))
 LABEL_SEED=$((LABEL_SEED_BASE + GLOBAL_SHARD))
 ROOT="${ROOT:-/home/yl4535/projects/pps}"
 PYTHON="${PYTHON:-/home/yl4535/envs/pps/bin/python}"
-HDF5="${HDF5:-${ROOT}/data/weight/generated_dataset_50.hdf5}"
+HDF5="${HDF5:-${ROOT}/data/weight/ref_demo50_compact.hdf5}"
 BASE_CHECKPOINT_DIR="${BASE_CHECKPOINT_DIR:-${ROOT}/checkpoints/score_task_weight/task_eps_bidir_openpi_image_only_demo_meanstd/30000}"
 BASE_ACTION_STATS="${BASE_ACTION_STATS:-/autodl-fs/data/yl4535/pps/demo_stats/weight_action_norm_stats.json}"
 
