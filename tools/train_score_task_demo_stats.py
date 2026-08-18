@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import os
 import pathlib
@@ -56,6 +57,34 @@ def _validate_mean_std_stats(stats_dir: pathlib.Path, task: str) -> None:
             )
 
 
+def _sha256(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_init_checkpoint(init_from: pathlib.Path, stats_dir: pathlib.Path) -> pathlib.Path:
+    """Require a strict model checkpoint whose normalization is byte-identical to task training."""
+    checkpoint_dir = init_from if init_from.is_dir() else init_from.parent
+    model_path = checkpoint_dir / "model.safetensors" if init_from.is_dir() else init_from
+    if not model_path.is_file():
+        raise FileNotFoundError(f"Initial model checkpoint not found: {model_path}")
+    norm_files = sorted((checkpoint_dir / "assets").glob("**/norm_stats.json"))
+    if len(norm_files) != 1:
+        raise ValueError(
+            f"Expected exactly one norm_stats.json under {checkpoint_dir / 'assets'}, "
+            f"found {len(norm_files)}"
+        )
+    task_norm = stats_dir / "norm_stats.json"
+    if _sha256(norm_files[0]) != _sha256(task_norm):
+        raise ValueError(
+            f"Init checkpoint normalization differs from task training: {norm_files[0]} vs {task_norm}"
+        )
+    return model_path
+
+
 def build_config(args: argparse.Namespace):
     config_name = f"score_task_{args.task}"
     repo_id = f"cn356/isaaclab_{args.task}"
@@ -80,6 +109,11 @@ def build_config(args: argparse.Namespace):
         prediction_type="epsilon",
         bidirectional_attention=True,
     )
+    init_path = None
+    if args.init_from is not None:
+        if args.resume:
+            raise ValueError("--init-from initializes a new run and cannot be combined with --resume.")
+        init_path = _validate_init_checkpoint(args.init_from, stats_dir)
     return dataclasses.replace(
         config,
         model=model,
@@ -89,6 +123,7 @@ def build_config(args: argparse.Namespace):
         num_workers=0,
         overwrite=args.overwrite,
         resume=args.resume,
+        pytorch_weight_path=str(init_path) if init_path is not None else None,
     )
 
 
@@ -100,6 +135,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exp-name", default=DEFAULT_EXP_NAME)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument(
+        "--init-from",
+        type=pathlib.Path,
+        default=None,
+        help="Ref checkpoint directory (or model.safetensors) used to initialize a new task run.",
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--overwrite", action="store_true")
     mode.add_argument("--resume", action="store_true")
