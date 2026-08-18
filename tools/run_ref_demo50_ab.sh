@@ -43,10 +43,18 @@ if [[ ! -f "${CACHE_FILE}" ]]; then
         --output "${CACHE_FILE}" >"${RUN_ROOT}/merge.log" 2>&1
 fi
 
+NCCL_LIB="${NCCL_LIB:-/root/autodl-tmp/yl4535/nccl_debug_2277/nvidia/nccl/lib/libnccl.so.2}"
+if [[ ! -f "${NCCL_LIB}" ]]; then
+    echo "Missing required NCCL 2.27.7 runtime: ${NCCL_LIB}" >&2
+    exit 1
+fi
+export LD_PRELOAD="${NCCL_LIB}${LD_PRELOAD:+:${LD_PRELOAD}}"
+export NCCL_IB_DISABLE=1
+
 cd "${ROOT}/openpi"
 export PYTHONPATH="${ROOT}/openpi/src:${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
-CUDA_VISIBLE_DEVICES=0,1,2 "${PYTHON}" -m torch.distributed.run \
+CUDA_VISIBLE_DEVICES=0,2,4 "${PYTHON}" -m torch.distributed.run \
     --standalone --nproc_per_node=3 \
     scripts/train_mpc_proxy_score_pytorch.py train \
     --config score_ref_weight_demo_meanstd \
@@ -72,7 +80,7 @@ while [[ ! -f "${OBS_CACHE}/metadata.json" ]]; do
     sleep 10
 done
 
-CUDA_VISIBLE_DEVICES=3,4,5 "${PYTHON}" -m torch.distributed.run \
+CUDA_VISIBLE_DEVICES=1,3,5 "${PYTHON}" -m torch.distributed.run \
     --standalone --nproc_per_node=3 \
     scripts/train_mpc_proxy_score_pytorch.py train-bc \
     --config score_ref_weight_demo_meanstd \
