@@ -4,6 +4,8 @@ wandb
 outputs
 data
 .local_data/
+demo_stats/
+perception_cache/
 /IsaacLab/
 /checkpoints/
 .codex/
