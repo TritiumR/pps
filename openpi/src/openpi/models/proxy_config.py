@@ -58,6 +58,8 @@ class ProxyConfig(_model.BaseModelConfig):
     concerto_enable_flash: bool = False
     freeze_concerto_encoder: bool = True
     attention_mode: str = "two_block_diffusion"
+    phase_conditioning: bool = False
+    num_phases: int = 4
 
     def __post_init__(self):
         if self.max_token_len is None:
@@ -77,11 +79,13 @@ class ProxyConfig(_model.BaseModelConfig):
                 )
             if self.pointcloud_prefix_tokens_per_camera <= 0:
                 raise ValueError("pointcloud_prefix_tokens_per_camera must be positive.")
-        if self.attention_mode != "two_block_diffusion":
+        if self.attention_mode not in ("causal", "two_block_diffusion"):
             raise ValueError(
-                "Only attention_mode='two_block_diffusion' is supported; "
+                "attention_mode must be 'causal' or 'two_block_diffusion'; "
                 f"got {self.attention_mode!r}."
             )
+        if self.num_phases < 1:
+            raise ValueError("num_phases must be positive.")
 
     @property
     @override
@@ -108,6 +112,11 @@ class ProxyConfig(_model.BaseModelConfig):
                 images={key: image_spec for key in self.image_keys},
                 image_masks={key: image_mask_spec for key in self.image_keys},
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
+                phase_one_hot=(
+                    jax.ShapeDtypeStruct([batch_size, self.num_phases], jnp.float32)
+                    if self.phase_conditioning
+                    else None
+                ),
                 pointcloud=(
                     {
                         key: jax.ShapeDtypeStruct(

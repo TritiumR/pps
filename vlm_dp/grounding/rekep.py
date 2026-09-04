@@ -591,7 +591,26 @@ class RekepGrounding:
                 print(f"[rekep-dbg] {_n}: grasp_center={np.round(obj_pos(_n), 3)} "
                       f"gt={np.round(_gt, 3)} err={err:.1f}mm", flush=True)
 
-        objects = [SceneObject(name=n, pos=(lambda n=n: obj_pos(n)), extents=extents.get(n, _DEFAULT_EXTENT),
+        required_objects = {name for name in (self.place_obj, *self.grasp_objs) if name}
+        missing_required = sorted(required_objects - kp_of.keys())
+        if missing_required:
+            raise KeyError(
+                f"[rekep] required task objects have no grasp centre: {missing_required}"
+            )
+        missing_optional = sorted(set(scene_objects) - kp_of.keys())
+        if missing_optional:
+            print(
+                f"[rekep] WARNING: optional objects without keypoints use live world centres: "
+                f"{missing_optional}",
+                flush=True,
+            )
+
+        def scene_pos(name):
+            if name in kp_of:
+                return obj_pos(name)
+            return world.object_pose(name)[0]
+
+        objects = [SceneObject(name=n, pos=(lambda n=n: scene_pos(n)), extents=extents.get(n, _DEFAULT_EXTENT),
                                axis=grasp_axis.get(n), grasp_extent=grasp_ext_of.get(n),
                                grasp_region=grasp_region_of.get(n))
                    for n in scene_objects]

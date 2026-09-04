@@ -781,6 +781,9 @@ class MPCScoreDataset(torch.utils.data.Dataset):
         self.times = self.cache["time"].astype(np.float32)
         self.prompt = prompt
         self.config = config
+        self.observation_image_keys = tuple(
+            getattr(config.model, "image_keys", OBSERVATION_IMAGE_KEYS)
+        )
         self.data_config, self.input_transform = _build_data_pipeline(config)
 
         metadata = json.loads(str(self.cache["metadata_json"].item()))
@@ -942,7 +945,7 @@ class MPCScoreDataset(torch.utils.data.Dataset):
             "prompt": self.prompt,
             "norm_stats_fingerprint": _norm_stats_fingerprint(self.data_config.norm_stats),
             "use_quantile_norm": bool(self.data_config.use_quantile_norm),
-            "image_keys": list(OBSERVATION_IMAGE_KEYS),
+            "image_keys": list(self.observation_image_keys),
             "image_shape": [224, 224, 3],
         }
 
@@ -977,13 +980,13 @@ class MPCScoreDataset(torch.utils.data.Dataset):
             tmp_path / "images.npy",
             mode="w+",
             dtype=np.uint8,
-            shape=(num_observations, len(OBSERVATION_IMAGE_KEYS), 224, 224, 3),
+            shape=(num_observations, len(self.observation_image_keys), 224, 224, 3),
         )
         image_masks = np.lib.format.open_memmap(
             tmp_path / "image_masks.npy",
             mode="w+",
             dtype=np.bool_,
-            shape=(num_observations, len(OBSERVATION_IMAGE_KEYS)),
+            shape=(num_observations, len(self.observation_image_keys)),
         )
         states = np.lib.format.open_memmap(
             tmp_path / "states.npy",
@@ -1011,7 +1014,7 @@ class MPCScoreDataset(torch.utils.data.Dataset):
                     prompt=self.prompt,
                 )
                 inputs = self.input_transform(jax.tree.map(lambda x: x, raw))
-                for image_idx, image_key in enumerate(OBSERVATION_IMAGE_KEYS):
+                for image_idx, image_key in enumerate(self.observation_image_keys):
                     image = np.asarray(inputs["image"][image_key])
                     if image.shape != (224, 224, 3) or image.dtype != np.uint8:
                         raise ValueError(
@@ -1061,14 +1064,14 @@ class MPCScoreDataset(torch.utils.data.Dataset):
         inputs = {
             "image": {
                 image_key: torch.from_numpy(self.cached_images[observation_idx, image_idx])
-                for image_idx, image_key in enumerate(OBSERVATION_IMAGE_KEYS)
+                for image_idx, image_key in enumerate(self.observation_image_keys)
             },
             "image_mask": {
                 image_key: torch.as_tensor(
                     bool(self.cached_image_masks[observation_idx, image_idx]),
                     dtype=torch.bool,
                 )
-                for image_idx, image_key in enumerate(OBSERVATION_IMAGE_KEYS)
+                for image_idx, image_key in enumerate(self.observation_image_keys)
             },
             "state": torch.from_numpy(self.cached_states[observation_idx]),
             "tokenized_prompt": torch.from_numpy(self.cached_tokenized_prompt),

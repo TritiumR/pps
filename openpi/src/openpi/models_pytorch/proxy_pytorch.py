@@ -120,6 +120,11 @@ class ProxyPytorch(nn.Module):
         #     )
         # else:
         self.state_proj = nn.Linear(action_dim, action_expert_config.width)
+        self.phase_embedding = (
+            nn.Embedding(int(config.num_phases), action_expert_config.width)
+            if getattr(config, "phase_conditioning", False)
+            else None
+        )
         self.action_time_mlp_in = nn.Linear(
             2 * action_expert_config.width, action_expert_config.width
         )
@@ -170,11 +175,15 @@ class ProxyPytorch(nn.Module):
         prefix_pad_masks: torch.Tensor,
         suffix_pad_masks: torch.Tensor,
     ) -> torch.Tensor:
-        """Build two-block non-diffusion/diffusion attention."""
+        """Build the checkpoint-compatible causal or two-block attention mask."""
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        if self.config.attention_mode == "causal":
+            # A 2-D padding mask lets Gemma apply its native causal mask. This is the
+            # attention form used by the original causal FM proxy checkpoints.
+            return pad_masks
         if self.config.attention_mode != "two_block_diffusion":
             raise ValueError(
-                "Only two_block_diffusion attention is supported, got "
+                "Unknown proxy attention mode "
                 f"{self.config.attention_mode!r}"
             )
         expected_suffix = 1 + int(self.config.action_horizon)
@@ -210,6 +219,7 @@ class ProxyPytorch(nn.Module):
             list(observation.image_masks.values()),
             observation.state,
             observation.pointcloud,
+            observation.phase_one_hot,
         )
 
     def sample_noise(self, shape, device):
@@ -232,7 +242,7 @@ class ProxyPytorch(nn.Module):
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
-        self, images, img_masks, pointclouds=None
+        self, images, img_masks, pointclouds=None, phase_one_hot=None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed RGB images with DINO and camera point clouds with Concerto."""
         embs = []
@@ -265,6 +275,57 @@ class ProxyPytorch(nn.Module):
                 torch.ones(bsize, num_point_tokens, dtype=torch.bool, device=point_tokens.device)
             )
             att_masks += [0] * num_point_tokens
+
+        if self.phase_embedding is not None:
+            if phase_one_hot is None:
+                raise ValueError(
+                    "phase-conditioned proxy requires observation.phase_one_hot"
+                )
+            if phase_one_hot.ndim != 2 or phase_one_hot.shape[1] != int(
+                self.config.num_phases
+            ):
+                raise ValueError(
+                    "phase_one_hot must have shape [batch, num_phases], got "
+                    f"{tuple(phase_one_hot.shape)}"
+                )
+            phase_values = phase_one_hot.to(dtype=torch.float32)
+            if not torch.isfinite(phase_values).all():
+                raise ValueError("phase_one_hot contains non-finite values")
+            if not torch.allclose(
+                phase_values.sum(dim=1),
+                torch.ones(
+                    phase_values.shape[0],
+                    dtype=phase_values.dtype,
+                    device=phase_values.device,
+                ),
+                atol=1e-6,
+                rtol=0.0,
+            ):
+                raise ValueError("each phase_one_hot row must sum to one")
+            phase_indices = torch.argmax(phase_values, dim=1)
+            canonical = F.one_hot(
+                phase_indices, num_classes=int(self.config.num_phases)
+            ).to(dtype=phase_values.dtype)
+            if not torch.equal(phase_values, canonical):
+                raise ValueError("phase_one_hot rows must be exactly one-hot")
+            phase_token = self.phase_embedding(phase_indices).to(
+                dtype=next(self.expert_model.gemma_expert.parameters()).dtype
+            )
+            embs.append(phase_token[:, None, :])
+            pad_masks.append(
+                torch.ones(
+                    phase_token.shape[0],
+                    1,
+                    dtype=torch.bool,
+                    device=phase_token.device,
+                )
+            )
+            att_masks += [0]
+        elif phase_one_hot is not None:
+            raise ValueError(
+                "observation.phase_one_hot was provided but phase conditioning "
+                "is disabled in the model config"
+            )
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -381,7 +442,7 @@ class ProxyPytorch(nn.Module):
         if actions is None:
             raise ValueError("actions must be provided for training mode.")
 
-        images, img_masks, state, pointclouds = self._preprocess_observation(observation, train=True)
+        images, img_masks, state, pointclouds, phase_one_hot = self._preprocess_observation(observation, train=True)
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -394,7 +455,9 @@ class ProxyPytorch(nn.Module):
         u_t = noise - actions
 
         # Prefix: image features from DINO
-        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks, pointclouds)
+        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(
+            images, img_masks, pointclouds, phase_one_hot
+        )
 
         # print(prefix_embs.shape)
 
@@ -458,10 +521,12 @@ class ProxyPytorch(nn.Module):
         Returns:
             Loss tensor with shape (batch_size, num_steps, action_horizon, action_dim)
         """
-        images, img_masks, state, pointclouds = self._preprocess_observation(observation, train=True)
+        images, img_masks, state, pointclouds, phase_one_hot = self._preprocess_observation(observation, train=True)
 
         # Prefix: image features from DINO (static across all steps)
-        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks, pointclouds)
+        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(
+            images, img_masks, pointclouds, phase_one_hot
+        )
 
         initial_noise = noises[:, 0, :, : self.config.action_dim]
 
@@ -547,6 +612,41 @@ class ProxyPytorch(nn.Module):
             batch_size, num_steps, self.config.action_horizon, self.config.action_dim
         )
 
+    def velocity_matching_loss(
+        self,
+        observation,
+        x_t: Tensor,
+        time: Tensor,
+        target_velocity: Tensor,
+    ) -> Tensor:
+        """Supervise velocity at caller-provided states (the iDEM primitive)."""
+        images, img_masks, state, pointclouds, phase_one_hot = self._preprocess_observation(
+            observation, train=True
+        )
+        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(
+            images, img_masks, pointclouds, phase_one_hot
+        )
+        suffix_embs, suffix_pad_masks, _, adarms_cond = self.embed_suffix(
+            state, x_t, time
+        )
+        embs = torch.cat([prefix_embs, suffix_embs], dim=1)
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        attention_mask = self._make_attention_mask(
+            prefix_pad_masks, suffix_pad_masks
+        )
+        position_ids = (torch.cumsum(pad_masks, dim=1) - 1).to(dtype=torch.long)
+        hidden_states, _ = self.expert_model.forward(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=embs,
+            use_cache=False,
+            adarms_cond=adarms_cond,
+        )
+        suffix_out = hidden_states[:, -self.config.action_horizon :].float()
+        velocity = self.action_out_proj(suffix_out)
+        return F.mse_loss(velocity, target_velocity, reduction="none")
+
     @torch.no_grad()
     def forward_for_distill(
         self,
@@ -573,7 +673,7 @@ class ProxyPytorch(nn.Module):
             - actions: Final denoised actions after all updates
               Shape: (batch_size, action_horizon, action_dim)
         """
-        images, img_masks, state, pointclouds = self._preprocess_observation(observation, train=False)
+        images, img_masks, state, pointclouds, phase_one_hot = self._preprocess_observation(observation, train=False)
         bsize = state.shape[0]
         device = state.device
 
@@ -589,7 +689,9 @@ class ProxyPytorch(nn.Module):
         initial_noise = self.sample_noise(actions_shape, device)
         time_schedule = self.sample_bin_times(bsize, num_steps, device)
 
-        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks, pointclouds)
+        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(
+            images, img_masks, pointclouds, phase_one_hot
+        )
 
         x_t = initial_noise
         current_time = torch.tensor(1.0, dtype=torch.float32, device=device).expand(
@@ -651,26 +753,37 @@ class ProxyPytorch(nn.Module):
 
     @torch.no_grad()
     def sample_actions(
-        self, device, observation, noise=None, num_steps=10, start_time=1.0
-    ) -> Tensor:
+        self,
+        device,
+        observation,
+        noise=None,
+        num_steps=10,
+        start_time=1.0,
+        laplace=None,
+        return_denoise_uncertainty=False,
+    ) -> Tensor | tuple[Tensor, dict[str, Tensor]]:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = observation.state.shape[0]
         if noise is None:
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        images, img_masks, state, pointclouds = self._preprocess_observation(
+        images, img_masks, state, pointclouds, phase_one_hot = self._preprocess_observation(
             observation, train=False
         )
 
         # Prefix embeddings are static across denoising steps
-        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks, pointclouds)
+        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(
+            images, img_masks, pointclouds, phase_one_hot
+        )
 
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
 
         x_t = noise
         time = torch.tensor(start_time, dtype=torch.float32, device=device)
+        denoise_times = []
+        denoise_ratios = []
 
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
@@ -702,8 +815,27 @@ class ProxyPytorch(nn.Module):
             suffix_out = suffix_out.to(dtype=torch.float32)
             v_t = self.action_out_proj(suffix_out)
 
+            if laplace is not None:
+                laplace_statistics = laplace.sample_statistics(
+                    suffix_out
+                )
+                denoise_times.append(expanded_time.detach().clone())
+                denoise_ratios.append(
+                    laplace_statistics["posterior_to_prior_ratio"].detach()
+                )
             # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t + dt * v_t
             time += dt
 
+        if return_denoise_uncertainty:
+            if laplace is None:
+                raise ValueError(
+                    "return_denoise_uncertainty requires a Laplace posterior"
+                )
+            return x_t, {
+                "time": torch.stack(denoise_times, dim=1),
+                "posterior_to_prior_ratio": torch.stack(
+                    denoise_ratios, dim=1
+                ),
+            }
         return x_t

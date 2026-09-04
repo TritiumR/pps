@@ -150,6 +150,16 @@ def _multi_worker_preparse(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--exp_name", default="eval")
     parser.add_argument("--seed_start", type=int, default=1)
     parser.add_argument("--seed_end", type=int, default=51)
+    parser.add_argument(
+        "--env_batch_size",
+        "--env-batch-size",
+        type=int,
+        default=1,
+        help=(
+            "Number of Isaac environments stepped in lockstep in each worker. "
+            "Values above one use batched policy inference and independent MPC costs."
+        ),
+    )
     parser.add_argument("--task_num_steps", type=int, default=225)
     parser.add_argument("--workers", type=int, default=_DEFAULT_WORKERS)
     parser.add_argument("--gpus", default=_DEFAULT_GPUS)
@@ -653,6 +663,11 @@ from sim_free_mpc.action_space import (
     decode_model_action_chunks,
     load_action_norm_stats_json,
 )
+from sim_free_mpc.weight_release import WeightReleaseDetector
+from tools.annotate_capsule_phase_futures_wandb import (
+    panda_gripper_wireframe_link0,
+    project_table_camera,
+)
 from sim_free_mpc.ddim import ddim_iteration_alphas
 from sim_free_mpc.planner import task_tilt_weight
 from sim_free_mpc.score_steering import combine_scores, steer_scale_for_stage
@@ -671,6 +686,106 @@ _SOUND_AUDIO_MIN_DISTANCE = 1e-3
 _LAST_INFERENCE_RUNTIME = {}
 _WEIGHT_SCALE_CENTER_OFFSET_DEBUG = (-0.0470425, 0.0, 0.0272255)
 _WEIGHT_SCALE_TOP_OFFSET_Z_DEBUG = 0.0523800
+
+
+def _slice_batched_tree(value, index: int, batch_size: int):
+    """Select one lane while retaining its leading batch dimension."""
+    if torch.is_tensor(value):
+        return value[index : index + 1] if value.ndim and value.shape[0] == batch_size else value
+    if isinstance(value, np.ndarray):
+        return value[index : index + 1] if value.ndim and value.shape[0] == batch_size else value
+    if isinstance(value, dict):
+        return {key: _slice_batched_tree(item, index, batch_size) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_slice_batched_tree(item, index, batch_size) for item in value)
+    if isinstance(value, list):
+        return [_slice_batched_tree(item, index, batch_size) for item in value]
+    return value
+
+
+def _concat_policy_trees(values):
+    first = values[0]
+    if torch.is_tensor(first):
+        return torch.cat(values, dim=0)
+    if isinstance(first, dict):
+        return {key: _concat_policy_trees([value[key] for value in values]) for key in first}
+    raise TypeError(f"Unsupported batched policy input leaf: {type(first).__name__}")
+
+
+class _BatchedSimFreeMPC:
+    """Keep stateful costs per env while presenting one batched planner interface."""
+
+    def __init__(self, planners):
+        if not planners:
+            raise ValueError("Batched MPC needs at least one planner.")
+        self.planners = list(planners)
+        self.config = self.planners[0].config
+
+    def begin_inference(self):
+        for planner in self.planners:
+            planner.begin_inference()
+
+    def reset_episode(self):
+        for planner in self.planners:
+            planner.reset_episode()
+
+    def observe_subtasks(self, lane: int, subtasks):
+        _observe_mpc_subtasks(self.planners[lane], subtasks)
+
+    def _estimate(self, method, x_t, policy_inputs, contexts, **kwargs):
+        batch_size = x_t.shape[0]
+        if batch_size != len(self.planners) or len(contexts) != batch_size:
+            raise ValueError(
+                f"Batched MPC mismatch: x_t={batch_size}, planners={len(self.planners)}, "
+                f"contexts={len(contexts)}"
+            )
+        lane_outputs = []
+        for lane, planner in enumerate(self.planners):
+            lane_inputs = _slice_batched_tree(policy_inputs, lane, batch_size)
+            lane_outputs.append(
+                getattr(planner, method)(x_t[lane : lane + 1], lane_inputs, contexts[lane], **kwargs)
+            )
+        scores = torch.cat([output[0] for output in lane_outputs], dim=0)
+        numerators = torch.cat([output[1] for output in lane_outputs], dim=0)
+        diagnostics = self._merge_diagnostics([output[2] for output in lane_outputs])
+        return scores, numerators, diagnostics
+
+    @staticmethod
+    def _merge_diagnostics(lane_diagnostics):
+        merged = {"batch_lanes": lane_diagnostics}
+        common_keys = set.intersection(*(set(diag) for diag in lane_diagnostics))
+        for key in common_keys:
+            values = [diag[key] for diag in lane_diagnostics]
+            if all(isinstance(value, (int, float, np.number)) for value in values):
+                merged[key] = float(np.mean(values))
+            elif all(value == values[0] for value in values):
+                merged[key] = values[0]
+        return merged
+
+    def estimate_mbd_score_action_prox_terms(self, x_t, policy_inputs, contexts, **kwargs):
+        return self._estimate(
+            "estimate_mbd_score_action_prox_terms", x_t, policy_inputs, contexts, **kwargs
+        )
+
+    def estimate_mbd_score_action_warm_terms(self, x_t, policy_inputs, contexts, **kwargs):
+        return self._estimate(
+            "estimate_mbd_score_action_warm_terms", x_t, policy_inputs, contexts, **kwargs
+        )
+
+    def step_from_mbd_residual(self, x_t, base_numerator, residual_score, **kwargs):
+        # This DDIM update is stateless apart from optional per-lane ancestral noise.
+        return torch.cat(
+            [
+                planner.step_from_mbd_residual(
+                    x_t[lane : lane + 1],
+                    base_numerator[lane : lane + 1],
+                    residual_score[lane : lane + 1],
+                    **kwargs,
+                )
+                for lane, planner in enumerate(self.planners)
+            ],
+            dim=0,
+        )
 
 
 # =========================================================================== runtime determinism
@@ -802,6 +917,10 @@ def _validate_policy_environment_inputs(policy, raw_obs: dict, role: str) -> Non
 
 
 def _obs_to_input_checked(policy, raw_obs: dict, role: str):
+    if isinstance(raw_obs, (list, tuple)):
+        converted = [_obs_to_input_checked(policy, lane_obs, role) for lane_obs in raw_obs]
+        inputs = _concat_policy_trees([item[1] for item in converted])
+        return _model.Observation.from_dict(inputs), inputs
     _validate_policy_environment_inputs(policy, raw_obs, role)
     try:
         return policy.obs_to_input(raw_obs)
@@ -1003,10 +1122,33 @@ def _prepare_proxy_steering(model, observation):
     model_type = model.config.model_type
 
     if model_type in (_model.ModelType.PROXY, _model.ModelType.PROXY_SCORE):
-        images, img_masks, state = model._preprocess_observation(observation, train=False)
-        prefix_embs, prefix_pad_masks, prefix_att_masks = model.embed_prefix(
-            images, img_masks
-        )
+        preprocessed = model._preprocess_observation(observation, train=False)
+        phase_one_hot = None
+        if len(preprocessed) == 3:
+            images, img_masks, state = preprocessed
+            pointclouds = None
+        elif len(preprocessed) == 4:
+            images, img_masks, state, pointclouds = preprocessed
+        elif len(preprocessed) == 5:
+            images, img_masks, state, pointclouds, phase_one_hot = preprocessed
+        else:
+            raise ValueError(
+                "Proxy preprocessing must return images, masks, state, and "
+                "optional pointclouds/phase conditioning; "
+                f"got {len(preprocessed)} values."
+            )
+        if pointclouds is None and phase_one_hot is None:
+            prefix_embs, prefix_pad_masks, prefix_att_masks = model.embed_prefix(
+                images,
+                img_masks,
+            )
+        else:
+            prefix_embs, prefix_pad_masks, prefix_att_masks = model.embed_prefix(
+                images,
+                img_masks,
+                pointclouds,
+                phase_one_hot,
+            )
         return {
             "kind": "sequence",
             "state": state,
@@ -1344,6 +1486,15 @@ def _uses_vlm_mpc_base(args) -> bool:
     return _score_steering_mode(args) is not None
 
 
+def _uses_weight_keypose_flow(args) -> bool:
+    return bool(getattr(args, "weight_keypose_flow", False))
+
+
+def _uses_flow_score_averaging(args) -> bool:
+    """Whether to convexly average the pi and task rectified-flow fields."""
+    return bool(getattr(args, "flow_score_averaging", False))
+
+
 def _standalone_policy_role(args) -> str | None:
     if getattr(args, "ref_only", False):
         return "ref"
@@ -1356,8 +1507,12 @@ def _required_policy_roles(args) -> set[str]:
     standalone_role = _standalone_policy_role(args)
     if standalone_role is not None:
         return {standalone_role}
+    if _uses_flow_score_averaging(args):
+        return {"base", "task"}
 
     score_mode = _score_steering_mode(args)
+    if _uses_weight_keypose_flow(args):
+        return {"base"}
     # Proposal injection needs the task proxy loaded even in base-only mode: it supplies candidates,
     # not a score residual, so no reference is required.
     inject = float(getattr(args, "inject_proxy", 0.0)) > 0.0
@@ -1369,6 +1524,11 @@ def _required_policy_roles(args) -> set[str]:
 
 
 def _steering_mode_name(args) -> str:
+    if _uses_flow_score_averaging(args):
+        return (
+            "vlm_task_flow_score_averaging"
+            if _uses_vlm_mpc_base(args) else "flow_score_averaging"
+        )
     score_mode = _score_steering_mode(args)
     if score_mode == "base" or getattr(args, "no_steer", False):
         return "base_only"
@@ -1389,7 +1549,14 @@ def _base_source_name(args) -> str:
     standalone_role = _standalone_policy_role(args)
     if standalone_role is not None:
         return f"{standalone_role}_only"
+    if _uses_flow_score_averaging(args):
+        return (
+            "vlm_task_flow_score_averaging"
+            if _uses_vlm_mpc_base(args) else "pi_task_flow_score_averaging"
+        )
     score_mode = _score_steering_mode(args)
+    if _uses_weight_keypose_flow(args):
+        return "weight_keypose_flow_averaging"
     if score_mode is None:
         return "pi_checkpoint"
     if _uses_accel_action_mpc(args):
@@ -1550,6 +1717,12 @@ def _pixel_consumers(args) -> list[str]:
 def _can_use_compiled_infer(base_policy, task_policy, ref_policy, args) -> bool:
     if _uses_vlm_mpc_base(args):
         return False
+    if _uses_weight_keypose_flow(args):
+        return False
+    if _uses_flow_score_averaging(args):
+        # The compiled three-policy path requires a reference proxy and implements
+        # base + lambda * (task - ref), not the exact two-policy convex mixture.
+        return False
     if args.no_steer:
         return False
     if args.compare_difference:
@@ -1688,8 +1861,19 @@ def infer_actions_with_mpc(
         standalone_policy = ref_policy if standalone_role == "ref" else task_policy
         if standalone_policy is None:
             raise ValueError(f"--{standalone_role}_only requires a {standalone_role} checkpoint.")
-        _validate_policy_environment_inputs(standalone_policy, raw_obs, standalone_role)
-        outputs = standalone_policy.infer(raw_obs)
+        if isinstance(raw_obs, (list, tuple)):
+            for lane_obs in raw_obs:
+                _validate_policy_environment_inputs(
+                    standalone_policy, lane_obs, standalone_role
+                )
+            outputs = standalone_policy.infer_batch(list(raw_obs))
+            current_joint_pos = np.stack(
+                [lane_obs["observation/joint_position"] for lane_obs in raw_obs], axis=0
+            )
+        else:
+            _validate_policy_environment_inputs(standalone_policy, raw_obs, standalone_role)
+            outputs = standalone_policy.infer(raw_obs)
+            current_joint_pos = raw_obs.get("observation/joint_position")
         actions = np.asarray(outputs["actions"], dtype=np.float32)
         # Clamp in executable joint space: the first target is relative to the current robot
         # state, each later one to the preceding clamped target.
@@ -1699,7 +1883,7 @@ def infer_actions_with_mpc(
         actions = (
             clamp_real_action_chunk(
                 torch.as_tensor(actions, dtype=torch.float32),
-                current_joint_pos=raw_obs.get("observation/joint_position"),
+                current_joint_pos=current_joint_pos,
                 max_joint_delta=max_joint_delta,
             )
             .cpu()
@@ -1723,7 +1907,9 @@ def infer_actions_with_mpc(
         return actions, {}
     if _uses_vlm_mpc_base(args) and mpc_planner is None:
         raise ValueError("VLM/MPC base mode requires a SimFreeMPC planner.")
-    if not _uses_vlm_mpc_base(args):
+    if not (
+        _uses_vlm_mpc_base(args) or _uses_weight_keypose_flow(args)
+    ):
         return infer_actions(base_policy, task_policy, ref_policy, raw_obs, args)
     if mpc_planner is None:
         return infer_actions(base_policy, task_policy, ref_policy, raw_obs, args)
@@ -1738,6 +1924,19 @@ def infer_actions_with_mpc(
         warm_shift_steps=warm_shift_steps,
         base_decode_policy=base_decode_policy,
     )
+
+
+def _output_to_actions_preserve_batch(policy, inputs, x_t: torch.Tensor) -> np.ndarray:
+    """Apply a Policy's output transforms independently without dropping batch lanes."""
+    decoded = []
+    for lane in range(x_t.shape[0]):
+        outputs = {
+            "state": np.asarray(inputs["state"][lane].detach().cpu()),
+            "actions": np.asarray(x_t[lane].detach().cpu()),
+        }
+        outputs = policy._output_transform(outputs)  # noqa: SLF001
+        decoded.append(np.asarray(outputs["actions"], dtype=np.float32))
+    return np.stack(decoded, axis=0)
 
 
 def _infer_actions_eager(
@@ -1759,9 +1958,18 @@ def _infer_actions_eager(
     device = base_obs.state.device
     need_compare = args.compare_difference
     use_vlm_mpc_base = _uses_vlm_mpc_base(args)
+    use_weight_keypose_flow = _uses_weight_keypose_flow(args)
+    use_flow_score_averaging = _uses_flow_score_averaging(args)
     score_steering_mode = _score_steering_mode(args)
-    disable_steering = bool(getattr(args, "no_steer", False)) or score_steering_mode == "base"
-    if score_steering_mode == "task":
+    disable_steering = (
+        bool(getattr(args, "no_steer", False))
+        or score_steering_mode == "base"
+        or use_weight_keypose_flow
+    )
+    if use_flow_score_averaging:
+        need_task = True
+        need_ref = False
+    elif score_steering_mode == "task":
         need_task = True
         need_ref = False
     elif score_steering_mode == "full":
@@ -1782,6 +1990,10 @@ def _infer_actions_eager(
         )
     if use_vlm_mpc_base and (mpc_planner is None or mpc_context is None):
         raise ValueError("VLM/MPC base mode requires mpc_planner and mpc_context.")
+    if use_weight_keypose_flow and (mpc_planner is None or mpc_context is None):
+        raise ValueError(
+            "Weight keypose flow averaging requires mpc_planner and mpc_context."
+        )
 
     base_model = base_policy._model
     task_model = task_policy._model if task_policy is not None else None
@@ -1798,8 +2010,18 @@ def _infer_actions_eager(
     )
     noise = base_model.sample_noise(actions_shape, device)
 
+    prepared_base = None
     if use_vlm_mpc_base:
         state = None
+        base_prefix_pad_masks = None
+        base_past_key_values = None
+    elif use_weight_keypose_flow:
+        prepared_base = _prepare_proxy_steering(base_model, base_obs)
+        if prepared_base["kind"] != "sequence":
+            raise ValueError(
+                "Weight keypose flow averaging currently requires a sequence Proxy base."
+            )
+        state = prepared_base["state"]
         base_prefix_pad_masks = None
         base_past_key_values = None
     else:
@@ -2225,7 +2447,11 @@ def _infer_actions_eager(
                     mpc_context["task_tilt"]["discrimination"] = True
                     mpc_context["task_tilt"]["ess_cap"] = args.tilt_ess_cap
             else:
-                mpc_context.pop("task_tilt", None)
+                if isinstance(mpc_context, (list, tuple)):
+                    for lane_context in mpc_context:
+                        lane_context.pop("task_tilt", None)
+                else:
+                    mpc_context.pop("task_tilt", None)
 
             if args.mpc_update == "mbd_score_action_prox":
                 base_score, base_numerator, geom_stats = (
@@ -2519,14 +2745,43 @@ def _infer_actions_eager(
                     flush=True,
                 )
         else:
-            base_v_t = base_model.denoise_step(
-                state,
-                base_prefix_pad_masks,
-                base_past_key_values,
-                x_t,
-                expanded_time,
-            )
+            if use_weight_keypose_flow:
+                base_v_t = _predict_proxy_flow(
+                    prepared_base,
+                    base_model,
+                    x_t,
+                    expanded_time,
+                )
+            else:
+                base_v_t = base_model.denoise_step(
+                    state,
+                    base_prefix_pad_masks,
+                    base_past_key_values,
+                    x_t,
+                    expanded_time,
+                )
             runtime_stats["used_base_model_velocity"] = True
+            if use_weight_keypose_flow:
+                base_v_t, geom_stats = mpc_planner.flow_average_weight_keypose(
+                    x_t,
+                    base_v_t,
+                    base_inputs,
+                    mpc_context,
+                    time_value=denoise_time,
+                )
+                runtime_stats["v_vlm_shape"] = tuple(base_v_t.shape)
+                record_mpc_stats(geom_stats)
+                if args.mpc_debug_stdout:
+                    print(
+                        "weight_keypose_flow "
+                        f"t={geom_stats['flow_time']:.4f} "
+                        f"cost_min={geom_stats['cost_min']:.4f} "
+                        f"cost_mean={geom_stats['cost_mean']:.4f} "
+                        f"l1_max={geom_stats['keypose_action_l1_max']:.4f} "
+                        f"l1_mean={geom_stats['keypose_action_l1_mean']:.4f}"
+                        f"{_format_mpc_term_debug(geom_stats)}",
+                        flush=True,
+                    )
         if need_compare:
             teacher_base_v_t = base_model.denoise_step(
                 state,
@@ -2537,18 +2792,20 @@ def _infer_actions_eager(
             )
 
         if denoise_time >= 0.0:
-            if need_task_and_ref:
+            if need_task:
                 task_v_t = _predict_proxy_flow(
                     prepared_task, task_model, x_t, expanded_time
                 )
+            else:
+                task_v_t = None
+            if need_ref:
                 ref_v_t = _predict_proxy_flow(
                     prepared_ref, ref_model, x_t, expanded_time
                 )
             else:
-                task_v_t = None
                 ref_v_t = None
-            if need_task_and_ref:
-                if task_v_t.shape != ref_v_t.shape:
+            if need_task:
+                if need_ref and task_v_t.shape != ref_v_t.shape:
                     raise ValueError(
                         "task/ref velocity shapes must match: "
                         f"task={tuple(task_v_t.shape)}, ref={tuple(ref_v_t.shape)}."
@@ -2559,9 +2816,10 @@ def _infer_actions_eager(
                         f"task={tuple(task_v_t.shape)}, x_t={tuple(x_t.shape)}."
                     )
                 runtime_stats["proxy_task_shape"] = tuple(task_v_t.shape)
-                runtime_stats["proxy_ref_shape"] = tuple(ref_v_t.shape)
                 runtime_stats["v_task_shape"] = tuple(task_v_t.shape)
-                runtime_stats["v_ref_shape"] = tuple(ref_v_t.shape)
+                if need_ref:
+                    runtime_stats["proxy_ref_shape"] = tuple(ref_v_t.shape)
+                    runtime_stats["v_ref_shape"] = tuple(ref_v_t.shape)
                 if need_compare:
                     teacher_task_v_t = _predict_proxy_flow(
                         prepared_task, task_model, teacher_path_x_t, expanded_time
@@ -2595,7 +2853,17 @@ def _infer_actions_eager(
                     compute_batch_metrics(teacher_ref, teacher_task),
                 )
 
-            if use_vlm_mpc_base:
+            if use_flow_score_averaging:
+                if task_v_t is None:
+                    raise ValueError("--flow_score_averaging requires a task flow field.")
+                gamma = float(args.flow_gamma)
+                v_t = base_v_t.clone()
+                v_t[:, :, :proxy_action_dim] = (
+                    (1.0 - gamma) * base_v_t[:, :, :proxy_action_dim]
+                    + gamma * task_v_t
+                )
+                runtime_stats["checked_vlm_task_ref_shapes"] = True
+            elif use_vlm_mpc_base:
                 if disable_steering:
                     v_t = args.gamma_base * base_v_t
                     runtime_stats["checked_vlm_task_ref_shapes"] = False
@@ -2633,19 +2901,26 @@ def _infer_actions_eager(
         mpc_planner.set_warm_action(x_t, state=base_inputs["state"])
 
     if base_decode_policy is None:
-        actions = base_policy.output_to_actions(base_inputs, x_t)
+        if isinstance(raw_obs, (list, tuple)):
+            actions = _output_to_actions_preserve_batch(base_policy, base_inputs, x_t)
+        else:
+            actions = base_policy.output_to_actions(base_inputs, x_t)
     else:
         # The executed chunk must leave the same space the planner scored it in, so it cannot go
         # through the checkpoint's output transforms.
-        actions = (
-            decode_model_action_chunks(base_decode_policy, base_inputs, x_t, apply_clamp=False)
-            .real_actions[0]
-            .detach()
-            .cpu()
-            .numpy()
-        )
+        decoded_actions = decode_model_action_chunks(
+            base_decode_policy, base_inputs, x_t, apply_clamp=False
+        ).real_actions
+        actions = decoded_actions.detach().cpu().numpy()
+        if not isinstance(raw_obs, (list, tuple)):
+            actions = actions[0]
     if use_vlm_mpc_base:
-        current_joint_pos = raw_obs.get("observation/joint_position")
+        if isinstance(raw_obs, (list, tuple)):
+            current_joint_pos = np.stack(
+                [lane_obs["observation/joint_position"] for lane_obs in raw_obs], axis=0
+            )
+        else:
+            current_joint_pos = raw_obs.get("observation/joint_position")
         max_joint_delta = (
             None
             if args.sampler == "truncated"
@@ -2848,7 +3123,7 @@ def _extract_capsule_mpc_state(env, env_origin=None):
 
 # ========================================================================== MPC context assembly
 
-def build_mpc_context(env, env_obs_dict, args):
+def build_mpc_context(env, env_obs_dict, args, *, runtime_subtasks=None):
     policy_obs = env_obs_dict["policy"]
     env_origin = None
     if hasattr(env.scene, "env_origins"):
@@ -2882,9 +3157,14 @@ def build_mpc_context(env, env_obs_dict, args):
             robot_root_quat = fk_source_quat
     except Exception:
         pass
+    subtasks = _extract_subtasks(env_obs_dict)
+    if runtime_subtasks is not None:
+        subtasks.update(
+            {str(key): bool(value) for key, value in runtime_subtasks.items()}
+        )
     context = {
         "task": _task_name_for_mpc(args.task),
-        "subtasks": _extract_subtasks(env_obs_dict),
+        "subtasks": subtasks,
         "joint_pos": _context_tensor(policy_obs.get("joint_pos")),
         "joint_vel": _context_tensor(policy_obs.get("joint_vel")),
         "eef_pos": _context_tensor(policy_obs.get("eef_pos")),
@@ -2920,6 +3200,403 @@ def build_mpc_context(env, env_obs_dict, args):
     if capsule_lid_joint_pos is not None:
         context["capsule_lid_joint_pos"] = capsule_lid_joint_pos
     return context
+
+
+def _slice_context_lane(value, lane: int, batch_size: int):
+    """Select an environment lane and remove the env batch axis for MPC costs."""
+    if torch.is_tensor(value):
+        return value[lane] if value.ndim and value.shape[0] == batch_size else value
+    if isinstance(value, np.ndarray):
+        return value[lane] if value.ndim and value.shape[0] == batch_size else value
+    if isinstance(value, dict):
+        return {key: _slice_context_lane(item, lane, batch_size) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_slice_context_lane(item, lane, batch_size) for item in value)
+    if isinstance(value, list):
+        return [_slice_context_lane(item, lane, batch_size) for item in value]
+    return value
+
+
+def _batched_policy_observations(env_obs_dict, batch_size: int, prompt: str):
+    observations = []
+    for lane in range(batch_size):
+        lane_policy = _slice_batched_tree(env_obs_dict["policy"], lane, batch_size)
+        lane_obs = get_pi_observation(lane_policy)
+        lane_obs["prompt"] = prompt
+        observations.append(lane_obs)
+    return observations
+
+
+def _batched_scene_state(env, env_obs_dict, lane: int, batch_size: int) -> dict[str, Any]:
+    """Capture enough live simulator state to hand a lane to another policy."""
+    origin = env.scene.env_origins[lane].detach().cpu().tolist()
+    entities: dict[str, Any] = {}
+    seen: set[tuple[str, str]] = set()
+    collections = (
+        ("rigid_object", "rigid_objects", "_rigid_objects"),
+        ("articulation", "articulations", "_articulations"),
+        ("deformable_object", "deformable_objects", "_deformable_objects"),
+        ("rigid_object_collection", "rigid_object_collections", "_rigid_object_collections"),
+    )
+    for entity_type, public_name, private_name in collections:
+        collection = getattr(env.scene, public_name, None)
+        if collection is None:
+            collection = getattr(env.scene, private_name, None)
+        if not collection:
+            continue
+        for name, asset in collection.items():
+            identity = (entity_type, str(name))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            data = getattr(asset, "data", None)
+            if data is None:
+                continue
+            state: dict[str, Any] = {"type": entity_type}
+            root_state = getattr(data, "root_state_w", None)
+            if root_state is None:
+                root_state = getattr(data, "object_state_w", None)
+            if root_state is not None:
+                lane_root = root_state[lane].detach().cpu()
+                state["root_state_w"] = lane_root.tolist()
+                local_root = lane_root.clone()
+                local_root[..., :3] -= torch.as_tensor(origin, dtype=local_root.dtype)
+                state["root_state_env"] = local_root.tolist()
+            for field in ("joint_pos", "joint_vel", "joint_pos_target", "joint_vel_target"):
+                value = getattr(data, field, None)
+                if value is not None:
+                    state[field] = value[lane].detach().cpu().tolist()
+            entities[str(name)] = state
+
+    lane_policy = _slice_batched_tree(env_obs_dict["policy"], lane, batch_size)
+    policy_state = {}
+    for field in ("joint_pos", "joint_vel", "eef_pos", "eef_quat", "gripper_pos"):
+        if field in lane_policy:
+            policy_state[field] = _jsonable_debug_value(lane_policy[field])
+    return {"env_origin_w": origin, "entities": entities, "policy_state": policy_state}
+
+
+def _write_batched_state_frame(
+    handle,
+    *,
+    env,
+    env_obs_dict,
+    group_index: int,
+    step: int,
+    group_seeds: list[int],
+    batch_size: int,
+    active,
+    action=None,
+    success=None,
+    done=None,
+) -> None:
+    if handle is None:
+        return
+    lanes = []
+    for lane in range(batch_size):
+        valid = lane < len(group_seeds)
+        lane_obs = _slice_batched_tree(env_obs_dict, lane, batch_size)
+        lanes.append(
+            {
+                "lane": lane,
+                "valid": valid,
+                "seed": group_seeds[lane] if valid else None,
+                "active": bool(active[lane]) if valid else False,
+                "done": bool(done[lane]) if valid and done is not None else False,
+                "success": bool(success[lane]) if valid and success is not None else False,
+                "subtasks": _debug_subtasks(lane_obs) if valid else {},
+                "action": (
+                    np.asarray(action[lane], dtype=np.float32).tolist()
+                    if valid and action is not None
+                    else None
+                ),
+                **_batched_scene_state(env, env_obs_dict, lane, batch_size),
+            }
+        )
+    record = {
+        "event": "frame",
+        "group_index": group_index,
+        "step": step,
+        "lanes": lanes,
+    }
+    handle.write(json.dumps(_jsonable_debug_value(record), sort_keys=True) + "\n")
+
+
+def _run_batched_env_rollouts(
+    *,
+    env,
+    args,
+    base_policy,
+    task_policy,
+    ref_policy,
+    base_decode_policy,
+    mpc_planner,
+    success_term,
+    failure_terms,
+    output_path: str,
+    steps_per_inference: int,
+):
+    """Run fixed-size groups in one Isaac vector env with one batched policy call."""
+    batch_size = int(args.env_batch_size)
+    seeds = list(range(args.seed_start, args.seed_end))
+    run_id = time.strftime("%Y%m%d-%H%M%S") + f"-pid{os.getpid()}-batch{batch_size}"
+    experiment_output_path = os.path.join(
+        output_path, _experiment_output_name(args, run_id=run_id)
+    )
+    os.makedirs(experiment_output_path, exist_ok=False)
+    results_path = os.path.join(experiment_output_path, "results.json")
+    state_trace_path = os.path.join(experiment_output_path, "state_trace.jsonl")
+    state_trace_file = open(state_trace_path, "w", encoding="utf-8") if args.state_trace else None
+    results = {
+        "run_id": run_id,
+        "command": sys.argv,
+        "config": vars(args),
+        "batching": {
+            "env_batch_size": batch_size,
+            "scheduling": "lockstep_any_phase_change_replans_all_active_lanes",
+            "seed_semantics": (
+                "Each lane is selectively reset with its labeled seed. Policy noise is drawn "
+                "from one deterministic batched RNG stream seeded by the group's first seed."
+            ),
+        },
+        "episodes": [],
+    }
+    if state_trace_file is not None:
+        results["state_trace"] = state_trace_path
+        state_trace_file.write(
+            json.dumps(
+                {
+                    "event": "schema",
+                    "version": 1,
+                    "root_state_w": "position_xyz, quaternion_wxyz, linear_velocity_xyz, angular_velocity_xyz",
+                    "root_state_env": "root_state_w with position relative to env_origin_w",
+                    "frame_semantics": "step 0 is post-reset; step N is post-env.step for action N",
+                    "restoration": "write root states, then articulation joint position/velocity; render a fresh observation before base-policy inference",
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
+    _write_experiment_results(results_path, results)
+    print(
+        f"[batch-env] {len(seeds)} episodes in groups of {batch_size}; results={results_path}",
+        flush=True,
+    )
+
+    for group_start in range(0, len(seeds), batch_size):
+        group_seeds = seeds[group_start : group_start + batch_size]
+        valid_lanes = len(group_seeds)
+        reset_seed = group_seeds[0]
+        _seed_runtime(reset_seed)
+        if mpc_planner is not None:
+            mpc_planner.reset_episode()
+        lane_reset_seeds = group_seeds + [reset_seed] * (batch_size - valid_lanes)
+        env_obs_dict = None
+        for lane, lane_seed in enumerate(lane_reset_seeds):
+            env_obs_dict, _ = env.reset(
+                seed=lane_seed if args.determine else None,
+                env_ids=torch.as_tensor([lane], dtype=torch.int64, device=env.device),
+            )
+        if args.determine:
+            _seed_runtime(reset_seed)
+
+        active = np.zeros(batch_size, dtype=bool)
+        active[:valid_lanes] = True
+        successes = np.zeros(batch_size, dtype=bool)
+        done_steps = np.full(batch_size, args.task_num_steps, dtype=np.int64)
+        inference_calls = 0
+        inference_time_s = 0.0
+        actions = None
+        action_start_step = -steps_per_inference
+        force_replan = False
+
+        lane_subtasks = []
+        lane_phases = []
+        for lane in range(batch_size):
+            lane_env_obs = _slice_batched_tree(env_obs_dict, lane, batch_size)
+            subtasks = _debug_subtasks(lane_env_obs)
+            lane_subtasks.append(subtasks)
+            lane_phases.append(_debug_phase_from_subtasks(args.task, subtasks))
+            if mpc_planner is not None:
+                mpc_planner.observe_subtasks(lane, subtasks)
+        print(
+            f"[batch-env] group seeds={group_seeds} lane_reset_seeds={lane_reset_seeds} "
+            f"phases={lane_phases[:valid_lanes]}",
+            flush=True,
+        )
+        for lane, seed in enumerate(group_seeds):
+            _emit_worker_progress(
+                args, "rollout_start", seed=seed,
+                rollout_index=group_start + lane, task_num_steps=args.task_num_steps,
+            )
+        _write_batched_state_frame(
+            state_trace_file,
+            env=env,
+            env_obs_dict=env_obs_dict,
+            group_index=group_start // batch_size,
+            step=0,
+            group_seeds=group_seeds,
+            batch_size=batch_size,
+            active=active,
+        )
+        group_control_start = time.perf_counter()
+
+        for step_idx in tqdm(
+            range(args.task_num_steps),
+            desc=f"Batched Policy Control Loop ({valid_lanes}/{batch_size})",
+            disable=args.worker_progress_path is not None,
+        ):
+            if not active.any():
+                break
+            if actions is None or force_replan or step_idx - action_start_step >= steps_per_inference:
+                raw_observations = _batched_policy_observations(
+                    env_obs_dict, batch_size, args.prompt
+                )
+                contexts = None
+                if (
+                    _standalone_policy_role(args) is None
+                    and (not _uses_flow_score_averaging(args)
+                         or _uses_vlm_mpc_base(args))
+                ):
+                    full_context = build_mpc_context(env, env_obs_dict, args)
+                    contexts = [
+                        _slice_context_lane(full_context, lane, batch_size)
+                        for lane in range(batch_size)
+                    ]
+                infer_start = time.perf_counter()
+                with torch.no_grad():
+                    actions, _ = infer_actions_with_mpc(
+                        base_policy,
+                        task_policy,
+                        ref_policy,
+                        raw_observations,
+                        args,
+                        mpc_planner=mpc_planner,
+                        mpc_context=contexts,
+                        warm_shift_steps=0,
+                        base_decode_policy=base_decode_policy,
+                    )
+                inference_time_s += time.perf_counter() - infer_start
+                inference_calls += 1
+                actions = np.asarray(actions, dtype=np.float32)[:, :steps_per_inference]
+                action_start_step = step_idx
+                force_replan = False
+
+            action_step = actions[:, step_idx - action_start_step].copy()
+            current_joint = _to_numpy_unbatched(env_obs_dict["policy"]["joint_pos"])
+            if current_joint.ndim == 1:
+                current_joint = current_joint[None]
+            for lane in range(batch_size):
+                if not active[lane]:
+                    action_step[lane, :8] = current_joint[lane, :8]
+            pre_step_object_z = {}
+            for object_name in ("apple", "pear"):
+                try:
+                    pre_step_object_z[object_name] = (
+                        env.scene[object_name].data.root_pos_w[:, 2].detach().cpu().numpy().copy()
+                    )
+                except Exception:
+                    pass
+            env_obs_dict, _, _, truncated, extras = env.step(
+                torch.as_tensor(action_step, dtype=torch.float32, device=env.device)
+            )
+
+            success_values = success_term.func(env, **success_term.params)
+            success_values = torch.as_tensor(success_values).detach().cpu().numpy().astype(bool)
+            terminated_values = np.zeros(batch_size, dtype=bool)
+            failure_values = {}
+            for failure_name, failure_term in failure_terms.items():
+                values = failure_term.func(env, **failure_term.params)
+                values = torch.as_tensor(values).detach().cpu().numpy().astype(bool)
+                failure_values[failure_name] = values
+                terminated_values |= values
+            truncated_values = torch.as_tensor(truncated).detach().cpu().numpy().astype(bool)
+            newly_done = active & (success_values | terminated_values | truncated_values)
+            for lane in np.flatnonzero(newly_done):
+                print(
+                    f"[batch-env] early_done seed={group_seeds[lane]} lane={lane} "
+                    f"step={step_idx + 1} terminated={bool(terminated_values[lane])} "
+                    f"truncated={bool(truncated_values[lane])} "
+                    f"success={bool(success_values[lane])} "
+                    f"failure_terms="
+                    f"{{{', '.join(f'{name}: {bool(values[lane])}' for name, values in failure_values.items())}}} "
+                    f"pre_step_object_z="
+                    f"{{{', '.join(f'{name}: {float(values[lane]):.5f}' for name, values in pre_step_object_z.items())}}} "
+                    f"action={np.round(action_step[lane], 5).tolist()} "
+                    f"extras_log={_jsonable_debug_value(extras.get('log', {}))}",
+                    flush=True,
+                )
+            successes[newly_done] = success_values[newly_done]
+            done_steps[newly_done] = step_idx + 1
+            active[newly_done] = False
+            _write_batched_state_frame(
+                state_trace_file,
+                env=env,
+                env_obs_dict=env_obs_dict,
+                group_index=group_start // batch_size,
+                step=step_idx + 1,
+                group_seeds=group_seeds,
+                batch_size=batch_size,
+                active=active,
+                action=action_step,
+                success=success_values,
+                done=newly_done,
+            )
+
+            for lane in range(batch_size):
+                if lane >= valid_lanes or not active[lane]:
+                    continue
+                lane_env_obs = _slice_batched_tree(env_obs_dict, lane, batch_size)
+                next_subtasks = _debug_subtasks(lane_env_obs)
+                if mpc_planner is not None:
+                    mpc_planner.observe_subtasks(lane, next_subtasks)
+                next_phase = _debug_phase_from_subtasks(args.task, next_subtasks)
+                if next_phase != lane_phases[lane]:
+                    print(
+                        f"[batch-env] phase seed={group_seeds[lane]} step={step_idx + 1} "
+                        f"{lane_phases[lane]}->{next_phase}",
+                        flush=True,
+                    )
+                    force_replan = True
+                lane_subtasks[lane] = next_subtasks
+                lane_phases[lane] = next_phase
+
+        group_control_elapsed_s = time.perf_counter() - group_control_start
+        executed_lane_steps = int(sum(min(int(step), args.task_num_steps) for step in done_steps[:valid_lanes]))
+        lane_steps_per_s = executed_lane_steps / group_control_elapsed_s
+        avg_infer_ms = 1000.0 * inference_time_s / inference_calls if inference_calls else None
+        for lane, seed in enumerate(group_seeds):
+            episode = {
+                "rollout_index": group_start + lane,
+                "seed": seed,
+                "success": bool(successes[lane]),
+                "steps": int(done_steps[lane]),
+                "video": None,
+                "inference_calls": inference_calls,
+                "average_batch_inference_ms": avg_infer_ms,
+                "env_batch_size": batch_size,
+                "group_control_elapsed_s": group_control_elapsed_s,
+                "group_lane_steps_per_s": lane_steps_per_s,
+            }
+            results["episodes"].append(episode)
+            _emit_worker_progress(
+                args, "rollout_end", seed=seed, rollout_index=group_start + lane,
+                steps=int(done_steps[lane]), task_num_steps=args.task_num_steps,
+                success=bool(successes[lane]),
+            )
+        _write_experiment_results(results_path, results)
+        if state_trace_file is not None:
+            state_trace_file.flush()
+        print(
+            f"[batch-env] completed seeds={group_seeds} success="
+            f"{successes[:valid_lanes].tolist()} avg_batch_infer_ms={avg_infer_ms:.1f} "
+            f"control_s={group_control_elapsed_s:.2f} lane_steps_per_s={lane_steps_per_s:.2f}",
+            flush=True,
+        )
+
+    if state_trace_file is not None:
+        state_trace_file.close()
+    return results_path
 
 
 # ================================================================ MPC debug logging and overlays
@@ -2987,6 +3664,10 @@ def _observe_mpc_subtasks(mpc_planner, subtasks: dict[str, bool]) -> None:
 def _debug_phase_from_subtasks(task_name: str, subtasks: dict[str, bool]) -> str:
     task = task_name.lower()
     if "weight" in task:
+        if subtasks.get("open_gripper_apple", False):
+            return "open_gripper_apple"
+        if subtasks.get("open_gripper_pear", False):
+            return "open_gripper_pear"
         if subtasks.get("grasp_apple", False):
             return "place_apple"
         if subtasks.get("grasp_pear", False):
@@ -3001,6 +3682,51 @@ def _debug_phase_from_subtasks(task_name: str, subtasks: dict[str, bool]) -> str
             return "grasp_pod"
         return "open_lid"
     return "unknown"
+
+
+def _weight_scale_top_position(env) -> np.ndarray | None:
+    try:
+        scale = env.scene["scale"]
+        scale_pos = _context_tensor(scale.data.root_pos_w)
+        scale_quat = _context_tensor(scale.data.root_quat_w)
+        if scale_pos is None or scale_quat is None:
+            return None
+        env_origin = _context_tensor(getattr(env.scene, "env_origins", None))
+        if env_origin is not None:
+            scale_pos = scale_pos - env_origin.to(
+                device=scale_pos.device,
+                dtype=scale_pos.dtype,
+            )
+        offset = torch.tensor(
+            [
+                _WEIGHT_SCALE_CENTER_OFFSET_DEBUG[0],
+                _WEIGHT_SCALE_CENTER_OFFSET_DEBUG[1],
+                _WEIGHT_SCALE_CENTER_OFFSET_DEBUG[2]
+                + _WEIGHT_SCALE_TOP_OFFSET_Z_DEBUG,
+            ],
+            device=scale_pos.device,
+            dtype=scale_pos.dtype,
+        )
+        top = scale_pos + _quat_apply_wxyz(scale_quat, offset)
+        return top.detach().cpu().numpy()
+    except Exception:
+        return None
+
+
+def _update_weight_release_subtasks(
+    detector: WeightReleaseDetector | None,
+    env,
+    env_obs_dict,
+    raw_subtasks: dict[str, bool],
+) -> tuple[dict[str, bool], dict[str, Any]]:
+    if detector is None:
+        return raw_subtasks, {}
+    eef_pos = _to_numpy_unbatched(env_obs_dict["policy"]["eef_pos"])
+    return detector.update(
+        eef_pos=eef_pos,
+        scale_top_pos=_weight_scale_top_position(env),
+        subtasks=raw_subtasks,
+    )
 
 
 def _mpc_debug_stats(stats: dict[str, Any] | None) -> dict[str, Any]:
@@ -3687,7 +4413,66 @@ def _draw_vlm_overlay(image: np.ndarray, env, camera_name: str, vlm: dict) -> np
     return out
 
 
-def _build_rollout_frame(obs, use_thermal_overlay=False, debug_overlay=None):
+def _overlay_predicted_keypose(frame, keypose, alpha):
+    """Project one predicted joint-position keypose into the table camera."""
+    keypose = np.asarray(keypose, dtype=np.float32).reshape(-1)
+    if keypose.size < 8:
+        raise ValueError(f"Expected an 8D keypose, got shape {keypose.shape}.")
+
+    overlay = frame.copy()
+    points_link0, lines = panda_gripper_wireframe_link0(
+        keypose[:7],
+        keypose[7],
+    )
+    pixels, valid = project_table_camera(
+        points_link0,
+        width=frame.shape[1],
+        height=frame.shape[0],
+    )
+    cyan = (0, 255, 255)
+    for start, end in lines:
+        if valid[start] and valid[end]:
+            cv2.line(
+                overlay,
+                tuple(pixels[start]),
+                tuple(pixels[end]),
+                cyan,
+                5,
+                cv2.LINE_AA,
+            )
+    for index, point in enumerate(pixels):
+        if valid[index]:
+            cv2.circle(
+                overlay,
+                tuple(point),
+                7 if index in (1, 6) else 5,
+                cyan,
+                -1,
+                cv2.LINE_AA,
+            )
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    output = cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0.0)
+    cv2.rectangle(output, (8, 8), (480, 46), (0, 0, 0), -1)
+    cv2.putText(
+        output,
+        f"CYAN: predicted keypose  gripper={keypose[7]:+.3f}",
+        (16, 35),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        cyan,
+        2,
+        cv2.LINE_AA,
+    )
+    return output
+
+
+def _build_rollout_frame(
+    obs,
+    use_thermal_overlay=False,
+    debug_overlay=None,
+    predicted_keypose=None,
+    keypose_overlay_alpha=0.55,
+):
     table_image = _to_uint8_image(obs["observation/exterior_image_1_left"])
     # Under a render diet the wrist camera may be gone; the frame is then table-only.
     wrist_raw = obs.get("observation/wrist_image_left")
@@ -3714,6 +4499,13 @@ def _build_rollout_frame(obs, use_thermal_overlay=False, debug_overlay=None):
                 table_image = _draw_vlm_overlay(table_image, env, "table_cam", vlm)
             except Exception as exc:
                 print(f"[vlm_dp] overlay draw failed: {exc}", flush=True)
+
+    if predicted_keypose is not None:
+        table_image = _overlay_predicted_keypose(
+            table_image,
+            predicted_keypose,
+            alpha=keypose_overlay_alpha,
+        )
 
     frame = (
         table_image
@@ -4165,6 +4957,16 @@ def parse_args():
     parser.add_argument("--seed_start", type=int, default=1)
     parser.add_argument("--seed_end", type=int, default=51)
     parser.add_argument(
+        "--env_batch_size",
+        "--env-batch-size",
+        type=int,
+        default=1,
+        help=(
+            "Number of Isaac environments stepped in lockstep in each worker. "
+            "Values above one use batched policy inference and independent MPC costs."
+        ),
+    )
+    parser.add_argument(
         "--determine",
         "--deterministic-eval",
         dest="determine",
@@ -4195,6 +4997,42 @@ def parse_args():
         help="Base policy checkpoint directory. Defaults to the weight-task pi05 Droid joint-position checkpoint.",
     )
     parser.add_argument(
+        "--base_model_action_horizon",
+        type=int,
+        default=None,
+        help="Override the base model output horizon; use 16 for action+keypose.",
+    )
+    parser.add_argument(
+        "--base_model_attention_mode",
+        choices=("two_block_diffusion",),
+        default=None,
+        help="Override the base model attention mode to match its checkpoint.",
+    )
+    parser.add_argument(
+        "--keypose_overlay",
+        action="store_true",
+        help="Draw the terminal action/keypose prediction as a translucent cyan gripper.",
+    )
+    parser.add_argument("--keypose_overlay_alpha", type=float, default=0.55)
+    parser.add_argument(
+        "--weight_release_ee_speed_threshold",
+        type=float,
+        default=0.05,
+        help="Enter the weight open-gripper phase below this measured EE speed in m/s.",
+    )
+    parser.add_argument(
+        "--weight_release_scale_xy_radius",
+        type=float,
+        default=0.12,
+        help="Maximum EE-to-scale-top horizontal distance for release, in meters.",
+    )
+    parser.add_argument(
+        "--weight_release_min_height",
+        type=float,
+        default=0.0,
+        help="Required EE height above the scale-top plane for release, in meters.",
+    )
+    parser.add_argument(
         "--task_checkpoint_dir",
         type=str,
         default=None,
@@ -4206,8 +5044,9 @@ def parse_args():
         choices=("config", "causal", "bidirectional"),
         default="config",
         help=(
-            "Attention mask used by the task score proxy. 'config' uses the model config; "
-            "the explicit modes are checkpoint-compatibility/ablation overrides."
+            "Attention mask used by the task proxy. 'config' uses the model config; "
+            "'causal' selects causal action-token attention and 'bidirectional' selects "
+            "the score-proxy bidirectional mask or FM two-block diffusion mask."
         ),
     )
     parser.add_argument(
@@ -4300,7 +5139,10 @@ def parse_args():
         "--vlm-base",
         dest="vlm_base",
         action="store_true",
-        help="Evaluate only the FK/cost MBD base score, without task/ref steering.",
+        help=(
+            "Use the FK/cost MBD velocity as the base. Alone this is base-only; it may also "
+            "be combined with --flow_score_averaging to mix in a task rectified-flow field."
+        ),
     )
     score_mode_group.add_argument(
         "--full_steer",
@@ -4517,6 +5359,35 @@ def parse_args():
             "gamma_base scales the effective base before interpolation."
         ),
     )
+    score_mode_group.add_argument(
+        "--weight_keypose_flow",
+        "--weight-keypose-flow",
+        dest="weight_keypose_flow",
+        action="store_true",
+        help=(
+            "Average the trained action/keypose policy flow with an endpoint-only "
+            "weight-task MBD keypose flow, then extend it to the 15 action tokens "
+            "with capped time-ramped L1 descent."
+        ),
+    )
+    parser.add_argument(
+        "--flow_score_averaging",
+        "--flow-score-averaging",
+        dest="flow_score_averaging",
+        action="store_true",
+        help=(
+            "Convexly average a base velocity and the task-proxy rectified-flow field as "
+            "(1 - flow_gamma) * base + flow_gamma * task. The base is pi0.5 by default, "
+            "or the VLM/MPC velocity when combined with --vlm_base. No reference is loaded."
+        ),
+    )
+    parser.add_argument(
+        "--flow_gamma",
+        "--flow-gamma",
+        type=float,
+        default=0.5,
+        help="Task-policy weight in --flow_score_averaging; must be in [0, 1].",
+    )
     parser.add_argument(
         "--gamma_base",
         type=float,
@@ -4533,7 +5404,8 @@ def parse_args():
         default="mbd",
         help=(
             "Cost-score estimator. 'mbd' uses weighted sample displacement; "
-            "'backprop' uses the softmax-weighted cost gradient through action decoding and FK."
+            "'backprop' blends that MBD score with the softmax-weighted cost gradient "
+            "through action decoding and FK, annealing the gradient weight from 0.5 to 0.0."
         ),
     )
     parser.add_argument(
@@ -4574,10 +5446,30 @@ def parse_args():
             "grasp_flow_fake",
             "grasp_flow_loose",
             "capsule_flow",
+            "weight_keypose",
         ),
         default="priority",
         help="Cost function used by sim-free MPC.",
     )
+    parser.add_argument("--keypose_index", type=int, default=15)
+    parser.add_argument("--keypose_steering_coeff", type=float, default=0.8)
+    parser.add_argument(
+        "--keypose_action_steering_coeff",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument("--keypose_action_l1_step", type=float, default=0.4)
+    parser.add_argument(
+        "--keypose_action_l1_time_ramp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--keypose_action_l1_include_gripper",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--keypose_normalized_limit", type=float, default=1.0)
     parser.add_argument(
         "--vlm_cost",
         choices=("none", "gt", "rekep_fake", "rekep_real", "rekep_fake_vlm", "rekep_real_vlm"),
@@ -4715,6 +5607,14 @@ def parse_args():
         help="Also print detailed MPC debug iterations to stdout. By default --mpc_debug writes them to a jsonl log.",
     )
     parser.add_argument("--task_debug", action="store_true")
+    parser.add_argument(
+        "--state_trace",
+        action="store_true",
+        help=(
+            "Write state_trace.jsonl with every batched control frame, including all scene "
+            "entity root poses/velocities and robot articulation state."
+        ),
+    )
     parser.add_argument(
         "--profile",
         action="store_true",
@@ -4969,6 +5869,8 @@ parser.set_defaults(enable_cameras=True, headless=True)
 args = parser.parse_args()
 if args.workers <= 0:
     parser.error("--workers must be positive.")
+if args.env_batch_size < 1:
+    parser.error("--env_batch_size must be >= 1.")
 try:
     configured_gpu_ids = _parse_gpu_ids(args.gpus)
 except ValueError as exc:
@@ -4993,6 +5895,8 @@ if standalone_role is not None:
             ("--vlm_base", args.vlm_base),
             ("--full_steer", args.full_steer),
             ("--task_steer", args.task_steer),
+            ("--weight_keypose_flow", args.weight_keypose_flow),
+            ("--flow_score_averaging", args.flow_score_averaging),
             ("--no_steer", args.no_steer),
             ("--only_steer", args.only_steer),
             ("--compare_difference", args.compare_difference),
@@ -5005,7 +5909,28 @@ if standalone_role is not None:
             + ", ".join(incompatible_flags)
             + "."
         )
+if not 0.0 <= args.flow_gamma <= 1.0:
+    parser.error("--flow_gamma must be in [0, 1].")
 score_steering_mode = _score_steering_mode(args)
+if args.flow_score_averaging:
+    incompatible_flags = [
+        flag
+        for flag, enabled in (
+            ("--full_steer", args.full_steer),
+            ("--task_steer", args.task_steer),
+            ("--weight_keypose_flow", args.weight_keypose_flow),
+            ("--no_steer", args.no_steer),
+            ("--only_steer", args.only_steer),
+            ("--compare_difference", args.compare_difference),
+        )
+        if enabled
+    ]
+    if incompatible_flags:
+        parser.error(
+            "--flow_score_averaging can optionally combine with --vlm_base, but not "
+            + ", ".join(incompatible_flags)
+            + "."
+        )
 if score_steering_mode in ("full", "task"):
     incompatible_flags = [
         flag
@@ -5060,6 +5985,48 @@ if args.mpc_cost == "capsule_flow" and "capsule" not in args.task.lower():
         "--mpc_cost capsule_flow requires a capsule task, for example "
         "--task Isaac-Capsule-Droid-Visuomotor-v0."
     )
+if args.weight_keypose_flow:
+    if "weight" not in args.task.lower():
+        parser.error("--weight_keypose_flow requires a weight task.")
+    if args.mpc_cost != "weight_keypose":
+        parser.error(
+            "--weight_keypose_flow requires --mpc_cost weight_keypose."
+        )
+    if args.mpc_optimize_space != "action":
+        parser.error(
+            "--weight_keypose_flow requires --mpc_optimize_space action."
+        )
+    if args.interpolate:
+        parser.error(
+            "--weight_keypose_flow cannot interpolate action and keypose tokens."
+        )
+    if args.keypose_index < 1:
+        parser.error("--keypose_index must leave at least one executable action.")
+    if args.steps_per_inference > args.keypose_index:
+        parser.error(
+            "--steps_per_inference must not execute the terminal keypose token."
+        )
+    if not 0.0 <= args.keypose_steering_coeff <= 1.0:
+        parser.error("--keypose_steering_coeff must be in [0, 1].")
+    if not 0.0 <= args.keypose_action_steering_coeff <= 1.0:
+        parser.error("--keypose_action_steering_coeff must be in [0, 1].")
+    if not 0.0 <= args.keypose_action_l1_step <= 1.0:
+        parser.error("--keypose_action_l1_step must be in [0, 1].")
+    if args.keypose_normalized_limit <= 0.0:
+        parser.error("--keypose_normalized_limit must be positive.")
+    if args.weight_release_ee_speed_threshold <= 0.0:
+        parser.error("--weight_release_ee_speed_threshold must be positive.")
+    if args.weight_release_scale_xy_radius <= 0.0:
+        parser.error("--weight_release_scale_xy_radius must be positive.")
+elif args.mpc_cost == "weight_keypose":
+    parser.error(
+        "--mpc_cost weight_keypose is only valid with --weight_keypose_flow."
+    )
+if args.keypose_overlay:
+    if not args.weight_keypose_flow:
+        parser.error("--keypose_overlay currently requires --weight_keypose_flow.")
+    if not 0.0 <= args.keypose_overlay_alpha <= 1.0:
+        parser.error("--keypose_overlay_alpha must be in [0, 1].")
 if _uses_accel_action_mpc(args):
     if score_steering_mode != "base":
         raise ValueError("--mpc_optimize_space accel currently supports --vlm_base base-only mode.")
@@ -5176,7 +6143,16 @@ print(f"Environment name: {env_name}", flush=True)
 
 # Configure environment
 _report_initialization_stage(args, "parsing environment config", environment=env_name)
-env_cfg = parse_env_cfg(env_name, device=args.device, num_envs=1)
+env_cfg = parse_env_cfg(env_name, device=args.device, num_envs=args.env_batch_size)
+if args.env_batch_size > 1:
+    # The weight cfg defaults to heterogeneous cloning. With homogeneous vector rollouts that
+    # produces multiple PhysX scenes whose stepping diverges on the first control step (the fruit
+    # bodies are flung below z=0). Replicate the source environment's physics instead.
+    env_cfg.scene.replicate_physics = True
+    # This task's prestartup USD edits are homogeneous: fixed mass/scale properties and
+    # deactivating the same decorative prims in every clone. They are therefore compatible with
+    # shared replicated physics, unlike per-environment USD randomization.
+    env_cfg.allow_replicated_prestartup = True
 _report_initialization_stage(args, "environment config ready", environment=env_name)
 
 if args.vlm_cost.startswith("rekep") or args.vlm_state == "real":
@@ -5265,6 +6241,16 @@ else:
         "No success termination term was found in the environment."
     )
 
+# Vector rollouts cannot let Isaac auto-reset one lane while its batch peers are still
+# executing. Evaluate failure predicates in the batched control loop and freeze completed lanes.
+batched_failure_terms = {}
+if args.env_batch_size > 1:
+    for failure_name in ("apple_dropping", "pear_dropping"):
+        failure_term = getattr(env_cfg.terminations, failure_name, None)
+        if failure_term is not None:
+            batched_failure_terms[failure_name] = failure_term
+            setattr(env_cfg.terminations, failure_name, None)
+
 # Configure for data generation
 # env_cfg.terminations = None
 # env_cfg.observations.policy.concatenate_terms = False
@@ -5311,6 +6297,16 @@ required_policy_roles = _required_policy_roles(args)
 if "base" in required_policy_roles:
     base_config_name = _config_name_from_checkpoint_dir(base_checkpoint_dir)
     base_config = _config.get_config(base_config_name)
+    base_model_overrides = {}
+    if args.base_model_action_horizon is not None:
+        base_model_overrides["action_horizon"] = args.base_model_action_horizon
+    if args.base_model_attention_mode is not None:
+        base_model_overrides["attention_mode"] = args.base_model_attention_mode
+    if base_model_overrides:
+        base_config = dataclasses.replace(
+            base_config,
+            model=dataclasses.replace(base_config.model, **base_model_overrides),
+        )
     _report_initialization_stage(
         args,
         "loading base policy",
@@ -5324,27 +6320,53 @@ if "base" in required_policy_roles:
         load_weights=not args.base_decode_only,
     )
     _report_initialization_stage(args, "base policy ready", config=base_config_name)
+    if args.weight_keypose_flow:
+        expected_horizon = args.keypose_index + 1
+        actual_horizon = int(base_policy._model.config.action_horizon)
+        if actual_horizon != expected_horizon:
+            raise ValueError(
+                "Weight action/keypose checkpoint must expose exactly "
+                f"{expected_horizon} outputs ({args.keypose_index} actions + keypose); "
+                f"got {actual_horizon}. Pass --base_model_action_horizon "
+                f"{expected_horizon}."
+            )
 if "task" in required_policy_roles:
     task_config_name = _config_name_from_checkpoint_dir(task_checkpoint_dir)
     task_config = _config.get_config(task_config_name)
     if args.task_attention != "config":
-        if not hasattr(task_config.model, "bidirectional_attention"):
+        if hasattr(task_config.model, "attention_mode"):
+            task_config = dataclasses.replace(
+                task_config,
+                model=dataclasses.replace(
+                    task_config.model,
+                    attention_mode=(
+                        "causal"
+                        if args.task_attention == "causal"
+                        else "two_block_diffusion"
+                    ),
+                ),
+            )
+        elif hasattr(task_config.model, "bidirectional_attention"):
+            task_config = dataclasses.replace(
+                task_config,
+                model=dataclasses.replace(
+                    task_config.model,
+                    bidirectional_attention=args.task_attention == "bidirectional",
+                ),
+            )
+        else:
             raise ValueError(
-                "--task_attention is only supported for ProxyScore task models; "
+                "--task_attention requires a proxy model with an attention-mode setting; "
                 f"config {task_config_name!r} uses {type(task_config.model).__name__}."
             )
-        task_config = dataclasses.replace(
-            task_config,
-            model=dataclasses.replace(
-                task_config.model,
-                bidirectional_attention=args.task_attention == "bidirectional",
-            ),
+    if hasattr(task_config.model, "attention_mode"):
+        task_attention = task_config.model.attention_mode
+    else:
+        task_attention = (
+            "bidirectional"
+            if getattr(task_config.model, "bidirectional_attention", False)
+            else "causal"
         )
-    task_attention = (
-        "bidirectional"
-        if getattr(task_config.model, "bidirectional_attention", False)
-        else "causal"
-    )
     _report_initialization_stage(
         args,
         "loading task policy",
@@ -5417,7 +6439,7 @@ if args.base_action_space == "demo_delta":
 CONTROL_FREQUENCY = 15
 
 mpc_planner = None
-if _uses_vlm_mpc_base(args):
+if _uses_vlm_mpc_base(args) or _uses_weight_keypose_flow(args):
     inferred_task = _task_name_for_mpc(args.task)
     if _uses_accel_action_mpc(args):
         mpc_planner = AccelActionMPC(
@@ -5462,6 +6484,19 @@ if _uses_vlm_mpc_base(args):
                 prior_weight_schedule=args.prior_weight_schedule,
                 feasibility_gate=args.feasibility_gate,
                 cost_executable_actions=args.cost_executable_actions,
+                keypose_index=args.keypose_index,
+                keypose_steering_coeff=args.keypose_steering_coeff,
+                keypose_action_steering_coeff=(
+                    args.keypose_action_steering_coeff
+                ),
+                keypose_action_l1_step=args.keypose_action_l1_step,
+                keypose_action_l1_time_ramp=(
+                    args.keypose_action_l1_time_ramp
+                ),
+                keypose_action_l1_include_gripper=(
+                    args.keypose_action_l1_include_gripper
+                ),
+                keypose_normalized_limit=args.keypose_normalized_limit,
             ),
         )
     print(
@@ -5477,6 +6512,62 @@ if _uses_vlm_mpc_base(args):
         f"interpolate_high_frequency={args.interpolate_high_frequency}",
         flush=True,
     )
+
+if args.env_batch_size > 1:
+    batch_task_only = standalone_role == "task"
+    batch_flow_average = _uses_flow_score_averaging(args)
+    if not batch_task_only and not batch_flow_average:
+        if not isinstance(mpc_planner, SimFreeMPC):
+            raise SystemExit(
+                "--env_batch_size > 1 requires --task_only or the SimFreeMPC "
+                "task-steering path."
+            )
+        if not args.task_steer or args.mpc_update != "mbd_score_action_prox":
+            raise SystemExit(
+                "Batched MPC environments require --task_steer "
+                "--mpc_update mbd_score_action_prox."
+            )
+    if args.vlm_cost != "none" or args.load_init_from_dataset is not None:
+        raise SystemExit(
+            "Batched environments currently support ground-truth MPC context only "
+            "(no --vlm_cost or --load_init_from_dataset)."
+        )
+    if args.task_tilt > 0.0 or args.inject_proxy > 0.0 or args.fk_fork > 1:
+        raise SystemExit(
+            "Batched environments do not yet support task tilt, proxy injection, or FK forks."
+        )
+    if any(
+        scale is not None
+        for scale in (args.grasp_steer_scale, args.lift_steer_scale, args.place_steer_scale)
+    ):
+        raise SystemExit(
+            "Batched environments currently require one shared --steer_scale; "
+            "per-stage steering scales are not supported."
+        )
+    if batch_task_only:
+        print(
+            f"[batch-env] enabled pure task policy lanes={args.env_batch_size}; "
+            "policy forward is batched",
+            flush=True,
+        )
+    elif batch_flow_average:
+        print(
+            f"[batch-env] enabled pi/task flow averaging lanes={args.env_batch_size}; "
+            "both policy forwards are batched",
+            flush=True,
+        )
+    else:
+        lane_planners = [mpc_planner]
+        lane_planners.extend(
+            SimFreeMPC(mpc_planner.policy, mpc_planner.config)
+            for _ in range(1, args.env_batch_size)
+        )
+        mpc_planner = _BatchedSimFreeMPC(lane_planners)
+        print(
+            f"[batch-env] enabled lanes={args.env_batch_size}; "
+            "policy forward is batched and MPC cost state is lane-local",
+            flush=True,
+        )
 
 vlm_bridge = None
 if args.vlm_cost != "none":
@@ -5612,8 +6703,32 @@ if args.determine:
 if args.vlm_cost != "none":
     vlm_bridge.reset(env)
 _report_initialization_stage(args, "building warmup observation")
-obs = get_pi_observation(env_obs_dict["policy"])
-obs["prompt"] = args.prompt
+if args.env_batch_size > 1:
+    obs = _batched_policy_observations(env_obs_dict, args.env_batch_size, args.prompt)
+    if standalone_role is not None or (
+        _uses_flow_score_averaging(args) and not _uses_vlm_mpc_base(args)
+    ):
+        warmup_mpc_context = None
+    else:
+        warmup_full_context = build_mpc_context(env, env_obs_dict, args)
+        warmup_mpc_context = [
+            _slice_context_lane(warmup_full_context, lane, args.env_batch_size)
+            for lane in range(args.env_batch_size)
+        ]
+else:
+    obs = get_pi_observation(env_obs_dict["policy"])
+    obs["prompt"] = args.prompt
+    warmup_mpc_context = (
+        None
+        if standalone_role is not None or (
+            _uses_flow_score_averaging(args) and not _uses_vlm_mpc_base(args)
+        )
+        else (
+            vlm_bridge.context(env, env_obs_dict)
+            if args.vlm_cost != "none"
+            else build_mpc_context(env, env_obs_dict, args)
+        )
+    )
 _report_initialization_stage(args, "compiling/warming policy inference")
 with torch.no_grad():
     warmup_actions, _ = infer_actions_with_mpc(
@@ -5623,15 +6738,7 @@ with torch.no_grad():
         copy.deepcopy(obs),
         args,
         mpc_planner=mpc_planner,
-        mpc_context=(
-            None
-            if standalone_role is not None
-            else (
-                vlm_bridge.context(env, env_obs_dict)
-                if args.vlm_cost != "none"
-                else build_mpc_context(env, env_obs_dict, args)
-            )
-        ),
+        mpc_context=warmup_mpc_context,
         base_decode_policy=base_decode_policy,
     )
 _report_initialization_stage(args, "initialization complete")
@@ -5666,6 +6773,25 @@ if args.dry_run:
     env.close()
     if dataset_file is not None:
         dataset_file.close()
+    simulation_app.close()
+    sys.exit(0)
+
+if args.env_batch_size > 1:
+    results_path = _run_batched_env_rollouts(
+        env=env,
+        args=args,
+        base_policy=base_policy,
+        task_policy=task_policy,
+        ref_policy=ref_policy,
+        base_decode_policy=base_decode_policy,
+        mpc_planner=mpc_planner,
+        success_term=success_term,
+        failure_terms=batched_failure_terms,
+        output_path=output_path,
+        steps_per_inference=steps_per_inference,
+    )
+    print(f"[batch-env] rollout complete: {results_path}", flush=True)
+    env.close()
     simulation_app.close()
     sys.exit(0)
 
@@ -5836,7 +6962,22 @@ for rollout_idx, seed in enumerate(eval_seeds):
             _write_experiment_results(experiment_results_path, experiment_results)
             continue
 
-    current_subtasks = _debug_subtasks(env_obs_dict)
+    release_detector = (
+        WeightReleaseDetector(
+            ee_speed_threshold=args.weight_release_ee_speed_threshold,
+            scale_xy_radius=args.weight_release_scale_xy_radius,
+            min_height=args.weight_release_min_height,
+            control_frequency=CONTROL_FREQUENCY,
+        )
+        if args.weight_keypose_flow
+        else None
+    )
+    current_subtasks, release_debug = _update_weight_release_subtasks(
+        release_detector,
+        env,
+        env_obs_dict,
+        _debug_subtasks(env_obs_dict),
+    )
     _observe_mpc_subtasks(mpc_planner, current_subtasks)
     current_phase = _debug_phase_from_subtasks(args.task, current_subtasks)
     # Ever-fired set for the futility abort: flags are INSTANTANEOUS (grasp_pear drops on release,
@@ -5851,11 +6992,12 @@ for rollout_idx, seed in enumerate(eval_seeds):
         step=0,
         phase=current_phase,
         subtasks=current_subtasks,
+        weight_release=release_debug,
         # The {placeholder} values THIS episode's plan was rendered with. With the per-step
         # grounded keypoints below, the log carries everything an offline re-evaluation of any
         # completion predicate against this exact episode needs.
         **({"plan_fields": _pf} if (_pf := (getattr(getattr(vlm_bridge, "grounding", None),
-                                                    "plan_fields", None)
+                                            "plan_fields", None)
                                             if vlm_bridge is not None else None)) else {}),
     )
     _emit_worker_progress(
@@ -5903,6 +7045,7 @@ for rollout_idx, seed in enumerate(eval_seeds):
     action_start_step = -steps_per_inference
     actions = None
     latch_raw = {}
+    predicted_keypose = None
     for step_idx in tqdm(
         range(args.task_num_steps),
         desc="Policy Control Loop",
@@ -5929,7 +7072,12 @@ for rollout_idx, seed in enumerate(eval_seeds):
                         else (
                             vlm_bridge.context(env, env_obs_dict, warm_shift_steps)
                             if args.vlm_cost != "none"
-                            else build_mpc_context(env, env_obs_dict, args)
+                            else build_mpc_context(
+                                env,
+                                env_obs_dict,
+                                args,
+                                runtime_subtasks=current_subtasks,
+                            )
                         )
                     )
 
@@ -6001,6 +7149,11 @@ for rollout_idx, seed in enumerate(eval_seeds):
                         )
                         latch_raw = dict(latch_suppressed)
                         vlm_bridge.observe_plan(actions)
+                    if args.keypose_overlay:
+                        predicted_keypose = np.asarray(
+                            actions[args.keypose_index],
+                            dtype=np.float32,
+                        ).copy()
                     infer_elapsed = time.perf_counter() - infer_start
                     _prof_toc("planner.replan", infer_start)
                     if args.mpc_debug:
@@ -6080,7 +7233,12 @@ for rollout_idx, seed in enumerate(eval_seeds):
                 if pose_changed:
                     env_obs_dict = env.observation_manager.compute(update_history=True)
 
-            next_subtasks = _debug_subtasks(env_obs_dict)
+            next_subtasks, release_debug = _update_weight_release_subtasks(
+                release_detector,
+                env,
+                env_obs_dict,
+                _debug_subtasks(env_obs_dict),
+            )
             _observe_mpc_subtasks(mpc_planner, next_subtasks)
             next_phase = _debug_phase_from_subtasks(args.task, next_subtasks)
             if next_phase != current_phase:
@@ -6097,6 +7255,7 @@ for rollout_idx, seed in enumerate(eval_seeds):
                     from_phase=current_phase,
                     to_phase=next_phase,
                     subtasks=next_subtasks,
+                    weight_release=release_debug,
                 )
                 force_replan = True
             current_phase = next_phase
@@ -6163,6 +7322,7 @@ for rollout_idx, seed in enumerate(eval_seeds):
                 phase=current_phase,
                 subtasks=current_subtasks,
                 action_gripper=_debug_action_gripper(action_step),
+                weight_release=release_debug,
                 **step_trace,
             )
             _prof_toc("debug.step_log", _prof_start)
@@ -6200,6 +7360,8 @@ for rollout_idx, seed in enumerate(eval_seeds):
                     obs,
                     use_thermal_overlay=False,
                     debug_overlay=debug_overlay,
+                    predicted_keypose=predicted_keypose,
+                    keypose_overlay_alpha=args.keypose_overlay_alpha,
                 )
                 excute_frames.append(_add_video_header(vis_image, video_header_lines))
             if record_frame and _has_sound_observation(obs):
@@ -6217,6 +7379,8 @@ for rollout_idx, seed in enumerate(eval_seeds):
                             obs,
                             use_thermal_overlay=True,
                             debug_overlay=debug_overlay,
+                            predicted_keypose=predicted_keypose,
+                            keypose_overlay_alpha=args.keypose_overlay_alpha,
                         ),
                         video_header_lines,
                     )

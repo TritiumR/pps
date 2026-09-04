@@ -189,6 +189,7 @@ def preprocess_observation_pytorch(
         images=out_images,
         image_masks=out_masks,
         state=observation.state,
+        phase_one_hot=observation.phase_one_hot,
         pointcloud=observation.pointcloud,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,

@@ -245,6 +245,17 @@ def _with_pointcloud_norm_stats(
 ) -> _config.DataConfig:
     if skip_norm_stats or data_config.repo_id in (None, "fake"):
         return data_config
+    # Concerto consumes metric XYZ and raw RGB. Do not apply the legacy global
+    # single-cloud normalization stats to its camera-keyed point-cloud tree.
+    if getattr(model_config, "pointcloud_keys", ()):
+        if data_config.norm_stats is not None and "pointcloud" in data_config.norm_stats:
+            return dataclasses.replace(
+                data_config,
+                norm_stats={
+                    key: value for key, value in data_config.norm_stats.items() if key != "pointcloud"
+                },
+            )
+        return data_config
     if model_config.model_type not in (
         _model.ModelType.PROXY_POINTCLOUD,
         _model.ModelType.PROXY_DP3,

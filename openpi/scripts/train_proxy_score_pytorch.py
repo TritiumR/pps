@@ -47,6 +47,10 @@ TASK_CACHE_IMAGE_KEYS = ("base_0_rgb", "left_wrist_0_rgb")
 TASK_CACHE_ENV = "SCORE_TASK_CACHE_PATH"
 
 
+def _task_cache_image_keys(config) -> tuple[str, ...]:
+    return tuple(getattr(config.model, "image_keys", TASK_CACHE_IMAGE_KEYS))
+
+
 def _norm_stats_fingerprint(norm_stats) -> str | None:
     if norm_stats is None:
         return None
@@ -77,7 +81,7 @@ def _task_cache_metadata(config, data_config, *, num_samples: int) -> dict:
         "action_dim": int(config.model.action_dim),
         "norm_stats_fingerprint": _norm_stats_fingerprint(data_config.norm_stats),
         "use_quantile_norm": bool(data_config.use_quantile_norm),
-        "image_keys": list(TASK_CACHE_IMAGE_KEYS),
+        "image_keys": list(_task_cache_image_keys(config)),
         "image_shape": [224, 224, 3],
     }
 
@@ -128,6 +132,7 @@ def _task_cache_matches(cache_path: pathlib.Path, metadata: dict) -> bool:
 
 def prepare_task_cache(config, cache_path: pathlib.Path, *, num_workers: int) -> None:
     data_config = _build_task_data_config(config)
+    image_keys = _task_cache_image_keys(config)
     dataset = _data.create_torch_dataset(
         data_config,
         config.model.action_horizon,
@@ -149,13 +154,13 @@ def prepare_task_cache(config, cache_path: pathlib.Path, *, num_workers: int) ->
         tmp_path / "images.npy",
         mode="w+",
         dtype=np.uint8,
-        shape=(num_samples, len(TASK_CACHE_IMAGE_KEYS), 224, 224, 3),
+        shape=(num_samples, len(image_keys), 224, 224, 3),
     )
     image_masks = np.lib.format.open_memmap(
         tmp_path / "image_masks.npy",
         mode="w+",
         dtype=np.bool_,
-        shape=(num_samples, len(TASK_CACHE_IMAGE_KEYS)),
+        shape=(num_samples, len(image_keys)),
     )
     states = np.lib.format.open_memmap(
         tmp_path / "states.npy",
@@ -202,7 +207,7 @@ def prepare_task_cache(config, cache_path: pathlib.Path, *, num_workers: int) ->
     for batch in tqdm.tqdm(loader, total=len(loader), desc="Task observation cache"):
         batch_size = int(batch["state"].shape[0])
         batch_slice = slice(cursor, cursor + batch_size)
-        for image_idx, image_key in enumerate(TASK_CACHE_IMAGE_KEYS):
+        for image_idx, image_key in enumerate(image_keys):
             image_batch = batch["image"][image_key].numpy()
             if image_batch.shape[1:] != (224, 224, 3) or image_batch.dtype != np.uint8:
                 raise ValueError(
@@ -254,6 +259,12 @@ class TaskScoreCacheDataset(torch.utils.data.Dataset):
                     f"Task score cache field {key!r} is stale: "
                     f"{metadata.get(key)!r} != {expected_value!r}."
                 )
+        self.image_keys = _task_cache_image_keys(config)
+        if tuple(metadata.get("image_keys", ())) != self.image_keys:
+            raise ValueError(
+                "Task score cache image keys are stale: "
+                f"{metadata.get('image_keys')!r} != {list(self.image_keys)!r}."
+            )
         self.num_samples = int(metadata["num_samples"])
         self.images = np.load(self.cache_path / "images.npy", mmap_mode="c")
         self.image_masks = np.load(self.cache_path / "image_masks.npy", mmap_mode="c")
@@ -273,13 +284,13 @@ class TaskScoreCacheDataset(torch.utils.data.Dataset):
         inputs = {
             "image": {
                 image_key: torch.from_numpy(self.images[idx, image_idx])
-                for image_idx, image_key in enumerate(TASK_CACHE_IMAGE_KEYS)
+                for image_idx, image_key in enumerate(self.image_keys)
             },
             "image_mask": {
                 image_key: torch.as_tensor(
                     bool(self.image_masks[idx, image_idx]), dtype=torch.bool
                 )
-                for image_idx, image_key in enumerate(TASK_CACHE_IMAGE_KEYS)
+                for image_idx, image_key in enumerate(self.image_keys)
             },
             "state": torch.from_numpy(self.states[idx]),
             "tokenized_prompt": torch.from_numpy(self.tokenized_prompt[idx]),

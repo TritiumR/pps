@@ -264,7 +264,10 @@ def _torch_output_to_actions(
     if actions is None:
         return None
 
-    state = _state_for_sample(policy_inputs).to(device=device, dtype=dtype)
+    state = policy_inputs["state"]
+    if not torch.is_tensor(state):
+        state = torch.as_tensor(state)
+    state = state.to(device=device, dtype=dtype)
     state = _unnormalize_torch(
         state,
         output_norm_stats["state"],
@@ -272,7 +275,9 @@ def _torch_output_to_actions(
     )
     if state is None:
         return None
-    if state.ndim != 1:
+    if state.ndim == 1:
+        state = state.unsqueeze(0)
+    if state.ndim != 2 or state.shape[0] not in (1, model_chunks.shape[0]):
         return None
     _maybe_print_torch_output_norm_debug(
         policy,
@@ -282,7 +287,9 @@ def _torch_output_to_actions(
     )
     delta_dims = min(7, actions.shape[-1], state.shape[-1])
     actions = actions.clone()
-    actions[..., :delta_dims] = actions[..., :delta_dims] + state[:delta_dims]
+    actions[..., :delta_dims] = (
+        actions[..., :delta_dims] + state[:, None, :delta_dims]
+    )
     return actions[..., :8]
 
 
@@ -314,18 +321,26 @@ def clamp_real_action_chunk(
 
     if max_joint_delta is not None and max_joint_delta > 0.0 and current_joint_pos is not None:
         current = torch.as_tensor(current_joint_pos, device=out.device, dtype=out.dtype)[..., :7]
-        if current.ndim > 1:
-            current = current.reshape(-1, current.shape[-1])[0]
-
         arm = out[..., :7]
         if arm.ndim == 1:
+            if current.ndim > 1:
+                current = current.reshape(-1, current.shape[-1])[0]
             delta = torch.clamp(arm - current, -max_joint_delta, max_joint_delta)
             out[..., :7] = torch.clamp(current + delta, lower, upper)
         else:
             original_shape = arm.shape
             horizon = original_shape[-2]
             flat = arm.reshape(-1, horizon, 7)
-            prev = current.view(1, 7).expand(flat.shape[0], 7)
+            if current.ndim == 1:
+                prev = current.view(1, 7).expand(flat.shape[0], 7)
+            else:
+                current = current.reshape(-1, current.shape[-1])
+                if current.shape[0] not in (1, flat.shape[0]):
+                    raise ValueError(
+                        "current_joint_pos batch does not match action batch: "
+                        f"current={tuple(current.shape)}, actions={tuple(original_shape)}"
+                    )
+                prev = current[:, :7].expand(flat.shape[0], 7)
             for step in range(horizon):
                 delta = torch.clamp(flat[:, step, :] - prev, -max_joint_delta, max_joint_delta)
                 next_joint = torch.clamp(prev + delta, lower, upper)

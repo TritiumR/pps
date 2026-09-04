@@ -20,6 +20,7 @@ import isaaclab.sim as sim_utils
 import isaaclab.utils.math as math_utils
 from isaaclab.assets import Articulation, AssetBase, RigidObject
 from isaaclab.managers import SceneEntityCfg
+from isaaclab_tasks.manager_based.manipulation._usd_scale import apply_spawn_scale_once
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
@@ -100,27 +101,7 @@ def apply_scale_from_spawn_cfg(
         if not prim.IsValid():
             continue
 
-        xformable = UsdGeom.Xformable(prim)
-        scale_op = None
-        for op in xformable.GetOrderedXformOps():
-            if op.GetOpType() == UsdGeom.XformOp.TypeScale:
-                scale_op = op
-                break
-        if scale_op is None:
-            scale_op = xformable.AddScaleOp(UsdGeom.XformOp.PrecisionDouble)
-            current_scale = Gf.Vec3d(1.0, 1.0, 1.0)
-        else:
-            current_scale = scale_op.Get()
-            if current_scale is None:
-                current_scale = Gf.Vec3d(1.0, 1.0, 1.0)
-
-        scale_op.Set(
-            Gf.Vec3d(
-                current_scale[0] * sx,
-                current_scale[1] * sy,
-                current_scale[2] * sz,
-            )
-        )
+        apply_spawn_scale_once(UsdGeom.Xformable(prim), (sx, sy, sz))
 
 
 def _env_root_from_prim_path(prim_path: str) -> str | None:

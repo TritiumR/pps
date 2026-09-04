@@ -31,6 +31,7 @@ def main(
     repo_name: str,
     prompt: str,
     *,
+    right_wrist_key: str | None = None,
     push_to_hub: bool = False,
     droid_action: bool = False,
 ):
@@ -63,6 +64,17 @@ def main(
                 "shape": (180, 320, 3),
                 "names": ["height", "width", "channel"],
             },
+            **(
+                {
+                    "wrist_image_right": {
+                        "dtype": "image",
+                        "shape": (180, 320, 3),
+                        "names": ["height", "width", "channel"],
+                    }
+                }
+                if right_wrist_key is not None
+                else {}
+            ),
             "joint_position": {
                 "dtype": "float32",
                 "shape": (7,),
@@ -115,6 +127,8 @@ def main(
 
         trajectory_length = len(trajectory["obs/table_cam"])
         assert trajectory_length == len(trajectory["obs/wrist_cam"])
+        if right_wrist_key is not None:
+            assert trajectory_length == len(trajectory[right_wrist_key])
         assert trajectory_length == len(trajectory["obs/joint_pos"])
         assert trajectory_length == len(trajectory["obs/gripper_pos"])
         assert trajectory_length == len(trajectory["obs/joint_actions"])
@@ -124,6 +138,11 @@ def main(
         for step_idx in range(trajectory_length):
             exterior_image_1_left = trajectory["obs/table_cam"][step_idx]
             wrist_image_left = trajectory["obs/wrist_cam"][step_idx]
+            wrist_image_right = (
+                resize_image(trajectory[right_wrist_key][step_idx], (320, 180))
+                if right_wrist_key is not None
+                else None
+            )
             exterior_image_1_left = resize_image(exterior_image_1_left, (320, 180))
             wrist_image_left = resize_image(wrist_image_left, (320, 180))
             joint_position = np.asarray(
@@ -156,6 +175,11 @@ def main(
                 {
                     "exterior_image_1_left": exterior_image_1_left,
                     "wrist_image_left": wrist_image_left,
+                    **(
+                        {"wrist_image_right": wrist_image_right}
+                        if wrist_image_right is not None
+                        else {}
+                    ),
                     "joint_position": joint_position,
                     "gripper_position": gripper_position,
                     "mic1_log_mel": mic1_log_mel,

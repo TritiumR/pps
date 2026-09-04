@@ -103,6 +103,9 @@ class Observation(Generic[ArrayT]):
     # Low-dimensional robot state.
     state: at.Float[ArrayT, "*b s"]
 
+    # Optional categorical task phase represented as a one-hot vector.
+    phase_one_hot: at.Float[ArrayT, "*b phases"] | None = None
+
     # Images, in [-1, 1] float32.
     images: dict[str, at.Float[ArrayT, "*b h w c"]] | None = None
     # Image masks, with same keys as images.
@@ -158,6 +161,7 @@ class Observation(Generic[ArrayT]):
             images=data["image"] if "image" in data else None,
             image_masks=data["image_mask"] if "image_mask" in data else None,
             state=data["state"],
+            phase_one_hot=data.get("phase_one_hot"),
             pointcloud=data["pointcloud"] if "pointcloud" in data else None,
             sound=data["sound"] if "sound" in data else None,
             tokenized_prompt=data.get("tokenized_prompt"),
@@ -249,6 +253,7 @@ def preprocess_observation(
         images=out_images,
         image_masks=out_masks,
         state=observation.state,
+        phase_one_hot=observation.phase_one_hot,
         pointcloud=observation.pointcloud,
         sound=observation.sound,
         tokenized_prompt=observation.tokenized_prompt,

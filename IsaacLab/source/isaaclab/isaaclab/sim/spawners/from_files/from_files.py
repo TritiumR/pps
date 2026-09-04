@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 import isaacsim.core.utils.prims as prim_utils
 import omni.kit.commands
 import omni.log
-from pxr import Gf, Sdf, Usd
+from pxr import Gf, Sdf, Usd, UsdPhysics
 
 # from Isaac Sim 4.2 onwards, pxr.Semantics is deprecated
 try:
@@ -287,6 +287,16 @@ def _spawn_from_usd_file(
     # modify variants
     if hasattr(cfg, "variants") and cfg.variants is not None:
         select_usd_variants(prim_path, cfg.variants)
+
+    # Scene-level USDs occasionally contain their own PhysicsScene. Replicating such an
+    # asset produces one physics scene per environment, which PhysX does not support and
+    # can make cloned environments behave differently from env_0. Author inactive
+    # overrides before environment cloning so only the application's global scene remains.
+    if getattr(cfg, "strip_embedded_physics_scenes", False):
+        root_prim = prim_utils.get_prim_at_path(prim_path)
+        for descendant in Usd.PrimRange(root_prim, Usd.TraverseInstanceProxies()):
+            if descendant.IsA(UsdPhysics.Scene):
+                descendant.SetActive(False)
 
     # modify rigid body properties
     if cfg.rigid_props is not None:

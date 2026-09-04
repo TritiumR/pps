@@ -126,6 +126,30 @@ def test_weighted_mean_of_truncated_candidates_remains_valid():
     _assert_valid(decoded_mean, current, delta)
 
 
+def test_batched_decode_uses_lane_local_state_and_joint_clamp():
+    policy, _ = _policy_and_inputs(use_quantile_norm=False)
+    states = torch.tensor(
+        [
+            [0.0, -0.4, 0.0, -2.4, 0.0, 2.0, 0.8, 0.0],
+            [0.4, -0.3, 0.1, -2.2, -0.1, 1.8, 0.6, 0.0],
+        ]
+    )
+    chunks = torch.zeros(2, 3, 8)
+    chunks[:, :, :7] = 2.0
+    decoded = decode_model_action_chunks(
+        policy,
+        {"state": states},
+        chunks,
+        current_joint_pos=states,
+        max_joint_delta=0.15,
+    ).real_actions
+
+    assert decoded.shape == (2, 3, 8)
+    expected_first = states[:, None, :7] + 0.15
+    assert torch.allclose(decoded[:, :1, :7], expected_first, atol=1e-6)
+    assert not torch.allclose(decoded[0, 0, :7], decoded[1, 0, :7])
+
+
 def test_legacy_optimizer_uses_custom_proposal():
     sampler = DIALSampler(
         DIALSamplerConfig(num_samples=4, iterations=1, noise=0.3)

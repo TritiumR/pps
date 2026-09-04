@@ -1,6 +1,7 @@
 import os
 import sys
 import subprocess
+import dataclasses
 
 # Use the IsaacLab copy bundled in this repository (self-contained), not an
 # external checkout. Prepend its source packages so `import isaaclab*` resolves
@@ -25,7 +26,6 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
 
 from isaaclab.app import AppLauncher
-import pinocchio
 
 from openpi.training import config as _config
 from openpi.policies import policy_config
@@ -34,28 +34,17 @@ from openpi.shared import download
 # from openpi.policies import libero_policy
 
 import time
-from multiprocessing.managers import SharedMemoryManager
 import cv2
 import numpy as np
 import torch
-import dill
-import hydra
-import pandas as pd
 import argparse
 import copy
 from tqdm import tqdm
-from botocore.exceptions import NoCredentialsError
 
-# from diffusion_policy.common.precise_sleep import precise_wait
-from diffusion_policy.common.pytorch_util import dict_apply
-from diffusion_policy.workspace.base_workspace import BaseWorkspace
-from diffusion_policy.policy.base_image_policy import BaseImagePolicy
-from diffusion_policy.real_world.real_inference_util import (
-    get_real_obs_resolution,
-    get_real_obs_dict_droid,
+from tools.annotate_capsule_phase_futures_wandb import (
+    panda_gripper_wireframe_link0,
+    project_table_camera,
 )
-
-import scipy.spatial.transform as R
 
 
 _SOUND_VIDEO_SCALE = None
@@ -131,7 +120,6 @@ def _add_pointcloud_observation(obs, env_obs_dict):
     pointcloud = _first_existing(env_obs_dict, ("pointcloud",))
     if pointcloud is not None:
         obs["observation/pointcloud"] = _to_numpy_unbatched(pointcloud).astype(np.float32)
-        return
 
     coord = _first_existing(
         env_obs_dict,
@@ -141,6 +129,31 @@ def _add_pointcloud_observation(obs, env_obs_dict):
     if coord is not None and color is not None:
         obs["observation/pointcloud_coord"] = _to_numpy_unbatched(coord).astype(np.float32)
         obs["observation/pointcloud_color"] = _to_numpy_unbatched(color).astype(np.float32)
+
+    wrist_specs = (
+        (
+            "left_wrist_",
+            ("left_wrist_pointcloud", "wrist_pointcloud_left"),
+            ("left_wrist_point_positions", "left_wrist_point_position", "left_wrist_pointcloud_coord"),
+            ("left_wrist_point_color", "left_wrist_pointcloud_color"),
+        ),
+        (
+            "right_wrist_",
+            ("right_wrist_pointcloud", "wrist_pointcloud_right"),
+            ("right_wrist_point_positions", "right_wrist_point_position", "right_wrist_pointcloud_coord"),
+            ("right_wrist_point_color", "right_wrist_pointcloud_color"),
+        ),
+    )
+    for prefix, combined_keys, coord_keys, color_keys in wrist_specs:
+        pointcloud = _first_existing(env_obs_dict, combined_keys)
+        if pointcloud is not None:
+            obs[f"observation/{prefix}pointcloud"] = _to_numpy_unbatched(pointcloud).astype(np.float32)
+            continue
+        coord = _first_existing(env_obs_dict, coord_keys)
+        color = _first_existing(env_obs_dict, color_keys)
+        if coord is not None and color is not None:
+            obs[f"observation/{prefix}pointcloud_coord"] = _to_numpy_unbatched(coord).astype(np.float32)
+            obs[f"observation/{prefix}pointcloud_color"] = _to_numpy_unbatched(color).astype(np.float32)
 
 
 def get_pi_observation(env_obs_dict, train_config=None):
@@ -155,6 +168,16 @@ def get_pi_observation(env_obs_dict, train_config=None):
         wrist_cam = _overlay_thermal_on_rgb(wrist_cam, env_obs_dict["thermal_wrist_cam"])
     obs["observation/exterior_image_1_left"] = table_cam
     obs["observation/wrist_image_left"] = wrist_cam
+    image_keys = getattr(getattr(train_config, "model", None), "image_keys", ())
+    if "right_wrist_0_rgb" in image_keys:
+        right_wrist_cam = _first_existing(
+            env_obs_dict, ("right_wrist_cam", "wrist_cam_right")
+        )
+        if right_wrist_cam is None:
+            raise KeyError(
+                "Bimanual policy requires right_wrist_cam or wrist_cam_right in the environment observation."
+            )
+        obs["observation/wrist_image_right"] = _to_numpy_unbatched(right_wrist_cam)
     # print(env_obs_dict['joint_pos'].cpu().numpy()[0])
     joint_pos = _to_numpy_unbatched(env_obs_dict["joint_pos"])
     obs["observation/joint_position"] = joint_pos[:7]
@@ -450,7 +473,68 @@ def _visualize_log_mel_spectrogram(
     return image
 
 
-def _build_visualization_frame(obs, env, use_thermal_overlay, env_policy_obs=None):
+def _overlay_predicted_keypose(frame, keypose, alpha):
+    """Project one predicted capsule keypose into the table-camera image."""
+    keypose = np.asarray(keypose, dtype=np.float32).reshape(-1)
+    if keypose.size < 8:
+        raise ValueError(f"Expected an 8D keypose, got shape {keypose.shape}.")
+
+    output = frame.copy()
+    overlay = frame.copy()
+    points_link0, lines = panda_gripper_wireframe_link0(
+        keypose[:7],
+        keypose[7],
+    )
+    pixels, valid = project_table_camera(
+        points_link0,
+        width=frame.shape[1],
+        height=frame.shape[0],
+    )
+    cyan = (0, 255, 255)  # RGB
+    for start, end in lines:
+        if valid[start] and valid[end]:
+            cv2.line(
+                overlay,
+                tuple(pixels[start]),
+                tuple(pixels[end]),
+                cyan,
+                5,
+                cv2.LINE_AA,
+            )
+    for index, point in enumerate(pixels):
+        if valid[index]:
+            cv2.circle(
+                overlay,
+                tuple(point),
+                7 if index in (1, 6) else 5,
+                cyan,
+                -1,
+                cv2.LINE_AA,
+            )
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    output = cv2.addWeighted(overlay, alpha, output, 1.0 - alpha, 0.0)
+    cv2.rectangle(output, (8, 8), (440, 46), (0, 0, 0), -1)
+    cv2.putText(
+        output,
+        f"CYAN: predicted keypose  gripper={keypose[7]:+.3f}",
+        (16, 35),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        cyan,
+        2,
+        cv2.LINE_AA,
+    )
+    return output
+
+
+def _build_visualization_frame(
+    obs,
+    env,
+    use_thermal_overlay,
+    env_policy_obs=None,
+    predicted_keypose=None,
+    keypose_overlay_alpha=0.55,
+):
     table_image = _to_uint8_rgb(obs["observation/exterior_image_1_left"])
     wrist_image = _to_uint8_rgb(obs["observation/wrist_image_left"])
 
@@ -461,6 +545,13 @@ def _build_visualization_frame(obs, env, use_thermal_overlay, env_policy_obs=Non
             table_image = _overlay_thermal_on_rgb(table_rgb, table_image)
         if wrist_rgb is not None:
             wrist_image = _overlay_thermal_on_rgb(wrist_rgb, wrist_image)
+
+    if predicted_keypose is not None:
+        table_image = _overlay_predicted_keypose(
+            table_image,
+            predicted_keypose,
+            alpha=keypose_overlay_alpha,
+        )
 
     rgb_frame = np.concatenate((table_image, wrist_image), axis=1)
 
@@ -553,6 +644,40 @@ def _finalize_video(tmp_video_path, final_video_path, video_writer, label, audio
         print(f"no {label} frames recorded; skipping video save")
 
 
+def _upload_rollout_videos_to_wandb(records, args, checkpoint_dir):
+    import wandb
+
+    run = wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        group=args.wandb_group,
+        name=args.wandb_name or args.name,
+        mode=args.wandb_mode,
+        config={
+            "checkpoint_dir": os.path.abspath(checkpoint_dir),
+            "model_name": args.model_name,
+            "model_action_horizon": args.model_action_horizon,
+            "steps_per_inference": args.steps_per_inference,
+            "task": args.task,
+            "prompt": args.prompt,
+            "seed_start": args.seed_start,
+            "seed_end": args.seed_end,
+            "num_rollouts": args.seed_end - args.seed_start,
+            "keypose_overlay_alpha": args.keypose_overlay_alpha,
+        },
+    )
+    table = wandb.Table(columns=["seed", "success", "steps", "video"])
+    payload = {}
+    for record in records:
+        video = wandb.Video(record["path"], fps=CONTROL_FREQUENCY, format="mp4")
+        table.add_data(record["seed"], record["success"], record["steps"], video)
+        payload[f"rollouts/seed_{record['seed']:04d}"] = video
+    payload["rollouts/summary"] = table
+    run.log(payload)
+    run.finish()
+    print(f"Uploaded {len(records)} rollout videos to W&B.")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Evaluate the model on the real droid robot."
@@ -576,6 +701,31 @@ def parse_args():
         help="Path to the checkpoint directory. If not provided, will try to download from S3 or use default location.",
     )
     parser.add_argument("--max_steps", type=int, default=1200)
+    parser.add_argument(
+        "--model_action_horizon",
+        type=int,
+        default=None,
+        help="Override the model output horizon. Use 16 for the capsule action+keypose checkpoint.",
+    )
+    parser.add_argument(
+        "--model_attention_mode",
+        choices=("two_block_diffusion",),
+        default=None,
+        help="Override Proxy attention mode to match the training checkpoint.",
+    )
+    parser.add_argument("--steps_per_inference", type=int, default=8)
+    parser.add_argument("--keypose_overlay", action="store_true")
+    parser.add_argument("--keypose_overlay_alpha", type=float, default=0.55)
+    parser.add_argument("--wandb_upload", action="store_true")
+    parser.add_argument("--wandb_project", type=str, default="openpi")
+    parser.add_argument("--wandb_entity", type=str, default=None)
+    parser.add_argument("--wandb_group", type=str, default="capsule-action-keypose-rollout")
+    parser.add_argument("--wandb_name", type=str, default=None)
+    parser.add_argument(
+        "--wandb_mode",
+        choices=("online", "offline", "disabled"),
+        default="online",
+    )
     parser.add_argument("--ood_mode", action="store_true")
     parser.add_argument("--ood_mode_light", type=str, default="none") # "light_intensity", "light_color", "light_texture", "all" or "none"
     parser.add_argument("--ood_mode_camera", type=str, default="none") # "camera_position", "camera_orientation", "all" or "none"
@@ -597,15 +747,10 @@ if not os.path.exists(output_path):
 app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
 
-import asyncio
 import gymnasium as gym
-import inspect
 import random
 
-import omni
-
-from isaaclab.envs import ManagerBasedRLMimicEnv
-
+import isaaclab.utils.math as math_utils
 import isaaclab_mimic.envs  # noqa: F401
 
 import isaaclab_mimic.envs.pinocchio_envs  # noqa: F401
@@ -614,6 +759,39 @@ from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 # from isaaclab_mimic.datagen.utils import get_env_name_from_dataset, setup_output_paths
 
 import isaaclab_tasks  # noqa: F401
+
+
+def _capsule_success_diagnostics(env):
+    """Return the state values used by the capsule task's success predicate."""
+    can = env.scene["can"]
+    capsule = env.scene["capsule"]
+    robot = env.scene["robot"]
+    can_pos_capsule = math_utils.quat_apply_inverse(
+        capsule.data.root_quat_w,
+        can.data.root_pos_w - capsule.data.root_pos_w,
+    )[0]
+    gripper_joint_ids, _ = robot.find_joints(env.cfg.gripper_joint_names)
+    gripper_qpos = robot.data.joint_pos[0, gripper_joint_ids]
+    xy_distance = torch.linalg.vector_norm(can_pos_capsule[:2])
+    xy_pass = xy_distance <= 0.10
+    z_pass = torch.logical_and(can_pos_capsule[2] >= 0.25, can_pos_capsule[2] <= 0.33)
+    gripper_pass = torch.all(
+        torch.isclose(
+            gripper_qpos,
+            torch.as_tensor(env.cfg.gripper_open_val, device=env.device),
+            atol=0.01,
+            rtol=0.01,
+        )
+    )
+    return {
+        "pod_local_xyz": [float(value) for value in can_pos_capsule],
+        "pod_xy_distance": float(xy_distance),
+        "pod_xy_pass": bool(xy_pass),
+        "pod_z_pass": bool(z_pass),
+        "pod_placed": bool(torch.logical_and(xy_pass, z_pass)),
+        "gripper_qpos": [float(value) for value in gripper_qpos],
+        "gripper_open": bool(gripper_pass),
+    }
 
 # Setup output paths and get env name
 output_dir = os.path.join("results", f"{args.task}/{args.name}")
@@ -657,6 +835,16 @@ env = gym.make(env_name, cfg=env_cfg).unwrapped
 
 # load checkpoint
 config = _config.get_config(args.model_name)
+model_overrides = {}
+if args.model_action_horizon is not None:
+    model_overrides["action_horizon"] = args.model_action_horizon
+if args.model_attention_mode is not None:
+    model_overrides["attention_mode"] = args.model_attention_mode
+if model_overrides:
+    config = dataclasses.replace(
+        config,
+        model=dataclasses.replace(config.model, **model_overrides),
+    )
 checkpoint_dir = args.checkpoint_dir
 if not os.path.exists(checkpoint_dir):
     # checkpoint_dir = download.maybe_download(
@@ -669,9 +857,22 @@ if not os.path.exists(checkpoint_dir):
 # Create a trained policy.
 vla_policy = policy_config.create_trained_policy(config, checkpoint_dir)
 
-steps_per_inference = 8
+steps_per_inference = args.steps_per_inference
 CONTROL_FREQUENCY = 15
 max_steps = args.max_steps
+model_action_horizon = int(config.model.action_horizon)
+if steps_per_inference <= 0:
+    raise ValueError("--steps_per_inference must be positive.")
+if steps_per_inference > model_action_horizon:
+    raise ValueError(
+        f"--steps_per_inference ({steps_per_inference}) exceeds the model action horizon "
+        f"({model_action_horizon})."
+    )
+if args.keypose_overlay and steps_per_inference >= model_action_horizon:
+    raise ValueError(
+        "Keypose overlay requires at least one unexecuted final output slot. "
+        "For this checkpoint, use --model_action_horizon 16 and --steps_per_inference at most 15."
+    )
 
 # example = libero_policy.make_libero_example()
 
@@ -689,6 +890,7 @@ with torch.no_grad():
     actions = vla_policy.infer(copy.deepcopy(obs))["actions"]
 
 print("Ready!")
+rollout_records = []
 for seed in range(args.seed_start, args.seed_end):
     success = None
 
@@ -727,6 +929,7 @@ for seed in range(args.seed_start, args.seed_end):
     # ========== policy control loop ==============
     step_idx = 0
     success = False
+    predicted_keypose = None
     for step_idx in tqdm(range(max_steps), desc="Policy Control Loop"):
         try:
             s = time.time()
@@ -735,14 +938,19 @@ for seed in range(args.seed_start, args.seed_end):
                 # print('predict_action')
                 # run inference
                 with torch.no_grad():
-                    actions = vla_policy.infer(copy.deepcopy(obs))["actions"]
+                    full_actions = np.asarray(
+                        vla_policy.infer(copy.deepcopy(obs))["actions"]
+                    )
                     # print('actions: ', actions.shape)
                     # print("Inference latency:", time.time() - s)
+
+                if args.keypose_overlay:
+                    predicted_keypose = full_actions[-1].copy()
 
                 # execute actions
                 start_idx = 0
                 end_idx = start_idx + steps_per_inference
-                actions = actions[start_idx:end_idx]
+                actions = full_actions[start_idx:end_idx]
 
             action_step = actions[step_idx % steps_per_inference]
 
@@ -779,6 +987,8 @@ for seed in range(args.seed_start, args.seed_end):
                 env,
                 use_thermal_overlay=use_thermal_overlay_video,
                 env_policy_obs=env_obs_dict["policy"],
+                predicted_keypose=predicted_keypose,
+                keypose_overlay_alpha=args.keypose_overlay_alpha,
             )
             video_writer = _write_rgb_video_frame(video_writer, tmp_video_path, vis_image)
             if _has_sound_observation(env_obs_dict["policy"]):
@@ -831,10 +1041,21 @@ for seed in range(args.seed_start, args.seed_end):
         print("success")
     else:
         print("fail")
+    if env_name == "Isaac-Capsule-Droid-Visuomotor-v0":
+        print(f"capsule success diagnostics: {_capsule_success_diagnostics(env)}")
 
     video_name = _episode_video_name(seed, success)
     video_path = os.path.join(output_path, video_name)
     _finalize_video(tmp_video_path, video_path, video_writer, "overlay", audio_path=audio_path)
+    if os.path.exists(video_path):
+        rollout_records.append(
+            {
+                "seed": seed,
+                "success": bool(success),
+                "steps": step_idx + 1,
+                "path": video_path,
+            }
+        )
 
     if use_thermal_overlay_video:
         for camera_name, tmp_thermal_video_path in tmp_thermal_video_paths.items():
@@ -850,6 +1071,9 @@ for seed in range(args.seed_start, args.seed_end):
                 thermal_video_writers[camera_name],
                 f"thermal {camera_name}",
             )
+
+if args.wandb_upload:
+    _upload_rollout_videos_to_wandb(rollout_records, args, checkpoint_dir)
 
 env.close()
 

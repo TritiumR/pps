@@ -60,6 +60,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output", type=Path, default=Path("pi05_hutchinson_likelihood.jsonl"))
     parser.add_argument("--summary", type=Path, default=None)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Validate and retain existing output rows, then score only missing chunks.",
+    )
     parser.add_argument("--action-horizon", type=int, default=15)
     parser.add_argument("--action-dim", type=int, default=8)
     parser.add_argument(
@@ -202,6 +207,62 @@ def load_samples(args: argparse.Namespace) -> list[TraceSample]:
     return sorted(selected, key=lambda sample: (sample.seed, sample.step))
 
 
+def _sample_key(sample: TraceSample) -> tuple[str, int, int, int, int]:
+    return (str(sample.trace), sample.group_index, sample.lane, sample.seed, sample.step)
+
+
+def _row_key(row: dict[str, Any]) -> tuple[str, int, int, int, int]:
+    try:
+        return (
+            str(row["trace"]),
+            int(row["group_index"]),
+            int(row["lane"]),
+            int(row["seed"]),
+            int(row["step"]),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"Malformed likelihood row identity: {row!r}") from error
+
+
+def _load_resume_rows(
+    path: Path,
+    args: argparse.Namespace,
+    valid_keys: set[tuple[str, int, int, int, int]],
+) -> list[dict[str, Any]]:
+    if not path.is_file() or path.stat().st_size == 0:
+        raise FileNotFoundError(f"--resume requires a nonempty existing output: {path}")
+    rows = []
+    seen = set()
+    expected = {
+        "action_horizon": args.action_horizon,
+        "active_action_dim": args.action_dim,
+        "ode_steps": args.ode_steps,
+        "hutchinson_probes": args.hutchinson_probes,
+    }
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"Invalid JSON in {path}:{line_number}: {error}") from error
+            key = _row_key(row)
+            if key not in valid_keys:
+                raise ValueError(
+                    f"Existing row {path}:{line_number} does not belong to the selected traces: {key}"
+                )
+            if key in seen:
+                raise ValueError(f"Duplicate existing likelihood row in {path}:{line_number}: {key}")
+            for field, value in expected.items():
+                if int(row.get(field, -1)) != value:
+                    raise ValueError(
+                        f"Resume setting mismatch at {path}:{line_number}: "
+                        f"{field}={row.get(field)!r}, expected {value}"
+                    )
+            seen.add(key)
+            rows.append(row)
+    return rows
+
+
 def _restore_state(env, state: dict[str, Any]) -> None:
     import torch
 
@@ -303,15 +364,27 @@ def main() -> None:
     args.enable_cameras = True
     if args.policy_batch_size < 1:
         parser.error("--policy-batch-size must be positive")
-    samples = load_samples(args)
-    if not samples:
+    all_samples = load_samples(args)
+    if not all_samples:
         raise SystemExit("No complete action chunks matched the requested traces/seeds/stride.")
-    print(f"Selected {len(samples)} chunks across {len({sample.seed for sample in samples})} seeds", flush=True)
+    existing_rows = (
+        _load_resume_rows(args.output, args, {_sample_key(sample) for sample in all_samples})
+        if args.resume
+        else []
+    )
+    completed_keys = {_row_key(row) for row in existing_rows}
+    samples = [sample for sample in all_samples if _sample_key(sample) not in completed_keys]
+    print(
+        f"Selected {len(all_samples)} chunks across "
+        f"{len({sample.seed for sample in all_samples})} seeds; "
+        f"completed={len(existing_rows)} remaining={len(samples)}",
+        flush=True,
+    )
     progress_stream = (
         os.fdopen(args.progress_fd, "w", closefd=False) if args.progress_fd >= 0 else sys.stderr
     )
     progress = tqdm(
-        total=len(samples), desc="pi0.5 initialization", unit="chunk",
+        total=len(all_samples), initial=len(existing_rows), desc="pi0.5 initialization", unit="chunk",
         position=args.progress_position, dynamic_ncols=True, file=progress_stream,
     )
 
@@ -328,7 +401,7 @@ def main() -> None:
     from sim_free_mpc.hutchinson_likelihood import estimate_probability_flow_log_likelihood
 
     env_cfg = parse_env_cfg(args.task, device=args.device, num_envs=1)
-    env_cfg.seed = samples[0].seed
+    env_cfg.seed = (samples or all_samples)[0].seed
     env_cfg.sim.physx.enable_enhanced_determinism = True
     env = gym.make(args.task, cfg=env_cfg).unwrapped
 
@@ -363,10 +436,10 @@ def main() -> None:
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     summary_path = args.summary or args.output.with_suffix(".summary.json")
-    rows = []
+    rows = list(existing_rows)
     current_seed = None
     progress.set_description("pi0.5 Hutchinson")
-    with args.output.open("w", encoding="utf-8") as output:
+    with args.output.open("a" if args.resume else "w", encoding="utf-8") as output:
         for batch_start in range(0, len(samples), args.policy_batch_size):
             batch_samples = samples[batch_start : batch_start + args.policy_batch_size]
             observations = []
@@ -422,7 +495,6 @@ def main() -> None:
             )
             dimensions = args.action_horizon * args.action_dim
             for batch_index, sample in enumerate(batch_samples):
-                index = batch_start + batch_index
                 log_prob_normalized = float(estimate.log_prob[batch_index].item())
                 row = {
                     "trace": str(sample.trace),
@@ -451,7 +523,7 @@ def main() -> None:
                 output.write(json.dumps(row, sort_keys=True) + "\n")
                 rows.append(row)
                 print(
-                    f"[{index + 1}/{len(samples)}] seed={sample.seed} step={sample.step} "
+                    f"[{len(rows)}/{len(all_samples)}] seed={sample.seed} step={sample.step} "
                     f"logp={log_prob_normalized:.3f} "
                     f"nll/dim={row['nll_per_dim_normalized']:.4f}",
                     flush=True,
@@ -475,6 +547,7 @@ def main() -> None:
         "norm_stats_dir": str(args.norm_stats_dir),
         "prompt": args.prompt,
         "sample_count": len(rows),
+        "resumed_from_count": len(existing_rows),
         "seed_count": len({row["seed"] for row in rows}),
         "mean_log_prob_normalized": float(normalized.mean()),
         "std_log_prob_normalized": float(normalized.std()),

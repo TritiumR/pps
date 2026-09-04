@@ -12,6 +12,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sim_free_mpc import SimFreeMPC, SimFreeMPCConfig  # noqa: E402
 from sim_free_mpc.ddim import ddim_iteration_alphas  # noqa: E402
+from sim_free_mpc.fk import PandaFK  # noqa: E402
+
+
+def test_panda_fk_quaternion_backward_is_finite():
+    joints = torch.zeros((4, 15, 7), dtype=torch.float32, requires_grad=True)
+
+    quat = PandaFK().forward(joints).ee_quat
+    loss = (quat * torch.tensor([0.3, -0.2, 0.7, 0.4])).sum()
+    (gradient,) = torch.autograd.grad(loss, joints)
+
+    assert torch.isfinite(quat).all()
+    assert torch.isfinite(gradient).all()
 
 
 def test_bspline_basis_is_partition_of_unity():
@@ -208,6 +220,37 @@ def test_backprop_clean_score_matches_weighted_pathwise_gradient_under_no_grad()
 
 def test_mbd_is_default_gradient_calculation_method():
     assert SimFreeMPCConfig().grad_calc == "mbd"
+
+
+def test_gradient_score_blend_weight_anneals_linearly_from_half_to_zero():
+    # Six alpha states produce five executed updates.
+    weights = [SimFreeMPC._gradient_score_blend_weight(i, 6) for i in range(5)]
+
+    assert weights == pytest.approx([0.5, 0.375, 0.25, 0.125, 0.0])
+
+
+def test_gradient_score_blend_is_convex_combination():
+    planner = object.__new__(SimFreeMPC)
+    mbd_score = torch.full((1, 2, 3), 2.0)
+    gradient_score = torch.full((1, 2, 3), 10.0)
+
+    initial, initial_weight = planner._blend_mbd_and_gradient_scores(
+        mbd_score,
+        gradient_score,
+        iteration=0,
+        num_iterations=3,
+    )
+    final, final_weight = planner._blend_mbd_and_gradient_scores(
+        mbd_score,
+        gradient_score,
+        iteration=2,
+        num_iterations=4,
+    )
+
+    assert initial_weight == pytest.approx(0.5)
+    assert torch.equal(initial, torch.full_like(initial, 6.0))
+    assert final_weight == pytest.approx(0.0)
+    assert torch.equal(final, mbd_score)
 
 
 def test_step_mbd_score_updates_only_active_dims(monkeypatch):

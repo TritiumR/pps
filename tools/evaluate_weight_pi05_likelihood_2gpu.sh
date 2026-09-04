@@ -10,6 +10,16 @@ HUTCHINSON_PROBES=${HUTCHINSON_PROBES:-1}
 POLICY_BATCH_SIZE=${POLICY_BATCH_SIZE:-4}
 CHUNK_STRIDE=${CHUNK_STRIDE:-${FRAME_STRIDE:-1}}
 MAX_SAMPLES_PER_SEED=${MAX_SAMPLES_PER_SEED:-0}
+RESUME=${RESUME:-0}
+
+if [[ "$RESUME" != 0 && "$RESUME" != 1 ]]; then
+    echo "[pi05-likelihood][FATAL] RESUME must be 0 or 1, got: $RESUME" >&2
+    exit 2
+fi
+resume_args=()
+if [[ "$RESUME" == 1 ]]; then
+    resume_args+=(--resume)
+fi
 
 if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi -L >/dev/null 2>&1; then
     echo "[pi05-likelihood][FATAL] No NVIDIA GPU/driver is visible. Run this launcher on a GPU compute node." >&2
@@ -50,7 +60,7 @@ if [[ "$TRACE_0" == "$TRACE_1" ]]; then
 fi
 mkdir -p "$OUTPUT_DIR"
 
-echo "[pi05-likelihood] output=$OUTPUT_DIR ode_steps=$ODE_STEPS probes=$HUTCHINSON_PROBES policy_batch_size=$POLICY_BATCH_SIZE chunk_stride=$CHUNK_STRIDE samples_per_seed=$MAX_SAMPLES_PER_SEED"
+echo "[pi05-likelihood] output=$OUTPUT_DIR ode_steps=$ODE_STEPS probes=$HUTCHINSON_PROBES policy_batch_size=$POLICY_BATCH_SIZE chunk_stride=$CHUNK_STRIDE samples_per_seed=$MAX_SAMPLES_PER_SEED resume=$RESUME"
 
 print_worker_failure() {
     local worker=$1 exit_code=$2 log=$3
@@ -66,8 +76,15 @@ print_worker_failure() {
 run_worker() {
     local worker=$1 log=$2 output=$3 summary=$4
     shift 4
-    # Empty these first so stale files can never make a failed rerun look complete.
-    : >"$output"
+    if [[ "$RESUME" == 1 ]]; then
+        if [[ ! -s "$output" ]]; then
+            echo "[pi05-likelihood][FATAL] worker=$worker cannot resume missing or empty output: $output" >&2
+            return 4
+        fi
+    else
+        # Empty this first so stale files can never make a fresh run look complete.
+        : >"$output"
+    fi
     : >"$summary"
     set +e
     "$@" >"$log" 2>&1
@@ -101,6 +118,7 @@ for worker in 0 1; do
         --max-samples-per-seed "$MAX_SAMPLES_PER_SEED" \
         --progress-position "$worker" \
         --progress-fd 3 \
+        "${resume_args[@]}" \
         --output "$OUTPUT_DIR/worker_${worker}.jsonl" \
         --summary "$OUTPUT_DIR/worker_${worker}.summary.json" \
         "${traces[$worker]}" \

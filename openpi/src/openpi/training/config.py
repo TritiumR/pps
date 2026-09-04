@@ -199,6 +199,11 @@ class ModelTransformFactory(GroupFactory):
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
                         _transforms.ResizeImages(224, 224),
+                        *(
+                            [_transforms.ResizePointCloud(model_config.pointcloud_num_points)]
+                            if getattr(model_config, "use_pointcloud_prefix", False)
+                            else []
+                        ),
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                         ),
@@ -790,23 +795,37 @@ class ProxyLeRobotDROIDJointPosDataConfig(DataConfigFactory):
 
     default_prompt: str | None = None
     use_quantile_norm: bool = False
+    use_right_wrist_image: bool = False
 
     @override
     def create(
         self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
     ) -> DataConfig:
+        repack_structure = {
+            "observation/exterior_image_1_left": "exterior_image_1_left",
+            "observation/wrist_image_left": "wrist_image_left",
+            "observation/joint_position": "joint_position",
+            "observation/gripper_position": "gripper_position",
+            "actions": "actions",
+            "prompt": "prompt",
+        }
+        if self.use_right_wrist_image:
+            repack_structure["observation/wrist_image_right"] = "wrist_image_right"
+        if getattr(model_config, "use_pointcloud_prefix", False):
+            repack_structure.update(
+                {
+                    "observation/pointcloud_coord": "point_position",
+                    "observation/pointcloud_color": "point_color",
+                    "observation/left_wrist_pointcloud_coord": "left_wrist_point_position",
+                    "observation/left_wrist_pointcloud_color": "left_wrist_point_color",
+                    "observation/right_wrist_pointcloud_coord": "right_wrist_point_position",
+                    "observation/right_wrist_pointcloud_color": "right_wrist_point_color",
+                }
+            )
+
         repack_transform = _transforms.Group(
             inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/exterior_image_1_left": "exterior_image_1_left",
-                        "observation/wrist_image_left": "wrist_image_left",
-                        "observation/joint_position": "joint_position",
-                        "observation/gripper_position": "gripper_position",
-                        "actions": "actions",
-                        "prompt": "prompt",
-                    }
-                )
+                _transforms.RepackTransform(repack_structure)
             ]
         )
 
@@ -814,7 +833,12 @@ class ProxyLeRobotDROIDJointPosDataConfig(DataConfigFactory):
         delta_action_mask = _transforms.make_bool_mask(7, -1)
         data_transforms = _transforms.Group(
             inputs=[
-                droid_policy.DroidInputs(model_type=model_config.model_type),
+                droid_policy.DroidInputs(
+                    model_type=model_config.model_type,
+                    use_right_wrist_image=self.use_right_wrist_image,
+                    use_pointcloud=getattr(model_config, "use_pointcloud_prefix", False),
+                    pointcloud_keys=getattr(model_config, "pointcloud_keys", ()),
+                ),
                 _transforms.DeltaActions(delta_action_mask),
             ],
             outputs=[
@@ -834,6 +858,15 @@ class ProxyLeRobotDROIDJointPosDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
             use_quantile_norm=self.use_quantile_norm,
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class BimanualProxyLeRobotDROIDJointPosDataConfig(
+    ProxyLeRobotDROIDJointPosDataConfig
+):
+    """DROID-format proxy data with valid left and right wrist camera streams."""
+
+    use_right_wrist_image: bool = True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -5480,7 +5513,7 @@ _CONFIGS = [
             repo_id="cn356/isaaclab_weight",
             base_config=DataConfig(prompt_from_task=True),
             assets=AssetsConfig(asset_id="cn356/isaaclab_weight"),
-            norm_stats_dir="checkpoints/pi05_droid_jointpos/assets/droid",
+            norm_stats_dir="checkpoints/pytorch/pi05_droid_jointpos/assets/droid",
             use_quantile_norm=True,
         ),
         num_train_steps=10_001,
@@ -5503,6 +5536,30 @@ _CONFIGS = [
             assets=AssetsConfig(asset_id="local/isaaclab_weight_score"),
             norm_stats_dir="checkpoints/pytorch/pi05_droid_jointpos/assets/droid",
             use_quantile_norm=True,
+        ),
+        num_train_steps=30_000,
+        save_interval=1_000,
+        batch_size=32,
+    ),
+    TrainConfig(
+        # Bidirectional epsilon proxy trained and decoded in the weight-demo
+        # mean/std space. Keep this separate from the causal, quantile-normalized
+        # score_task_weight config so evaluation cannot silently use the wrong mask.
+        name="score_task_weight_demo_meanstd",
+        model=proxy_score_config.ProxyScoreConfig(
+            action_horizon=15,
+            action_dim=8,
+            action_expert_variant="gemma_12m",
+            dino_model_name="facebook/dinov3-vits16-pretrain-lvd1689m",
+            ddim_num_train_timesteps=100,
+            prediction_type="epsilon",
+            bidirectional_attention=True,
+        ),
+        data=ProxyLeRobotDROIDJointPosDataConfig(
+            repo_id="cn356/isaaclab_weight",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="cn356/isaaclab_weight"),
+            use_quantile_norm=False,
         ),
         num_train_steps=30_000,
         save_interval=1_000,
@@ -6358,27 +6415,6 @@ _CONFIGS = [
             norm_stats_dir="checkpoints/pytorch/pi05_droid_jointpos/assets/droid",
             use_quantile_norm=True,
         ),
-        batch_size=32,
-    ),
-    TrainConfig(
-        name="score_task_tea",
-        model=proxy_score_config.ProxyScoreConfig(
-            action_horizon=15,
-            action_dim=8,
-            action_expert_variant="gemma_12m",
-            dino_model_name="facebook/dinov3-vits16-pretrain-lvd1689m",
-            ddim_num_train_timesteps=100,
-            prediction_type="epsilon",
-        ),
-        data=ProxyLeRobotDROIDJointPosDataConfig(
-            repo_id="local/isaaclab_tea_score",
-            base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(asset_id="local/isaaclab_tea_score"),
-            norm_stats_dir="checkpoints/pytorch/pi05_droid_jointpos/assets/droid",
-            use_quantile_norm=True,
-        ),
-        num_train_steps=30_000,
-        save_interval=1_000,
         batch_size=32,
     ),
     TrainConfig(

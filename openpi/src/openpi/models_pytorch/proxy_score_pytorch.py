@@ -12,12 +12,6 @@ import openpi.models.gemma as _gemma
 from openpi.models_pytorch.expert_pytorch import DINOExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
-IMAGE_KEYS = (
-    "base_0_rgb",
-    "left_wrist_0_rgb",
-)
-
-
 def get_safe_dtype(target_dtype, device_type):
     if device_type == "cpu":
         if target_dtype == torch.bfloat16:
@@ -210,7 +204,7 @@ class ProxyScorePytorch(nn.Module):
 
     def _preprocess_observation(self, observation, *, train=True):
         observation = _preprocessing.preprocess_observation_pytorch(
-            observation, image_keys=IMAGE_KEYS, train=train
+            observation, image_keys=self.config.image_keys, train=train
         )
         return (
             list(observation.images.values()),

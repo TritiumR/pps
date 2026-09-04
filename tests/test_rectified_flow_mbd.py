@@ -266,6 +266,47 @@ def test_weighted_three_center_mixture_uses_actual_sample_fractions() -> None:
     assert result.diagnostics["importance_total_samples"] == sum(counts)
 
 
+def test_log_acceptance_tilt_is_exactly_importance_corrected() -> None:
+    count = 20000
+    engine = RectifiedFlowMBD(
+        RectifiedFlowMBDConfig(
+            proposals_per_particle=count,
+            temperature=1.0,
+            proposal_std=1.0,
+            proposal_sampler="truncated_gaussian",
+        )
+    )
+    center = torch.zeros((1, 1, 1))
+    lower = torch.full((1,), -8.0)
+    upper = torch.full((1,), 8.0)
+    tilted_scale = 0.8
+
+    def log_acceptance(samples: torch.Tensor) -> torch.Tensor:
+        value = samples[..., 0, 0]
+        return -0.5 * value.square() * (1.0 / tilted_scale**2 - 1.0)
+
+    result = engine.optimize_clean_trajectories(
+        center,
+        lower=lower,
+        upper=upper,
+        cost_fn=lambda candidates: torch.zeros(candidates.shape[:2]),
+        generator=torch.Generator().manual_seed(202),
+        proposal_scale=1.0,
+        proposal_log_acceptance_fn=log_acceptance,
+    )
+
+    squared = result.candidates[..., 0, 0].square()
+    tilted_second_moment = float(squared.mean())
+    corrected_second_moment = float((result.weights * squared).sum())
+    assert 0.58 < tilted_second_moment < 0.70
+    assert 0.90 < corrected_second_moment < 1.10
+    assert result.diagnostics["importance_density_correction"] is True
+    assert result.diagnostics["proposal_log_acceptance_tilt"] is True
+    assert result.diagnostics["importance_proposal"] == (
+        "bounded_gaussian_mixture_times_log_acceptance_tilt"
+    )
+
+
 def test_clipped_gaussian_log_prob_uses_boundary_probability_mass() -> None:
     samples = torch.tensor([[[[-1.0]], [[0.25]], [[1.0]]]])
     center = torch.tensor([[[0.2]]])
@@ -435,6 +476,40 @@ def test_sequential_guidance_supports_distinct_proposal_populations() -> None:
     assert result.waypoints is not None
     assert result.waypoints.proposals.candidates.shape == (1, 7, 2, 1)
 
+
+
+def test_sequential_guidance_supports_waypoint_only_temperature() -> None:
+    engine = RectifiedFlowMBD(
+        RectifiedFlowMBDConfig(
+            proposals_per_particle=16,
+            temperature=0.01,
+            proposal_std=0.5,
+        )
+    )
+    x_t = torch.zeros((1, 3, 1))
+    policy_velocity = torch.zeros_like(x_t)
+    bounds = torch.full((1,), 2.0)
+
+    def cost_fn(candidates: torch.Tensor) -> torch.Tensor:
+        return torch.square(candidates).mean(dim=(2, 3))
+
+    result = engine.guide_keypose_then_waypoints(
+        x_t,
+        policy_velocity,
+        time_value=0.5,
+        lower=-bounds,
+        upper=bounds,
+        keypose_cost_fn=cost_fn,
+        waypoint_cost_fn=cost_fn,
+        generator=torch.Generator().manual_seed(23),
+        waypoint_coefficient=1.0,
+        keypose_coefficient=1.0,
+        waypoint_temperature=0.5,
+    )
+
+    assert result.waypoints is not None
+    assert result.keypose.proposals.diagnostics["beta_schedule"] == [0.0, 100.0]
+    assert result.waypoints.proposals.diagnostics["beta_schedule"] == [0.0, 2.0]
 
 def test_sequential_guidance_can_condition_on_guided_keypose() -> None:
     engine = RectifiedFlowMBD(

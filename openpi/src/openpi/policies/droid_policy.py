@@ -82,12 +82,43 @@ def _parse_pointcloud(data: dict) -> np.ndarray:
     return pointcloud
 
 
+def _parse_camera_pointcloud(data: dict, camera_key: str) -> np.ndarray:
+    stems = {
+        "base_0_pointcloud": "pointcloud",
+        "left_wrist_0_pointcloud": "left_wrist_pointcloud",
+        "right_wrist_0_pointcloud": "right_wrist_pointcloud",
+    }
+    try:
+        stem = stems[camera_key]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported point-cloud camera key: {camera_key!r}.") from exc
+
+    combined_key = f"observation/{stem}"
+    coord_key = f"observation/{stem}_coord"
+    color_key = f"observation/{stem}_color"
+    if combined_key in data:
+        pointcloud = np.asarray(data[combined_key])
+    elif coord_key in data and color_key in data:
+        pointcloud = np.concatenate(
+            [np.asarray(data[coord_key]), np.asarray(data[color_key])], axis=-1
+        )
+    else:
+        raise KeyError(
+            f"Expected {combined_key} or both {coord_key} and {color_key}."
+        )
+    if pointcloud.shape[-1] < 6:
+        raise ValueError(f"Expected XYZRGB for {camera_key}, got {pointcloud.shape}.")
+    return pointcloud.astype(np.float32, copy=False)
+
+
 @dataclasses.dataclass(frozen=True)
 class DroidInputs(transforms.DataTransformFn):
     # Determines which model will be used.
     model_type: _model.ModelType
     use_pointcloud: bool = False
+    pointcloud_keys: tuple[str, ...] = ()
     use_sound: bool = False
+    use_right_wrist_image: bool = False
 
     def __call__(self, data: dict) -> dict:
         gripper_pos = np.asarray(data["observation/gripper_position"])
@@ -97,7 +128,11 @@ class DroidInputs(transforms.DataTransformFn):
         state = np.concatenate([data["observation/joint_position"], gripper_pos])
 
         pointcloud = None
-        if (
+        if self.use_pointcloud and self.pointcloud_keys:
+            pointcloud = {
+                key: _parse_camera_pointcloud(data, key) for key in self.pointcloud_keys
+            }
+        elif (
             "observation/pointcloud" in data
             or "observation/pointcloud_coord" in data
             or "observation/pointcloud_color" in data
@@ -118,8 +153,15 @@ class DroidInputs(transforms.DataTransformFn):
                 base_image = _parse_image(data["observation/exterior_image_1_left"])
                 wrist_image = _parse_image(data["observation/wrist_image_left"])
                 names = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
-                images = (base_image, wrist_image, np.zeros_like(base_image))
-                image_masks = (np.True_, np.True_, np.False_)
+                if self.use_right_wrist_image:
+                    right_wrist_image = _parse_image(
+                        data["observation/wrist_image_right"]
+                    )
+                    images = (base_image, wrist_image, right_wrist_image)
+                    image_masks = (np.True_, np.True_, np.True_)
+                else:
+                    images = (base_image, wrist_image, np.zeros_like(base_image))
+                    image_masks = (np.True_, np.True_, np.False_)
                 inputs = {
                     "state": state,
                     "image": dict(zip(names, images, strict=True)),
@@ -138,7 +180,7 @@ class DroidInputs(transforms.DataTransformFn):
                 ):
                     inputs["sound"] = _parse_sound(data)
                 if (
-                    self.model_type in (_model.ModelType.PI0, _model.ModelType.PI05)
+                    self.model_type in (_model.ModelType.PI0, _model.ModelType.PI05, _model.ModelType.PROXY)
                     and self.use_pointcloud
                     and pointcloud is not None
                 ):

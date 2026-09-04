@@ -101,6 +101,14 @@ class UsdFileCfg(FileCfg):
     usd_path: str = MISSING
     """Path to the USD file to spawn asset from."""
 
+    strip_embedded_physics_scenes: bool = False
+    """Whether to deactivate physics scenes contained inside the referenced USD.
+
+    Enable this for scene-level assets that are cloned into multiple environments. A nested
+    ``PhysicsScene`` must not be replicated with each environment; simulation physics should be
+    owned by the environment's global physics scene instead.
+    """
+
     variants: object | dict[str, str] | None = None
     """Variants to select from in the input USD file. Defaults to None, in which case no variants are applied.
 

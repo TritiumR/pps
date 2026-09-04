@@ -17,11 +17,13 @@ class _SyntheticTaskDataset(torch.utils.data.Dataset):
         image = np.full((224, 224, 3), idx, dtype=np.uint8)
         return {
             "image": {
+                "right_wrist_0_rgb": image + 2,
                 "base_0_rgb": image,
                 "left_wrist_0_rgb": image + 1,
             },
             "image_mask": {
                 "base_0_rgb": np.asarray(True),
+                "right_wrist_0_rgb": np.asarray(True),
                 "left_wrist_0_rgb": np.asarray(True),
             },
             "state": np.full((2,), idx, dtype=np.float32),
@@ -90,3 +92,27 @@ def test_task_cache_reuses_preprocessed_tensors(monkeypatch, tmp_path):
     assert noise is None
     assert tuple(input_batch["image"]["base_0_rgb"].shape) == (2, 224, 224, 3)
     assert tuple(action_batch.shape) == (2, 3, 2)
+
+
+def test_task_cache_preserves_bimanual_camera_set(monkeypatch, tmp_path):
+    config = _synthetic_config()
+    config.model.image_keys = (
+        "base_0_rgb",
+        "left_wrist_0_rgb",
+        "right_wrist_0_rgb",
+    )
+    dataset = _SyntheticTaskDataset()
+    monkeypatch.setattr(train_score._data, "create_torch_dataset", lambda *_: dataset)
+    monkeypatch.setattr(train_score._data, "transform_dataset", lambda value, *_: value)
+
+    cache_path = tmp_path / "bimanual-task.observations"
+    train_score.prepare_task_cache(config, cache_path, num_workers=0)
+    cached_dataset = train_score.TaskScoreCacheDataset(
+        str(cache_path),
+        config,
+        config.data.create(None, None),
+    )
+
+    inputs, _ = cached_dataset[0]
+    assert tuple(inputs["image"]) == config.model.image_keys
+    assert tuple(inputs["image_mask"]) == config.model.image_keys

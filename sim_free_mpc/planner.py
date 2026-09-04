@@ -16,6 +16,7 @@ from .costs_grasp_flow_ex import GraspFlowStateCost as ExtendedGraspFlowStateCos
 from .costs_grasp_flow_fake import GraspFlowStateCost as FakeGraspFlowStateCost
 from .costs_grasp_flow_loose import GraspFlowStateCost as LooseGraspFlowStateCost
 from .costs_ref_style import RefStyleStateCost
+from .costs_weight_keypose import WeightKeyposeStateCost
 from .ddim import ddim_clean_sample_std_scale, ddim_iteration_alphas
 from .dial_sampler import DIALSampler, DIALSamplerConfig
 from .fk import PandaFK, quat_mul_wxyz, transform_points_wxyz
@@ -120,6 +121,68 @@ class SimFreeMPCConfig:
     # excluded from the softmax. 0 disables it, leaving feasibility to compete on magnitude as today.
     # If nothing passes the gate the whole population is kept, so the sampler can never be starved.
     feasibility_gate: float = 0.0
+    keypose_index: int = -1
+    keypose_steering_coeff: float = 0.8
+    keypose_action_steering_coeff: float = 1.0
+    keypose_action_l1_step: float = 0.4
+    keypose_action_l1_time_ramp: bool = True
+    keypose_action_l1_include_gripper: bool = True
+    keypose_normalized_limit: float = 1.0
+
+
+def _apply_action_keypose_l1_descent(
+    clean_actions: torch.Tensor,
+    *,
+    keypose_index: int,
+    active_dims: int,
+    step_size: float,
+    time_ramp: bool,
+    include_gripper: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply the sort-ball-style capped L1 descent to action tokens only."""
+
+    if clean_actions.ndim != 3:
+        raise ValueError(
+            "Action/keypose L1 descent expects [B,H,D], got "
+            f"{tuple(clean_actions.shape)}"
+        )
+    index = int(keypose_index)
+    if index < 1 or index >= clean_actions.shape[1]:
+        raise ValueError(
+            f"keypose_index must be in [1, {clean_actions.shape[1] - 1}], got {index}"
+        )
+    if not 0.0 <= float(step_size) <= 1.0:
+        raise ValueError(
+            f"keypose_action_l1_step must be in [0, 1], got {step_size}"
+        )
+    dims = min(int(active_dims), clean_actions.shape[-1])
+    if not include_gripper and dims > 7:
+        dims = 7
+    zero = torch.zeros(
+        (),
+        device=clean_actions.device,
+        dtype=clean_actions.dtype,
+    )
+    if float(step_size) == 0.0 or dims <= 0:
+        return clean_actions, zero, zero
+
+    action_prefix = clean_actions[:, :index, :dims]
+    terminal_keypose = clean_actions[:, index : index + 1, :dims]
+    delta = terminal_keypose - action_prefix
+    if time_ramp:
+        ramp = torch.linspace(
+            1.0 / float(index),
+            1.0,
+            steps=index,
+            device=clean_actions.device,
+            dtype=clean_actions.dtype,
+        ).view(1, index, 1)
+        max_step = float(step_size) * ramp
+    else:
+        max_step = torch.full_like(delta, float(step_size))
+    l1_step = torch.sign(delta) * torch.minimum(torch.abs(delta), max_step)
+    action_prefix.add_(l1_step)
+    return clean_actions, l1_step.abs().max(), l1_step.abs().mean()
 
 
 class SimFreeMPC:
@@ -157,6 +220,8 @@ class SimFreeMPC:
             self.cost = FakeGraspFlowStateCost(config.task_name)
         elif config.cost_style == "grasp_flow_loose":
             self.cost = LooseGraspFlowStateCost(config.task_name)
+        elif config.cost_style == "weight_keypose":
+            self.cost = WeightKeyposeStateCost(config.task_name)
         elif config.cost_style == "capsule_flow":
             self.cost = CapsuleFlowStateCost(config.task_name)
         elif config.cost_style == "priority":
@@ -171,6 +236,25 @@ class SimFreeMPC:
             raise ValueError(f"Unknown MPC gradient calculation method: {config.grad_calc!r}")
         if config.grad_calc == "backprop" and config.optimize_space != "action":
             raise ValueError("Backprop cost gradients only support action optimize_space.")
+        if config.cost_style == "weight_keypose":
+            if "weight" not in config.task_name.lower():
+                raise ValueError("weight_keypose cost requires a weight task.")
+            if config.optimize_space != "action":
+                raise ValueError("weight_keypose cost requires action optimize_space.")
+            if config.interpolate:
+                raise ValueError(
+                    "weight_keypose output tokens must not be temporally interpolated."
+                )
+            if not 0.0 <= config.keypose_steering_coeff <= 1.0:
+                raise ValueError("keypose_steering_coeff must be in [0, 1].")
+            if not 0.0 <= config.keypose_action_steering_coeff <= 1.0:
+                raise ValueError(
+                    "keypose_action_steering_coeff must be in [0, 1]."
+                )
+            if not 0.0 <= config.keypose_action_l1_step <= 1.0:
+                raise ValueError("keypose_action_l1_step must be in [0, 1].")
+            if config.keypose_normalized_limit <= 0.0:
+                raise ValueError("keypose_normalized_limit must be positive.")
         if config.sampler == "truncated":
             if config.optimize_space != "action":
                 raise ValueError(
@@ -708,6 +792,7 @@ class SimFreeMPC:
             "grasp_flow_fake",
             "grasp_flow_loose",
             "capsule_flow",
+            "weight_keypose",
         ):
             total = self.cost(real_actions=real, tcp_pos=ee_pos, tcp_quat=ee_quat, context=context)
         else:
@@ -757,6 +842,170 @@ class SimFreeMPC:
                 excluded = ranked.max().detach() + 1.0e4
                 ranked = torch.where(keep, ranked, excluded.expand_as(ranked))
         return ranked
+
+    def flow_average_weight_keypose(
+        self,
+        x_t: torch.Tensor,
+        policy_velocity: torch.Tensor,
+        policy_inputs: dict[str, Any],
+        context: dict[str, Any],
+        *,
+        time_value: float | torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Blend endpoint-cost MBD into the learned keypose flow."""
+
+        if self.config.cost_style != "weight_keypose":
+            raise ValueError(
+                "flow_average_weight_keypose requires cost_style='weight_keypose'."
+            )
+        if x_t.shape != policy_velocity.shape or x_t.ndim != 3:
+            raise ValueError(
+                "x_t and policy_velocity must have the same [B,H,D] shape; "
+                f"got {tuple(x_t.shape)} and {tuple(policy_velocity.shape)}"
+            )
+        if x_t.shape[0] != 1:
+            raise ValueError("Weight keypose flow averaging expects batch size 1.")
+        keypose_index = (
+            x_t.shape[1] - 1
+            if self.config.keypose_index < 0
+            else int(self.config.keypose_index)
+        )
+        if keypose_index != x_t.shape[1] - 1:
+            raise ValueError(
+                "The weight keypose must be the final output token; "
+                f"got index {keypose_index} for horizon {x_t.shape[1]}."
+            )
+        active_dims = min(self.config.action_dims, x_t.shape[-1])
+        time = float(torch.as_tensor(time_value).detach().cpu())
+        if not 0.0 < time <= 1.0 + 1e-6:
+            raise ValueError(f"Flow time must be in (0, 1], got {time}.")
+
+        policy_clean = x_t.detach() - time * policy_velocity.detach()
+        endpoint_center = policy_clean[0, keypose_index, :active_dims].unsqueeze(0)
+        proposal_std = (
+            0.0
+            if time >= 1.0 - 1e-8
+            else self.config.noise * time / max(1.0 - time, self.config.flow_eps)
+        )
+        normalized_limit = float(self.config.keypose_normalized_limit)
+        prior_proposal_fn = self.sampler.proposal_fn
+
+        def bounded_endpoint_proposals(
+            mean: torch.Tensor,
+            noise_scale,
+            num_samples: int,
+            generator,
+        ) -> torch.Tensor:
+            scale = torch.as_tensor(
+                noise_scale,
+                device=mean.device,
+                dtype=mean.dtype,
+            )
+            if scale.ndim == 0:
+                scale = scale.view(1, 1)
+            elif scale.ndim == 1:
+                scale = scale.view(-1, 1)
+            noise = torch.randn(
+                (num_samples, *mean.shape),
+                device=mean.device,
+                dtype=mean.dtype,
+                generator=generator,
+            )
+            proposals = mean.unsqueeze(0) + noise * scale.unsqueeze(0)
+            proposals.clamp_(-normalized_limit, normalized_limit)
+            proposals[0] = mean.clamp(-normalized_limit, normalized_limit)
+            return proposals
+
+        def endpoint_cost(samples: torch.Tensor) -> torch.Tensor:
+            full = policy_clean.repeat(samples.shape[0], 1, 1)
+            full[:, keypose_index : keypose_index + 1, :active_dims] = samples
+            return self._cost_active_samples(
+                full,
+                x_t,
+                active_dims,
+                policy_inputs,
+                context,
+            )
+
+        self.sampler.proposal_fn = bounded_endpoint_proposals
+        try:
+            result = self.sampler.optimize_with_noise_scale(
+                endpoint_center,
+                endpoint_cost,
+                noise_scale=proposal_std,
+            )
+        finally:
+            self.sampler.proposal_fn = prior_proposal_fn
+
+        guided_clean = policy_clean.clone()
+        if time < 1.0 - 1e-8:
+            guided_keypose = endpoint_center + float(
+                self.config.keypose_steering_coeff
+            ) * (result.mean - endpoint_center)
+            guided_clean[
+                :, keypose_index : keypose_index + 1, :active_dims
+            ] = guided_keypose.unsqueeze(0)
+        guided_clean, l1_max, l1_mean = _apply_action_keypose_l1_descent(
+            guided_clean,
+            keypose_index=keypose_index,
+            active_dims=active_dims,
+            step_size=(
+                0.0
+                if time >= 1.0 - 1e-8
+                else self.config.keypose_action_l1_step
+            ),
+            time_ramp=self.config.keypose_action_l1_time_ramp,
+            include_gripper=self.config.keypose_action_l1_include_gripper,
+        )
+        guided_clean.clamp_(-normalized_limit, normalized_limit)
+
+        extended_velocity = (x_t.detach() - guided_clean) / max(
+            time,
+            self.config.flow_eps,
+        )
+        guided_velocity = policy_velocity.detach().clone()
+        guided_velocity[:, keypose_index, :active_dims] = extended_velocity[
+            :, keypose_index, :active_dims
+        ]
+        guided_velocity[:, :keypose_index, :active_dims] += float(
+            self.config.keypose_action_steering_coeff
+        ) * (
+            extended_velocity[:, :keypose_index, :active_dims]
+            - policy_velocity.detach()[:, :keypose_index, :active_dims]
+        )
+
+        diagnostics = self._diagnostics(
+            result=result,
+            target=guided_clean,
+            x_t=x_t,
+            score=None,
+        )
+        diagnostics.update(
+            {
+                "update_mode": "weight_keypose_flow_averaging",
+                "flow_time": time,
+                "keypose_index": keypose_index,
+                "keypose_proposal_std": float(proposal_std),
+                "keypose_steering_coeff": float(
+                    self.config.keypose_steering_coeff
+                ),
+                "keypose_action_steering_coeff": float(
+                    self.config.keypose_action_steering_coeff
+                ),
+                "keypose_action_l1_step": float(
+                    self.config.keypose_action_l1_step
+                ),
+                "keypose_action_l1_max": float(l1_max.detach().cpu()),
+                "keypose_action_l1_mean": float(l1_mean.detach().cpu()),
+                "policy_velocity_norm": float(
+                    torch.linalg.vector_norm(policy_velocity.detach()).cpu()
+                ),
+                "guided_velocity_norm": float(
+                    torch.linalg.vector_norm(guided_velocity.detach()).cpu()
+                ),
+            }
+        )
+        return guided_velocity, diagnostics
 
     def _backprop_clean_score(
         self,
@@ -841,6 +1090,36 @@ class SimFreeMPC:
                 if flat.numel() >= 1:
                     out[f"mean_plan_term_{name}"] = float(flat[0].detach().cpu())
         return out
+
+    @staticmethod
+    def _gradient_score_blend_weight(iteration: int, num_iterations: int) -> float:
+        """Linearly anneal the backprop score weight from 0.5 to 0.0."""
+        if num_iterations <= 0:
+            raise ValueError("num_iterations must be positive")
+        if iteration < 0 or iteration >= num_iterations:
+            raise ValueError(
+                f"iteration must be in [0, {num_iterations}), got {iteration}"
+            )
+        if num_iterations == 1:
+            return 0.5
+        # The DDIM schedule includes the terminal alpha state, while updates
+        # execute through ``num_iterations - 2``. Reach zero on that last
+        # executed update and remain there if the terminal state is evaluated.
+        last_update = max(num_iterations - 2, 1)
+        progress = min(float(iteration) / float(last_update), 1.0)
+        return 0.5 * (1.0 - progress)
+
+    def _blend_mbd_and_gradient_scores(
+        self,
+        mbd_score: torch.Tensor,
+        gradient_score: torch.Tensor,
+        *,
+        iteration: int,
+        num_iterations: int,
+    ) -> tuple[torch.Tensor, float]:
+        gradient_weight = self._gradient_score_blend_weight(iteration, num_iterations)
+        blended = (1.0 - gradient_weight) * mbd_score + gradient_weight * gradient_score
+        return blended, gradient_weight
 
     def _last_cost_term_diagnostics(self, result) -> dict[str, Any]:
         cost = getattr(self, "cost", None)
@@ -1200,14 +1479,23 @@ class SimFreeMPC:
         score = torch.zeros_like(x_t)
         active_x = x_t.detach()[:, :, :active_dims]
         active_x0 = x0_hat[:, :, :active_dims]
+        gradient_weight = 0.0
         if self.config.grad_calc == "backprop":
-            score = self._backprop_clean_score(
+            mbd_score = torch.zeros_like(x_t)
+            mbd_score[:, :, :active_dims] = (-active_x + sqrt_alpha * active_x0) / beta
+            gradient_score = self._backprop_clean_score(
                 result,
                 x_t,
                 active_dims,
                 policy_inputs,
                 context,
                 alpha_bar=alpha_bar,
+            )
+            score, gradient_weight = self._blend_mbd_and_gradient_scores(
+                mbd_score,
+                gradient_score,
+                iteration=iteration,
+                num_iterations=num_iterations,
             )
             active_score = score[:, :, :active_dims]
             score_x0 = (active_x + beta * active_score) / sqrt_alpha
@@ -1257,6 +1545,8 @@ class SimFreeMPC:
                 "alpha_bar": float(alpha_bar),
                 "alpha_bar_prev": float(alpha_bar_prev),
                 "clean_sample_std": float(clean_std),
+                "gradient_score_weight": float(gradient_weight),
+                "mbd_score_weight": float(1.0 - gradient_weight),
                 "ddim_step_delta_norm": float(torch.linalg.vector_norm((next_x - x_t).detach()).cpu()),
             }
         )
@@ -1295,14 +1585,23 @@ class SimFreeMPC:
         active_x0 = x0_hat[:, :, :active_dims]
 
         alpha_step = torch.clamp(alpha / torch.clamp(alpha_prev, min=self.config.flow_eps), min=self.config.flow_eps)
+        gradient_weight = 0.0
         if self.config.grad_calc == "backprop":
-            score = self._backprop_clean_score(
+            mbd_score = torch.zeros_like(x_t)
+            mbd_score[:, :, :active_dims] = (sqrt_alpha * active_x0 - active_x) / beta
+            gradient_score = self._backprop_clean_score(
                 result,
                 x_t,
                 active_dims,
                 policy_inputs,
                 context,
                 alpha_bar=alpha_bar,
+            )
+            score, gradient_weight = self._blend_mbd_and_gradient_scores(
+                mbd_score,
+                gradient_score,
+                iteration=iteration,
+                num_iterations=num_iterations,
             )
             score_numerator = beta * score[:, :, :active_dims]
             active_prev = (
@@ -1345,6 +1644,8 @@ class SimFreeMPC:
                 "alpha_bar_prev": float(alpha_bar_prev),
                 "clean_sample_std": float(clean_std),
                 "score_scale": float(score_scale),
+                "gradient_score_weight": float(gradient_weight),
+                "mbd_score_weight": float(1.0 - gradient_weight),
                 "mbd_step_delta_norm": float(torch.linalg.vector_norm((next_x - x_t).detach()).cpu()),
             }
         )
@@ -1521,14 +1822,23 @@ class SimFreeMPC:
         active_x = x_t.detach()[:, :, :active_dims]
         active_x0 = x0_hat[:, :, :active_dims]
 
+        gradient_weight = 0.0
         if self.config.grad_calc == "backprop":
-            score = self._backprop_clean_score(
+            mbd_score = torch.zeros_like(x_t)
+            mbd_score[:, :, :active_dims] = (sqrt_alpha * active_x0 - active_x) / beta
+            gradient_score = self._backprop_clean_score(
                 result,
                 x_t,
                 active_dims,
                 policy_inputs,
                 context,
                 alpha_bar=alpha_bar,
+            )
+            score, gradient_weight = self._blend_mbd_and_gradient_scores(
+                mbd_score,
+                gradient_score,
+                iteration=iteration,
+                num_iterations=num_iterations,
             )
             numerator[:, :, :active_dims] = beta * score[:, :, :active_dims]
         elif self.config.optimize_space == "accel":
@@ -1558,6 +1868,8 @@ class SimFreeMPC:
                 "alpha_bar_prev": float(alpha_bar_prev),
                 "active_dims": int(active_dims),
                 "clean_sample_std": float(clean_std),
+                "gradient_score_weight": float(gradient_weight),
+                "mbd_score_weight": float(1.0 - gradient_weight),
             }
         )
         return score, numerator, diagnostics

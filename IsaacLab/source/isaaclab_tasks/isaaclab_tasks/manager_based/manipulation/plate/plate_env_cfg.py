@@ -91,6 +91,7 @@ class PlateSceneCfg(InteractiveSceneCfg):
             usd_path=os.path.abspath(
                 os.path.join(KITCHEN_ASSET_DIR, "Interactive_kitchen.usd")
             ),
+            strip_embedded_physics_scenes=True,
             rigid_props=kinematic_body_properties,
             collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
         ),

@@ -45,6 +45,10 @@ def test_proxy_config_rejects_duplicate_cameras():
         ProxyConfig(image_keys=("base_0_rgb", "base_0_rgb"))
 
 
-def test_proxy_config_rejects_causal_attention():
-    with pytest.raises(ValueError, match="Only attention_mode"):
-        ProxyConfig(attention_mode="causal")
+def test_proxy_config_accepts_causal_attention():
+    assert ProxyConfig(attention_mode="causal").attention_mode == "causal"
+
+
+def test_proxy_config_rejects_unknown_attention():
+    with pytest.raises(ValueError, match="attention_mode must be"):
+        ProxyConfig(attention_mode="unknown")

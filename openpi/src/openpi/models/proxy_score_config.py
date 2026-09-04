@@ -13,6 +13,18 @@ if TYPE_CHECKING:
     from openpi.models_pytorch.proxy_score_pytorch import ProxyScorePytorch
 
 
+DEFAULT_IMAGE_KEYS = (
+    "base_0_rgb",
+    "left_wrist_0_rgb",
+)
+
+BIMANUAL_IMAGE_KEYS = (
+    "base_0_rgb",
+    "left_wrist_0_rgb",
+    "right_wrist_0_rgb",
+)
+
+
 @dataclasses.dataclass(frozen=True)
 class ProxyScoreConfig(_model.BaseModelConfig):
     dtype: str = "float32"
@@ -27,6 +39,7 @@ class ProxyScoreConfig(_model.BaseModelConfig):
     # opt in during training, or be selected explicitly by eval's --task_attention.
     bidirectional_attention: bool = False
     compile_sample_actions: bool = False
+    image_keys: tuple[str, ...] = DEFAULT_IMAGE_KEYS
 
     action_dim: int = 8
     action_horizon: int = 10
@@ -41,6 +54,10 @@ class ProxyScoreConfig(_model.BaseModelConfig):
             raise ValueError(
                 "prediction_type must be 'score', 'epsilon', 'x0' or 'regress'."
             )
+        if not self.image_keys:
+            raise ValueError("image_keys must contain at least one camera.")
+        if len(set(self.image_keys)) != len(self.image_keys):
+            raise ValueError(f"image_keys must be unique, got {self.image_keys}.")
 
     @property
     @override
@@ -65,16 +82,8 @@ class ProxyScoreConfig(_model.BaseModelConfig):
 
         with at.disable_typechecking():
             observation_spec = _model.Observation(
-                images={
-                    "base_0_rgb": image_spec,
-                    "left_wrist_0_rgb": image_spec,
-                    "right_wrist_0_rgb": image_spec,
-                },
-                image_masks={
-                    "base_0_rgb": image_mask_spec,
-                    "left_wrist_0_rgb": image_mask_spec,
-                    "right_wrist_0_rgb": image_mask_spec,
-                },
+                images={key: image_spec for key in self.image_keys},
+                image_masks={key: image_mask_spec for key in self.image_keys},
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct(
                     [batch_size, self.max_token_len], jnp.int32
@@ -87,3 +96,10 @@ class ProxyScoreConfig(_model.BaseModelConfig):
             [batch_size, self.action_horizon, self.action_dim], jnp.float32
         )
         return observation_spec, action_spec
+
+
+@dataclasses.dataclass(frozen=True)
+class BimanualProxyScoreConfig(ProxyScoreConfig):
+    """Three-camera score proxy for an egocentric view and both wrists."""
+
+    image_keys: tuple[str, ...] = BIMANUAL_IMAGE_KEYS

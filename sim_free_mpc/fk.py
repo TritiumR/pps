@@ -137,10 +137,15 @@ def inverse_transform_points_wxyz(
 
 def _matrix_to_quat_wxyz(matrix: torch.Tensor) -> torch.Tensor:
     m = matrix[:, :3, :3]
-    qw = 0.5 * torch.sqrt(torch.clamp(1.0 + m[:, 0, 0] + m[:, 1, 1] + m[:, 2, 2], min=0.0))
-    qx = 0.5 * torch.sqrt(torch.clamp(1.0 + m[:, 0, 0] - m[:, 1, 1] - m[:, 2, 2], min=0.0))
-    qy = 0.5 * torch.sqrt(torch.clamp(1.0 - m[:, 0, 0] + m[:, 1, 1] - m[:, 2, 2], min=0.0))
-    qz = 0.5 * torch.sqrt(torch.clamp(1.0 - m[:, 0, 0] - m[:, 1, 1] + m[:, 2, 2], min=0.0))
+    # A zero clamp is fine for inference, but sqrt'(0) is infinite and turns
+    # otherwise finite cost gradients into NaNs when differentiating through
+    # FK. The tiny positive floor preserves the represented rotation after
+    # normalization while keeping the backward pass finite.
+    quat_floor = torch.finfo(m.dtype).tiny
+    qw = 0.5 * torch.sqrt(torch.clamp(1.0 + m[:, 0, 0] + m[:, 1, 1] + m[:, 2, 2], min=quat_floor))
+    qx = 0.5 * torch.sqrt(torch.clamp(1.0 + m[:, 0, 0] - m[:, 1, 1] - m[:, 2, 2], min=quat_floor))
+    qy = 0.5 * torch.sqrt(torch.clamp(1.0 - m[:, 0, 0] + m[:, 1, 1] - m[:, 2, 2], min=quat_floor))
+    qz = 0.5 * torch.sqrt(torch.clamp(1.0 - m[:, 0, 0] - m[:, 1, 1] + m[:, 2, 2], min=quat_floor))
 
     qx = torch.copysign(qx, m[:, 2, 1] - m[:, 1, 2])
     qy = torch.copysign(qy, m[:, 0, 2] - m[:, 2, 0])
