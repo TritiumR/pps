@@ -1,17 +1,10 @@
 # Proxy Policy Steering
 
-Steer a pretrained pi0 / pi0.5 VLA policy toward a specific task using a pair of
-small **proxy** models, and evaluate the result in IsaacLab manipulation scenes.
-
 **[Project page](https://ppsteering.github.io/)** ·
 **[Assets](https://huggingface.co/datasets/Tritiumac/PPS_assets)** ·
 **[Checkpoints](https://huggingface.co/Tritiumac/PPS_checkpoints)**
 
-<a href="https://github.com/TritiumR/pps/blob/main/media/teaser.mp4">
-  <img src="media/teaser_poster.jpg" alt="Proxy Policy Steering - teaser video" width="720">
-</a>
-
-<sub><b>▶ Click the image to play the teaser</b> (18 s) &middot; <a href="https://github.com/TritiumR/pps/raw/main/media/teaser.mp4">direct download</a></sub>
+<img src="media/teaser.gif" alt="Proxy Policy Steering" width="720">
 
 ## How it works
 
