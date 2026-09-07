@@ -7,9 +7,11 @@ small **proxy** models, and evaluate the result in IsaacLab manipulation scenes.
 **[Assets](https://huggingface.co/datasets/Tritiumac/PPS_assets)** ·
 **[Checkpoints](https://huggingface.co/Tritiumac/PPS_checkpoints)**
 
-<video src="https://github.com/TritiumR/pps/raw/main/media/teaser.mp4" controls muted loop playsinline width="720"></video>
+<a href="https://github.com/TritiumR/pps/blob/main/media/teaser.mp4">
+  <img src="media/teaser_poster.jpg" alt="Proxy Policy Steering - teaser video" width="720">
+</a>
 
-[▶ Watch the teaser](https://github.com/TritiumR/pps/raw/main/media/teaser.mp4)
+<sub><b>▶ Click the image to play the teaser</b> (18 s) &middot; <a href="https://github.com/TritiumR/pps/raw/main/media/teaser.mp4">direct download</a></sub>
 
 ## How it works
 
