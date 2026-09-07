@@ -1,6 +1,6 @@
 # Proxy Policy Steering
 
-Project page: https://proxy-policy-steering.github.io/
+Project page: https://ppsteering.github.io/
 
 ## Prerequisites
 
