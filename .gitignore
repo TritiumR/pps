@@ -10,6 +10,8 @@ core.*
 _wandb
 /droid/results
 *.mp4
+# ...except the README demo clip, which is committed on purpose.
+!media/*.mp4
 # IsaacLab scene/object assets (large, not committed)
 IsaacLab/assets
 similarity
