@@ -44,7 +44,7 @@ IsaacLab/              bundled IsaacLab, code only
   assets/              (not committed) scene + object USDs live here
 
 droid/                 real-robot stack
-media/teaser.mp4       the clip above
+media/teaser.gif       the clip above
 ```
 
 ## Setup
