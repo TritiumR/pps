@@ -103,6 +103,10 @@ class RectifiedFlowMBDConfig:
     smc_beta_tolerance: float = 1e-4
     smc_max_tempering_stages: int = 64
     record_proposal_zero_candidate: bool = False
+    replicated_snis_groups: int = 1
+    replicated_snis_exact_quality_guard: bool = True
+    replicated_snis_blend: float = 1.0
+    first_order_proxy_exact_quality_guard: bool = True
 
     def validate(self) -> None:
         if int(self.proposals_per_particle) < 1:
@@ -111,6 +115,10 @@ class RectifiedFlowMBDConfig:
             raise ValueError("temperature must be positive")
         if float(self.proposal_std) <= 0.0:
             raise ValueError("proposal_std must be positive")
+        if int(self.replicated_snis_groups) < 1:
+            raise ValueError("replicated_snis_groups must be positive")
+        if not 0.0 <= float(self.replicated_snis_blend) <= 1.0:
+            raise ValueError("replicated_snis_blend must be in [0, 1]")
         if self.proposal_sampler not in ("clipped_gaussian", "truncated_gaussian"):
             raise ValueError(
                 "proposal_sampler must be 'clipped_gaussian' or 'truncated_gaussian'"
@@ -280,6 +288,29 @@ class LocalQuadraticGaussianProposal:
     damping: float = 1.0e-4
 
 
+@dataclass(frozen=True)
+class FirstOrderGaussianProposal:
+    """Defensive exact-IS proposal shaped by one local cost gradient.
+
+    A linear cost tilt shifts an isotropic Gaussian mean by
+    ``-variance * gradient / temperature``.  The shifted component is mixed
+    with the original likelihood and the exact mixture density is included in
+    every importance weight.  The gradient therefore changes finite-sample
+    variance only: the estimator retains full support and converges to the
+    same Tweedie posterior mean even when the gradient comes from a cheaper,
+    imperfect dynamics model such as ARX.
+    """
+
+    gradient: torch.Tensor
+    cost_at_reference: torch.Tensor | None = None
+    reference: torch.Tensor | None = None
+    defensive_fraction: float = 0.25
+    max_shift_standard_deviations: float = 0.75
+    shifted_center_override: torch.Tensor | None = None
+    shifted_scale_multiplier: float = 1.0
+    use_control_variate: bool = True
+
+
 def logmeanexp(values: np.ndarray, axis: int) -> np.ndarray:
     values = np.asarray(values, dtype=np.float64)
     maximum = np.max(values, axis=axis, keepdims=True)
@@ -436,6 +467,8 @@ def sample_independent_truncated_gaussian(
     upper: torch.Tensor,
     num_samples: int,
     generator: torch.Generator,
+    antithetic: bool = False,
+    uniform_samples: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sample an exact axis-aligned truncated Gaussian with inverse CDF."""
     if center.ndim != 2:
@@ -446,18 +479,68 @@ def sample_independent_truncated_gaussian(
     center64 = center.to(dtype=work_dtype)
     lower64 = lower.to(device=center.device, dtype=work_dtype)
     upper64 = upper.to(device=center.device, dtype=work_dtype)
+    if bool(torch.any(upper64 < lower64).item()):
+        raise RuntimeError("truncated Gaussian has an empty support interval")
+    fixed = upper64 == lower64
+    if bool(torch.any(fixed).item()):
+        # Constant training-action coordinates carry a unit point mass, as in
+        # bounded_gaussian_log_prob. Sample only the nonconstant subspace.
+        samples = lower64[None, None, :].expand(
+            int(center.shape[0]), int(num_samples), int(center.shape[1])
+        ).clone().to(dtype=center.dtype)
+        varying = ~fixed
+        if bool(torch.any(varying).item()):
+            samples[..., varying] = sample_independent_truncated_gaussian(
+                center[:, varying], scale=scale, lower=lower64[varying],
+                upper=upper64[varying], num_samples=num_samples, generator=generator,
+                antithetic=antithetic,
+                uniform_samples=(
+                    None if uniform_samples is None else uniform_samples[..., varying]
+                ),
+            )
+        return samples
     scale64 = torch.as_tensor(float(scale), device=center.device, dtype=work_dtype)
     sqrt_two = math.sqrt(2.0)
     standardized_lower = (lower64[None, :] - center64) / scale64
     standardized_upper = (upper64[None, :] - center64) / scale64
     if bool(torch.any(standardized_upper <= standardized_lower).item()):
         raise RuntimeError("truncated Gaussian has an empty support interval")
-    uniform = torch.rand(
-        (int(center.shape[0]), int(num_samples), int(center.shape[1])),
-        device=center.device,
-        dtype=work_dtype,
-        generator=generator,
+    uniform_shape = (int(center.shape[0]), int(center.shape[1]))
+    expected_uniform_shape = (
+        uniform_shape[0], int(num_samples), uniform_shape[1]
     )
+    if uniform_samples is not None:
+        if tuple(uniform_samples.shape) != expected_uniform_shape:
+            raise ValueError(
+                "uniform_samples must match [particles, samples, dimensions]"
+            )
+        uniform = uniform_samples.to(device=center.device, dtype=work_dtype)
+    elif antithetic and int(num_samples) >= 2:
+        pair_count = int(num_samples) // 2
+        primary = torch.rand(
+            (uniform_shape[0], pair_count, uniform_shape[1]),
+            device=center.device,
+            dtype=work_dtype,
+            generator=generator,
+        )
+        uniform = torch.cat((primary, 1.0 - primary), dim=1)
+        if int(num_samples) % 2:
+            uniform = torch.cat((
+                uniform,
+                torch.rand(
+                    (uniform_shape[0], 1, uniform_shape[1]),
+                    device=center.device,
+                    dtype=work_dtype,
+                    generator=generator,
+                ),
+            ), dim=1)
+    else:
+        uniform = torch.rand(
+            (uniform_shape[0], int(num_samples), uniform_shape[1]),
+            device=center.device,
+            dtype=work_dtype,
+            generator=generator,
+        )
     epsilon = torch.finfo(work_dtype).eps
     uniform = uniform.clamp(epsilon, 1.0 - epsilon)
 
@@ -707,6 +790,317 @@ def sample_local_quadratic_gaussian_proposals(
     return candidates, log_density_ratio, diagnostics
 
 
+def sample_first_order_gaussian_proposals(
+    center: torch.Tensor,
+    *,
+    gradient: torch.Tensor,
+    temperature: float,
+    scale: float,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    num_samples: int,
+    generator: torch.Generator,
+    defensive_fraction: float = 0.25,
+    max_shift_standard_deviations: float = 0.75,
+    shifted_center_override: torch.Tensor | None = None,
+    shifted_scale_multiplier: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+    """Sample a trust-region linear tilt with exact mixture correction.
+
+    This is deliberately O(PWD): unlike the local-quadratic proposal it does
+    not factor a dense Hessian.  That makes a cheap ARX gradient useful even
+    when the proposal costs themselves come from MJX/MJWarp.
+    """
+    if center.ndim != 3 or gradient.shape != center.shape:
+        raise ValueError("first-order center/gradient must have shape [P,W,D]")
+    if int(num_samples) < 2:
+        raise ValueError("first-order proposals require at least two samples")
+    if not 0.0 < float(defensive_fraction) < 1.0:
+        raise ValueError("first-order defensive fraction must lie in (0,1)")
+    if (
+        float(temperature) <= 0.0
+        or float(scale) <= 0.0
+        or float(max_shift_standard_deviations) <= 0.0
+        or float(shifted_scale_multiplier) <= 0.0
+    ):
+        raise ValueError("first-order temperature/scale/trust region must be positive")
+    if not bool(torch.all(torch.isfinite(gradient)).item()):
+        raise ValueError("first-order gradient must be finite")
+
+    raw_shift = -float(scale) ** 2 * gradient / float(temperature)
+    flat_shift = raw_shift.flatten(start_dim=1)
+    raw_shift_norm = torch.linalg.vector_norm(flat_shift, dim=1).clamp_min(1.0e-12)
+    maximum_norm = float(max_shift_standard_deviations) * float(scale)
+    trust_scale = torch.clamp(maximum_norm / raw_shift_norm, max=1.0)
+    shift = raw_shift * trust_scale.reshape(-1, 1, 1)
+    shifted_center = center + shift
+    if shifted_center_override is not None:
+        if shifted_center_override.shape != center.shape:
+            raise ValueError("shifted center override must match proposal center")
+        shifted_center = shifted_center_override.to(
+            device=center.device, dtype=center.dtype
+        )
+        shift = shifted_center - center
+    shifted_scale = float(scale) * float(shifted_scale_multiplier)
+
+    defensive_count = max(1, min(
+        int(num_samples) - 1,
+        int(round(float(num_samples) * float(defensive_fraction))),
+    ))
+    shifted_count = int(num_samples) - defensive_count
+    defensive = sample_trajectory_proposals(
+        center,
+        scale=float(scale),
+        lower=lower,
+        upper=upper,
+        num_samples=defensive_count,
+        sampler="truncated_gaussian",
+        generator=generator,
+        include_center=False,
+        quasi_random=True,
+    )
+    tilted = sample_trajectory_proposals(
+        shifted_center,
+        scale=shifted_scale,
+        lower=lower,
+        upper=upper,
+        num_samples=shifted_count,
+        sampler="truncated_gaussian",
+        generator=generator,
+        include_center=False,
+        quasi_random=True,
+    )
+    candidates = torch.cat((defensive, tilted), dim=1)
+    base_log = bounded_gaussian_log_prob(
+        candidates,
+        center=center,
+        scale=float(scale),
+        lower=lower,
+        upper=upper,
+        sampler="truncated_gaussian",
+    )
+    shifted_log = bounded_gaussian_log_prob(
+        candidates,
+        center=shifted_center,
+        scale=shifted_scale,
+        lower=lower,
+        upper=upper,
+        sampler="truncated_gaussian",
+    )
+    base_fraction = float(defensive_count) / float(num_samples)
+    proposal_log = torch.logaddexp(
+        base_log + math.log(base_fraction),
+        shifted_log + math.log(1.0 - base_fraction),
+    )
+    return candidates, base_log - proposal_log, {
+        "first_order_gaussian": True,
+        "randomized_qmc_within_components": "scrambled_sobol",
+        "defensive_fraction": base_fraction,
+        "defensive_count": defensive_count,
+        "shifted_count": shifted_count,
+        "base_variance": float(scale) ** 2,
+        "shifted_variance": shifted_scale ** 2,
+        "shifted_scale_multiplier": float(shifted_scale_multiplier),
+        "shifted_center_override": shifted_center_override is not None,
+        "raw_mean_shift_rms": torch.sqrt(
+            flat_shift.square().mean(dim=1)
+        ).tolist(),
+        "mean_shift_rms": torch.sqrt(
+            shift.flatten(start_dim=1).square().mean(dim=1)
+        ).tolist(),
+        "trust_scale": trust_scale.tolist(),
+        "mean_shift_mahalanobis_norm": (
+            torch.linalg.vector_norm(shift.flatten(start_dim=1), dim=1)
+            / float(scale)
+        ).tolist(),
+        "max_shift_standard_deviations": float(max_shift_standard_deviations),
+        "gradient_source": "caller_supplied_may_be_low_fidelity",
+        "importance_target": "unchanged_base_gaussian",
+    }
+
+
+def _truncated_gaussian_partition_and_mean(
+    center: torch.Tensor,
+    *,
+    scale: float,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return log box probability and mean for independent Gaussians."""
+    dtype = torch.float64
+    mean = center.to(dtype=dtype)
+    lo = lower.to(device=center.device, dtype=dtype).reshape(1, 1, -1)
+    hi = upper.to(device=center.device, dtype=dtype).reshape(1, 1, -1)
+    sigma = torch.as_tensor(float(scale), device=center.device, dtype=dtype)
+    fixed = hi == lo
+    z_lo = (lo - mean) / sigma
+    z_hi = (hi - mean) / sigma
+    log_cdf_lo = torch.special.log_ndtr(z_lo)
+    log_cdf_hi = torch.special.log_ndtr(z_hi)
+    ratio = torch.clamp(
+        log_cdf_lo - log_cdf_hi, max=-torch.finfo(dtype).eps
+    )
+    coordinate_log_z = log_cdf_hi + torch.log1p(-torch.exp(ratio))
+    coordinate_log_z = torch.where(
+        fixed, torch.zeros_like(coordinate_log_z), coordinate_log_z
+    )
+    log_phi_lo = -0.5 * z_lo.square() - 0.5 * math.log(2.0 * math.pi)
+    log_phi_hi = -0.5 * z_hi.square() - 0.5 * math.log(2.0 * math.pi)
+    standardized_mean = (
+        torch.exp(log_phi_lo - coordinate_log_z)
+        - torch.exp(log_phi_hi - coordinate_log_z)
+    )
+    truncated_mean = mean + sigma * standardized_mean
+    truncated_mean = torch.where(fixed, lo.expand_as(mean), truncated_mean)
+    return coordinate_log_z.flatten(start_dim=1).sum(dim=1), truncated_mean
+
+
+def _cross_fitted_first_order_control_variate_mean(
+    candidates: torch.Tensor,
+    *,
+    reward_logits: np.ndarray,
+    log_base_over_proposal: torch.Tensor,
+    center: torch.Tensor,
+    scale: float,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    temperature: float,
+    proposal: FirstOrderGaussianProposal,
+) -> tuple[torch.Tensor | None, dict[str, Any]]:
+    """Estimate exact posterior moments with a linear-cost control variate.
+
+    Regression coefficients are learned on the opposite parity fold, so each
+    corrected unnormalized moment remains unbiased conditional on its training
+    fold. The final ratio has only the ordinary finite-sample ratio bias and is
+    consistent for the exact-cost posterior, regardless of surrogate quality.
+    """
+    count = int(candidates.shape[1])
+    if count < 4 or proposal.cost_at_reference is None:
+        return None, {"first_order_control_variate": False, "reason": "missing_moments"}
+    reference = center if proposal.reference is None else proposal.reference
+    if reference.shape != center.shape:
+        raise ValueError("first-order reference must match the proposal center")
+    cost_at_reference = proposal.cost_at_reference.reshape(-1).to(
+        device=center.device, dtype=torch.float64
+    )
+    if int(cost_at_reference.numel()) != int(center.shape[0]):
+        raise ValueError("first-order reference cost must have one value per particle")
+
+    center64 = center.to(dtype=torch.float64)
+    gradient = proposal.gradient.to(device=center.device, dtype=torch.float64)
+    reference64 = reference.to(device=center.device, dtype=torch.float64)
+    raw_shift = -float(scale) ** 2 * gradient / float(temperature)
+    shift_norm = torch.linalg.vector_norm(
+        raw_shift.flatten(start_dim=1), dim=1
+    ).clamp_min(1.0e-12)
+    maximum_norm = (
+        float(proposal.max_shift_standard_deviations) * float(scale)
+    )
+    trust_scale = torch.clamp(maximum_norm / shift_norm, max=1.0)
+    effective_gradient = gradient * trust_scale.reshape(-1, 1, 1)
+    shifted_center = (
+        center64
+        - float(scale) ** 2 * effective_gradient / float(temperature)
+    )
+    base_log_z, _ = _truncated_gaussian_partition_and_mean(
+        center64, scale=scale, lower=lower, upper=upper
+    )
+    shifted_log_z, shifted_mean = _truncated_gaussian_partition_and_mean(
+        shifted_center, scale=scale, lower=lower, upper=upper
+    )
+    center_offset = (
+        (center64 - reference64) * effective_gradient
+    ).flatten(start_dim=1).sum(1)
+    gradient_sq = effective_gradient.flatten(start_dim=1).square().sum(1)
+    linear_log_partition = (
+        -cost_at_reference / float(temperature)
+        - center_offset / float(temperature)
+        + 0.5 * float(scale) ** 2 * gradient_sq / float(temperature) ** 2
+        + shifted_log_z
+        - base_log_z
+    )
+    values = candidates.to(dtype=torch.float64).flatten(start_dim=2)
+    linear_cost = cost_at_reference[:, None] + torch.sum(
+        effective_gradient[:, None].flatten(start_dim=2)
+        * (values - reference64[:, None].flatten(start_dim=2)),
+        dim=-1,
+    )
+    log_v = (
+        log_base_over_proposal.to(dtype=torch.float64)
+        - linear_cost / float(temperature)
+    )
+    log_u = torch.as_tensor(
+        reward_logits, device=center.device, dtype=torch.float64
+    )
+    corrected: list[torch.Tensor] = []
+    denominator_values: list[float] = []
+    fallback_particles: list[int] = []
+    epsilon = torch.finfo(torch.float64).eps
+    for particle in range(int(center.shape[0])):
+        finite_u = log_u[particle][torch.isfinite(log_u[particle])]
+        common = torch.max(torch.cat((
+            finite_u,
+            log_v[particle],
+            linear_log_partition[particle, None],
+        )))
+        u = torch.exp(log_u[particle] - common)
+        v = torch.exp(log_v[particle] - common)
+        expected_v = torch.exp(linear_log_partition[particle] - common)
+        y = values[particle]
+        expected_vy = expected_v * shifted_mean[particle].reshape(-1)
+        fold_estimates_b: list[torch.Tensor] = []
+        fold_estimates_a: list[torch.Tensor] = []
+        for parity in (0, 1):
+            test_index = torch.arange(parity, count, 2, device=center.device)
+            train_index = torch.arange(1 - parity, count, 2, device=center.device)
+            train_v = v[train_index]
+            train_u = u[train_index]
+            centered_v = train_v - train_v.mean()
+            variance_v = torch.sum(centered_v.square()).clamp_min(epsilon)
+            beta_b = torch.sum(
+                centered_v * (train_u - train_u.mean())
+            ) / variance_v
+            fold_estimates_b.append(
+                torch.mean(u[test_index] - beta_b * (v[test_index] - expected_v))
+            )
+            train_h = v[train_index, None] * y[train_index]
+            train_x = u[train_index, None] * y[train_index]
+            centered_h = train_h - train_h.mean(dim=0)
+            variance_h = torch.sum(centered_h.square(), dim=0).clamp_min(epsilon)
+            beta_a = torch.sum(
+                centered_h * (train_x - train_x.mean(dim=0)), dim=0
+            ) / variance_h
+            fold_estimates_a.append(torch.mean(
+                u[test_index, None] * y[test_index]
+                - beta_a * (v[test_index, None] * y[test_index] - expected_vy),
+                dim=0,
+            ))
+        estimate_b = torch.stack(fold_estimates_b).mean()
+        estimate_a = torch.stack(fold_estimates_a).mean(dim=0)
+        if not bool(torch.isfinite(estimate_b).item()) or float(estimate_b.item()) <= 0.0:
+            fallback_particles.append(particle)
+            corrected.append(torch.empty(0, device=center.device, dtype=torch.float64))
+            denominator_values.append(float("nan"))
+        else:
+            corrected.append(estimate_a / estimate_b)
+            denominator_values.append(float(estimate_b.item()))
+    if fallback_particles:
+        return None, {
+            "first_order_control_variate": False,
+            "reason": "nonpositive_corrected_partition",
+            "fallback_particles": fallback_particles,
+        }
+    mean = torch.stack(corrected).reshape_as(center64).to(dtype=center.dtype)
+    return mean, {
+        "first_order_control_variate": True,
+        "method": "two_fold_cross_fitted_unnormalized_moments",
+        "corrected_partition_scaled": denominator_values,
+        "surrogate": "local_linear_cost_with_analytic_truncated_gaussian_moments",
+        "asymptotic_target": "exact_cost_tweedie_posterior",
+        "trust_scale": trust_scale.tolist(),
+    }
+
+
 def sample_trajectory_proposals(
     center: torch.Tensor,
     *,
@@ -717,12 +1111,40 @@ def sample_trajectory_proposals(
     sampler: str,
     generator: torch.Generator,
     include_center: bool = True,
+    antithetic: bool = False,
+    quasi_random: bool = False,
 ) -> torch.Tensor:
     """Sample ``[particle, proposal, pose, joint]`` clean trajectories."""
     if center.ndim != 3:
         raise ValueError("trajectory center must have shape [P,W,D]")
     particles, poses, action_dim = center.shape
     if sampler == "truncated_gaussian":
+        uniform_samples = None
+        if quasi_random:
+            sobol_dimension = int(poses * action_dim)
+            if sobol_dimension > 21_201:
+                raise ValueError(
+                    "Sobol proposal dimension exceeds Torch's 21201 limit"
+                )
+            particle_uniforms = []
+            for _ in range(int(particles)):
+                sobol_seed = int(torch.randint(
+                    0,
+                    2**31 - 1,
+                    (1,),
+                    device=center.device,
+                    generator=generator,
+                ).item())
+                values = torch.quasirandom.SobolEngine(
+                    sobol_dimension, scramble=True, seed=sobol_seed
+                ).draw(int(num_samples), dtype=torch.float64)
+                particle_uniforms.append(values.reshape(
+                    int(num_samples), int(poses), int(action_dim)
+                ))
+            uniform_samples = torch.stack(particle_uniforms).to(center.device)
+            uniform_samples = uniform_samples.permute(0, 2, 1, 3).reshape(
+                int(particles * poses), int(num_samples), int(action_dim)
+            )
         flattened = sample_independent_truncated_gaussian(
             center.reshape(particles * poses, action_dim),
             scale=scale,
@@ -730,6 +1152,8 @@ def sample_trajectory_proposals(
             upper=upper,
             num_samples=num_samples,
             generator=generator,
+            antithetic=antithetic,
+            uniform_samples=uniform_samples,
         )
         candidates = flattened.reshape(
             particles, poses, num_samples, action_dim
@@ -1131,6 +1555,430 @@ def sample_autoregressive_waypoint_proposals(
         candidates[:, :, waypoint_index, :dims] = sampled
         previous = sampled
     return candidates
+
+
+def _standard_normal_log_interval(
+    lower: torch.Tensor, upper: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Stable log[Phi(upper)-Phi(lower)] using upper-tail symmetry."""
+    if lower.dtype != torch.float64 or upper.dtype != torch.float64:
+        raise ValueError("standard-normal interval inputs must be float64")
+    reflect = lower >= 0.0
+    lo = torch.where(reflect, -upper, lower)
+    hi = torch.where(reflect, -lower, upper)
+    log_lo = torch.special.log_ndtr(lo)
+    log_hi = torch.special.log_ndtr(hi)
+    delta = torch.clamp(
+        log_lo - log_hi, max=-torch.finfo(torch.float64).eps
+    )
+    log_one_minus = torch.where(
+        delta < -math.log(2.0),
+        torch.log1p(-torch.exp(delta)),
+        torch.log(-torch.expm1(delta)),
+    )
+    return log_hi + log_one_minus, log_lo, reflect
+
+
+def _sample_truncated_standard_normal(
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    *,
+    generator: torch.Generator,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Inverse-CDF sampling stable in either Gaussian tail."""
+    log_interval, log_lo, reflect = _standard_normal_log_interval(lower, upper)
+    eps = torch.finfo(torch.float64).eps
+    uniform = torch.rand(
+        lower.shape,
+        device=lower.device,
+        dtype=torch.float64,
+        generator=generator,
+    ).clamp(eps, 1.0 - eps)
+    log_probability = torch.logaddexp(log_lo, torch.log(uniform) + log_interval)
+    probability = torch.exp(log_probability).clamp(
+        torch.finfo(torch.float64).tiny, 1.0 - eps
+    )
+    standardized = torch.special.ndtri(probability)
+    # Inverse CDF cannot represent probabilities below the float64 subnormal
+    # range. Sample those one-sided tails exactly with Robert's exponential
+    # rejection proposal, truncated at the finite upper endpoint when needed.
+    transformed_lo = torch.where(reflect, -upper, lower)
+    transformed_hi = torch.where(reflect, -lower, upper)
+    tail = transformed_hi < -5.0
+    if bool(torch.any(tail).item()):
+        positive_lower = -transformed_hi
+        positive_upper = -transformed_lo
+        alpha = 0.5 * (
+            positive_lower + torch.sqrt(positive_lower.square() + 4.0)
+        )
+        accepted = ~tail
+        tail_sample = torch.zeros_like(standardized)
+        for _ in range(256):
+            if bool(torch.all(accepted).item()):
+                break
+            draw_u = torch.rand(
+                lower.shape,
+                device=lower.device,
+                dtype=torch.float64,
+                generator=generator,
+            ).clamp(eps, 1.0 - eps)
+            width = positive_upper - positive_lower
+            exponential_mass = -torch.expm1(-alpha * width)
+            proposal = positive_lower - torch.log1p(
+                -draw_u * exponential_mass
+            ) / alpha
+            mode = torch.minimum(
+                positive_upper, torch.maximum(positive_lower, alpha)
+            )
+            log_acceptance = (
+                -0.5 * (proposal - alpha).square()
+                + 0.5 * (mode - alpha).square()
+            )
+            draw_v = torch.rand(
+                lower.shape,
+                device=lower.device,
+                dtype=torch.float64,
+                generator=generator,
+            ).clamp_min(torch.finfo(torch.float64).tiny)
+            take = (~accepted) & (torch.log(draw_v) <= log_acceptance)
+            tail_sample = torch.where(take, proposal, tail_sample)
+            accepted |= take
+        if not bool(torch.all(accepted).item()):
+            raise RuntimeError("far-tail truncated Gaussian rejection did not converge")
+        standardized = torch.where(tail, -tail_sample, standardized)
+    standardized = torch.where(reflect, -standardized, standardized)
+    return standardized, log_interval
+
+
+def sample_joint_covariance_smoothness_gaussian_proposals(
+    center: torch.Tensor,
+    *,
+    alternate_center: torch.Tensor,
+    initial: torch.Tensor,
+    previous: torch.Tensor | None,
+    physical_scale: torch.Tensor,
+    joint_covariance: torch.Tensor,
+    dense_basis: torch.Tensor,
+    dense_residual: torch.Tensor,
+    smoothness_weight: float,
+    velocity_smoothness_weight: float,
+    boundary_acceleration_weight: float,
+    difference_order: int,
+    temperature: float,
+    scale: float,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    num_samples: int,
+    generator: torch.Generator,
+    autoregressive_bounds_fn: Any,
+    include_central_trajectory: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+    """Sample a full joint-covariance knot Gaussian with exact q density.
+
+    The base covariance can vary by particle and knot and is combined with
+    the physical first-difference smoothness quadratic in one ``K*D`` Gaussian.
+    Joint/waypoint bounds are imposed through scalar Gaussian conditionals in
+    knot-major order.  Their history-dependent normalizers are included in
+    the returned deterministic-mixture proposal density.
+    """
+    if center.ndim != 3 or alternate_center.shape != center.shape:
+        raise ValueError("joint-covariance centers must have shape [P,K,D]")
+    particles, knots, action_dim = center.shape
+    if joint_covariance.shape != (particles, knots, action_dim, action_dim):
+        raise ValueError("joint covariance must have shape [P,K,D,D]")
+    if int(num_samples) < 2 or float(scale) <= 0.0:
+        raise ValueError("joint-covariance proposal requires 2+ samples and positive scale")
+    if float(smoothness_weight) <= 0.0 or float(temperature) <= 0.0:
+        raise ValueError("joint-covariance smoothness/temperature must be positive")
+    if int(difference_order) not in (1, 3):
+        raise ValueError("joint-covariance difference order must be 1 or 3")
+    if float(velocity_smoothness_weight) < 0.0:
+        raise ValueError("joint-covariance velocity weight must be nonnegative")
+    if float(boundary_acceleration_weight) < 0.0:
+        raise ValueError("joint-covariance boundary acceleration must be nonnegative")
+    initial = initial.to(device=center.device, dtype=center.dtype).reshape(
+        particles, action_dim
+    )
+    physical_scale = physical_scale.to(
+        device=center.device, dtype=center.dtype
+    ).reshape(action_dim)
+    if dense_basis.ndim != 2 or dense_basis.shape[1] != knots:
+        raise ValueError("dense knot basis must have shape [H,K]")
+    horizon = int(dense_basis.shape[0])
+    dense_basis = dense_basis.to(device=center.device, dtype=center.dtype)
+    dense_residual = dense_residual.to(device=center.device, dtype=center.dtype)
+    if dense_residual.shape != (particles, horizon, action_dim):
+        raise ValueError("dense residual must have shape [P,H,D]")
+    covariance_shape = 0.5 * (
+        joint_covariance + joint_covariance.transpose(-1, -2)
+    )
+    base_precision = torch.linalg.inv(covariance_shape) / float(scale) ** 2
+    dimensions = int(knots * action_dim)
+    precision = torch.zeros(
+        (particles, dimensions, dimensions),
+        device=center.device,
+        dtype=center.dtype,
+    )
+    rhs = torch.einsum("pkij,pkj->pki", base_precision, center).reshape(
+        particles, dimensions
+    )
+    for knot_index in range(knots):
+        start = knot_index * action_dim
+        precision[:, start : start + action_dim, start : start + action_dim] = (
+            base_precision[:, knot_index]
+        )
+
+    time_index = torch.arange(knots, device=center.device) * action_dim
+    smooth_rhs = torch.zeros_like(center)
+
+    def add_quadratic(
+        operator: torch.Tensor,
+        anchor: torch.Tensor,
+        weight: float,
+    ) -> None:
+        if float(weight) <= 0.0:
+            return
+        rows = int(operator.shape[0])
+        curvature = (
+            2.0
+            * float(weight)
+            * physical_scale.square()
+            / float(rows * action_dim * temperature)
+        )
+        temporal_precision = operator.T @ operator
+        smooth_rhs.add_(
+            -torch.einsum("d,ij,pjd->pid", curvature, operator.T, anchor)
+        )
+        for joint_index in range(action_dim):
+            flat_index = time_index + joint_index
+            precision[:, flat_index[:, None], flat_index[None, :]] += (
+                curvature[joint_index] * temporal_precision
+            )
+
+    velocity_difference = torch.eye(
+        horizon, device=center.device, dtype=center.dtype
+    )
+    if horizon > 1:
+        dense_indices = torch.arange(1, horizon, device=center.device)
+        velocity_difference[dense_indices, dense_indices - 1] = -1.0
+    velocity_operator = velocity_difference @ dense_basis
+    velocity_anchor = torch.einsum(
+        "ij,pjd->pid", velocity_difference, dense_residual
+    )
+    velocity_anchor[:, 0] -= initial
+    if int(difference_order) == 1:
+        add_quadratic(velocity_operator, velocity_anchor, smoothness_weight)
+    else:
+        if horizon > 2:
+            acceleration_difference = torch.zeros(
+                (horizon - 2, horizon),
+                device=center.device,
+                dtype=center.dtype,
+            )
+            acceleration_index = torch.arange(
+                horizon - 2, device=center.device
+            )
+            acceleration_difference[acceleration_index, acceleration_index] = 1.0
+            acceleration_difference[acceleration_index, acceleration_index + 1] = -2.0
+            acceleration_difference[acceleration_index, acceleration_index + 2] = 1.0
+            add_quadratic(
+                acceleration_difference @ dense_basis,
+                torch.einsum(
+                    "ij,pjd->pid", acceleration_difference, dense_residual
+                ),
+                smoothness_weight,
+            )
+        add_quadratic(
+            velocity_operator, velocity_anchor, velocity_smoothness_weight
+        )
+    if float(boundary_acceleration_weight) > 0.0 and previous is not None:
+        previous = previous.to(device=center.device, dtype=center.dtype).reshape(
+            particles, action_dim
+        )
+        boundary_anchor = (
+            dense_residual[:, :1] - 2.0 * initial[:, None] + previous[:, None]
+        )
+        add_quadratic(
+            dense_basis[:1], boundary_anchor, boundary_acceleration_weight
+        )
+    rhs += smooth_rhs.reshape(particles, dimensions)
+    precision = 0.5 * (precision + precision.transpose(-1, -2))
+    posterior_covariance = torch.linalg.inv(precision)
+    posterior_covariance = 0.5 * (
+        posterior_covariance + posterior_covariance.transpose(-1, -2)
+    )
+    jitter = 8.0 * torch.finfo(center.dtype).eps
+    identity = torch.eye(dimensions, device=center.device, dtype=center.dtype)
+    cholesky = torch.linalg.cholesky(
+        posterior_covariance + jitter * identity[None]
+    )
+
+    def posterior_mean(base_center: torch.Tensor) -> torch.Tensor:
+        base_rhs = torch.einsum(
+            "pkij,pkj->pki", base_precision, base_center
+        ).reshape(particles, dimensions)
+        base_rhs += smooth_rhs.reshape(particles, dimensions)
+        return torch.linalg.solve(precision, base_rhs[..., None])[..., 0]
+
+    nominal_mean = posterior_mean(center)
+    alternate_mean = posterior_mean(alternate_center)
+    alternate_count = int(num_samples) // 2
+    nominal_count = int(num_samples) - alternate_count
+    component_mean = torch.cat(
+        (
+            nominal_mean[:, None].expand(-1, nominal_count, -1),
+            alternate_mean[:, None].expand(-1, alternate_count, -1),
+        ),
+        dim=1,
+    )
+    candidates_flat = torch.empty(
+        (particles, int(num_samples), dimensions),
+        device=center.device,
+        dtype=center.dtype,
+    )
+    conditional_locations = component_mean.clone()
+    sampled_lower = torch.empty_like(candidates_flat)
+    sampled_upper = torch.empty_like(candidates_flat)
+    previous = initial[:, None].expand(-1, int(num_samples), -1)
+    proposal_log_density_generating = torch.zeros(
+        (particles, int(num_samples)), device=center.device, dtype=torch.float64
+    )
+    for knot_index in range(knots):
+        local_lower = lower[None, None, :].expand(
+            particles, int(num_samples), action_dim
+        )
+        local_upper = upper[None, None, :].expand_as(local_lower)
+        local_lower, local_upper = autoregressive_bounds_fn(
+            knot_index, previous, local_lower, local_upper
+        )
+        knot_start = knot_index * action_dim
+        knot_stop = knot_start + action_dim
+        sampled_lower[:, :, knot_start:knot_stop] = local_lower
+        sampled_upper[:, :, knot_start:knot_stop] = local_upper
+        for joint_index in range(action_dim):
+            flat_index = knot_index * action_dim + joint_index
+            conditional_mean = conditional_locations[:, :, flat_index]
+            conditional_std = cholesky[:, flat_index, flat_index][:, None]
+            mean64 = conditional_mean.to(torch.float64)
+            std64 = conditional_std.to(torch.float64)
+            lo64 = local_lower[..., joint_index].to(torch.float64)
+            hi64 = local_upper[..., joint_index].to(torch.float64)
+            standardized, log_interval = _sample_truncated_standard_normal(
+                (lo64 - mean64) / std64,
+                (hi64 - mean64) / std64,
+                generator=generator,
+            )
+            if include_central_trajectory:
+                forced_value = center[:, knot_index, joint_index].to(torch.float64)
+                forced_value = torch.maximum(
+                    torch.minimum(forced_value, hi64[:, 0]), lo64[:, 0]
+                )
+                standardized[:, 0] = (
+                    forced_value - mean64[:, 0]
+                ) / std64[:, 0]
+            sampled = mean64 + std64 * standardized
+            sampled = torch.maximum(torch.minimum(sampled, hi64), lo64)
+            candidates_flat[:, :, flat_index] = sampled.to(center.dtype)
+            standardized_native = ((sampled - mean64) / std64).to(center.dtype)
+            if flat_index + 1 < dimensions:
+                conditional_locations[:, :, flat_index + 1:] += (
+                    standardized_native[..., None]
+                    * cholesky[:, None, flat_index + 1:, flat_index]
+                )
+            proposal_log_density_generating += (
+                -0.5 * standardized.square()
+                - torch.log(std64)
+                - 0.5 * math.log(2.0 * math.pi)
+                - log_interval
+            )
+        previous = candidates_flat[
+            :, :, knot_index * action_dim : (knot_index + 1) * action_dim
+        ]
+    candidates = candidates_flat.reshape(
+        particles, int(num_samples), knots, action_dim
+    )
+
+    bounds_lower_flat = sampled_lower.reshape(
+        particles, int(num_samples), dimensions
+    ).to(torch.float64)
+    bounds_upper_flat = sampled_upper.reshape(
+        particles, int(num_samples), dimensions
+    ).to(torch.float64)
+    diagonal = torch.diagonal(cholesky, dim1=-2, dim2=-1)
+    # Both mixture components share one covariance. Solve all 2N right-hand
+    # sides against the single factor instead of broadcasting that factor to
+    # [P,N,D,D]. This removes the dominant 1024-sample memory traffic.
+    component_means = torch.stack((nominal_mean, alternate_mean), dim=1)
+    delta = candidates_flat[:, None] - component_means[:, :, None]
+    solve_rhs = delta.permute(0, 3, 1, 2).reshape(
+        particles, dimensions, 2 * int(num_samples)
+    )
+    component_innovations = torch.linalg.solve_triangular(
+        cholesky, solve_rhs, upper=False
+    ).reshape(
+        particles, dimensions, 2, int(num_samples)
+    ).permute(0, 2, 3, 1)
+    # Given z=L^-1(x-m), each scalar conditional location is x_i-L_ii*z_i.
+    # Therefore all conditional locations and normalization intervals can be
+    # evaluated at once; no O(D) Python loop or prefix einsum is required.
+    conditional_mean = (
+        candidates_flat[:, None]
+        - component_innovations * diagonal[:, None, None]
+    ).to(torch.float64)
+    conditional_std = diagonal[:, None, None].to(torch.float64)
+    standardized_lower = (
+        bounds_lower_flat[:, None] - conditional_mean
+    ) / conditional_std
+    standardized_upper = (
+        bounds_upper_flat[:, None] - conditional_mean
+    ) / conditional_std
+    log_interval, _, _ = _standard_normal_log_interval(
+        standardized_lower, standardized_upper
+    )
+    component_log_density_all = torch.sum(
+        -0.5 * component_innovations.to(torch.float64).square()
+        - torch.log(conditional_std)
+        - 0.5 * math.log(2.0 * math.pi)
+        - log_interval,
+        dim=-1,
+    )
+    nominal_log_density = component_log_density_all[:, 0]
+    alternate_log_density = component_log_density_all[:, 1]
+    mixture_log_density = torch.logaddexp(
+        nominal_log_density + math.log(float(nominal_count) / float(num_samples)),
+        alternate_log_density + math.log(float(alternate_count) / float(num_samples)),
+    )
+    return candidates, mixture_log_density.to(center.dtype), {
+        "full_joint_covariance": True,
+        "smoothness_absorption": "exact_dense_quadratic_through_knot_basis",
+        "difference_order": int(difference_order),
+        "velocity_smoothness_weight": float(velocity_smoothness_weight),
+        "boundary_acceleration_weight": float(boundary_acceleration_weight),
+        "density": "exact_scalar_autoregressive_truncation_mixture",
+        "optimized_dimensions": dimensions,
+        "nominal_count": nominal_count,
+        "alternate_count": alternate_count,
+        "included_policy_center_trajectory": bool(include_central_trajectory),
+        "policy_center_projection_rms": float(
+            torch.sqrt(
+                torch.mean((candidates[:, 0] - center).square())
+            ).item()
+        ) if include_central_trajectory else None,
+        "generating_log_density_check_max_abs": float(
+            torch.max(torch.abs(
+                proposal_log_density_generating
+                - torch.where(
+                    torch.arange(int(num_samples), device=center.device)[None]
+                    < nominal_count,
+                    nominal_log_density,
+                    alternate_log_density,
+                )
+            )).item()
+        ),
+        "posterior_variance_mean": float(
+            posterior_covariance.diagonal(dim1=-2, dim2=-1).mean().item()
+        ),
+    }
 
 
 def sample_quadratic_smoothness_gaussian_proposals(
@@ -1910,6 +2758,7 @@ class RectifiedFlowMBD:
         quadratic_smoothness_proposal: (
             QuadraticSmoothnessGaussianProposal | None
         ) = None,
+        first_order_proposal: FirstOrderGaussianProposal | None = None,
         local_quadratic_proposal: LocalQuadraticGaussianProposal | None = None,
         proposal_log_acceptance_fn: ProposalLogAcceptance | None = None,
         proposal_prefilter_cost_fn: ProposalPrefilterCost | None = None,
@@ -2083,12 +2932,42 @@ class RectifiedFlowMBD:
                 raise ValueError(
                     "quadratic smoothness proposal owns its Gaussian center"
                 )
+        if first_order_proposal is not None:
+            if self.config.inference_sampler != "direct":
+                raise ValueError("first-order proposals require direct IS")
+            if self.config.proposal_sampler != "truncated_gaussian":
+                raise ValueError(
+                    "first-order proposals require truncated_gaussian"
+                )
+            if (
+                autoregressive
+                or quadratic_smoothness_proposal is not None
+                or (
+                    target_center is not None
+                    and persistent_proposal_bank is None
+                )
+                or mixture_with_target
+                or proposal_mixture_center is not None
+                or multi_center_mixture
+            ):
+                raise ValueError(
+                    "first-order proposal owns its proposal distribution"
+                )
+            if (
+                persistent_proposal_bank is not None
+                and first_order_proposal.use_control_variate
+            ):
+                raise ValueError(
+                    "persistent first-order mixtures do not support the "
+                    "local control variate"
+                )
         if local_quadratic_proposal is not None:
             if self.config.inference_sampler != "direct":
                 raise ValueError("local quadratic proposals require direct IS")
             if (
                 autoregressive
                 or quadratic_smoothness_proposal is not None
+                or first_order_proposal is not None
                 or target_center is not None
                 or mixture_with_target
                 or proposal_mixture_center is not None
@@ -2104,6 +2983,7 @@ class RectifiedFlowMBD:
                 proposal_log_acceptance_fn is not None
                 or autoregressive
                 or quadratic_smoothness_proposal is not None
+                or first_order_proposal is not None
                 or local_quadratic_proposal is not None
             ):
                 raise ValueError(
@@ -2115,6 +2995,7 @@ class RectifiedFlowMBD:
             if (
                 autoregressive
                 or quadratic_smoothness_proposal is not None
+                or first_order_proposal is not None
                 or local_quadratic_proposal is not None
             ):
                 raise ValueError(
@@ -2140,6 +3021,7 @@ class RectifiedFlowMBD:
         started = time.perf_counter()
         proposal_diagnostics: dict[str, Any] = {}
         smoothness_log_density_ratio: torch.Tensor | None = None
+        first_order_log_density_ratio: torch.Tensor | None = None
         local_quadratic_log_density_ratio: torch.Tensor | None = None
         tilt_log_acceptance: torch.Tensor | None = None
         retained_proposal_count = (
@@ -2212,6 +3094,33 @@ class RectifiedFlowMBD:
                     generator=generator,
                     log_acceptance_fn=proposal_log_acceptance_fn,
                 )
+            )
+        elif first_order_proposal is not None:
+            (
+                candidates,
+                first_order_log_density_ratio,
+                proposal_diagnostics,
+            ) = sample_first_order_gaussian_proposals(
+                center,
+                gradient=first_order_proposal.gradient,
+                temperature=float(self.config.temperature),
+                scale=float(proposal_scale),
+                lower=lower,
+                upper=upper,
+                num_samples=proposal_count,
+                generator=generator,
+                defensive_fraction=float(
+                    first_order_proposal.defensive_fraction
+                ),
+                max_shift_standard_deviations=float(
+                    first_order_proposal.max_shift_standard_deviations
+                ),
+                shifted_center_override=(
+                    first_order_proposal.shifted_center_override
+                ),
+                shifted_scale_multiplier=float(
+                    first_order_proposal.shifted_scale_multiplier
+                ),
             )
         elif local_quadratic_proposal is not None:
             (
@@ -2413,23 +3322,63 @@ class RectifiedFlowMBD:
                     (*persistent_proposal_bank.candidate_batches, candidates),
                     dim=1,
                 )
-            fresh_component_centers = (
-                tuple(proposal_mixture_centers)
-                if multi_center_mixture
-                else (center,)
-            )
-            fresh_component_counts = (
-                tuple(int(count) for count in sampling_mixture_counts)
-                if multi_center_mixture
-                else (int(fresh_candidates.shape[1]),)
-            )
+            if first_order_proposal is not None:
+                raw_shift = (
+                    -float(proposal_scale) ** 2
+                    * first_order_proposal.gradient
+                    / float(self.config.temperature)
+                )
+                raw_norm = torch.linalg.vector_norm(
+                    raw_shift.flatten(start_dim=1), dim=1
+                ).clamp_min(1.0e-12)
+                maximum_norm = (
+                    float(first_order_proposal.max_shift_standard_deviations)
+                    * float(proposal_scale)
+                )
+                trust = torch.clamp(maximum_norm / raw_norm, max=1.0)
+                shifted_center = center + raw_shift * trust.reshape(-1, 1, 1)
+                if first_order_proposal.shifted_center_override is not None:
+                    shifted_center = first_order_proposal.shifted_center_override.to(
+                        device=center.device, dtype=center.dtype
+                    )
+                defensive_count = max(1, min(
+                    int(proposal_count) - 1,
+                    int(round(
+                        float(proposal_count)
+                        * float(first_order_proposal.defensive_fraction)
+                    )),
+                ))
+                fresh_component_centers = (center, shifted_center)
+                fresh_component_scales = (
+                    float(proposal_scale),
+                    float(proposal_scale)
+                    * float(first_order_proposal.shifted_scale_multiplier),
+                )
+                fresh_component_counts = (
+                    defensive_count,
+                    int(proposal_count) - defensive_count,
+                )
+            else:
+                fresh_component_centers = (
+                    tuple(proposal_mixture_centers)
+                    if multi_center_mixture
+                    else (center,)
+                )
+                fresh_component_scales = tuple(
+                    float(proposal_scale) for _ in fresh_component_centers
+                )
+                fresh_component_counts = (
+                    tuple(int(count) for count in sampling_mixture_counts)
+                    if multi_center_mixture
+                    else (int(fresh_candidates.shape[1]),)
+                )
             persistent_component_centers = tuple(
                 (*persistent_proposal_bank.component_centers, *fresh_component_centers)
             )
             persistent_component_scales = tuple(
                 (
                     *persistent_proposal_bank.component_scales,
-                    *(float(proposal_scale) for _ in fresh_component_centers),
+                    *fresh_component_scales,
                 )
             )
             persistent_component_counts = tuple(
@@ -2498,7 +3447,7 @@ class RectifiedFlowMBD:
             costs = np.concatenate(
                 (*persistent_proposal_bank.cost_batches, fresh_costs), axis=1
             )
-            if multi_center_mixture:
+            if len(fresh_component_counts) > 1:
                 split_indices = np.cumsum(fresh_component_counts[:-1])
                 fresh_eligibility_batches = tuple(
                     None
@@ -2558,6 +3507,19 @@ class RectifiedFlowMBD:
                 smoothness_log_density_ratio.detach().cpu().numpy()
             )
             reward_logits = reward_logits + log_density_ratio
+        if (
+            first_order_log_density_ratio is not None
+            and persistent_proposal_bank is None
+        ):
+            first_order_ratio = (
+                first_order_log_density_ratio.detach().cpu().numpy()
+            )
+            reward_logits = reward_logits + first_order_ratio
+            log_density_ratio = (
+                first_order_ratio
+                if log_density_ratio is None
+                else log_density_ratio + first_order_ratio
+            )
         if local_quadratic_log_density_ratio is not None:
             local_ratio = (
                 local_quadratic_log_density_ratio.detach().cpu().numpy()
@@ -2691,6 +3653,300 @@ class RectifiedFlowMBD:
             weights_np, device=center.device, dtype=center.dtype
         )
         mean = torch.sum(weights[..., None, None] * candidates, dim=1)
+        direct_importance_mean = mean
+        control_variate_diagnostics: dict[str, Any] = {
+            "first_order_control_variate": False,
+            "reason": "not_requested",
+        }
+        quality_guard_evaluations = 0
+        proxy_guard_diagnostics: dict[str, Any] = {
+            "first_order_proxy_quality_guard": "not_applicable",
+        }
+        if (
+            bool(self.config.first_order_proxy_exact_quality_guard)
+            and first_order_proposal is not None
+            and first_order_proposal.shifted_center_override is not None
+            and first_order_log_density_ratio is not None
+            and persistent_proposal_bank is None
+        ):
+            # The first component is sampled directly from the unchanged FM
+            # likelihood. Its standalone SNIS mean and the exact-mixture SNIS
+            # mean are both consistent for the same Tweedie posterior. Select
+            # between them with the authoritative nonlinear cost, preventing
+            # a useful proxy mode from worsening finite-sample reward without
+            # changing the asymptotic score.
+            defensive_count = int(proposal_diagnostics["defensive_count"])
+            defensive_candidates = candidates[:, :defensive_count]
+            defensive_logits = (
+                -np.asarray(costs[:, :defensive_count], dtype=np.float64)
+                / float(self.config.temperature)
+            )
+            defensive_available = np.ones(center.shape[0], dtype=bool)
+            if eligible_value is not None:
+                defensive_eligible = np.asarray(
+                    eligible_value[:, :defensive_count], dtype=bool
+                )
+                defensive_available = np.any(defensive_eligible, axis=1)
+                defensive_logits = np.where(
+                    defensive_eligible, defensive_logits, -np.inf
+                )
+            defensive_weights_np = np.stack(
+                [normalized_weights(row) for row in defensive_logits], axis=0
+            )
+            defensive_weights = torch.as_tensor(
+                defensive_weights_np, device=center.device, dtype=center.dtype
+            )
+            defensive_mean = torch.sum(
+                defensive_weights[..., None, None] * defensive_candidates,
+                dim=1,
+            )
+            comparison_candidates = torch.stack(
+                (defensive_mean, direct_importance_mean), dim=1
+            )
+            comparison_value = cost_fn(comparison_candidates)
+            comparison_eligible = None
+            if isinstance(comparison_value, ProposalCostResult):
+                comparison_eligible = comparison_value.eligible
+                comparison_value = comparison_value.costs
+            comparison_costs = (
+                comparison_value.detach().cpu().numpy()
+                if torch.is_tensor(comparison_value)
+                else np.asarray(comparison_value)
+            )
+            if comparison_costs.shape != candidates.shape[:1] + (2,):
+                raise ValueError("proxy quality guard cost must return [P,2]")
+            mixture_eligible = np.ones(center.shape[0], dtype=bool)
+            if comparison_eligible is not None:
+                comparison_eligible = (
+                    comparison_eligible.detach().cpu().numpy()
+                    if torch.is_tensor(comparison_eligible)
+                    else np.asarray(comparison_eligible)
+                )
+                if comparison_eligible.shape != comparison_costs.shape:
+                    raise ValueError(
+                        "proxy quality guard eligibility must return [P,2]"
+                    )
+                defensive_available &= comparison_eligible[:, 0].astype(
+                    bool, copy=False
+                )
+                mixture_eligible = comparison_eligible[:, 1].astype(
+                    bool, copy=False
+                )
+            select_defensive = (
+                defensive_available
+                & np.isfinite(comparison_costs[:, 0])
+                & (
+                    ~mixture_eligible
+                    | (comparison_costs[:, 0] <= comparison_costs[:, 1] + 1.0e-12)
+                )
+            )
+            mean = torch.where(
+                torch.as_tensor(
+                    select_defensive, device=center.device, dtype=torch.bool
+                ).reshape(-1, 1, 1),
+                defensive_mean,
+                direct_importance_mean,
+            )
+            direct_importance_mean = mean
+            quality_guard_evaluations += int(2 * center.shape[0])
+            proxy_guard_diagnostics = {
+                "first_order_proxy_quality_guard": "exact_cost_nonincrease",
+                "first_order_proxy_defensive_cost": comparison_costs[:, 0].tolist(),
+                "first_order_proxy_mixture_cost": comparison_costs[:, 1].tolist(),
+                "first_order_proxy_selected_cost": np.where(
+                    select_defensive, comparison_costs[:, 0], comparison_costs[:, 1]
+                ).tolist(),
+                "first_order_proxy_selected_defensive": select_defensive.tolist(),
+                "first_order_proxy_defensive_samples": defensive_count,
+            }
+        replicated_groups = min(
+            int(self.config.replicated_snis_groups), candidates.shape[1]
+        )
+        replicated_diagnostics: dict[str, Any] = {
+            "replicated_snis_groups": replicated_groups,
+            "replicated_snis_quality_guard_accepted": None,
+        }
+        if replicated_groups > 1:
+            # Interleaving keeps every replicated estimate representative when
+            # proposal components occupy contiguous slices of the population.
+            group_means = []
+            group_sizes = []
+            for group_index in range(replicated_groups):
+                group_logits = reward_logits[:, group_index::replicated_groups]
+                group_candidates = candidates[:, group_index::replicated_groups]
+                group_weights_np = np.stack(
+                    [normalized_weights(row) for row in group_logits], axis=0
+                )
+                group_weights = torch.as_tensor(
+                    group_weights_np, device=center.device, dtype=center.dtype
+                )
+                group_means.append(torch.sum(
+                    group_weights[..., None, None] * group_candidates, dim=1
+                ))
+                group_sizes.append(int(group_candidates.shape[1]))
+            replicated_mean = torch.stack(group_means, dim=1).mean(dim=1)
+            blend = float(self.config.replicated_snis_blend)
+            replicated_mean = (
+                (1.0 - blend) * direct_importance_mean
+                + blend * replicated_mean
+            )
+            replicated_diagnostics["replicated_snis_blend"] = blend
+            if not self.config.replicated_snis_exact_quality_guard:
+                mean = replicated_mean
+                replicated_diagnostics.update({
+                    "replicated_snis_group_sizes": group_sizes,
+                    "replicated_snis_quality_guard": "disabled",
+                })
+            else:
+                comparison_candidates = torch.stack(
+                    (direct_importance_mean, replicated_mean), dim=1
+                )
+                comparison_value = cost_fn(comparison_candidates)
+                comparison_eligible = None
+                if isinstance(comparison_value, ProposalCostResult):
+                    comparison_eligible = comparison_value.eligible
+                    comparison_value = comparison_value.costs
+                comparison_costs = (
+                    comparison_value.detach().cpu().numpy()
+                    if torch.is_tensor(comparison_value)
+                    else np.asarray(comparison_value)
+                )
+                if comparison_costs.shape != candidates.shape[:1] + (2,):
+                    raise ValueError("replicated SNIS guard cost must return [P,2]")
+                direct_eligible = np.ones(center.shape[0], dtype=bool)
+                replicated_eligible = np.ones(center.shape[0], dtype=bool)
+                if comparison_eligible is not None:
+                    comparison_eligible = (
+                        comparison_eligible.detach().cpu().numpy()
+                        if torch.is_tensor(comparison_eligible)
+                        else np.asarray(comparison_eligible)
+                    )
+                    if comparison_eligible.shape != comparison_costs.shape:
+                        raise ValueError(
+                            "replicated SNIS guard eligibility must return [P,2]"
+                        )
+                    direct_eligible = comparison_eligible[:, 0].astype(
+                        bool, copy=False
+                    )
+                    replicated_eligible = comparison_eligible[:, 1].astype(
+                        bool, copy=False
+                    )
+                accept_replicated = (
+                    replicated_eligible
+                    & np.isfinite(comparison_costs[:, 1])
+                    & (
+                        ~direct_eligible
+                        | (
+                            comparison_costs[:, 1]
+                            <= comparison_costs[:, 0] + 1.0e-12
+                        )
+                    )
+                )
+                mean = torch.where(
+                    torch.as_tensor(
+                        accept_replicated, device=center.device, dtype=torch.bool
+                    ).reshape(-1, 1, 1),
+                    replicated_mean,
+                    direct_importance_mean,
+                )
+                quality_guard_evaluations += int(2 * center.shape[0])
+                replicated_diagnostics.update({
+                    "replicated_snis_group_sizes": group_sizes,
+                    "replicated_snis_direct_cost": comparison_costs[:, 0].tolist(),
+                    "replicated_snis_candidate_cost": comparison_costs[:, 1].tolist(),
+                    "replicated_snis_selected_cost": np.where(
+                        accept_replicated,
+                        comparison_costs[:, 1],
+                        comparison_costs[:, 0],
+                    ).tolist(),
+                    "replicated_snis_quality_guard_accepted": (
+                        accept_replicated.tolist()
+                    ),
+                })
+        if (
+            first_order_proposal is not None
+            and first_order_log_density_ratio is not None
+            and first_order_proposal.use_control_variate
+        ):
+            corrected_mean, control_variate_diagnostics = (
+                _cross_fitted_first_order_control_variate_mean(
+                    candidates,
+                    reward_logits=reward_logits,
+                    log_base_over_proposal=first_order_log_density_ratio,
+                    center=center,
+                    scale=float(proposal_scale),
+                    lower=lower,
+                    upper=upper,
+                    temperature=float(self.config.temperature),
+                    proposal=first_order_proposal,
+                )
+            )
+            if corrected_mean is not None:
+                comparison_candidates = torch.stack(
+                    (direct_importance_mean, corrected_mean), dim=1
+                )
+                comparison_value = cost_fn(comparison_candidates)
+                comparison_eligible = None
+                if isinstance(comparison_value, ProposalCostResult):
+                    comparison_eligible = comparison_value.eligible
+                    comparison_value = comparison_value.costs
+                comparison_costs = (
+                    comparison_value.detach().cpu().numpy()
+                    if torch.is_tensor(comparison_value)
+                    else np.asarray(comparison_value)
+                )
+                if comparison_costs.shape != candidates.shape[:1] + (2,):
+                    raise ValueError(
+                        "quality guard cost callback must return [P,2]"
+                    )
+                direct_eligible = np.ones(center.shape[0], dtype=bool)
+                corrected_eligible = np.ones(center.shape[0], dtype=bool)
+                if comparison_eligible is not None:
+                    comparison_eligible = (
+                        comparison_eligible.detach().cpu().numpy()
+                        if torch.is_tensor(comparison_eligible)
+                        else np.asarray(comparison_eligible)
+                    )
+                    if comparison_eligible.shape != comparison_costs.shape:
+                        raise ValueError(
+                            "quality guard eligibility must return [P,2]"
+                        )
+                    direct_eligible = comparison_eligible[:, 0].astype(
+                        bool, copy=False
+                    )
+                    corrected_eligible = comparison_eligible[:, 1].astype(
+                        bool, copy=False
+                    )
+                accept = (
+                    corrected_eligible
+                    & np.isfinite(comparison_costs[:, 1])
+                    & (
+                        ~direct_eligible
+                        | (
+                            comparison_costs[:, 1]
+                            <= comparison_costs[:, 0] + 1.0e-12
+                        )
+                    )
+                )
+                mean = torch.where(
+                    torch.as_tensor(
+                        accept, device=center.device, dtype=torch.bool
+                    ).reshape(-1, 1, 1),
+                    corrected_mean,
+                    direct_importance_mean,
+                )
+                quality_guard_evaluations += int(2 * center.shape[0])
+                control_variate_diagnostics.update({
+                    "quality_guard": "exact_cost_nonincrease",
+                    "quality_guard_direct_cost": comparison_costs[:, 0].tolist(),
+                    "quality_guard_corrected_cost": comparison_costs[:, 1].tolist(),
+                    "quality_guard_selected_cost": np.where(
+                        accept, comparison_costs[:, 1], comparison_costs[:, 0]
+                    ).tolist(),
+                    "quality_guard_direct_eligible": direct_eligible.tolist(),
+                    "quality_guard_corrected_eligible": corrected_eligible.tolist(),
+                    "quality_guard_accepted": accept.tolist(),
+                })
         raw_variance = torch.var(candidates, dim=1, correction=0)
         weighted_variance = torch.sum(
             weights[..., None, None] * (candidates - mean[:, None]).square(),
@@ -2741,16 +3997,21 @@ class RectifiedFlowMBD:
             else None
         )
         diagnostics = {
+            **replicated_diagnostics,
             "sampler": (
-                "local_quadratic_gaussian_exact_importance"
-                if local_quadratic_proposal is not None
+                "first_order_gaussian_exact_importance"
+                if first_order_proposal is not None
                 else (
-                    "quadratic_smoothness_gaussian_residual_importance"
-                    if quadratic_smoothness_proposal is not None
+                    "local_quadratic_gaussian_exact_importance"
+                    if local_quadratic_proposal is not None
                     else (
-                        "autoregressive_p99_truncated_importance"
-                        if autoregressive
-                        else "direct_importance"
+                        "quadratic_smoothness_gaussian_residual_importance"
+                        if quadratic_smoothness_proposal is not None
+                        else (
+                            "autoregressive_p99_truncated_importance"
+                            if autoregressive
+                            else "direct_importance"
+                        )
                     )
                 )
             ),
@@ -2812,10 +4073,12 @@ class RectifiedFlowMBD:
                 else None
             ),
             "wall_clock_seconds": time.perf_counter() - started,
-            "full_cost_evaluation_calls": 1,
+            "full_cost_evaluation_calls": 1 + (
+                quality_guard_evaluations // max(2 * center.shape[0], 1)
+            ),
             "full_cost_particle_evaluations": int(
                 cost_candidates.shape[0] * cost_candidates.shape[1]
-            ),
+            ) + quality_guard_evaluations,
             "cached_cost_particle_evaluations": int(
                 candidates.shape[0] * persistent_previous_count
             ),
@@ -2824,11 +4087,15 @@ class RectifiedFlowMBD:
             "importance_density_correction": (
                 target_center is not None
                 or smoothness_log_density_ratio is not None
+                or first_order_log_density_ratio is not None
+                or local_quadratic_log_density_ratio is not None
                 or tilt_log_acceptance is not None
             ),
             "importance_proposal": (
                 "bounded_gaussian_mixture_times_log_acceptance_tilt"
                 if tilt_log_acceptance is not None
+                else "fm_gaussian_times_first_order_tilt_mixture"
+                if first_order_proposal is not None
                 else "fm_gaussian_times_quadratic_smoothness"
                 if quadratic_smoothness_proposal is not None
                 else (
@@ -2945,10 +4212,13 @@ class RectifiedFlowMBD:
             ),
         }
         diagnostics.update(proposal_diagnostics)
+        diagnostics.update(proxy_guard_diagnostics)
+        diagnostics.update(control_variate_diagnostics)
         if persistent_proposal_bank is not None:
             offset = 0
-            for component_center, component_count in zip(
+            for component_center, component_scale, component_count in zip(
                 fresh_component_centers,
+                fresh_component_scales,
                 fresh_component_counts,
                 strict=True,
             ):
@@ -2956,7 +4226,7 @@ class RectifiedFlowMBD:
                 persistent_proposal_bank.append(
                     fresh_candidates[:, offset:stop],
                     center=component_center,
-                    scale=float(proposal_scale),
+                    scale=float(component_scale),
                     costs=fresh_costs[:, offset:stop],
                     eligible=(
                         None
@@ -3000,6 +4270,7 @@ class RectifiedFlowMBD:
                     autoregressive_residual_bounds=autoregressive_residual_bounds,
                     autoregressive_dims=int(autoregressive_dims),
                     quadratic_smoothness_proposal=quadratic_smoothness_proposal,
+                    first_order_proposal=first_order_proposal,
                     local_quadratic_proposal=local_quadratic_proposal,
                     proposal_log_acceptance_fn=proposal_log_acceptance_fn,
             proposal_prefilter_cost_fn=proposal_prefilter_cost_fn,
@@ -3172,6 +4443,12 @@ class RectifiedFlowMBD:
         generator: torch.Generator,
         trajectory_coefficient: float,
         gradient_cost_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        first_order_gradient_cost_fn: (
+            Callable[[torch.Tensor], torch.Tensor] | None
+        ) = None,
+        first_order_defensive_fraction: float = 0.25,
+        first_order_max_shift_standard_deviations: float = 0.75,
+        first_order_proposal_override: FirstOrderGaussianProposal | None = None,
         keypose_coefficient: float | None = None,
         proposals_per_particle: int | None = None,
         proposal_center: torch.Tensor | None = None,
@@ -3277,6 +4554,66 @@ class RectifiedFlowMBD:
                 min=lower,
                 max=upper,
             )
+        if (
+            first_order_gradient_cost_fn is not None
+            and first_order_proposal_override is not None
+        ):
+            raise ValueError(
+                "first-order gradient and cached proposal override are exclusive"
+            )
+        first_order_proposal = first_order_proposal_override
+        first_order_gradient_seconds = 0.0
+        if first_order_gradient_cost_fn is not None:
+            if local_quadratic_proposal is not None:
+                raise ValueError(
+                    "first-order and local-quadratic proposals are exclusive"
+                )
+            if any(value is not None for value in (
+                quadratic_smoothness_proposal,
+                proposal_log_acceptance_fn,
+                proposal_prefilter_cost_fn,
+            )):
+                raise ValueError(
+                    "first-order gradients are exclusive with another "
+                    "specialized proposal"
+                )
+            gradient_center = (
+                importance_target_center
+                if importance_target_center is not None
+                else resolved_proposal_center
+            )
+            # The Gaussian mean may lie outside the executable box late in the
+            # reverse solve. Linearize at its projection, but keep the original
+            # mean as the exact importance target.
+            gradient_point = torch.maximum(
+                torch.minimum(gradient_center, upper), lower
+            ).detach().requires_grad_(True)
+            gradient_started = time.perf_counter()
+            with torch.enable_grad():
+                gradient_cost = first_order_gradient_cost_fn(
+                    gradient_point[:, None]
+                )
+                if gradient_cost.shape != gradient_point.shape[:1] + (1,):
+                    raise ValueError(
+                        "first-order gradient callback must return [P,1]"
+                    )
+                gradient = torch.autograd.grad(
+                    gradient_cost.sum(), gradient_point, create_graph=False
+                )[0]
+            first_order_gradient_seconds = time.perf_counter() - gradient_started
+            first_order_proposal = FirstOrderGaussianProposal(
+                gradient=gradient.detach(),
+                cost_at_reference=gradient_cost.detach()[:, 0],
+                reference=gradient_point.detach(),
+                defensive_fraction=float(first_order_defensive_fraction),
+                max_shift_standard_deviations=float(
+                    first_order_max_shift_standard_deviations
+                ),
+            )
+        first_order_owns_importance_target = bool(
+            first_order_proposal is not None
+            and importance_target_center is not None
+        )
         local_quadratic_owns_importance_target = bool(
             local_quadratic_proposal is not None
             and importance_target_center is not None
@@ -3289,6 +4626,7 @@ class RectifiedFlowMBD:
             importance_target_center
             if (
                 smc_starts_from_importance_target
+                or first_order_owns_importance_target
                 or local_quadratic_owns_importance_target
             )
             else resolved_proposal_center
@@ -3298,6 +4636,7 @@ class RectifiedFlowMBD:
             if (
                 (
                     smc_starts_from_importance_target
+                    or first_order_owns_importance_target
                     or local_quadratic_owns_importance_target
                 )
                 and importance_target_scale is not None
@@ -3317,6 +4656,7 @@ class RectifiedFlowMBD:
                 None
                 if (
                     smc_starts_from_importance_target
+                    or first_order_owns_importance_target
                     or local_quadratic_owns_importance_target
                 )
                 else (
@@ -3329,6 +4669,7 @@ class RectifiedFlowMBD:
                 None
                 if (
                     smc_starts_from_importance_target
+                    or first_order_owns_importance_target
                     or local_quadratic_owns_importance_target
                 )
                 else importance_target_scale
@@ -3351,6 +4692,7 @@ class RectifiedFlowMBD:
             autoregressive_residual_bounds=autoregressive_residual_bounds,
             autoregressive_dims=int(autoregressive_dims),
             quadratic_smoothness_proposal=quadratic_smoothness_proposal,
+            first_order_proposal=first_order_proposal,
             local_quadratic_proposal=local_quadratic_proposal,
             proposal_log_acceptance_fn=proposal_log_acceptance_fn,
             proposal_prefilter_cost_fn=proposal_prefilter_cost_fn,
@@ -3360,6 +4702,12 @@ class RectifiedFlowMBD:
             diagnostic_repeats=int(diagnostic_repeats),
             persistent_proposal_bank=persistent_proposal_bank,
         )
+        if first_order_proposal is not None:
+            if proposals.diagnostics is None:
+                raise RuntimeError("first-order proposal diagnostics are missing")
+            proposals.diagnostics["first_order_gradient_wall_clock_seconds"] = (
+                first_order_gradient_seconds
+            )
         mbd_score = (
             (1.0 - float(time_value)) * proposals.mean - x_t
         ) / (float(time_value) ** 2)
@@ -3518,6 +4866,14 @@ class RectifiedFlowMBD:
         keypose_gradient_cost_fn: (
             Callable[[torch.Tensor], torch.Tensor] | None
         ) = None,
+        keypose_first_order_gradient_cost_fn: (
+            Callable[[torch.Tensor], torch.Tensor] | None
+        ) = None,
+        keypose_first_order_defensive_fraction: float = 0.25,
+        keypose_first_order_max_shift_standard_deviations: float = 0.75,
+        keypose_first_order_proposal_override: (
+            FirstOrderGaussianProposal | None
+        ) = None,
         waypoint_gradient_cost_fn: (
             Callable[[torch.Tensor], torch.Tensor] | None
         ) = None,
@@ -3594,6 +4950,14 @@ class RectifiedFlowMBD:
             generator=resolved_keypose_generator,
             trajectory_coefficient=float(keypose_coefficient),
             gradient_cost_fn=keypose_gradient_cost_fn,
+            first_order_gradient_cost_fn=keypose_first_order_gradient_cost_fn,
+            first_order_defensive_fraction=float(
+                keypose_first_order_defensive_fraction
+            ),
+            first_order_max_shift_standard_deviations=float(
+                keypose_first_order_max_shift_standard_deviations
+            ),
+            first_order_proposal_override=keypose_first_order_proposal_override,
             keypose_coefficient=float(keypose_coefficient),
             proposals_per_particle=keypose_proposals_per_particle,
             proposal_center=(
@@ -3761,6 +5125,7 @@ class RectifiedFlowMBD:
 __all__ = [
     "CleanTrajectoryCost",
     "FlowBlendCoefficients",
+    "FirstOrderGaussianProposal",
     "ProposalResult",
     "ProposalCostResult",
     "RectifiedFlowMBD",
@@ -3782,6 +5147,7 @@ __all__ = [
     "sample_autoregressive_waypoint_proposals",
     "sample_quadratic_smoothness_gaussian_proposals",
     "sample_independent_truncated_gaussian",
+    "sample_first_order_gaussian_proposals",
     "sample_local_quadratic_gaussian_proposals",
     "sample_trajectory_proposals",
     "straight_line_cspace_path",

@@ -661,3 +661,36 @@ def test_adaptive_smc_is_optional_and_uses_gradient_callback_for_mala() -> None:
     assert result.diagnostics["gradient_cost_evaluation_calls"] > 0
     assert result.diagnostics["mala_acceptance_rate"] is not None
     assert float(result.mean.item()) > 0.5
+
+
+def test_truncated_gaussian_keeps_fixed_coordinates_and_samples_remaining_subspace():
+    from sim_free_mpc.rectified_flow_mbd import sample_independent_truncated_gaussian
+    center = torch.tensor([[0.2, 99.0, -0.3], [-0.1, -99.0, 0.4]])
+    lower = torch.tensor([-1.0, 0.0, -2.0])
+    upper = torch.tensor([1.0, 0.0, 2.0])
+    samples = sample_independent_truncated_gaussian(
+        center, scale=0.4, lower=lower, upper=upper, num_samples=100,
+        generator=torch.Generator().manual_seed(12))
+    varying = torch.tensor([True, False, True])
+    reference = sample_independent_truncated_gaussian(
+        center[:, varying], scale=0.4, lower=lower[varying], upper=upper[varying],
+        num_samples=100, generator=torch.Generator().manual_seed(12))
+    assert torch.equal(samples[..., 1], torch.zeros_like(samples[..., 1]))
+    torch.testing.assert_close(samples[..., varying], reference)
+    density = bounded_gaussian_log_prob(samples[:, :, None], center=center[:, None],
+        scale=0.4, lower=lower, upper=upper, sampler="truncated_gaussian")
+    reference_density = bounded_gaussian_log_prob(reference[:, :, None],
+        center=center[:, None, varying], scale=0.4, lower=lower[varying],
+        upper=upper[varying], sampler="truncated_gaussian")
+    torch.testing.assert_close(density, reference_density)
+
+
+def test_truncated_gaussian_all_fixed_and_reversed_bounds():
+    from sim_free_mpc.rectified_flow_mbd import sample_independent_truncated_gaussian
+    bounds = torch.tensor([0.0, 2.0])
+    samples = sample_independent_truncated_gaussian(torch.ones(1, 2), scale=0.4,
+        lower=bounds, upper=bounds, num_samples=5, generator=torch.Generator())
+    torch.testing.assert_close(samples, bounds[None, None].expand(1, 5, 2))
+    with pytest.raises(RuntimeError, match="empty support"):
+        sample_independent_truncated_gaussian(torch.ones(1, 2), scale=0.4,
+            lower=bounds, upper=bounds - 1, num_samples=5, generator=torch.Generator())
